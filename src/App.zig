@@ -264,6 +264,8 @@ pub fn init(
         .colors = config.terminalColors(),
     });
     errdefer term.deinit(alloc);
+    term.width_px = initial_cols * font.cell_width;
+    term.height_px = initial_rows * font.cell_height;
 
     // Child-exit detection is driven by SIGCHLD, not pty EOF: block the
     // signal and receive it through a signalfd in the poll loop. This
@@ -2178,18 +2180,25 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void
     const self: *App = @ptrCast(@alignCast(ctx));
     self.renderer.focused = self.focused;
     const resized = try self.ensureRenderPixels(width, height);
+    const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
     if (self.term.modes.get(.synchronized_output)) {
         if (resized) try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
         @memcpy(pixels, self.render_pixels.items);
         return;
     }
     try self.render_state.update(self.alloc, &self.term);
-    if (resized) self.render_state.dirty = .full;
+    const kitty_graphics_dirty = self.term.screens.active.kitty_images.dirty;
+    if (resized or kitty_graphics_dirty or has_kitty_graphics) self.render_state.dirty = .full;
     switch (self.render_state.dirty) {
         .false => {},
-        .full => try self.renderer.render(&self.render_state, self.render_pixels.items, width, height),
+        .full => if (has_kitty_graphics) {
+            try self.renderer.renderWithKittyGraphics(&self.render_state, &self.term, self.render_pixels.items, width, height);
+        } else {
+            try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
+        },
         .partial => try self.renderer.renderDirty(&self.render_state, self.render_pixels.items, width, height),
     }
+    if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
     self.clearRenderDirty();
     @memcpy(pixels, self.render_pixels.items);
 }
@@ -2219,10 +2228,16 @@ fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
     const cols: u16 = @intCast(@min(std.math.maxInt(u16), @max(1, width / self.font.cell_width)));
     const rows: u16 = @intCast(@min(std.math.maxInt(u16), @max(1, height / self.font.cell_height)));
-    if (cols == self.term.cols and rows == self.term.rows) return;
+    const pixels_changed = width != self.term.width_px or height != self.term.height_px;
+    const cells_changed = cols != self.term.cols or rows != self.term.rows;
+    if (!cells_changed and !pixels_changed) return;
 
-    log.debug("resize to {d}x{d} cells", .{ cols, rows });
-    try self.term.resize(self.alloc, cols, rows);
+    self.term.width_px = width;
+    self.term.height_px = height;
+    if (cells_changed) {
+        log.debug("resize to {d}x{d} cells", .{ cols, rows });
+        try self.term.resize(self.alloc, cols, rows);
+    }
     try self.pty.setWinsize(.{
         .row = rows,
         .col = cols,

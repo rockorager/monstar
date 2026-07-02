@@ -13,6 +13,9 @@ const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
 
 const log = std.log.scoped(.renderer);
+const KittyImage = vt.kitty.graphics.Image;
+const KittyPlacement = vt.kitty.graphics.ImageStorage.Placement;
+const KittyPlacementKey = vt.kitty.graphics.ImageStorage.PlacementKey;
 
 alloc: std.mem.Allocator,
 font: *Font,
@@ -87,6 +90,63 @@ pub fn render(
     }
 }
 
+pub fn renderWithKittyGraphics(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    terminal: *const vt.Terminal,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
+    std.debug.assert(pixels.len == @as(usize, width) * height);
+
+    @memset(pixels, argb(state.colors.background));
+    if (state.rows == 0 or state.cols == 0) return;
+
+    try self.renderKittyGraphics(terminal, pixels, width, height, .below_bg);
+
+    const rows = state.row_data.slice();
+    const all_cells = rows.items(.cells);
+    const all_selections = rows.items(.selection);
+    for (0..state.rows) |y| {
+        try self.prepareRow(
+            state,
+            all_cells[y].slice(),
+            all_selections[y],
+            @intCast(y),
+            pixels,
+            width,
+            height,
+            true,
+        );
+    }
+
+    try self.renderKittyGraphics(terminal, pixels, width, height, .below_text);
+
+    for (0..state.rows) |y| {
+        try self.prepareRow(
+            state,
+            all_cells[y].slice(),
+            all_selections[y],
+            @intCast(y),
+            pixels,
+            width,
+            height,
+            false,
+        );
+        try self.renderRowForeground(
+            state,
+            all_cells[y].slice(),
+            @intCast(y),
+            pixels,
+            width,
+            height,
+        );
+    }
+
+    try self.renderKittyGraphics(terminal, pixels, width, height, .above_text);
+}
+
 /// Draw only rows marked dirty in `state`, preserving other pixels.
 /// Dirty rows are expanded by one neighboring row to cover glyph and
 /// sprite overhang from the previous frame.
@@ -126,6 +186,327 @@ pub fn renderDirty(
     }
 }
 
+fn renderKittyGraphics(
+    self: *Renderer,
+    terminal: *const vt.Terminal,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    layer: KittyGraphicsLayer,
+) !void {
+    std.debug.assert(pixels.len == @as(usize, width) * height);
+
+    const storage = &terminal.screens.active.kitty_images;
+    if (storage.placements.count() == 0) return;
+
+    var placements: std.ArrayList(KittyRenderItem) = .empty;
+    defer placements.deinit(self.alloc);
+
+    var it = storage.placements.iterator();
+    while (it.next()) |entry| {
+        const image = storage.imageById(entry.key_ptr.image_id) orelse continue;
+        switch (entry.value_ptr.location) {
+            .pin => {},
+            // Unicode placeholder placement needs fragment-specific render
+            // geometry; leave it for a separate pass.
+            .virtual => continue,
+        }
+        if (!layer.matches(entry.value_ptr.z)) continue;
+        try placements.append(self.alloc, .{
+            .key = entry.key_ptr.*,
+            .placement = entry.value_ptr.*,
+            .image = image,
+        });
+    }
+
+    std.mem.sortUnstable(KittyRenderItem, placements.items, {}, kittyRenderItemLessThan);
+    for (placements.items) |item| try self.renderKittyPlacement(
+        terminal,
+        pixels,
+        width,
+        height,
+        item.placement,
+        item.image,
+    );
+}
+
+const KittyGraphicsLayer = enum {
+    below_bg,
+    below_text,
+    above_text,
+
+    fn matches(self: KittyGraphicsLayer, z: i32) bool {
+        const bg_limit = std.math.minInt(i32) / 2;
+        return switch (self) {
+            .below_bg => z < bg_limit,
+            .below_text => z >= bg_limit and z < 0,
+            .above_text => z >= 0,
+        };
+    }
+};
+
+const KittyRenderItem = struct {
+    key: KittyPlacementKey,
+    placement: KittyPlacement,
+    image: KittyImage,
+};
+
+fn kittyRenderItemLessThan(_: void, lhs: KittyRenderItem, rhs: KittyRenderItem) bool {
+    if (lhs.placement.z != rhs.placement.z) return lhs.placement.z < rhs.placement.z;
+    if (lhs.key.image_id != rhs.key.image_id) return lhs.key.image_id < rhs.key.image_id;
+    return lhs.key.placement_id.id < rhs.key.placement_id.id;
+}
+
+fn renderKittyPlacement(
+    self: *Renderer,
+    terminal: *const vt.Terminal,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    placement: KittyPlacement,
+    image: KittyImage,
+) !void {
+    if (image.width == 0 or image.height == 0 or image.data.len == 0) return;
+
+    const viewport = kittyPlacementViewport(terminal, placement, image, self.font.cell_width, self.font.cell_height) orelse return;
+    if (!viewport.visible) return;
+
+    const dest_width = viewport.pixel_width;
+    const dest_height = viewport.pixel_height;
+    if (dest_width == 0 or dest_height == 0) return;
+
+    const source_width = viewport.source_width;
+    const source_height = viewport.source_height;
+    if (source_width == 0 or source_height == 0) return;
+
+    var source = try self.alloc.alloc(u8, @as(usize, source_width) * source_height * 4);
+    defer self.alloc.free(source);
+    if (!copyKittySourceRgba(&source, image, viewport)) return;
+
+    const scaled = try self.alloc.alloc(u8, @as(usize, dest_width) * dest_height * 4);
+    defer self.alloc.free(scaled);
+    try resizeRgba(source, source_width, source_height, scaled, dest_width, dest_height);
+
+    const dest_x = viewport.viewport_col * @as(i32, @intCast(self.font.cell_width)) +
+        @as(i32, @intCast(placement.x_offset));
+    const dest_y = viewport.viewport_row * @as(i32, @intCast(self.font.cell_height)) +
+        @as(i32, @intCast(placement.y_offset));
+    blendRgba(pixels, width, height, scaled, dest_width, dest_height, dest_x, dest_y);
+}
+
+const KittyPlacementViewport = struct {
+    viewport_col: i32,
+    viewport_row: i32,
+    visible: bool,
+    pixel_width: u32,
+    pixel_height: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+};
+
+fn kittyPlacementViewport(
+    terminal: *const vt.Terminal,
+    placement: KittyPlacement,
+    image: KittyImage,
+    cell_width: u31,
+    cell_height: u31,
+) ?KittyPlacementViewport {
+    const pin = switch (placement.location) {
+        .pin => |pin| pin,
+        .virtual => return null,
+    };
+
+    const pages = &terminal.screens.active.pages;
+    const pin_screen = pages.pointFromPin(.screen, pin.*) orelse return null;
+    const vp_tl = pages.getTopLeft(.viewport);
+    const vp_screen = pages.pointFromPin(.screen, vp_tl) orelse return null;
+
+    const pixel_size = kittyPlacementPixelSize(placement, image, cell_width, cell_height);
+    const grid_rows = std.math.divCeil(u32, pixel_size.height + placement.y_offset, cell_height) catch return null;
+    const viewport_row: i32 = @as(i32, @intCast(pin_screen.screen.y)) -
+        @as(i32, @intCast(vp_screen.screen.y));
+    const viewport_col: i32 = @intCast(pin_screen.screen.x);
+    const visible = viewport_row + @as(i32, @intCast(grid_rows)) > 0 and
+        viewport_row < @as(i32, @intCast(terminal.rows));
+
+    const source_x = @min(placement.source_x, image.width);
+    const source_y = @min(placement.source_y, image.height);
+    return .{
+        .viewport_col = viewport_col,
+        .viewport_row = viewport_row,
+        .visible = visible,
+        .pixel_width = pixel_size.width,
+        .pixel_height = pixel_size.height,
+        .source_x = source_x,
+        .source_y = source_y,
+        .source_width = @min(if (placement.source_width > 0) placement.source_width else image.width, image.width - source_x),
+        .source_height = @min(if (placement.source_height > 0) placement.source_height else image.height, image.height - source_y),
+    };
+}
+
+fn kittyPlacementPixelSize(
+    placement: KittyPlacement,
+    image: KittyImage,
+    cell_width: u31,
+    cell_height: u31,
+) struct { width: u32, height: u32 } {
+    const source_width = if (placement.source_width > 0) placement.source_width else image.width;
+    const source_height = if (placement.source_height > 0) placement.source_height else image.height;
+
+    if (placement.columns == 0 and placement.rows == 0) return .{
+        .width = source_width,
+        .height = source_height,
+    };
+
+    if (placement.columns > 0 and placement.rows > 0) return .{
+        .width = placement.columns * cell_width,
+        .height = placement.rows * cell_height,
+    };
+
+    const width_f64: f64 = @floatFromInt(source_width);
+    const height_f64: f64 = @floatFromInt(source_height);
+    if (placement.columns > 0) {
+        const width = placement.columns * cell_width;
+        return .{
+            .width = width,
+            .height = @intFromFloat(@round(@as(f64, @floatFromInt(width)) * height_f64 / width_f64)),
+        };
+    }
+
+    const height = placement.rows * cell_height;
+    return .{
+        .width = @intFromFloat(@round(@as(f64, @floatFromInt(height)) * width_f64 / height_f64)),
+        .height = height,
+    };
+}
+
+fn copyKittySourceRgba(
+    dst: *[]u8,
+    image: KittyImage,
+    viewport: KittyPlacementViewport,
+) bool {
+    const channels: usize = switch (image.format) {
+        .gray => 1,
+        .gray_alpha => 2,
+        .rgb => 3,
+        .rgba => 4,
+        .png => return false,
+    };
+    const expected_len = @as(usize, image.width) * image.height * channels;
+    if (image.data.len < expected_len) return false;
+
+    var out: usize = 0;
+    for (0..viewport.source_height) |row| {
+        const source_y = viewport.source_y + row;
+        for (0..viewport.source_width) |col| {
+            const source_x = viewport.source_x + col;
+            const offset = (@as(usize, source_y) * image.width + source_x) * channels;
+            switch (image.format) {
+                .gray => {
+                    const gray = image.data[offset];
+                    dst.*[out + 0] = gray;
+                    dst.*[out + 1] = gray;
+                    dst.*[out + 2] = gray;
+                    dst.*[out + 3] = 0xff;
+                },
+                .gray_alpha => {
+                    const gray = image.data[offset];
+                    dst.*[out + 0] = gray;
+                    dst.*[out + 1] = gray;
+                    dst.*[out + 2] = gray;
+                    dst.*[out + 3] = image.data[offset + 1];
+                },
+                .rgb => {
+                    dst.*[out + 0] = image.data[offset + 0];
+                    dst.*[out + 1] = image.data[offset + 1];
+                    dst.*[out + 2] = image.data[offset + 2];
+                    dst.*[out + 3] = 0xff;
+                },
+                .rgba => {
+                    dst.*[out + 0] = image.data[offset + 0];
+                    dst.*[out + 1] = image.data[offset + 1];
+                    dst.*[out + 2] = image.data[offset + 2];
+                    dst.*[out + 3] = image.data[offset + 3];
+                },
+                .png => unreachable,
+            }
+            out += 4;
+        }
+    }
+    return true;
+}
+
+fn resizeRgba(
+    source: []const u8,
+    source_width: u32,
+    source_height: u32,
+    dest: []u8,
+    dest_width: u32,
+    dest_height: u32,
+) !void {
+    if (c.stbir_resize_uint8(
+        source.ptr,
+        @intCast(source_width),
+        @intCast(source_height),
+        @intCast(source_width * 4),
+        dest.ptr,
+        @intCast(dest_width),
+        @intCast(dest_height),
+        @intCast(dest_width * 4),
+        4,
+    ) == 0) return error.ImageResizeFailed;
+}
+
+fn blendRgba(
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    rgba: []const u8,
+    image_width: u32,
+    image_height: u32,
+    dest_x: i32,
+    dest_y: i32,
+) void {
+    for (0..image_height) |src_y| {
+        const y = dest_y + @as(i32, @intCast(src_y));
+        if (y < 0 or y >= height) continue;
+
+        for (0..image_width) |src_x| {
+            const x = dest_x + @as(i32, @intCast(src_x));
+            if (x < 0 or x >= width) continue;
+
+            const src_offset = (@as(usize, src_y) * image_width + src_x) * 4;
+            const alpha = rgba[src_offset + 3];
+            if (alpha == 0) continue;
+
+            const dst_idx = @as(usize, @intCast(y)) * width + @as(usize, @intCast(x));
+            if (alpha == 0xff) {
+                pixels[dst_idx] = 0xff000000 |
+                    (@as(u32, rgba[src_offset + 0]) << 16) |
+                    (@as(u32, rgba[src_offset + 1]) << 8) |
+                    @as(u32, rgba[src_offset + 2]);
+                continue;
+            }
+
+            pixels[dst_idx] = blendPixel(pixels[dst_idx], rgba[src_offset..][0..4]);
+        }
+    }
+}
+
+fn blendPixel(dst: u32, src: *const [4]u8) u32 {
+    const alpha = @as(u32, src[3]);
+    const inv_alpha = 255 - alpha;
+    const dst_r = (dst >> 16) & 0xff;
+    const dst_g = (dst >> 8) & 0xff;
+    const dst_b = dst & 0xff;
+    const r = (@as(u32, src[0]) * alpha + dst_r * inv_alpha + 127) / 255;
+    const g = (@as(u32, src[1]) * alpha + dst_g * inv_alpha + 127) / 255;
+    const b = (@as(u32, src[2]) * alpha + dst_b * inv_alpha + 127) / 255;
+    return 0xff000000 | (r << 16) | (g << 8) | b;
+}
+
 fn clearRow(
     self: *Renderer,
     state: *const vt.RenderState,
@@ -156,11 +537,25 @@ fn renderRow(
     width: u31,
     height: u31,
 ) !void {
+    try self.prepareRow(state, cells, selection, y, pixels, width, height, true);
+    try self.renderRowForeground(state, cells, y, pixels, width, height);
+}
+
+fn prepareRow(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    selection: ?[2]vt.size.CellCountInt,
+    y: u31,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    draw_backgrounds: bool,
+) !void {
     const font = self.font;
     const colors = &state.colors;
     const raws = cells.items(.raw);
     const styles = cells.items(.style);
-    const graphemes = cells.items(.grapheme);
     const cols: u31 = @min(state.cols, cells.len);
 
     const cursor_x: ?u31 = cursor: {
@@ -217,7 +612,8 @@ fn renderRow(
         }
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
-        if (bg) |bg_color| {
+        if (draw_backgrounds and bg != null) {
+            const bg_color = bg.?;
             fillRect(
                 pixels,
                 width,
@@ -230,6 +626,29 @@ fn renderRow(
             );
         }
     }
+}
+
+fn renderRowForeground(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    y: u31,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
+    const colors = &state.colors;
+    const raws = cells.items(.raw);
+    const styles = cells.items(.style);
+    const graphemes = cells.items(.grapheme);
+    const cols: u31 = @min(state.cols, cells.len);
+
+    const cursor_x: ?u31 = cursor: {
+        if (!state.cursor.visible) break :cursor null;
+        const viewport = state.cursor.viewport orelse break :cursor null;
+        if (viewport.y != y) break :cursor null;
+        break :cursor @intCast(viewport.x -| @intFromBool(viewport.wide_tail));
+    };
 
     // Text pass: shape and draw runs of consecutive cells with the same
     // style and font face.
