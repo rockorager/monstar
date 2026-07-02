@@ -32,6 +32,9 @@ window: *Window,
 keyboard: Keyboard,
 /// Terminal contents changed since the last committed frame.
 needs_redraw: bool,
+/// Cached DEC mode 2048 state, to detect the application enabling
+/// in-band size reports.
+in_band_reports: bool,
 /// The child hung up; drain and quit.
 child_eof: bool,
 /// Key repeat: timerfd armed while a repeating key is held.
@@ -100,6 +103,7 @@ pub fn init(
         .window = window,
         .keyboard = try .init(),
         .needs_redraw = true,
+        .in_band_reports = false,
         .child_eof = false,
         .repeat_fd = repeat_fd,
         .repeat_keycode = null,
@@ -153,7 +157,10 @@ fn effectEnquiry(_: *Handler) []const u8 {
 }
 
 fn effectSize(handler: *Handler) ?vt.size_report.Size {
-    const self = appFromHandler(handler);
+    return appFromHandler(handler).currentSize();
+}
+
+fn currentSize(self: *App) vt.size_report.Size {
     return .{
         .rows = self.term.rows,
         .columns = self.term.cols,
@@ -261,7 +268,28 @@ fn readPty(self: *App) void {
         return;
     }
     self.stream.nextSlice(buf[0..n]);
+    self.syncInBandSizeReports();
     self.needs_redraw = true;
+}
+
+/// DEC mode 2048 (in-band size reports): the terminal must send a size
+/// report when the application enables the mode, and again on every
+/// resize while it stays enabled. Neovim relies on these instead of
+/// SIGWINCH once DECRQM confirms support.
+///
+/// Detected by edge-triggering on the mode value after each PTY chunk,
+/// so re-enabling an already-enabled mode sends no duplicate report.
+fn syncInBandSizeReports(self: *App) void {
+    const enabled = self.term.modes.get(.in_band_size_reports);
+    if (enabled and !self.in_band_reports) self.sendSizeReport();
+    self.in_band_reports = enabled;
+}
+
+fn sendSizeReport(self: *App) void {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    vt.size_report.encode(&writer, .mode_2048, self.currentSize()) catch return;
+    self.writePty(writer.buffered());
 }
 
 /// Window keyboard delegate: track xkb state and encode key presses
@@ -410,5 +438,6 @@ fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
         .xpixel = @intCast(width),
         .ypixel = @intCast(height),
     });
+    if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.needs_redraw = true;
 }
