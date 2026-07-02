@@ -57,6 +57,9 @@ pointer_y: f64,
 scroll_pixels: f64,
 scroll_clicks: i32,
 scroll_had_discrete: bool,
+/// Left-button drag selection: the tracked anchor pin while dragging.
+selecting: bool,
+sel_anchor: ?*vt.Pin,
 
 /// Terminal lines per wheel click.
 const wheel_lines = 3;
@@ -139,6 +142,8 @@ pub fn init(
         .scroll_pixels = 0,
         .scroll_clicks = 0,
         .scroll_had_discrete = false,
+        .selecting = false,
+        .sel_anchor = null,
     };
     self.stream = self.term.vtStream();
 
@@ -238,6 +243,7 @@ fn setNonblocking(fd: posix.fd_t) void {
 }
 
 pub fn deinit(self: *App) void {
+    if (self.sel_anchor) |anchor| self.term.screens.active.pages.untrackPin(anchor);
     self.write_queue.deinit(self.alloc);
     _ = std.os.linux.close(self.repeat_fd);
     self.keyboard.deinit();
@@ -394,6 +400,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
+            if (self.selecting) self.extendSelection();
         },
         .axis => |axis| {
             if (axis.axis == .vertical_scroll and !self.scroll_had_discrete) {
@@ -408,23 +415,96 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         },
         .frame => self.finishScrollFrame(),
         .button => |button| {
-            // Buttons only matter to applications with mouse reporting
-            // enabled; selection is not implemented yet.
-            if (self.term.flags.mouse_event == .none) return;
-            const mouse_button: vt.input.MouseButton = switch (button.button) {
-                272 => .left, // BTN_LEFT
-                273 => .right, // BTN_RIGHT
-                274 => .middle, // BTN_MIDDLE
-                else => return,
-            };
-            self.sendMouseEvent(.{
-                .action = if (button.state == .pressed) .press else .release,
-                .button = mouse_button,
-                .mods = self.keyboard.currentMods(),
-                .pos = self.pointerPosPhysical(),
-            });
+            // Mouse reporting wins when the application asked for it,
+            // except that shift bypasses it for terminal-side selection.
+            const reporting = self.term.flags.mouse_event != .none and
+                !self.keyboard.currentMods().shift;
+            if (reporting) {
+                const mouse_button: vt.input.MouseButton = switch (button.button) {
+                    272 => .left, // BTN_LEFT
+                    273 => .right, // BTN_RIGHT
+                    274 => .middle, // BTN_MIDDLE
+                    else => return,
+                };
+                self.sendMouseEvent(.{
+                    .action = if (button.state == .pressed) .press else .release,
+                    .button = mouse_button,
+                    .mods = self.keyboard.currentMods(),
+                    .pos = self.pointerPosPhysical(),
+                });
+                return;
+            }
+            if (button.button == 272) { // BTN_LEFT: drag selection
+                switch (button.state) {
+                    .pressed => self.startSelection(),
+                    .released => self.finishSelection(),
+                    else => {},
+                }
+            }
         },
         .leave, .axis_source, .axis_stop => {},
+    }
+}
+
+/// The viewport cell under the pointer, clamped to the grid.
+fn cellAtPointer(self: *App) struct { x: u16, y: u16 } {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    const px: f64 = @max(0, self.pointer_x * scale);
+    const py: f64 = @max(0, self.pointer_y * scale);
+    const x: u16 = @intFromFloat(@min(
+        px / @as(f64, @floatFromInt(self.font.cell_width)),
+        @as(f64, @floatFromInt(self.term.cols -| 1)),
+    ));
+    const y: u16 = @intFromFloat(@min(
+        py / @as(f64, @floatFromInt(self.font.cell_height)),
+        @as(f64, @floatFromInt(self.term.rows -| 1)),
+    ));
+    return .{ .x = x, .y = y };
+}
+
+fn pinAtPointer(self: *App) ?vt.Pin {
+    const cell = self.cellAtPointer();
+    return self.term.screens.active.pages.pin(.{
+        .viewport = .{ .x = cell.x, .y = cell.y },
+    });
+}
+
+fn startSelection(self: *App) void {
+    const screen = self.term.screens.active;
+    self.clearSelection();
+    const anchor = self.pinAtPointer() orelse return;
+    self.sel_anchor = screen.pages.trackPin(anchor) catch null;
+    self.selecting = self.sel_anchor != null;
+}
+
+fn extendSelection(self: *App) void {
+    const screen = self.term.screens.active;
+    const anchor = self.sel_anchor orelse return;
+    const cur = self.pinAtPointer() orelse return;
+    screen.select(.init(anchor.*, cur, false)) catch return;
+    self.needs_redraw = true;
+}
+
+fn finishSelection(self: *App) void {
+    if (!self.selecting) return;
+    self.selecting = false;
+    if (self.sel_anchor) |anchor| {
+        self.term.screens.active.pages.untrackPin(anchor);
+        self.sel_anchor = null;
+    }
+}
+
+/// Drop the current selection and stop any in-progress drag.
+fn clearSelection(self: *App) void {
+    const screen = self.term.screens.active;
+    self.selecting = false;
+    if (self.sel_anchor) |anchor| {
+        screen.pages.untrackPin(anchor);
+        self.sel_anchor = null;
+    }
+    if (screen.selection != null) {
+        screen.clearSelection();
+        self.needs_redraw = true;
     }
 }
 

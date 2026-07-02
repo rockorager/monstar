@@ -56,8 +56,17 @@ pub fn render(
 
     const rows = state.row_data.slice();
     const all_cells = rows.items(.cells);
+    const all_selections = rows.items(.selection);
     for (0..state.rows) |y| {
-        try self.renderRow(state, all_cells[y].slice(), @intCast(y), pixels, width, height);
+        try self.renderRow(
+            state,
+            all_cells[y].slice(),
+            all_selections[y],
+            @intCast(y),
+            pixels,
+            width,
+            height,
+        );
     }
 }
 
@@ -65,6 +74,7 @@ fn renderRow(
     self: *Renderer,
     state: *const vt.RenderState,
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    selection: ?[2]vt.size.CellCountInt,
     y: u31,
     pixels: []u32,
     width: u31,
@@ -100,7 +110,10 @@ fn renderRow(
         const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
         var bg = style.bg(&raws[x], &colors.palette);
-        if (style.flags.inverse) {
+        // Selection renders as inverse video; a selected inverse cell
+        // flips back to normal.
+        const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
+        if (style.flags.inverse != selected) {
             const old_fg = fg;
             fg = bg orelse colors.background;
             bg = old_fg;
