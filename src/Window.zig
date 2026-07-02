@@ -33,6 +33,11 @@ height: u31,
 pending_width: u31,
 pending_height: u31,
 running: bool,
+render_ctx: ?*anyopaque,
+render_fn: ?RenderFn,
+
+/// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
+pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void;
 
 /// Globals collected during the initial registry roundtrip.
 const Globals = struct {
@@ -79,6 +84,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .pending_width = default_width,
         .pending_height = default_height,
         .running = true,
+        .render_ctx = null,
+        .render_fn = null,
     };
 
     wm_base.setListener(*Window, wmBaseListener, self);
@@ -110,10 +117,20 @@ pub fn dispatch(self: *Window) !bool {
     return self.running;
 }
 
-/// Fill the window with the background color and commit.
+/// Set the delegate that draws window contents.
+pub fn setRenderCallback(self: *Window, ctx: *anyopaque, render_fn: RenderFn) void {
+    self.render_ctx = ctx;
+    self.render_fn = render_fn;
+}
+
+/// Redraw the window contents and commit.
 fn draw(self: *Window) !void {
     const buffer = try self.acquireBuffer(self.width, self.height);
-    @memset(buffer.pixels(), bg_color);
+    if (self.render_fn) |render_fn| {
+        try render_fn(self.render_ctx.?, buffer.pixels(), self.width, self.height);
+    } else {
+        @memset(buffer.pixels(), bg_color);
+    }
 
     self.surface.attach(buffer.wl_buffer, 0, 0);
     self.surface.damageBuffer(0, 0, self.width, self.height);

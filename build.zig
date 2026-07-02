@@ -21,6 +21,18 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
 
+    // Font stack: fontconfig (discovery) + FreeType (rasterization) +
+    // HarfBuzz (shaping), imported through one translated C header.
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_c.linkSystemLibrary("fontconfig", .{});
+    translate_c.linkSystemLibrary("freetype2", .{});
+    translate_c.linkSystemLibrary("harfbuzz", .{});
+    root_module.addImport("c", translate_c.createModule());
+
     if (b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,
