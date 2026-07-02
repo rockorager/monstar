@@ -191,6 +191,7 @@ const AppStreamHandler = struct {
         self.terminal_handler.vt(action, value);
         switch (action) {
             .color_operation => self.app.answerOscColorQueries(&value.requests, value.terminator),
+            .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .dcs_hook => self.dcsHook(value),
             .dcs_put => self.dcsPut(value),
             .dcs_unhook => self.dcsUnhook(),
@@ -419,8 +420,15 @@ fn effectWritePty(handler: *Handler, data: [:0]const u8) void {
 }
 
 fn effectDeviceAttributes(_: *Handler) EffectResult("device_attributes") {
-    // Defaults report a reasonable VT220-level terminal.
-    return .{};
+    return deviceAttributes();
+}
+
+fn deviceAttributes() EffectResult("device_attributes") {
+    return .{
+        .primary = .{
+            .features = &.{ .ansi_color, .clipboard },
+        },
+    };
 }
 
 fn effectEnquiry(_: *Handler) []const u8 {
@@ -678,6 +686,47 @@ fn answerOscColorQueries(
     }
 }
 
+fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
+    if (data.len == 1 and data[0] == '?') {
+        log.debug("ignoring unsupported OSC 52 clipboard read", .{});
+        return;
+    }
+
+    const text = decodeOsc52ClipboardData(self.alloc, data) catch |err| {
+        switch (err) {
+            error.OutOfMemory => log.warn("out of memory decoding OSC 52 clipboard data", .{}),
+            else => log.info("application sent invalid base64 data for OSC 52", .{}),
+        }
+        return;
+    };
+
+    switch (osc52Target(kind)) {
+        .clipboard => self.claimClipboardText(text),
+        .primary => self.claimPrimaryText(text),
+    }
+}
+
+const Osc52Target = enum { clipboard, primary };
+
+fn osc52Target(kind: u8) Osc52Target {
+    return switch (kind) {
+        's', 'p' => .primary,
+        else => .clipboard,
+    };
+}
+
+fn decodeOsc52ClipboardData(alloc: std.mem.Allocator, data: []const u8) ![:0]const u8 {
+    const dec = std.base64.standard.Decoder;
+    const size = try dec.calcSizeForSlice(data);
+    const buf = try alloc.allocSentinel(u8, size, 0);
+    errdefer alloc.free(buf);
+    dec.decode(buf, data) catch |err| switch (err) {
+        error.InvalidPadding => {},
+        else => return err,
+    };
+    return buf;
+}
+
 fn answerDcsCommand(self: *App, cmd: *vt.dcs.Command) void {
     switch (cmd.*) {
         .xtgettcap => |*gettcap| self.answerXtgettcap(gettcap),
@@ -912,6 +961,24 @@ test "OSC color reports use 16-bit rgb format" {
         .bel,
     );
     try std.testing.expectEqualStrings("\x1b]4;7;rgb:abab/cdcd/efef\x07", writer.buffered());
+}
+
+test "OSC 52 set decodes clipboard payload" {
+    const text = try decodeOsc52ClipboardData(std.testing.allocator, "aGVsbG8=");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello", text);
+
+    try std.testing.expectEqual(.clipboard, osc52Target('c'));
+    try std.testing.expectEqual(.primary, osc52Target('s'));
+    try std.testing.expectEqual(.primary, osc52Target('p'));
+    try std.testing.expectEqual(.clipboard, osc52Target('7'));
+}
+
+test "DA1 advertises OSC 52 clipboard support" {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try deviceAttributes().encode(.primary, &writer);
+    try std.testing.expectEqualStrings("\x1b[?62;22;52c", writer.buffered());
 }
 
 test "XTGETTCAP reports hex encoded capabilities" {
@@ -1540,9 +1607,19 @@ fn selectionText(self: *App) ?[:0]const u8 {
 
 /// Claim the primary selection with the currently selected text.
 fn copyToPrimary(self: *App) void {
-    const manager = self.window.primary_manager orelse return;
-    const device = self.window.primary_device orelse return;
     const text = self.selectionText() orelse return;
+    self.claimPrimaryText(text);
+}
+
+fn claimPrimaryText(self: *App, text: [:0]const u8) void {
+    const manager = self.window.primary_manager orelse {
+        self.alloc.free(text);
+        return;
+    };
+    const device = self.window.primary_device orelse {
+        self.alloc.free(text);
+        return;
+    };
 
     const source = manager.createSource() catch {
         self.alloc.free(text);
@@ -1569,9 +1646,19 @@ fn copyToPrimary(self: *App) void {
 
 /// Claim the clipboard with the currently selected text.
 fn copyToClipboard(self: *App) void {
-    const manager = self.window.data_manager orelse return;
-    const device = self.window.data_device orelse return;
     const text = self.selectionText() orelse return;
+    self.claimClipboardText(text);
+}
+
+fn claimClipboardText(self: *App, text: [:0]const u8) void {
+    const manager = self.window.data_manager orelse {
+        self.alloc.free(text);
+        return;
+    };
+    const device = self.window.data_device orelse {
+        self.alloc.free(text);
+        return;
+    };
 
     const source = manager.createDataSource() catch {
         self.alloc.free(text);
@@ -1590,6 +1677,7 @@ fn copyToClipboard(self: *App) void {
 
     if (self.clip_source) |old| old.destroy();
     self.clip_source = ctx;
+    log.debug("claimed clipboard ({d} bytes)", .{text.len});
 }
 
 /// Ask the offer's owner to stream its contents into a pipe; the read
