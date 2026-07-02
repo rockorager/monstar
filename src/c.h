@@ -3,3 +3,4 @@
 #include FT_FREETYPE_H
 #include <hb.h>
 #include <hb-ft.h>
+#include <xkbcommon/xkbcommon.h>

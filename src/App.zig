@@ -9,8 +9,11 @@ const App = @This();
 
 const std = @import("std");
 const posix = std.posix;
+const wayland = @import("wayland");
+const wl = wayland.client.wl;
 const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
+const Keyboard = @import("Keyboard.zig");
 const Pty = @import("Pty.zig");
 const Renderer = @import("Renderer.zig");
 const Window = @import("Window.zig");
@@ -26,6 +29,7 @@ child_pid: posix.pid_t,
 font: Font,
 renderer: Renderer,
 window: *Window,
+keyboard: Keyboard,
 /// Terminal contents changed since the last committed frame.
 needs_redraw: bool,
 /// The child hung up; drain and quit.
@@ -83,15 +87,17 @@ pub fn init(
         .font = font,
         .renderer = try .init(alloc, &self.font),
         .window = window,
+        .keyboard = try .init(),
         .needs_redraw = true,
         .child_eof = false,
     };
     self.stream = self.term.vtStream();
-    window.setCallbacks(self, render, resize);
+    window.setCallbacks(self, render, resize, keyboardEvent);
     return self;
 }
 
 pub fn deinit(self: *App) void {
+    self.keyboard.deinit();
     self.window.destroy();
     self.renderer.deinit();
     self.render_state.deinit(self.alloc);
@@ -169,6 +175,71 @@ fn readPty(self: *App) void {
     }
     self.stream.nextSlice(buf[0..n]);
     self.needs_redraw = true;
+}
+
+/// Window keyboard delegate: track xkb state and encode key presses
+/// into PTY input.
+fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .keymap => |keymap| {
+            if (keymap.format != .xkb_v1) {
+                log.err("unsupported keymap format {}", .{keymap.format});
+                _ = std.os.linux.close(keymap.fd);
+                return;
+            }
+            // setKeymap takes ownership of the fd.
+            self.keyboard.setKeymap(keymap.fd, keymap.size) catch |err| {
+                log.err("keymap load failed: {}", .{err});
+            };
+        },
+        .modifiers => |mods| self.keyboard.updateMods(
+            mods.mods_depressed,
+            mods.mods_latched,
+            mods.mods_locked,
+            mods.group,
+        ),
+        .key => |key| {
+            const action: vt.input.KeyAction = switch (key.state) {
+                .pressed => .press,
+                .released => .release,
+                else => return,
+            };
+            self.onKey(key.key, action);
+        },
+        .enter, .leave, .repeat_info => {},
+    }
+}
+
+fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
+    var utf8_buf: [16]u8 = undefined;
+    const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
+
+    var out_buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&out_buf);
+    vt.input.encodeKey(&writer, event, .fromTerminal(&self.term)) catch |err| {
+        log.err("key encode failed: {}", .{err});
+        return;
+    };
+    const bytes = writer.buffered();
+    if (bytes.len == 0) return;
+    self.writePty(bytes);
+}
+
+fn writePty(self: *App, bytes: []const u8) void {
+    const linux = std.os.linux;
+    var remaining = bytes;
+    while (remaining.len > 0) {
+        const rc = linux.write(self.pty.master, remaining.ptr, remaining.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => remaining = remaining[rc..],
+            .INTR => continue,
+            else => |err| {
+                log.err("pty write failed: {}", .{err});
+                return;
+            },
+        }
+    }
 }
 
 /// Window render delegate: refresh the render state and draw the grid.

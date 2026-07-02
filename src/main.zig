@@ -122,6 +122,7 @@ fn buildEnvp(
 test {
     _ = App;
     _ = Font;
+    _ = @import("Keyboard.zig");
     _ = Pty;
     _ = Renderer;
     _ = Window;

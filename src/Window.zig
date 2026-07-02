@@ -24,6 +24,8 @@ registry: *wl.Registry,
 compositor: *wl.Compositor,
 shm: *wl.Shm,
 wm_base: *xdg.WmBase,
+seat: ?*wl.Seat,
+keyboard: ?*wl.Keyboard,
 surface: *wl.Surface,
 xdg_surface: *xdg.Surface,
 toplevel: *xdg.Toplevel,
@@ -40,6 +42,7 @@ redraw_queued: bool,
 render_ctx: ?*anyopaque,
 render_fn: ?RenderFn,
 resize_fn: ?ResizeFn,
+keyboard_fn: ?KeyboardFn,
 
 /// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
 pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void;
@@ -47,11 +50,15 @@ pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, heig
 /// Called when the window size changed, before the next draw.
 pub const ResizeFn = *const fn (ctx: *anyopaque, width: u31, height: u31) anyerror!void;
 
+/// Raw wl_keyboard events, forwarded as-is.
+pub const KeyboardFn = *const fn (ctx: *anyopaque, event: wl.Keyboard.Event) void;
+
 /// Globals collected during the initial registry roundtrip.
 const Globals = struct {
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
     wm_base: ?*xdg.WmBase = null,
+    seat: ?*wl.Seat = null,
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
@@ -83,6 +90,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .compositor = compositor,
         .shm = shm,
         .wm_base = wm_base,
+        .seat = globals.seat,
+        .keyboard = null,
         .surface = surface,
         .xdg_surface = xdg_surface,
         .toplevel = toplevel,
@@ -99,8 +108,10 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .render_ctx = null,
         .render_fn = null,
         .resize_fn = null,
+        .keyboard_fn = null,
     };
 
+    if (globals.seat) |seat| seat.setListener(*Window, seatListener, self);
     wm_base.setListener(*Window, wmBaseListener, self);
     xdg_surface.setListener(*Window, xdgSurfaceListener, self);
     toplevel.setListener(*Window, toplevelListener, self);
@@ -112,6 +123,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
 pub fn destroy(self: *Window) void {
     for (self.buffers.items) |buffer| buffer.destroy(self.alloc);
     self.buffers.deinit(self.alloc);
+    if (self.keyboard) |keyboard| keyboard.release();
+    if (self.seat) |seat| seat.release();
     self.toplevel.destroy();
     self.xdg_surface.destroy();
     self.surface.destroy();
@@ -130,11 +143,18 @@ pub fn dispatch(self: *Window) !bool {
     return self.running;
 }
 
-/// Set the delegates for drawing window contents and reacting to resizes.
-pub fn setCallbacks(self: *Window, ctx: *anyopaque, render_fn: RenderFn, resize_fn: ?ResizeFn) void {
+/// Set the delegates for drawing, resizing, and keyboard input.
+pub fn setCallbacks(
+    self: *Window,
+    ctx: *anyopaque,
+    render_fn: RenderFn,
+    resize_fn: ?ResizeFn,
+    keyboard_fn: ?KeyboardFn,
+) void {
     self.render_ctx = ctx;
     self.render_fn = render_fn;
     self.resize_fn = resize_fn;
+    self.keyboard_fn = keyboard_fn;
 }
 
 /// Redraw as soon as the compositor is ready for a new frame: now if no
@@ -218,10 +238,37 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
                 globals.wm_base = registry.bind(global.name, xdg.WmBase, 2) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
+                globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 5)) catch return;
             }
         },
         .global_remove => {},
     }
+}
+
+fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
+    switch (event) {
+        .capabilities => |caps| {
+            const has_keyboard = caps.capabilities.keyboard;
+            if (has_keyboard and self.keyboard == null) {
+                self.keyboard = seat.getKeyboard() catch |err| keyboard: {
+                    log.err("getKeyboard failed: {}", .{err});
+                    break :keyboard null;
+                };
+                if (self.keyboard) |keyboard| {
+                    keyboard.setListener(*Window, keyboardListener, self);
+                }
+            } else if (!has_keyboard and self.keyboard != null) {
+                self.keyboard.?.release();
+                self.keyboard = null;
+            }
+        },
+        .name => {},
+    }
+}
+
+fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) void {
+    if (self.keyboard_fn) |keyboard_fn| keyboard_fn(self.render_ctx.?, event);
 }
 
 fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, _: *Window) void {
