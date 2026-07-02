@@ -1,14 +1,25 @@
 const std = @import("std");
+const Scanner = @import("wayland").Scanner;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const scanner = Scanner.create(b, .{});
+    scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.generate("wl_compositor", 4);
+    scanner.generate("wl_shm", 1);
+    scanner.generate("xdg_wm_base", 2);
+    const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    root_module.addImport("wayland", wayland_mod);
+    root_module.linkSystemLibrary("wayland-client", .{});
 
     if (b.lazyDependency("ghostty", .{
         .target = target,

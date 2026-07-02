@@ -1,11 +1,13 @@
-//! vtread milestone 1: headless terminal core.
+//! Application entry point.
 //!
-//! Spawns a command on a PTY, feeds its output through ghostty-vt terminal
-//! emulation, and dumps the resulting screen as plain text on exit.
+//! `vtread` opens a Wayland window (milestone 2: solid background only).
+//! `vtread --dump [command...]` runs the headless pipeline: spawn a command
+//! on a PTY, feed its output through ghostty-vt, and dump the screen as text.
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
 const Pty = @import("Pty.zig");
+const Window = @import("Window.zig");
 
 const log = std.log.scoped(.main);
 
@@ -13,13 +15,26 @@ const cols = 80;
 const rows = 24;
 
 pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--dump")) {
+        return dump(init, args[2..]);
+    }
+
+    const window = try Window.create(init.gpa);
+    defer window.destroy();
+    while (try window.dispatch()) {}
+}
+
+/// Headless mode: run a command under terminal emulation, print the screen.
+fn dump(init: std.process.Init, args: []const [:0]const u8) !void {
     const alloc = init.gpa;
     const arena = init.arena.allocator();
 
     // Command to run: CLI args joined, or a colorful default.
-    const args = try init.minimal.args.toSlice(arena);
-    const cmd: [:0]const u8 = if (args.len > 1)
-        try std.mem.joinZ(arena, " ", args[1..])
+    const cmd: [:0]const u8 = if (args.len > 0)
+        try std.mem.joinZ(arena, " ", args)
     else
         "ls --color=auto /";
 
@@ -83,6 +98,7 @@ fn buildEnvp(
 
 test {
     _ = Pty;
+    _ = Window;
 }
 
 test "terminal emulation of simple output" {
