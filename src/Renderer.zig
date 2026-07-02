@@ -19,6 +19,8 @@ font: *Font,
 hb_buf: *c.hb_buffer_t,
 /// Per-cell resolved foreground colors for the row being rendered.
 fg_scratch: std.ArrayList(vt.color.RGB),
+/// Per-cell font face indices for the row being rendered.
+face_scratch: std.ArrayList(u16),
 
 pub fn init(alloc: std.mem.Allocator, font: *Font) !Renderer {
     const hb_buf = c.hb_buffer_create() orelse return error.OutOfMemory;
@@ -28,12 +30,14 @@ pub fn init(alloc: std.mem.Allocator, font: *Font) !Renderer {
         .font = font,
         .hb_buf = hb_buf,
         .fg_scratch = .empty,
+        .face_scratch = .empty,
     };
 }
 
 pub fn deinit(self: *Renderer) void {
     c.hb_buffer_destroy(self.hb_buf);
     self.fg_scratch.deinit(self.alloc);
+    self.face_scratch.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -80,9 +84,19 @@ fn renderRow(
         break :cursor @intCast(viewport.x -| @intFromBool(viewport.wide_tail));
     };
 
-    // Background + foreground-color pass.
+    // Background + foreground-color + face-resolution pass.
     try self.fg_scratch.resize(self.alloc, cols);
+    try self.face_scratch.resize(self.alloc, cols);
     for (0..cols) |x| {
+        self.face_scratch.items[x] = face: {
+            switch (raws[x].content_tag) {
+                .codepoint, .codepoint_grapheme => {},
+                else => break :face 0,
+            }
+            const cp = raws[x].content.codepoint.data;
+            if (cp == 0 or cp == ' ') break :face 0;
+            break :face self.font.faceForCodepoint(self.alloc, cp);
+        };
         const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
         var bg = style.bg(&raws[x], &colors.palette);
@@ -111,7 +125,9 @@ fn renderRow(
         }
     }
 
-    // Text pass: shape and draw runs of consecutive same-style cells.
+    // Text pass: shape and draw runs of consecutive cells with the same
+    // style and font face.
+    const faces = self.face_scratch.items;
     var run_start: u31 = 0;
     var x: u31 = 0;
     while (x < cols) : (x += 1) {
@@ -119,7 +135,9 @@ fn renderRow(
             .codepoint, .codepoint_grapheme => raws[x].content.codepoint.data != 0,
             else => false,
         };
-        const breaks_run = !has_text or raws[x].style_id != raws[run_start].style_id;
+        const breaks_run = !has_text or
+            raws[x].style_id != raws[run_start].style_id or
+            faces[x] != faces[run_start];
         if (breaks_run) {
             try self.drawRun(raws, graphemes, run_start, x, y, pixels, width, height);
             run_start = if (has_text) x else x + 1;
@@ -129,6 +147,7 @@ fn renderRow(
 }
 
 /// Shape cells [start, end) as one HarfBuzz run and blit the glyphs.
+/// The run's face is the one resolved for its first cell.
 fn drawRun(
     self: *Renderer,
     raws: []const vt.Cell,
@@ -142,6 +161,7 @@ fn drawRun(
 ) !void {
     if (start >= end) return;
     const font = self.font;
+    const face = font.face(self.face_scratch.items[start]);
 
     c.hb_buffer_clear_contents(self.hb_buf);
     var non_space = false;
@@ -159,7 +179,7 @@ fn drawRun(
 
     c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
     c.hb_buffer_guess_segment_properties(self.hb_buf);
-    c.hb_shape(font.hb_font, self.hb_buf, null, 0);
+    c.hb_shape(face.hb_font, self.hb_buf, null, 0);
 
     var glyph_count: c_uint = 0;
     const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
@@ -175,7 +195,7 @@ fn drawRun(
             cluster = info.cluster;
             pen_x = @as(i32, @intCast(cluster)) * font.cell_width;
         }
-        const g = try font.glyph(self.alloc, info.codepoint);
+        const g = try face.glyph(self.alloc, info.codepoint);
         blitGlyph(
             pixels,
             width,
@@ -271,7 +291,7 @@ test "render a simple grid" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init("monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font);
     defer renderer.deinit();

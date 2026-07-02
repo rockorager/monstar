@@ -69,7 +69,7 @@ pub fn init(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
 ) !*App {
-    var font: Font = try .init(opts.font_family, opts.font_size_px);
+    var font: Font = try .init(alloc, opts.font_family, opts.font_size_px);
     errdefer font.deinit(alloc);
 
     var term: vt.Terminal = try .init(io, alloc, .{
@@ -151,7 +151,7 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const size_px: u31 = @intCast((@as(u64, self.opts.font_size_px) * scale120 + 60) / 120);
     if (size_px == 0 or size_px == self.font_size_px) return;
 
-    const new_font: Font = try .init(self.opts.font_family, size_px);
+    const new_font: Font = try .init(self.alloc, self.opts.font_family, size_px);
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
