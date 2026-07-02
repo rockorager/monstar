@@ -27,6 +27,11 @@ config: *const Config,
 term: vt.Terminal,
 stream: vt.TerminalStream,
 render_state: vt.RenderState,
+/// Complete ARGB8888 backing frame. Dirty-row rendering updates this
+/// buffer, then the window copies it into the Wayland shm buffer it acquired.
+render_pixels: std.ArrayList(u32),
+render_width: u31,
+render_height: u31,
 pty: Pty,
 child_pid: posix.pid_t,
 font: Font,
@@ -198,6 +203,9 @@ pub fn init(
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
+        .render_pixels = .empty,
+        .render_width = 0,
+        .render_height = 0,
         .pty = pty,
         .child_pid = child_pid,
         .font = font,
@@ -278,6 +286,7 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
+    self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
 
@@ -350,6 +359,7 @@ pub fn deinit(self: *App) void {
     self.pty.deinit();
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
+    self.render_pixels.deinit(self.alloc);
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
@@ -1404,6 +1414,7 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
 fn setFocus(self: *App, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
+    self.render_state.dirty = .full;
     self.needs_redraw = true;
 
     // Applications with focus reporting (mode 1004) get CSI I / CSI O.
@@ -1559,13 +1570,40 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
     self.renderer.focused = self.focused;
+    const resized = try self.ensureRenderPixels(width, height);
     if (self.term.modes.get(.synchronized_output)) {
-        try self.renderer.render(&self.render_state, pixels, width, height);
+        if (resized) try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
+        @memcpy(pixels, self.render_pixels.items);
         return;
     }
     try self.render_state.update(self.alloc, &self.term);
+    if (resized) self.render_state.dirty = .full;
+    switch (self.render_state.dirty) {
+        .false => {},
+        .full => try self.renderer.render(&self.render_state, self.render_pixels.items, width, height),
+        .partial => try self.renderer.renderDirty(&self.render_state, self.render_pixels.items, width, height),
+    }
+    self.clearRenderDirty();
+    @memcpy(pixels, self.render_pixels.items);
+}
+
+fn ensureRenderPixels(self: *App, width: u31, height: u31) !bool {
+    const len = @as(usize, width) * height;
+    if (self.render_width == width and self.render_height == height and
+        self.render_pixels.items.len == len)
+    {
+        return false;
+    }
+    try self.render_pixels.resize(self.alloc, len);
+    self.render_width = width;
+    self.render_height = height;
+    return true;
+}
+
+fn clearRenderDirty(self: *App) void {
+    const rows = self.render_state.row_data.slice();
+    for (rows.items(.dirty)) |*dirty| dirty.* = false;
     self.render_state.dirty = .false;
-    try self.renderer.render(&self.render_state, pixels, width, height);
 }
 
 /// Window resize delegate: fit the grid to the new size, resize the

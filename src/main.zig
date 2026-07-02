@@ -107,7 +107,7 @@ fn dump(init: std.process.Init, args: []const [:0]const u8) !void {
 }
 
 /// Build an envp block for the child: the inherited environment with
-/// TERM forced to our terminfo entry.
+/// TERM forced to Ghostty's terminfo entry for now.
 fn buildEnvp(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
@@ -118,8 +118,7 @@ fn buildEnvp(
         if (std.mem.startsWith(u8, std.mem.span(e), "TERM=")) continue;
         try list.append(arena, e);
     }
-    // TODO: ship a monstar terminfo entry; xterm-256color is a stopgap.
-    try list.append(arena, "TERM=xterm-256color");
+    try list.append(arena, "TERM=xterm-ghostty");
     const slice = try list.toOwnedSliceSentinel(arena, null);
     return slice.ptr;
 }

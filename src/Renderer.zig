@@ -87,6 +87,65 @@ pub fn render(
     }
 }
 
+/// Draw only rows marked dirty in `state`, preserving other pixels.
+/// Dirty rows are expanded by one neighboring row to cover glyph and
+/// sprite overhang from the previous frame.
+pub fn renderDirty(
+    self: *Renderer,
+    state: *vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
+    std.debug.assert(pixels.len == @as(usize, width) * height);
+    if (state.rows == 0 or state.cols == 0) return;
+
+    const rows = state.row_data.slice();
+    const all_cells = rows.items(.cells);
+    const all_selections = rows.items(.selection);
+    const all_dirty = rows.items(.dirty);
+    var rendered_until: usize = 0;
+    for (all_dirty[0..state.rows], 0..) |dirty, y| {
+        if (!dirty) continue;
+        const start = if (y == 0) y else y - 1;
+        const end = @min(@as(usize, state.rows), y + 2);
+        var row = @max(start, rendered_until);
+        while (row < end) : (row += 1) {
+            self.clearRow(state, @intCast(row), pixels, width, height);
+            try self.renderRow(
+                state,
+                all_cells[row].slice(),
+                all_selections[row],
+                @intCast(row),
+                pixels,
+                width,
+                height,
+            );
+        }
+        rendered_until = @max(rendered_until, end);
+    }
+}
+
+fn clearRow(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    y: u31,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) void {
+    fillRect(
+        pixels,
+        width,
+        height,
+        0,
+        y * self.font.cell_height,
+        width,
+        self.font.cell_height,
+        argb(state.colors.background),
+    );
+}
+
 fn renderRow(
     self: *Renderer,
     state: *const vt.RenderState,
@@ -585,4 +644,42 @@ test "render a simple grid" {
         if (px != bg) non_bg += 1;
     }
     try std.testing.expect(non_bg > 0);
+}
+
+test "dirty row render matches full render" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 3 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("aaaaaaaa\r\nbbbbbbbb\r\ncccccccc");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 8;
+    const height: u31 = font.cell_height * 3;
+    const dirty_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(dirty_pixels);
+    const full_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(full_pixels);
+
+    try renderer.render(&state, dirty_pixels, width, height);
+    state.dirty = .false;
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+
+    stream.nextSlice("\x1b[2;2HX");
+    try state.update(alloc, &term);
+    try std.testing.expectEqual(vt.RenderState.Dirty.partial, state.dirty);
+
+    try renderer.renderDirty(&state, dirty_pixels, width, height);
+    try renderer.render(&state, full_pixels, width, height);
+    try std.testing.expectEqualSlices(u32, full_pixels, dirty_pixels);
 }
