@@ -1,8 +1,8 @@
 //! Application entry point.
 //!
-//! `vtread [command...]` runs a command (default: $SHELL) in a Wayland
+//! `monstar [command...]` runs a command (default: $SHELL) in a Wayland
 //! terminal window with live output.
-//! `vtread --dump [command...]` runs a command to completion headlessly
+//! `monstar --dump [command...]` runs a command to completion headlessly
 //! and prints the emulated screen as text.
 
 const std = @import("std");
@@ -118,7 +118,7 @@ fn buildEnvp(
         if (std.mem.startsWith(u8, std.mem.span(e), "TERM=")) continue;
         try list.append(arena, e);
     }
-    // TODO: ship a vtread terminfo entry; xterm-256color is a stopgap.
+    // TODO: ship a monstar terminfo entry; xterm-256color is a stopgap.
     try list.append(arena, "TERM=xterm-256color");
     const slice = try list.toOwnedSliceSentinel(arena, null);
     return slice.ptr;

@@ -111,8 +111,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
     const surface = try compositor.createSurface();
     const xdg_surface = try wm_base.getXdgSurface(surface);
     const toplevel = try xdg_surface.getToplevel();
-    toplevel.setAppId("vtread");
-    toplevel.setTitle("vtread");
+    toplevel.setAppId("monstar");
+    toplevel.setTitle("monstar");
 
     // Fractional scaling needs both protocols: the scale event and a
     // viewport to map the physical-pixel buffer onto the logical size.
@@ -497,7 +497,7 @@ const Buffer = struct {
         const stride: u31 = width * 4;
         const size: u31 = stride * height;
 
-        const fd = try posix.memfd_create("vtread-shm", linux.MFD.CLOEXEC);
+        const fd = try posix.memfd_create("monstar-shm", linux.MFD.CLOEXEC);
         defer _ = linux.close(fd);
         if (linux.errno(linux.ftruncate(fd, size)) != .SUCCESS) return error.ShmFailed;
 

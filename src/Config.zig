@@ -1,6 +1,6 @@
 //! Configuration: a flat `key = value` file, one entry per line, with
-//! `#` comments. Located at $XDG_CONFIG_HOME/vtread/config (falling
-//! back to ~/.config/vtread/config). Missing file means defaults;
+//! `#` comments. Located at $XDG_CONFIG_HOME/monstar/config (falling
+//! back to ~/.config/monstar/config). Missing file means defaults;
 //! invalid lines warn and keep their default.
 
 const Config = @This();
@@ -30,10 +30,10 @@ palette: [16]?vt.color.RGB = @splat(null),
 pub fn load(arena: std.mem.Allocator, environ: std.process.Environ) Config {
     const path = path: {
         if (environ.getPosix("XDG_CONFIG_HOME")) |base| {
-            break :path std.fmt.allocPrintSentinel(arena, "{s}/vtread/config", .{base}, 0) catch return .{};
+            break :path std.fmt.allocPrintSentinel(arena, "{s}/monstar/config", .{base}, 0) catch return .{};
         }
         if (environ.getPosix("HOME")) |home| {
-            break :path std.fmt.allocPrintSentinel(arena, "{s}/.config/vtread/config", .{home}, 0) catch return .{};
+            break :path std.fmt.allocPrintSentinel(arena, "{s}/.config/monstar/config", .{home}, 0) catch return .{};
         }
         return .{};
     };

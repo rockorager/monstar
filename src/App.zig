@@ -289,7 +289,7 @@ fn effectColorScheme(_: *Handler) ?vt.device_status.ColorScheme {
 }
 
 fn effectXtversion(_: *Handler) []const u8 {
-    return "vtread 0.0.0";
+    return "monstar 0.0.0";
 }
 
 fn effectTitleChanged(handler: *Handler) void {

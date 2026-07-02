@@ -34,7 +34,7 @@ size, BGRA blitting, and scaling into the cell.
 
 ## terminfo entry
 
-Ship a `vtread` terminfo (and stop defaulting TERM to
+Ship a `monstar` terminfo (and stop defaulting TERM to
 xterm-256color). ghostty's terminfo generator is a useful reference.
 
 ## Smaller items
