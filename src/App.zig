@@ -69,6 +69,10 @@ last_serial: u32,
 /// Current clipboard/primary offers from other clients (paste sources).
 clip_offer: ?*wl.DataOffer,
 primary_offer: ?*zwp.PrimarySelectionOfferV1,
+/// Our own outgoing selection sources, so exit can reclaim them if the
+/// compositor never cancels them (nobody else took the selection).
+clip_source: ?*SourceCtx,
+primary_source: ?*SourceCtx,
 /// An in-flight paste: pipe read end (-1 when idle) and received bytes.
 paste_fd: posix.fd_t,
 paste_buf: std.ArrayList(u8),
@@ -162,6 +166,8 @@ pub fn init(
         .last_serial = 0,
         .clip_offer = null,
         .primary_offer = null,
+        .clip_source = null,
+        .primary_source = null,
         .paste_fd = -1,
         .paste_buf = .empty,
     };
@@ -275,6 +281,8 @@ pub fn deinit(self: *App) void {
     self.paste_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
     if (self.primary_offer) |offer| offer.destroy();
+    if (self.clip_source) |source| source.destroy();
+    if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
     _ = std.os.linux.close(self.repeat_fd);
     self.keyboard.deinit();
@@ -608,22 +616,34 @@ fn clearSelection(self: *App) void {
     }
 }
 
-/// Heap context for an outgoing selection source: owns the text until
-/// the compositor cancels the source (someone else took the selection).
+/// Heap context for an outgoing selection source: owns the text and the
+/// source proxy. Destroyed when the compositor cancels the source
+/// (someone else took the selection), when we replace it with a new
+/// source, or at exit — whichever comes first.
 const SourceCtx = struct {
-    alloc: std.mem.Allocator,
+    app: *App,
     text: [:0]const u8,
+    source: union(enum) {
+        clipboard: *wl.DataSource,
+        primary: *zwp.PrimarySelectionSourceV1,
+    },
 
-    fn create(alloc: std.mem.Allocator, text: [:0]const u8) !*SourceCtx {
-        const ctx = try alloc.create(SourceCtx);
-        ctx.* = .{ .alloc = alloc, .text = text };
-        return ctx;
-    }
-
+    /// Destroy the proxy, release ownership, and detach from the app's
+    /// tracking slot (if it still points here).
     fn destroy(self: *SourceCtx) void {
-        const alloc = self.alloc;
-        alloc.free(self.text);
-        alloc.destroy(self);
+        const app = self.app;
+        switch (self.source) {
+            .clipboard => |source| {
+                if (app.clip_source == self) app.clip_source = null;
+                source.destroy();
+            },
+            .primary => |source| {
+                if (app.primary_source == self) app.primary_source = null;
+                source.destroy();
+            },
+        }
+        app.alloc.free(self.text);
+        app.alloc.destroy(self);
     }
 
     /// Stream the text to the requesting client and close the fd.
@@ -643,28 +663,22 @@ const SourceCtx = struct {
     }
 };
 
-fn dataSourceListener(source: *wl.DataSource, event: wl.DataSource.Event, ctx: *SourceCtx) void {
+fn dataSourceListener(_: *wl.DataSource, event: wl.DataSource.Event, ctx: *SourceCtx) void {
     switch (event) {
         .send => |send| ctx.send(send.fd),
-        .cancelled => {
-            source.destroy();
-            ctx.destroy();
-        },
+        .cancelled => ctx.destroy(),
         else => {},
     }
 }
 
 fn primarySourceListener(
-    source: *zwp.PrimarySelectionSourceV1,
+    _: *zwp.PrimarySelectionSourceV1,
     event: zwp.PrimarySelectionSourceV1.Event,
     ctx: *SourceCtx,
 ) void {
     switch (event) {
         .send => |send| ctx.send(send.fd),
-        .cancelled => {
-            source.destroy();
-            ctx.destroy();
-        },
+        .cancelled => ctx.destroy(),
     }
 }
 
@@ -705,19 +719,30 @@ fn copyToPrimary(self: *App) void {
     const manager = self.window.primary_manager orelse return;
     const device = self.window.primary_device orelse return;
     const text = self.selectionText() orelse return;
-    const ctx = SourceCtx.create(self.alloc, text) catch {
+
+    const source = manager.createSource() catch {
         self.alloc.free(text);
         return;
     };
-    const source = manager.createSource() catch {
-        ctx.destroy();
+    const ctx = self.alloc.create(SourceCtx) catch {
+        source.destroy();
+        self.alloc.free(text);
         return;
     };
+    ctx.* = .{ .app = self, .text = text, .source = .{ .primary = source } };
+
     source.offer(paste_mime);
     source.offer("text/plain");
     source.offer("UTF8_STRING");
     source.setListener(*SourceCtx, primarySourceListener, ctx);
     device.setSelection(source, self.last_serial);
+
+    // Replace any previous source of ours eagerly; the compositor's
+    // cancelled event for it would hit a destroyed proxy, which
+    // libwayland drops safely.
+    if (self.primary_source) |old| old.destroy();
+    self.primary_source = ctx;
+    log.debug("claimed primary selection ({d} bytes)", .{text.len});
 }
 
 /// Claim the clipboard with the currently selected text.
@@ -725,19 +750,26 @@ fn copyToClipboard(self: *App) void {
     const manager = self.window.data_manager orelse return;
     const device = self.window.data_device orelse return;
     const text = self.selectionText() orelse return;
-    const ctx = SourceCtx.create(self.alloc, text) catch {
+
+    const source = manager.createDataSource() catch {
         self.alloc.free(text);
         return;
     };
-    const source = manager.createDataSource() catch {
-        ctx.destroy();
+    const ctx = self.alloc.create(SourceCtx) catch {
+        source.destroy();
+        self.alloc.free(text);
         return;
     };
+    ctx.* = .{ .app = self, .text = text, .source = .{ .clipboard = source } };
+
     source.offer(paste_mime);
     source.offer("text/plain");
     source.offer("UTF8_STRING");
     source.setListener(*SourceCtx, dataSourceListener, ctx);
     device.setSelection(source, self.last_serial);
+
+    if (self.clip_source) |old| old.destroy();
+    self.clip_source = ctx;
 }
 
 /// Ask the offer's owner to stream its contents into a pipe; the read
