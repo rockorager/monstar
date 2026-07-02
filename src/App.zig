@@ -57,9 +57,12 @@ pointer_y: f64,
 scroll_pixels: f64,
 scroll_clicks: i32,
 scroll_had_discrete: bool,
-/// Left-button drag selection: the tracked anchor pin while dragging.
+/// Left-button drag selection. The anchor is a cell-boundary caret:
+/// a tracked pin for the anchored cell plus which of its vertical
+/// edges (0 = left, 1 = right) the press grabbed.
 selecting: bool,
 sel_anchor: ?*vt.Pin,
+sel_anchor_off: u1,
 
 /// Terminal lines per wheel click.
 const wheel_lines = 3;
@@ -144,6 +147,7 @@ pub fn init(
         .scroll_had_discrete = false,
         .selecting = false,
         .sel_anchor = null,
+        .sel_anchor_off = 0,
     };
     self.stream = self.term.vtStream();
 
@@ -462,26 +466,81 @@ fn cellAtPointer(self: *App) struct { x: u16, y: u16 } {
     return .{ .x = x, .y = y };
 }
 
-fn pinAtPointer(self: *App) ?vt.Pin {
-    const cell = self.cellAtPointer();
-    return self.term.screens.active.pages.pin(.{
-        .viewport = .{ .x = cell.x, .y = cell.y },
-    });
+/// The cell-boundary caret under the pointer: the row under the
+/// pointer and the nearest vertical cell edge (0..=cols), so grabbing
+/// the right half of a cell means "after this cell".
+fn boundaryAtPointer(self: *App) struct { x: u16, y: u16 } {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    const fx = @max(0, self.pointer_x * scale) / @as(f64, @floatFromInt(self.font.cell_width));
+    const fy = @max(0, self.pointer_y * scale) / @as(f64, @floatFromInt(self.font.cell_height));
+    const bx: u16 = @intFromFloat(@min(@floor(fx + 0.5), @as(f64, @floatFromInt(self.term.cols))));
+    const by: u16 = @intFromFloat(@min(@floor(fy), @as(f64, @floatFromInt(self.term.rows -| 1))));
+    return .{ .x = bx, .y = by };
 }
 
 fn startSelection(self: *App) void {
     const screen = self.term.screens.active;
     self.clearSelection();
-    const anchor = self.pinAtPointer() orelse return;
+
+    // Pin the cell left of the boundary; a boundary past the last
+    // column pins the last cell with its right edge.
+    const boundary = self.boundaryAtPointer();
+    const anchor_x: u16 = @min(boundary.x, self.term.cols - 1);
+    self.sel_anchor_off = @intCast(boundary.x - anchor_x);
+    const anchor = screen.pages.pin(.{
+        .viewport = .{ .x = anchor_x, .y = boundary.y },
+    }) orelse return;
     self.sel_anchor = screen.pages.trackPin(anchor) catch null;
     self.selecting = self.sel_anchor != null;
 }
 
 fn extendSelection(self: *App) void {
     const screen = self.term.screens.active;
+    const pages = &screen.pages;
     const anchor = self.sel_anchor orelse return;
-    const cur = self.pinAtPointer() orelse return;
-    screen.select(.init(anchor.*, cur, false)) catch return;
+    const cols: u32 = self.term.cols;
+
+    // Both carets in screen coordinates: boundary x in 0..=cols.
+    const anchor_pt = pages.pointFromPin(.screen, anchor.*) orelse return;
+    const a: [2]u32 = .{ anchor_pt.screen.y, anchor_pt.screen.x + self.sel_anchor_off };
+    const boundary = self.boundaryAtPointer();
+    const row_pin = pages.pin(.{ .viewport = .{ .x = 0, .y = boundary.y } }) orelse return;
+    const row_pt = pages.pointFromPin(.screen, row_pin) orelse return;
+    const e: [2]u32 = .{ row_pt.screen.y, boundary.x };
+
+    if (a[0] == e[0] and a[1] == e[1]) {
+        // Empty: no boundary crossed yet.
+        if (screen.selection != null) {
+            screen.clearSelection();
+            self.needs_redraw = true;
+        }
+        return;
+    }
+
+    // Cells strictly between the two carets, in reading order.
+    const a_first = a[0] < e[0] or (a[0] == e[0] and a[1] < e[1]);
+    const first = if (a_first) a else e;
+    const last = if (a_first) e else a;
+    const start: [2]u32 = if (first[1] >= cols) .{ first[0] + 1, 0 } else first;
+    const end: [2]u32 = if (last[1] == 0)
+        .{ last[0] -| 1, cols - 1 }
+    else
+        .{ last[0], last[1] - 1 };
+    if (start[0] > end[0] or (start[0] == end[0] and start[1] > end[1])) {
+        if (screen.selection != null) {
+            screen.clearSelection();
+            self.needs_redraw = true;
+        }
+        return;
+    }
+
+    const start_pin = pages.pin(.{
+        .screen = .{ .x = @intCast(start[1]), .y = start[0] },
+    }) orelse return;
+    const end_pin = pages.pin(.{
+        .screen = .{ .x = @intCast(end[1]), .y = end[0] },
+    }) orelse return;
+    screen.select(.init(start_pin, end_pin, false)) catch return;
     self.needs_redraw = true;
 }
 

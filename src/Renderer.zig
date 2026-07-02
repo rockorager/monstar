@@ -14,6 +14,9 @@ const Font = @import("Font.zig");
 
 const log = std.log.scoped(.renderer);
 
+/// Selection background. TODO: make configurable alongside the palette.
+const selection_bg: vt.color.RGB = .{ .r = 0x33, .g = 0x46, .b = 0x7c };
+
 alloc: std.mem.Allocator,
 font: *Font,
 hb_buf: *c.hb_buffer_t,
@@ -110,13 +113,17 @@ fn renderRow(
         const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
         var bg = style.bg(&raws[x], &colors.palette);
-        // Selection renders as inverse video; a selected inverse cell
-        // flips back to normal.
-        const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
-        if (style.flags.inverse != selected) {
+        if (style.flags.inverse) {
             const old_fg = fg;
             fg = bg orelse colors.background;
             bg = old_fg;
+        }
+        // Selection overrides cell colors: fixed background, default
+        // foreground, so selected text reads uniformly.
+        const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
+        if (selected) {
+            bg = selection_bg;
+            fg = colors.foreground;
         }
         // Block cursor: swap in the cursor color, invert the glyph.
         if (cursor_x != null and cursor_x.? == x) {
