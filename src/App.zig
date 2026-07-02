@@ -308,6 +308,13 @@ pub fn run(self: *App) !void {
         }
     }
 
+    // Window closed while the child is alive: hang it up like a real
+    // terminal whose master side went away. The child is its own
+    // session leader (setsid in spawn), so it owns SIGHUP delivery to
+    // its jobs.
+    if (!self.child_eof) {
+        _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
+    }
     _ = Pty.wait(self.child_pid) catch {};
 }
 
