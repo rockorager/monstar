@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Font stack: fontconfig (discovery) + FreeType (rasterization) +
-    // HarfBuzz (shaping) + stb_image_resize, imported through one
+    // HarfBuzz (shaping) + stb image helpers, imported through one
     // translated C header.
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
     });
     root_module.addCSourceFile(.{ .file = b.path("src/vendor/stb_image_resize.c") });
+    root_module.addCSourceFile(.{ .file = b.path("src/vendor/stb_image.c") });
 
     b.installArtifact(exe);
 

@@ -9,6 +9,7 @@ const App = @This();
 
 const std = @import("std");
 const posix = std.posix;
+const c = @import("c");
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
@@ -257,6 +258,8 @@ pub fn init(
     var font: Font = try .init(alloc, config.font_family, config.font_size);
     errdefer font.deinit(alloc);
 
+    vt.sys.decode_png = decodePng;
+
     var term: vt.Terminal = try .init(io, alloc, .{
         .cols = initial_cols,
         .rows = initial_rows,
@@ -400,6 +403,34 @@ pub fn init(
 
     window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, scaleChanged);
     return self;
+}
+
+fn decodePng(alloc: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.sys.Image {
+    var width: c_int = 0;
+    var height: c_int = 0;
+    var channels: c_int = 0;
+    const decoded = c.stbi_load_from_memory(
+        data.ptr,
+        @intCast(data.len),
+        &width,
+        &height,
+        &channels,
+        4,
+    ) orelse return error.InvalidData;
+    defer c.stbi_image_free(decoded);
+
+    if (width <= 0 or height <= 0) return error.InvalidData;
+    const pixel_count = std.math.mul(usize, @intCast(width), @intCast(height)) catch return error.InvalidData;
+    const len = std.math.mul(usize, pixel_count, 4) catch return error.InvalidData;
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+
+    @memcpy(out, decoded[0..len]);
+    return .{
+        .width = @intCast(width),
+        .height = @intCast(height),
+        .data = out,
+    };
 }
 
 /// Window scale delegate: reload the font at the physical pixel size so
@@ -1094,6 +1125,33 @@ test "OSC 52 set decodes clipboard payload" {
     try std.testing.expectEqual(.primary, osc52Target('s'));
     try std.testing.expectEqual(.primary, osc52Target('p'));
     try std.testing.expectEqual(.clipboard, osc52Target('7'));
+}
+
+test "kitty PNG direct transmit installs decoded RGBA image" {
+    const alloc = std.testing.allocator;
+    const old_decode_png = vt.sys.decode_png;
+    vt.sys.decode_png = decodePng;
+    defer vt.sys.decode_png = old_decode_png;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 10 });
+    defer term.deinit(alloc);
+
+    var command: std.Io.Writer.Allocating = .init(alloc);
+    defer command.deinit();
+    try command.writer.print("\x1b_Ga=T,f=100,i=7;{s}\x1b\\", .{
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+    });
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(command.writer.buffered());
+
+    const img = term.screens.active.kitty_images.imageById(7) orelse return error.MissingImage;
+    try std.testing.expectEqual(.rgba, img.format);
+    try std.testing.expect(img.width > 0);
+    try std.testing.expect(img.height > 0);
+    try std.testing.expectEqual(@as(usize, img.width) * img.height * 4, img.data.len);
+    try std.testing.expectEqual(@as(usize, 1), term.screens.active.kitty_images.placements.count());
 }
 
 test "DA1 advertises OSC 52 clipboard support" {
@@ -2228,12 +2286,14 @@ fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
     const cols: u16 = @intCast(@min(std.math.maxInt(u16), @max(1, width / self.font.cell_width)));
     const rows: u16 = @intCast(@min(std.math.maxInt(u16), @max(1, height / self.font.cell_height)));
-    const pixels_changed = width != self.term.width_px or height != self.term.height_px;
+    const grid_width_px = @as(u32, cols) * self.font.cell_width;
+    const grid_height_px = @as(u32, rows) * self.font.cell_height;
+    const pixels_changed = grid_width_px != self.term.width_px or grid_height_px != self.term.height_px;
     const cells_changed = cols != self.term.cols or rows != self.term.rows;
     if (!cells_changed and !pixels_changed) return;
 
-    self.term.width_px = width;
-    self.term.height_px = height;
+    self.term.width_px = grid_width_px;
+    self.term.height_px = grid_height_px;
     if (cells_changed) {
         log.debug("resize to {d}x{d} cells", .{ cols, rows });
         try self.term.resize(self.alloc, cols, rows);

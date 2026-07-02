@@ -1221,6 +1221,43 @@ test "render a simple grid" {
     try std.testing.expect(non_bg > 0);
 }
 
+test "render kitty image placement" {
+    const alloc = std.testing.allocator;
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer term.deinit(alloc);
+    term.width_px = term.cols * font.cell_width;
+    term.height_px = term.rows * font.cell_height;
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b_Ga=T,t=d,f=24,i=1,s=1,v=1,c=1,r=1;////\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), term.screens.active.kitty_images.placements.count());
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 4;
+    const height: u31 = font.cell_height * 2;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    try renderer.renderWithKittyGraphics(&state, &term, pixels, width, height);
+
+    var white_pixels: usize = 0;
+    for (pixels) |px| {
+        if (px == 0xffffffff) white_pixels += 1;
+    }
+    try std.testing.expect(white_pixels > 0);
+}
+
 test "dirty row render matches full render" {
     const alloc = std.testing.allocator;
 

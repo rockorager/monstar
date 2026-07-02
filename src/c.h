@@ -3,5 +3,6 @@
 #include FT_FREETYPE_H
 #include <hb.h>
 #include <hb-ft.h>
+#include "../vendor/ghostty/src/stb/stb_image.h"
 #include "vendor/stb_image_resize.h"
 #include <xkbcommon/xkbcommon.h>
