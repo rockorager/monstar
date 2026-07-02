@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
+    scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_seat", 5);
@@ -18,6 +19,8 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 1);
+    scanner.generate("wl_data_device_manager", 3);
+    scanner.generate("zwp_primary_selection_device_manager_v1", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
     const root_module = b.createModule(.{

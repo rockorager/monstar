@@ -11,6 +11,7 @@ const std = @import("std");
 const posix = std.posix;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
+const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
@@ -63,6 +64,16 @@ scroll_had_discrete: bool,
 selecting: bool,
 sel_anchor: ?*vt.Pin,
 sel_anchor_off: u1,
+/// Serial of the most recent input event, required to claim selections.
+last_serial: u32,
+/// Current clipboard/primary offers from other clients (paste sources).
+clip_offer: ?*wl.DataOffer,
+primary_offer: ?*zwp.PrimarySelectionOfferV1,
+/// An in-flight paste: pipe read end (-1 when idle) and received bytes.
+paste_fd: posix.fd_t,
+paste_buf: std.ArrayList(u8),
+
+const paste_mime = "text/plain;charset=utf-8";
 
 /// Terminal lines per wheel click.
 const wheel_lines = 3;
@@ -148,8 +159,20 @@ pub fn init(
         .selecting = false,
         .sel_anchor = null,
         .sel_anchor_off = 0,
+        .last_serial = 0,
+        .clip_offer = null,
+        .primary_offer = null,
+        .paste_fd = -1,
+        .paste_buf = .empty,
     };
     self.stream = self.term.vtStream();
+
+    if (window.data_device) |device| {
+        device.setListener(*App, dataDeviceListener, self);
+    }
+    if (window.primary_device) |device| {
+        device.setListener(*App, primaryDeviceListener, self);
+    }
 
     // Handle sequences that need responses or side effects.
     var effects: Effects = .readonly;
@@ -248,6 +271,10 @@ fn setNonblocking(fd: posix.fd_t) void {
 
 pub fn deinit(self: *App) void {
     if (self.sel_anchor) |anchor| self.term.screens.active.pages.untrackPin(anchor);
+    if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
+    self.paste_buf.deinit(self.alloc);
+    if (self.clip_offer) |offer| offer.destroy();
+    if (self.primary_offer) |offer| offer.destroy();
     self.write_queue.deinit(self.alloc);
     _ = std.os.linux.close(self.repeat_fd);
     self.keyboard.deinit();
@@ -268,10 +295,13 @@ pub fn run(self: *App) !void {
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.pty.master, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
+        // In-flight paste pipe; negative (ignored) while idle.
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pty_fd = &fds[1];
     const repeat_fd = &fds[2];
+    const paste_fd = &fds[3];
 
     while (self.window.running and !self.child_eof) {
         // Standard libwayland read dance: drain the local queue, flush
@@ -303,6 +333,7 @@ pub fn run(self: *App) !void {
         // POLLOUT would make every poll return immediately.
         pty_fd.events = posix.POLL.IN;
         if (self.write_queue.items.len > 0) pty_fd.events |= posix.POLL.OUT;
+        paste_fd.fd = self.paste_fd;
 
         _ = posix.poll(&fds, -1) catch |err| {
             display.cancelRead();
@@ -325,6 +356,10 @@ pub fn run(self: *App) !void {
 
         if (repeat_fd.revents & posix.POLL.IN != 0) {
             self.fireRepeat();
+        }
+
+        if (self.paste_fd >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            self.readPaste();
         }
 
         if (self.needs_redraw) {
@@ -419,6 +454,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         },
         .frame => self.finishScrollFrame(),
         .button => |button| {
+            self.last_serial = button.serial;
             // Mouse reporting wins when the application asked for it,
             // except that shift bypasses it for terminal-side selection.
             const reporting = self.term.flags.mouse_event != .none and
@@ -444,6 +480,9 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                     .released => self.finishSelection(),
                     else => {},
                 }
+            } else if (button.button == 274 and button.state == .pressed) {
+                // BTN_MIDDLE: paste the primary selection.
+                self.beginPaste(.primary);
             }
         },
         .leave, .axis_source, .axis_stop => {},
@@ -551,6 +590,8 @@ fn finishSelection(self: *App) void {
         self.term.screens.active.pages.untrackPin(anchor);
         self.sel_anchor = null;
     }
+    // Finished selections claim the primary selection, X style.
+    self.copyToPrimary();
 }
 
 /// Drop the current selection and stop any in-progress drag.
@@ -565,6 +606,199 @@ fn clearSelection(self: *App) void {
         screen.clearSelection();
         self.needs_redraw = true;
     }
+}
+
+/// Heap context for an outgoing selection source: owns the text until
+/// the compositor cancels the source (someone else took the selection).
+const SourceCtx = struct {
+    alloc: std.mem.Allocator,
+    text: [:0]const u8,
+
+    fn create(alloc: std.mem.Allocator, text: [:0]const u8) !*SourceCtx {
+        const ctx = try alloc.create(SourceCtx);
+        ctx.* = .{ .alloc = alloc, .text = text };
+        return ctx;
+    }
+
+    fn destroy(self: *SourceCtx) void {
+        const alloc = self.alloc;
+        alloc.free(self.text);
+        alloc.destroy(self);
+    }
+
+    /// Stream the text to the requesting client and close the fd.
+    /// Writes are blocking; selections are small enough in practice.
+    fn send(self: *SourceCtx, fd: i32) void {
+        const linux = std.os.linux;
+        defer _ = linux.close(fd);
+        var offset: usize = 0;
+        while (offset < self.text.len) {
+            const rc = linux.write(fd, self.text.ptr + offset, self.text.len - offset);
+            switch (linux.errno(rc)) {
+                .SUCCESS => offset += rc,
+                .INTR => continue,
+                else => return,
+            }
+        }
+    }
+};
+
+fn dataSourceListener(source: *wl.DataSource, event: wl.DataSource.Event, ctx: *SourceCtx) void {
+    switch (event) {
+        .send => |send| ctx.send(send.fd),
+        .cancelled => {
+            source.destroy();
+            ctx.destroy();
+        },
+        else => {},
+    }
+}
+
+fn primarySourceListener(
+    source: *zwp.PrimarySelectionSourceV1,
+    event: zwp.PrimarySelectionSourceV1.Event,
+    ctx: *SourceCtx,
+) void {
+    switch (event) {
+        .send => |send| ctx.send(send.fd),
+        .cancelled => {
+            source.destroy();
+            ctx.destroy();
+        },
+    }
+}
+
+fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *App) void {
+    switch (event) {
+        .selection => |selection| {
+            if (self.clip_offer) |old| old.destroy();
+            self.clip_offer = selection.id;
+        },
+        // Drag and drop is unsupported; those offers are ignored.
+        else => {},
+    }
+}
+
+fn primaryDeviceListener(
+    _: *zwp.PrimarySelectionDeviceV1,
+    event: zwp.PrimarySelectionDeviceV1.Event,
+    self: *App,
+) void {
+    switch (event) {
+        .selection => |selection| {
+            if (self.primary_offer) |old| old.destroy();
+            self.primary_offer = selection.id;
+        },
+        .data_offer => {},
+    }
+}
+
+/// The current selection's text, allocated, or null if nothing selected.
+fn selectionText(self: *App) ?[:0]const u8 {
+    const screen = self.term.screens.active;
+    const sel = screen.selection orelse return null;
+    return screen.selectionString(self.alloc, .{ .sel = sel, .trim = true }) catch null;
+}
+
+/// Claim the primary selection with the currently selected text.
+fn copyToPrimary(self: *App) void {
+    const manager = self.window.primary_manager orelse return;
+    const device = self.window.primary_device orelse return;
+    const text = self.selectionText() orelse return;
+    const ctx = SourceCtx.create(self.alloc, text) catch {
+        self.alloc.free(text);
+        return;
+    };
+    const source = manager.createSource() catch {
+        ctx.destroy();
+        return;
+    };
+    source.offer(paste_mime);
+    source.offer("text/plain");
+    source.offer("UTF8_STRING");
+    source.setListener(*SourceCtx, primarySourceListener, ctx);
+    device.setSelection(source, self.last_serial);
+}
+
+/// Claim the clipboard with the currently selected text.
+fn copyToClipboard(self: *App) void {
+    const manager = self.window.data_manager orelse return;
+    const device = self.window.data_device orelse return;
+    const text = self.selectionText() orelse return;
+    const ctx = SourceCtx.create(self.alloc, text) catch {
+        self.alloc.free(text);
+        return;
+    };
+    const source = manager.createDataSource() catch {
+        ctx.destroy();
+        return;
+    };
+    source.offer(paste_mime);
+    source.offer("text/plain");
+    source.offer("UTF8_STRING");
+    source.setListener(*SourceCtx, dataSourceListener, ctx);
+    device.setSelection(source, self.last_serial);
+}
+
+/// Ask the offer's owner to stream its contents into a pipe; the read
+/// end joins the poll loop and the paste completes on EOF.
+fn beginPaste(self: *App, comptime which: enum { clipboard, primary }) void {
+    if (self.paste_fd >= 0) return; // one paste at a time
+
+    var fds: [2]posix.fd_t = undefined;
+    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
+
+    switch (which) {
+        .clipboard => {
+            const offer = self.clip_offer orelse {
+                _ = std.os.linux.close(fds[0]);
+                _ = std.os.linux.close(fds[1]);
+                return;
+            };
+            offer.receive(paste_mime, fds[1]);
+        },
+        .primary => {
+            const offer = self.primary_offer orelse {
+                _ = std.os.linux.close(fds[0]);
+                _ = std.os.linux.close(fds[1]);
+                return;
+            };
+            offer.receive(paste_mime, fds[1]);
+        },
+    }
+    _ = std.os.linux.close(fds[1]);
+    setNonblocking(fds[0]);
+    self.paste_fd = fds[0];
+    self.paste_buf.clearRetainingCapacity();
+}
+
+/// Drain the paste pipe; on EOF encode and write the paste to the PTY.
+fn readPaste(self: *App) void {
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = posix.read(self.paste_fd, &buf) catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => break,
+        };
+        if (n == 0) break; // EOF: sender is done
+        self.paste_buf.appendSlice(self.alloc, buf[0..n]) catch break;
+    }
+    self.finishPaste();
+}
+
+fn finishPaste(self: *App) void {
+    _ = std.os.linux.close(self.paste_fd);
+    self.paste_fd = -1;
+    if (self.paste_buf.items.len == 0) return;
+
+    // Mutable input lets the encoder sanitize control bytes in place,
+    // so this cannot fail.
+    const parts = vt.input.encodePaste(
+        @as([]u8, self.paste_buf.items),
+        .fromTerminal(&self.term),
+    );
+    for (parts) |part| self.writePty(part);
+    self.paste_buf.clearRetainingCapacity();
 }
 
 /// Convert accumulated wheel movement into scrolled lines: wheel clicks
@@ -662,6 +896,7 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             mods.group,
         ),
         .key => |key| {
+            self.last_serial = key.serial;
             const action: vt.input.KeyAction = switch (key.state) {
                 .pressed => .press,
                 .released => .release,
@@ -733,6 +968,15 @@ fn fireRepeat(self: *App) void {
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
+
+    // Copy/paste bindings take priority over the application.
+    if (action == .press and event.mods.ctrl and event.mods.shift) {
+        switch (event.key) {
+            .key_c => return self.copyToClipboard(),
+            .key_v => return self.beginPaste(.clipboard),
+            else => {},
+        }
+    }
 
     // Typing snaps a scrolled-back viewport to the bottom.
     if (action == .press and self.term.screens.active.pages.viewport != .active) {

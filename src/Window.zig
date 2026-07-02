@@ -10,6 +10,7 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const wp = wayland.client.wp;
 const xdg = wayland.client.xdg;
+const zwp = wayland.client.zwp;
 
 const log = std.log.scoped(.window);
 
@@ -30,6 +31,12 @@ keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
 cursor_shape_manager: ?*wp.CursorShapeManagerV1,
 cursor_shape_device: ?*wp.CursorShapeDeviceV1,
+/// Clipboard: managers create sources (copy); devices carry offers
+/// (paste) and set selections. Null when the compositor lacks them.
+data_manager: ?*wl.DataDeviceManager,
+data_device: ?*wl.DataDevice,
+primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1,
+primary_device: ?*zwp.PrimarySelectionDeviceV1,
 viewport: ?*wp.Viewport,
 fractional_scale: ?*wp.FractionalScaleV1,
 surface: *wl.Surface,
@@ -83,6 +90,8 @@ const Globals = struct {
     viewporter: ?*wp.Viewporter = null,
     fractional_manager: ?*wp.FractionalScaleManagerV1 = null,
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
+    data_manager: ?*wl.DataDeviceManager = null,
+    primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1 = null,
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
@@ -123,6 +132,18 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         manager.destroy();
     }
 
+    // Clipboard devices only need the seat, not its capabilities.
+    var data_device: ?*wl.DataDevice = null;
+    var primary_device: ?*zwp.PrimarySelectionDeviceV1 = null;
+    if (globals.seat) |seat| {
+        if (globals.data_manager) |manager| {
+            data_device = manager.getDataDevice(seat) catch null;
+        }
+        if (globals.primary_manager) |manager| {
+            primary_device = manager.getDevice(seat) catch null;
+        }
+    }
+
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
     self.* = .{
@@ -137,6 +158,10 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .pointer = null,
         .cursor_shape_manager = globals.cursor_shape_manager,
         .cursor_shape_device = null,
+        .data_manager = globals.data_manager,
+        .data_device = data_device,
+        .primary_manager = globals.primary_manager,
+        .primary_device = primary_device,
         .viewport = viewport,
         .fractional_scale = fractional_scale,
         .surface = surface,
@@ -178,6 +203,10 @@ pub fn destroy(self: *Window) void {
     if (self.viewport) |viewport| viewport.destroy();
     if (self.cursor_shape_device) |device| device.destroy();
     if (self.cursor_shape_manager) |manager| manager.destroy();
+    if (self.data_device) |device| device.release();
+    if (self.data_manager) |manager| manager.destroy();
+    if (self.primary_device) |device| device.destroy();
+    if (self.primary_manager) |manager| manager.destroy();
     if (self.pointer) |pointer| pointer.release();
     if (self.keyboard) |keyboard| keyboard.release();
     if (self.seat) |seat| seat.release();
@@ -315,6 +344,10 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
                 globals.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wl.DataDeviceManager.interface.name) == .eq) {
+                globals.data_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, 3)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, zwp.PrimarySelectionDeviceManagerV1.interface.name) == .eq) {
+                globals.primary_manager = registry.bind(global.name, zwp.PrimarySelectionDeviceManagerV1, 1) catch return;
             }
         },
         .global_remove => {},
