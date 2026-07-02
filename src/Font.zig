@@ -29,12 +29,14 @@ const failed_face = std.math.maxInt(u16);
 ft_lib: c.FT_Library,
 /// Loaded faces; faces[0] is the primary and defines cell metrics.
 faces: std.ArrayList(Face),
-/// Fontconfig's sorted candidate list for fallback lookups.
-sort_set: *c.FcFontSet,
-/// sort_set index -> faces index (or failed_face).
-sort_faces: std.AutoHashMapUnmanaged(u32, u16),
-/// codepoint -> faces index, for codepoints the primary lacks.
-codepoint_faces: std.AutoHashMapUnmanaged(u21, u16),
+/// Fontconfig's sorted candidate lists for fallback lookups, one per style.
+sort_sets: [style_count]*c.FcFontSet,
+/// Primary face index for each style; 0 means fall back to regular.
+primary_faces: [style_count]u16,
+/// styled sort_set index -> faces index (or failed_face).
+sort_faces: std.AutoHashMapUnmanaged(SortFaceKey, u16),
+/// styled codepoint -> faces index, for codepoints the primary lacks.
+codepoint_faces: std.AutoHashMapUnmanaged(CodepointFaceKey, u16),
 /// faces index of the embedded symbols face, if it loaded.
 embedded_face: ?u16,
 /// Procedural sprite glyphs, keyed by codepoint and occupied cell span
@@ -52,6 +54,35 @@ cell_height: u31,
 baseline: u31,
 
 pub const Error = error{ FontNotFound, FontLoadFailed, GlyphResizeFailed, OutOfMemory };
+
+pub const FaceStyle = enum(u2) {
+    regular,
+    bold,
+    italic,
+    bold_italic,
+
+    pub fn init(bold: bool, italic: bool) FaceStyle {
+        return if (bold)
+            if (italic) .bold_italic else .bold
+        else if (italic) .italic else .regular;
+    }
+
+    fn weight(self: FaceStyle) ?c_int {
+        return switch (self) {
+            .regular, .italic => null,
+            .bold, .bold_italic => c.FC_WEIGHT_BOLD,
+        };
+    }
+
+    fn slant(self: FaceStyle) ?c_int {
+        return switch (self) {
+            .regular, .bold => null,
+            .italic, .bold_italic => c.FC_SLANT_ITALIC,
+        };
+    }
+};
+
+const style_count = std.meta.fields(FaceStyle).len;
 
 /// A single loaded font face with its glyph cache.
 pub const Face = struct {
@@ -304,6 +335,16 @@ const SpriteGlyphKey = struct {
     cell_span: u2,
 };
 
+const SortFaceKey = struct {
+    style: FaceStyle,
+    sort_index: u32,
+};
+
+const CodepointFaceKey = struct {
+    style: FaceStyle,
+    cp: u21,
+};
+
 const GlyphMetrics = struct {
     cell_width: u31 = 0,
     cell_height: u31 = 0,
@@ -446,28 +487,85 @@ fn bitmapRow(bitmap: c.FT_Bitmap, height: u31, y: usize) usize {
     return if (bitmap.pitch < 0) height - 1 - y else y;
 }
 
+fn fontSort(family: [:0]const u8, size_px: u31, style: FaceStyle) Error!*c.FcFontSet {
+    const pattern = c.FcPatternCreate() orelse return error.FontLoadFailed;
+    defer c.FcPatternDestroy(pattern);
+    _ = c.FcPatternAddString(pattern, c.FC_FAMILY, family.ptr);
+    _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, @floatFromInt(size_px));
+    _ = c.FcPatternAddInteger(pattern, c.FC_SPACING, c.FC_MONO);
+    if (style.weight()) |weight| _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
+    if (style.slant()) |slant| _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, slant);
+    if (c.FcConfigSubstitute(null, pattern, c.FcMatchPattern) != c.FcTrue)
+        return error.FontLoadFailed;
+    c.FcDefaultSubstitute(pattern);
+
+    var result: c.FcResult = undefined;
+    const sort_set = c.FcFontSort(null, pattern, c.FcTrue, null, &result) orelse
+        return error.FontNotFound;
+    errdefer c.FcFontSetDestroy(sort_set);
+    if (result != c.FcResultMatch or sort_set.*.nfont < 1) return error.FontNotFound;
+    return sort_set;
+}
+
+fn loadPrimaryStyle(
+    alloc: std.mem.Allocator,
+    faces: *std.ArrayList(Face),
+    ft_lib: c.FT_Library,
+    sort_sets: [style_count]*c.FcFontSet,
+    style: FaceStyle,
+    size_px: u31,
+    metrics: GlyphMetrics,
+) ?u16 {
+    const regular = sort_sets[@intFromEnum(FaceStyle.regular)].*.fonts[0];
+    const styled = sort_sets[@intFromEnum(style)].*.fonts[0];
+    if (samePatternFace(regular, styled)) return null;
+
+    const new_face = loadFromPattern(ft_lib, styled, size_px, metrics) catch return null;
+    const face_idx: u16 = @intCast(faces.items.len);
+    faces.append(alloc, new_face) catch {
+        var f = new_face;
+        f.deinit(alloc);
+        return null;
+    };
+    return face_idx;
+}
+
+fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
+    var a_file: [*c]c.FcChar8 = undefined;
+    var b_file: [*c]c.FcChar8 = undefined;
+    if (c.FcPatternGetString(a, c.FC_FILE, 0, &a_file) != c.FcResultMatch) return false;
+    if (c.FcPatternGetString(b, c.FC_FILE, 0, &b_file) != c.FcResultMatch) return false;
+    var a_index: c_int = 0;
+    var b_index: c_int = 0;
+    _ = c.FcPatternGetInteger(a, c.FC_INDEX, 0, &a_index);
+    _ = c.FcPatternGetInteger(b, c.FC_INDEX, 0, &b_index);
+    return a_index == b_index and std.mem.orderZ(u8, @ptrCast(a_file), @ptrCast(b_file)) == .eq;
+}
+
 /// Load the best match for `family` (e.g. "monospace") at `size_px`.
 pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!Font {
     std.debug.assert(size_px > 0);
 
     if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
 
-    const pattern = c.FcPatternCreate() orelse return error.FontLoadFailed;
-    defer c.FcPatternDestroy(pattern);
-    _ = c.FcPatternAddString(pattern, c.FC_FAMILY, family.ptr);
-    _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, @floatFromInt(size_px));
-    _ = c.FcPatternAddInteger(pattern, c.FC_SPACING, c.FC_MONO);
-    if (c.FcConfigSubstitute(null, pattern, c.FcMatchPattern) != c.FcTrue)
-        return error.FontLoadFailed;
-    c.FcDefaultSubstitute(pattern);
-
     // Sorted candidates: entry 0 is the best match (the primary face),
-    // the rest are fallbacks in preference order.
-    var result: c.FcResult = undefined;
-    const sort_set = c.FcFontSort(null, pattern, c.FcTrue, null, &result) orelse
-        return error.FontNotFound;
-    errdefer c.FcFontSetDestroy(sort_set);
-    if (result != c.FcResultMatch or sort_set.*.nfont < 1) return error.FontNotFound;
+    // the rest are fallbacks in preference order. Keep one list per style
+    // so fallback scripts can choose bold/italic variants too.
+    var sort_sets_opt: [style_count]?*c.FcFontSet = @splat(null);
+    errdefer {
+        for (sort_sets_opt) |sort_set| {
+            if (sort_set) |set| c.FcFontSetDestroy(set);
+        }
+    }
+    inline for (std.meta.fields(FaceStyle)) |field| {
+        const style: FaceStyle = @enumFromInt(field.value);
+        sort_sets_opt[field.value] = try fontSort(family, size_px, style);
+    }
+    const sort_sets: [style_count]*c.FcFontSet = sort_sets: {
+        var sets: [style_count]*c.FcFontSet = undefined;
+        for (sort_sets_opt, 0..) |sort_set, i| sets[i] = sort_set.?;
+        break :sort_sets sets;
+    };
 
     var ft_lib: c.FT_Library = undefined;
     if (c.FT_Init_FreeType(&ft_lib) != 0) return error.FontLoadFailed;
@@ -481,7 +579,7 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         faces.deinit(alloc);
     }
     {
-        var primary = try loadFromPattern(ft_lib, sort_set.*.fonts[0], size_px, .{});
+        var primary = try loadFromPattern(ft_lib, sort_sets[@intFromEnum(FaceStyle.regular)].*.fonts[0], size_px, .{});
         errdefer primary.deinit(alloc);
         try faces.append(alloc, primary);
     }
@@ -518,14 +616,31 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         break :embedded @intCast(faces.items.len - 1);
     };
 
+    var primary_faces: [style_count]u16 = @splat(0);
+    inline for (std.meta.fields(FaceStyle)) |field| {
+        const style: FaceStyle = @enumFromInt(field.value);
+        if (style == .regular) continue;
+        if (loadPrimaryStyle(alloc, &faces, ft_lib, sort_sets, style, size_px, .{
+            .cell_width = cell_width,
+            .cell_height = cell_height,
+            .baseline = baseline,
+        })) |idx| {
+            primary_faces[field.value] = idx;
+        }
+    }
+
     log.info("loaded primary face ({s}) cell {d}x{d} baseline {d}, {d} fallback candidates", .{
-        family, cell_width, cell_height, baseline, sort_set.*.nfont - 1,
+        family,
+        cell_width,
+        cell_height,
+        baseline,
+        sort_sets[@intFromEnum(FaceStyle.regular)].*.nfont - 1,
     });
 
     // Sprite metrics. Line thickness follows the font's underline
     // thickness (scaled to pixels) with a fallback for fonts lacking
     // one; positions are expressed from the cell top, like ghostty.
-    const ft_face = primary.ft_face;
+    const ft_face = faces.items[0].ft_face;
     const y_scale: i64 = ft_face.*.size.*.metrics.y_scale;
     const thickness: u32 = thickness: {
         const units: i64 = ft_face.*.underline_thickness;
@@ -560,7 +675,8 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
     return .{
         .ft_lib = ft_lib,
         .faces = faces,
-        .sort_set = sort_set,
+        .sort_sets = sort_sets,
+        .primary_faces = primary_faces,
         .sort_faces = .empty,
         .codepoint_faces = .empty,
         .embedded_face = embedded_face,
@@ -596,7 +712,7 @@ pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
     var deco_it = self.decoration_glyphs.valueIterator();
     while (deco_it.next()) |g| alloc.free(g.bitmap);
     self.decoration_glyphs.deinit(alloc);
-    c.FcFontSetDestroy(self.sort_set);
+    for (self.sort_sets) |sort_set| c.FcFontSetDestroy(sort_set);
     _ = c.FT_Done_FreeType(self.ft_lib);
     self.* = undefined;
 }
@@ -657,54 +773,78 @@ pub fn decorationGlyph(
 /// over system fonts so icons render identically everywhere; it only
 /// contains symbols, so it never shadows regular text coverage.
 pub fn faceForCodepoint(self: *Font, alloc: std.mem.Allocator, cp: u21) u16 {
+    return self.faceForCodepointStyle(alloc, cp, .regular);
+}
+
+/// Like `faceForCodepoint`, but prefers font faces matching `style`.
+pub fn faceForCodepointStyle(
+    self: *Font,
+    alloc: std.mem.Allocator,
+    cp: u21,
+    style: FaceStyle,
+) u16 {
     // Sprites override fonts so grid glyphs are always seamless.
     if (sprite.covers(cp)) return sprite_face_index;
+
+    const primary_idx = self.primary_faces[@intFromEnum(style)];
+    if (primary_idx != 0 and self.faces.items[primary_idx].hasCodepoint(cp)) return primary_idx;
     if (self.faces.items[0].hasCodepoint(cp)) return 0;
-    if (self.codepoint_faces.get(cp)) |idx| return idx;
+
+    const key: CodepointFaceKey = .{ .style = style, .cp = cp };
+    if (self.codepoint_faces.get(key)) |idx| return idx;
 
     const idx = idx: {
         if (self.embedded_face) |embedded| {
             if (self.faces.items[embedded].hasCodepoint(cp)) break :idx embedded;
         }
-        break :idx self.searchFallback(alloc, cp) orelse 0;
+        break :idx self.searchFallback(alloc, cp, style) orelse 0;
     };
-    self.codepoint_faces.put(alloc, cp, idx) catch {};
+    self.codepoint_faces.put(alloc, key, idx) catch {};
     return idx;
 }
 
 /// Walk the fontconfig sort order for the first usable face whose
 /// charset covers `cp`.
-fn searchFallback(self: *Font, alloc: std.mem.Allocator, cp: u21) ?u16 {
+fn searchFallback(self: *Font, alloc: std.mem.Allocator, cp: u21, style: FaceStyle) ?u16 {
     if (isEmojiCodepoint(cp)) {
-        if (self.searchFallbackPass(alloc, cp, true)) |face_idx| return face_idx;
+        if (self.searchFallbackPass(alloc, cp, style, true)) |face_idx| return face_idx;
     }
-    return self.searchFallbackPass(alloc, cp, false);
+    return self.searchFallbackPass(alloc, cp, style, false);
 }
 
 fn searchFallbackPass(
     self: *Font,
     alloc: std.mem.Allocator,
     cp: u21,
+    style: FaceStyle,
     color_only: bool,
 ) ?u16 {
-    const nfont: usize = @intCast(self.sort_set.*.nfont);
-    // Entry 0 is the primary, already known not to cover cp.
-    for (1..nfont) |i| {
-        const pattern = self.sort_set.*.fonts[i];
+    const sort_set = self.sort_sets[@intFromEnum(style)];
+    const nfont: usize = @intCast(sort_set.*.nfont);
+    const start: usize = if (style == .regular) 1 else 0;
+    for (start..nfont) |i| {
+        const pattern = sort_set.*.fonts[i];
         var charset: ?*c.FcCharSet = null;
         if (c.FcPatternGetCharSet(pattern, c.FC_CHARSET, 0, &charset) != c.FcResultMatch)
             continue;
         if (c.FcCharSetHasChar(charset, cp) != c.FcTrue) continue;
         if (color_only and !patternHasColor(pattern)) continue;
-        if (self.loadFallbackAt(alloc, i, cp)) |face_idx| return face_idx;
+        if (self.loadFallbackAt(alloc, style, i, cp)) |face_idx| return face_idx;
     }
     return null;
 }
 
-fn loadFallbackAt(self: *Font, alloc: std.mem.Allocator, sort_index: usize, cp: u21) ?u16 {
-    const pattern = self.sort_set.*.fonts[sort_index];
+fn loadFallbackAt(
+    self: *Font,
+    alloc: std.mem.Allocator,
+    style: FaceStyle,
+    sort_index: usize,
+    cp: u21,
+) ?u16 {
+    const pattern = self.sort_sets[@intFromEnum(style)].*.fonts[sort_index];
+    const key: SortFaceKey = .{ .style = style, .sort_index = @intCast(sort_index) };
 
-    if (self.sort_faces.get(@intCast(sort_index))) |loaded| {
+    if (self.sort_faces.get(key)) |loaded| {
         if (loaded == failed_face) return null;
         return loaded;
     }
@@ -714,7 +854,7 @@ fn loadFallbackAt(self: *Font, alloc: std.mem.Allocator, sort_index: usize, cp: 
         .cell_height = self.cell_height,
         .baseline = self.baseline,
     }) catch {
-        self.sort_faces.put(alloc, @intCast(sort_index), failed_face) catch {};
+        self.sort_faces.put(alloc, key, failed_face) catch {};
         return null;
     };
     const face_idx: u16 = @intCast(self.faces.items.len);
@@ -723,8 +863,8 @@ fn loadFallbackAt(self: *Font, alloc: std.mem.Allocator, sort_index: usize, cp: 
         f.deinit(alloc);
         return null;
     };
-    self.sort_faces.put(alloc, @intCast(sort_index), face_idx) catch {};
-    log.debug("loaded fallback face {d} for U+{X}", .{ face_idx, cp });
+    self.sort_faces.put(alloc, key, face_idx) catch {};
+    log.debug("loaded fallback face {d} for U+{X} ({})", .{ face_idx, cp, style });
     return face_idx;
 }
 
@@ -768,6 +908,20 @@ test "load monospace font and rasterize a glyph" {
     try std.testing.expect(g.width > 0 and g.height > 0);
     // Cached: same pointer on second lookup.
     try std.testing.expectEqual(g, try primary.glyph(alloc, idx, 1, false));
+}
+
+test "styled primary faces are selected when available" {
+    try std.testing.expectEqual(FaceStyle.bold, FaceStyle.init(true, false));
+    try std.testing.expectEqual(FaceStyle.italic, FaceStyle.init(false, true));
+    try std.testing.expectEqual(FaceStyle.bold_italic, FaceStyle.init(true, true));
+
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    const bold_idx = font.primary_faces[@intFromEnum(FaceStyle.bold)];
+    if (bold_idx == 0) return error.SkipZigTest;
+    try std.testing.expectEqual(bold_idx, font.faceForCodepointStyle(alloc, 'A', .bold));
 }
 
 test "embedded symbols face serves nerd font codepoints" {

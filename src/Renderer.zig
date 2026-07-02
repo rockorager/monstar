@@ -175,6 +175,7 @@ fn renderRow(
     try self.face_scratch.resize(self.alloc, cols);
     try self.reverse_scratch.resize(self.alloc, cols);
     for (0..cols) |x| {
+        const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         self.face_scratch.items[x] = face: {
             switch (raws[x].content_tag) {
                 .codepoint, .codepoint_grapheme => {},
@@ -182,9 +183,12 @@ fn renderRow(
             }
             const cp = raws[x].content.codepoint.data;
             if (cp == 0 or cp == ' ') break :face 0;
-            break :face self.font.faceForCodepoint(self.alloc, cp);
+            break :face self.font.faceForCodepointStyle(
+                self.alloc,
+                cp,
+                .init(style.flags.bold, style.flags.italic),
+            );
         };
-        const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
         var bg = style.bg(&raws[x], &colors.palette);
         var reverse_color_glyph = false;
