@@ -159,17 +159,21 @@ pub fn init(
     const window = try Window.create(alloc);
     errdefer window.destroy();
 
-    const repeat_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+    // Timerfds must be nonblocking: disarming a timerfd clears its
+    // pending expirations, so a reader acting on stale poll revents
+    // (event dispatched earlier in the same loop iteration disarmed
+    // the timer) would otherwise block the whole loop forever.
+    const repeat_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
     if (std.os.linux.errno(repeat_rc) != .SUCCESS) return error.TimerFdFailed;
     const repeat_fd: posix.fd_t = @intCast(repeat_rc);
     errdefer _ = std.os.linux.close(repeat_fd);
 
-    const sync_output_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+    const sync_output_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
     if (std.os.linux.errno(sync_output_rc) != .SUCCESS) return error.TimerFdFailed;
     const sync_output_fd: posix.fd_t = @intCast(sync_output_rc);
     errdefer _ = std.os.linux.close(sync_output_fd);
 
-    const selection_autoscroll_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+    const selection_autoscroll_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
     if (std.os.linux.errno(selection_autoscroll_rc) != .SUCCESS) return error.TimerFdFailed;
     const selection_autoscroll_fd: posix.fd_t = @intCast(selection_autoscroll_rc);
     errdefer _ = std.os.linux.close(selection_autoscroll_fd);
