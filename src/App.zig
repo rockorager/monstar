@@ -46,20 +46,37 @@ const xtgettcap_map = std.StaticStringMap([]const u8).initComptime(&.{
     .{ hexEncodeComptime("it"), "8" },
     .{ hexEncodeComptime("lines"), "24" },
     .{ hexEncodeComptime("pairs"), "32767" },
-    .{ hexEncodeComptime("Smulx"), "\\E[4:%p1%dm" },
-    .{ hexEncodeComptime("Setulc"), "\\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m" },
-    .{ hexEncodeComptime("Ss"), "\\E[%p1%d q" },
-    .{ hexEncodeComptime("Se"), "\\E[0 q" },
-    .{ hexEncodeComptime("Ms"), "\\E]52;%p1%s;%p2%s\\007" },
-    .{ hexEncodeComptime("Sync"), "\\E[?2026%?%p1%{1}%-%tl%eh%;" },
-    .{ hexEncodeComptime("BD"), "\\E[?2004l" },
-    .{ hexEncodeComptime("BE"), "\\E[?2004h" },
-    .{ hexEncodeComptime("PS"), "\\E[200~" },
-    .{ hexEncodeComptime("PE"), "\\E[201~" },
+    .{ hexEncodeComptime("Smulx"), tcapString("\\E[4:%p1%dm") },
+    .{ hexEncodeComptime("Setulc"), tcapString("\\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m") },
+    .{ hexEncodeComptime("Ss"), tcapString("\\E[%p1%d q") },
+    .{ hexEncodeComptime("Se"), tcapString("\\E[0 q") },
+    .{ hexEncodeComptime("Ms"), tcapString("\\E]52;%p1%s;%p2%s\\007") },
+    .{ hexEncodeComptime("Sync"), tcapString("\\E[?2026%?%p1%{1}%-%tl%eh%;") },
+    .{ hexEncodeComptime("BD"), tcapString("\\E[?2004l") },
+    .{ hexEncodeComptime("BE"), tcapString("\\E[?2004h") },
+    .{ hexEncodeComptime("PS"), tcapString("\\E[200~") },
+    .{ hexEncodeComptime("PE"), tcapString("\\E[201~") },
 });
 
 fn hexEncodeComptime(comptime input: []const u8) []const u8 {
     return comptime &(std.fmt.bytesToHex(input, .upper));
+}
+
+/// Prepare a terminfo string capability for an XTGETTCAP reply.
+/// Parameterized values (containing `%`) are sent in terminfo source
+/// form (kitty convention); plain strings get `\E` decoded to the
+/// escape byte (xterm convention). Mirrors ghostty's
+/// terminfo.Source.xtgettcapMap.
+fn tcapString(comptime v: []const u8) []const u8 {
+    comptime {
+        if (std.mem.indexOfScalar(u8, v, '%') != null) return v;
+        if (std.mem.indexOfScalar(u8, v, '^') != null)
+            @compileError("control-char escapes not handled: " ++ v);
+        var buf: [v.len]u8 = undefined;
+        const replacements = std.mem.replace(u8, v, "\\E", "\x1b", &buf);
+        const final = buf;
+        return final[0 .. v.len - replacements];
+    }
 }
 
 alloc: std.mem.Allocator,
@@ -1098,6 +1115,17 @@ test "XTGETTCAP reports hex encoded capabilities" {
         "\x1bP1+r536D756C78=5C455B343A25703125646D\x1b\\",
         buf[0..str_len],
     );
+}
+
+test "XTGETTCAP string values decode tcap escapes unless parameterized" {
+    // Parameterized: terminfo source form is preserved.
+    try std.testing.expectEqualStrings("\\E[4:%p1%dm", comptime tcapString("\\E[4:%p1%dm"));
+    // Plain: \E decodes to the escape byte before hex encoding.
+    try std.testing.expectEqualStrings("\x1b[0 q", comptime tcapString("\\E[0 q"));
+
+    var buf: [512]u8 = undefined;
+    const len = try formatXtgettcapResponse(&buf, hexEncodeComptime("Se"), comptime tcapString("\\E[0 q"));
+    try std.testing.expectEqualStrings("\x1bP1+r5365=1B5B302071\x1b\\", buf[0..len]);
 }
 
 fn suspendPty(self: *App, err: anyerror) void {
