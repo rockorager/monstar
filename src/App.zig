@@ -61,10 +61,15 @@ scroll_clicks: i32,
 scroll_had_discrete: bool,
 /// Left-button drag selection. The anchor is a cell-boundary caret:
 /// a tracked pin for the anchored cell plus which of its vertical
-/// edges (0 = left, 1 = right) the press grabbed.
+/// edges (0 = left, 1 = right) the press grabbed. The pin belongs to
+/// the screen that was active at press time (`sel_screen`), which is
+/// the only screen it may be untracked on.
 selecting: bool,
 sel_anchor: ?*vt.Pin,
 sel_anchor_off: u1,
+sel_screen: vt.ScreenSet.Key,
+/// Active screen at the last check, to detect alt screen switches.
+active_screen: vt.ScreenSet.Key,
 /// Serial of the most recent input event, required to claim selections.
 last_serial: u32,
 /// Current clipboard/primary offers from other clients (paste sources).
@@ -162,6 +167,8 @@ pub fn init(
         .selecting = false,
         .sel_anchor = null,
         .sel_anchor_off = 0,
+        .sel_screen = .primary,
+        .active_screen = .primary,
         .last_serial = 0,
         .clip_offer = null,
         .primary_offer = null,
@@ -275,7 +282,7 @@ fn setNonblocking(fd: posix.fd_t) void {
 }
 
 pub fn deinit(self: *App) void {
-    if (self.sel_anchor) |anchor| self.term.screens.active.pages.untrackPin(anchor);
+    self.cancelDrag();
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
@@ -412,6 +419,7 @@ fn readPty(self: *App) void {
         if (n < buf.len) break;
     }
     self.syncInBandSizeReports();
+    self.syncActiveScreen();
 }
 
 /// DEC mode 2048 (in-band size reports): the terminal must send a size
@@ -466,28 +474,33 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             // except that shift bypasses it for terminal-side selection.
             const reporting = self.term.flags.mouse_event != .none and
                 !self.keyboard.currentMods().shift;
-            if (reporting) {
-                const mouse_button: vt.input.MouseButton = switch (button.button) {
-                    272 => .left, // BTN_LEFT
-                    273 => .right, // BTN_RIGHT
-                    274 => .middle, // BTN_MIDDLE
-                    else => return,
-                };
-                self.sendMouseEvent(.{
-                    .action = if (button.state == .pressed) .press else .release,
-                    .button = mouse_button,
-                    .mods = self.keyboard.currentMods(),
-                    .pos = self.pointerPosPhysical(),
-                });
-                return;
-            }
-            if (button.button == 272) { // BTN_LEFT: drag selection
+
+            if (button.button == 272) { // BTN_LEFT
                 switch (button.state) {
-                    .pressed => self.startSelection(),
-                    .released => self.finishSelection(),
+                    .pressed => if (reporting) {
+                        self.forwardMouseButton(button);
+                    } else {
+                        self.startSelection();
+                    },
+                    // Routing may have changed since the press (shift
+                    // released mid-drag, app toggled mouse mode): an
+                    // armed drag always finishes; only presses the app
+                    // saw get their release.
+                    .released => if (self.selecting) {
+                        self.finishSelection();
+                    } else if (reporting) {
+                        self.forwardMouseButton(button);
+                    },
                     else => {},
                 }
-            } else if (button.button == 274 and button.state == .pressed) {
+                return;
+            }
+
+            if (reporting) {
+                self.forwardMouseButton(button);
+                return;
+            }
+            if (button.button == 274 and button.state == .pressed) {
                 // BTN_MIDDLE: paste the primary selection.
                 self.beginPaste(.primary);
             }
@@ -524,6 +537,24 @@ fn boundaryAtPointer(self: *App) struct { x: u16, y: u16 } {
     return .{ .x = bx, .y = by };
 }
 
+fn forwardMouseButton(self: *App, button: anytype) void {
+    const mouse_button: vt.input.MouseButton = switch (button.button) {
+        272 => .left, // BTN_LEFT
+        273 => .right, // BTN_RIGHT
+        274 => .middle, // BTN_MIDDLE
+        else => return,
+    };
+    // Buttons owned by the application dismiss any terminal-side
+    // selection; the application handles the event its own way.
+    self.clearSelection();
+    self.sendMouseEvent(.{
+        .action = if (button.state == .pressed) .press else .release,
+        .button = mouse_button,
+        .mods = self.keyboard.currentMods(),
+        .pos = self.pointerPosPhysical(),
+    });
+}
+
 fn startSelection(self: *App) void {
     const screen = self.term.screens.active;
     self.clearSelection();
@@ -537,10 +568,17 @@ fn startSelection(self: *App) void {
         .viewport = .{ .x = anchor_x, .y = boundary.y },
     }) orelse return;
     self.sel_anchor = screen.pages.trackPin(anchor) catch null;
+    self.sel_screen = self.term.screens.active_key;
     self.selecting = self.sel_anchor != null;
 }
 
 fn extendSelection(self: *App) void {
+    // A drag never survives a screen switch; the anchor pin belongs
+    // to the other screen's pages.
+    if (self.term.screens.active_key != self.sel_screen) {
+        self.cancelDrag();
+        return;
+    }
     const screen = self.term.screens.active;
     const pages = &screen.pages;
     const anchor = self.sel_anchor orelse return;
@@ -590,29 +628,43 @@ fn extendSelection(self: *App) void {
     self.needs_redraw = true;
 }
 
-fn finishSelection(self: *App) void {
-    if (!self.selecting) return;
+/// Stop any in-progress drag, untracking the anchor pin on the screen
+/// that owns it (which may no longer be the active one).
+fn cancelDrag(self: *App) void {
     self.selecting = false;
     if (self.sel_anchor) |anchor| {
-        self.term.screens.active.pages.untrackPin(anchor);
+        if (self.term.screens.get(self.sel_screen)) |screen| {
+            screen.pages.untrackPin(anchor);
+        }
         self.sel_anchor = null;
     }
+}
+
+fn finishSelection(self: *App) void {
+    if (!self.selecting) return;
+    self.cancelDrag();
     // Finished selections claim the primary selection, X style.
     self.copyToPrimary();
 }
 
 /// Drop the current selection and stop any in-progress drag.
 fn clearSelection(self: *App) void {
+    self.cancelDrag();
     const screen = self.term.screens.active;
-    self.selecting = false;
-    if (self.sel_anchor) |anchor| {
-        screen.pages.untrackPin(anchor);
-        self.sel_anchor = null;
-    }
     if (screen.selection != null) {
         screen.clearSelection();
         self.needs_redraw = true;
     }
+}
+
+/// React to alt screen enter/exit: an in-flight drag must not span
+/// screens (its anchor pin belongs to the old screen's pages). The
+/// terminal itself clears the incoming screen's selection.
+fn syncActiveScreen(self: *App) void {
+    const key = self.term.screens.active_key;
+    if (key == self.active_screen) return;
+    self.active_screen = key;
+    self.cancelDrag();
 }
 
 /// Heap context for an outgoing selection source: owns the text and the
@@ -857,6 +909,9 @@ fn finishScrollFrame(self: *App) void {
 fn scrollLines(self: *App, lines_down: i32) void {
     const lines_abs: u32 = @abs(lines_down);
     if (self.term.flags.mouse_event != .none) {
+        // A selection can exist here via the shift override; scrolling
+        // hands control back to the application, so drop it.
+        self.clearSelection();
         const button: vt.input.MouseButton = if (lines_down < 0) .four else .five;
         for (0..lines_abs) |_| {
             self.sendMouseEvent(.{
@@ -871,9 +926,11 @@ fn scrollLines(self: *App, lines_down: i32) void {
 
     if (self.term.screens.active_key == .alternate) {
         // Full-screen apps without mouse support (pagers, editors)
-        // expect cursor keys instead of viewport scrolling.
+        // expect cursor keys instead of viewport scrolling; the app
+        // will move content, so any selection over it goes stale.
+        self.clearSelection();
         const key: vt.input.Key = if (lines_down < 0) .arrow_up else .arrow_down;
-        for (0..lines_abs) |_| self.encodeAndWriteKey(.{ .key = key, .action = .press });
+        for (0..lines_abs) |_| _ = self.encodeAndWriteKey(.{ .key = key, .action = .press });
         return;
     }
 
@@ -1009,25 +1066,31 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
         }
     }
 
-    // Typing snaps a scrolled-back viewport to the bottom.
-    if (action == .press and self.term.screens.active.pages.viewport != .active) {
-        self.term.screens.active.pages.scroll(.active);
-        self.needs_redraw = true;
-    }
+    const wrote = self.encodeAndWriteKey(event);
 
-    self.encodeAndWriteKey(event);
+    // A non-modifier key that produced input dismisses the selection
+    // and snaps a scrolled-back viewport to the bottom (ghostty's
+    // selection-clear-on-typing behavior).
+    if (wrote and action != .release and !event.key.modifier()) {
+        self.clearSelection();
+        if (self.term.screens.active.pages.viewport != .active) {
+            self.term.screens.active.pages.scroll(.active);
+            self.needs_redraw = true;
+        }
+    }
 }
 
-fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) void {
+fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {
     var out_buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&out_buf);
     vt.input.encodeKey(&writer, event, .fromTerminal(&self.term)) catch |err| {
         log.err("key encode failed: {}", .{err});
-        return;
+        return false;
     };
     const bytes = writer.buffered();
-    if (bytes.len == 0) return;
+    if (bytes.len == 0) return false;
     self.writePty(bytes);
+    return true;
 }
 
 /// Write to the PTY without ever blocking: whatever the kernel won't
