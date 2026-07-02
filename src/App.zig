@@ -34,6 +34,12 @@ keyboard: Keyboard,
 needs_redraw: bool,
 /// The child hung up; drain and quit.
 child_eof: bool,
+/// Key repeat: timerfd armed while a repeating key is held.
+repeat_fd: posix.fd_t,
+repeat_keycode: ?u32,
+/// From wl_keyboard.repeat_info: characters per second and delay in ms.
+repeat_rate: i32,
+repeat_delay: i32,
 
 const initial_cols = 80;
 const initial_rows = 24;
@@ -74,6 +80,11 @@ pub fn init(
     const window = try Window.create(alloc);
     errdefer window.destroy();
 
+    const repeat_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+    if (std.os.linux.errno(repeat_rc) != .SUCCESS) return error.TimerFdFailed;
+    const repeat_fd: posix.fd_t = @intCast(repeat_rc);
+    errdefer _ = std.os.linux.close(repeat_fd);
+
     // Self-reference into listeners/streams requires a stable address.
     const self = try alloc.create(App);
     errdefer alloc.destroy(self);
@@ -90,13 +101,83 @@ pub fn init(
         .keyboard = try .init(),
         .needs_redraw = true,
         .child_eof = false,
+        .repeat_fd = repeat_fd,
+        .repeat_keycode = null,
+        .repeat_rate = 25,
+        .repeat_delay = 600,
     };
     self.stream = self.term.vtStream();
+
+    // Handle sequences that need responses or side effects.
+    var effects: Effects = .readonly;
+    effects.write_pty = effectWritePty;
+    effects.device_attributes = effectDeviceAttributes;
+    effects.enquiry = effectEnquiry;
+    effects.size = effectSize;
+    effects.color_scheme = effectColorScheme;
+    effects.xtversion = effectXtversion;
+    effects.title_changed = effectTitleChanged;
+    self.stream.handler.effects = effects;
+
     window.setCallbacks(self, render, resize, keyboardEvent);
     return self;
 }
 
+const Handler = vt.TerminalStream.Handler;
+const Effects = Handler.Effects;
+
+/// Effects callbacks only receive the handler; walk back up to the App
+/// through the stream that embeds it.
+fn appFromHandler(handler: *Handler) *App {
+    const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
+    return @fieldParentPtr("stream", stream);
+}
+
+/// Return type of an Effects callback, e.g. device_attributes.
+fn EffectResult(comptime field_name: []const u8) type {
+    const FnPtr = @typeInfo(@FieldType(Effects, field_name)).optional.child;
+    return @typeInfo(@typeInfo(FnPtr).pointer.child).@"fn".return_type.?;
+}
+
+fn effectWritePty(handler: *Handler, data: [:0]const u8) void {
+    appFromHandler(handler).writePty(data);
+}
+
+fn effectDeviceAttributes(_: *Handler) EffectResult("device_attributes") {
+    // Defaults report a reasonable VT220-level terminal.
+    return .{};
+}
+
+fn effectEnquiry(_: *Handler) []const u8 {
+    return "";
+}
+
+fn effectSize(handler: *Handler) ?vt.size_report.Size {
+    const self = appFromHandler(handler);
+    return .{
+        .rows = self.term.rows,
+        .columns = self.term.cols,
+        .cell_width = self.font.cell_width,
+        .cell_height = self.font.cell_height,
+    };
+}
+
+fn effectColorScheme(_: *Handler) ?vt.device_status.ColorScheme {
+    return .dark;
+}
+
+fn effectXtversion(_: *Handler) []const u8 {
+    return "vtread 0.0.0";
+}
+
+fn effectTitleChanged(handler: *Handler) void {
+    const self = appFromHandler(handler);
+    const title = self.term.getTitle() orelse return;
+    self.window.toplevel.setTitle(title.ptr);
+}
+
 pub fn deinit(self: *App) void {
+    _ = std.os.linux.close(self.repeat_fd);
     self.keyboard.deinit();
     self.window.destroy();
     self.renderer.deinit();
@@ -114,9 +195,11 @@ pub fn run(self: *App) !void {
     var fds = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.pty.master, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pty_fd = &fds[1];
+    const repeat_fd = &fds[2];
 
     while (self.window.running and !self.child_eof) {
         // Standard libwayland read dance: drain the local queue, flush
@@ -143,6 +226,10 @@ pub fn run(self: *App) !void {
 
         if (pty_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
             self.readPty();
+        }
+
+        if (repeat_fd.revents & posix.POLL.IN != 0) {
+            self.fireRepeat();
         }
 
         if (self.needs_redraw) {
@@ -206,9 +293,66 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
                 else => return,
             };
             self.onKey(key.key, action);
+            switch (action) {
+                .press => if (self.keyboard.keyRepeats(key.key)) self.armRepeat(key.key),
+                .release => if (self.repeat_keycode == key.key) self.cancelRepeat(),
+                else => {},
+            }
         },
-        .enter, .leave, .repeat_info => {},
+        .repeat_info => |info| {
+            self.repeat_rate = info.rate;
+            self.repeat_delay = info.delay;
+        },
+        // Keys held across a focus change must not keep repeating.
+        .leave => self.cancelRepeat(),
+        .enter => {},
     }
+}
+
+/// Start (or move) key repeat to the given key: first fire after the
+/// configured delay, then at the configured rate.
+fn armRepeat(self: *App, evdev_keycode: u32) void {
+    if (self.repeat_rate <= 0 or self.repeat_delay <= 0) return;
+    self.repeat_keycode = evdev_keycode;
+
+    const delay_ms: u64 = @intCast(self.repeat_delay);
+    const interval_ns: u64 = @divTrunc(std.time.ns_per_s, @as(u64, @intCast(self.repeat_rate)));
+    self.setRepeatTimer(.{
+        .it_value = timespecFromNs(delay_ms * std.time.ns_per_ms),
+        .it_interval = timespecFromNs(interval_ns),
+    });
+}
+
+fn cancelRepeat(self: *App) void {
+    self.repeat_keycode = null;
+    self.setRepeatTimer(.{
+        .it_value = .{ .sec = 0, .nsec = 0 },
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    });
+}
+
+fn setRepeatTimer(self: *App, spec: std.os.linux.itimerspec) void {
+    const rc = std.os.linux.timerfd_settime(self.repeat_fd, .{}, &spec, null);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        log.err("timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
+    }
+}
+
+fn timespecFromNs(ns: u64) std.os.linux.timespec {
+    return .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+}
+
+/// The repeat timer expired: re-send the held key.
+fn fireRepeat(self: *App) void {
+    var expirations: u64 = 0;
+    const n = posix.read(self.repeat_fd, std.mem.asBytes(&expirations)) catch return;
+    if (n != @sizeOf(u64)) return;
+    const keycode = self.repeat_keycode orelse return;
+    // Cap the burst so a stalled loop can't flood the PTY.
+    for (0..@min(expirations, 8)) |_| self.onKey(keycode, .repeat);
 }
 
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {

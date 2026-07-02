@@ -82,6 +82,12 @@ fn installKeymap(self: *Keyboard, keymap: *c.xkb_keymap) !void {
     };
 }
 
+/// Whether the key should repeat while held (letters yes, shift no).
+pub fn keyRepeats(self: *Keyboard, evdev_keycode: u32) bool {
+    const keymap = self.keymap orelse return false;
+    return c.xkb_keymap_key_repeats(keymap, evdev_keycode + 8) == 1;
+}
+
 /// Apply a wl_keyboard.modifiers event.
 pub fn updateMods(self: *Keyboard, depressed: u32, latched: u32, locked: u32, group: u32) void {
     const state = self.state orelse return;
