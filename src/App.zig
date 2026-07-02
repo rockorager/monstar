@@ -38,6 +38,10 @@ needs_redraw: bool,
 /// Cached DEC mode 2048 state, to detect the application enabling
 /// in-band size reports.
 in_band_reports: bool,
+/// PTY input that couldn't be written yet (master is nonblocking to
+/// avoid deadlocking against a child that has stopped reading while
+/// flooding output). Flushed when the master polls writable.
+write_queue: std.ArrayList(u8),
 /// The child hung up; drain and quit.
 child_eof: bool,
 /// Key repeat: timerfd armed while a repeating key is held.
@@ -83,6 +87,11 @@ pub fn init(
     errdefer pty.deinit();
     const child_pid = try pty.spawn(path, argv, envp);
 
+    // Nonblocking master: a blocking write can deadlock the whole loop
+    // when the child floods output (echoed responses need output-queue
+    // space) while we respond to queries embedded in that output.
+    setNonblocking(pty.master);
+
     const window = try Window.create(alloc);
     errdefer window.destroy();
 
@@ -109,6 +118,7 @@ pub fn init(
         .keyboard = try .init(),
         .needs_redraw = true,
         .in_band_reports = false,
+        .write_queue = .empty,
         .child_eof = false,
         .repeat_fd = repeat_fd,
         .repeat_keycode = null,
@@ -204,7 +214,16 @@ fn effectTitleChanged(handler: *Handler) void {
     self.window.toplevel.setTitle(title.ptr);
 }
 
+fn setNonblocking(fd: posix.fd_t) void {
+    const linux = std.os.linux;
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return;
+    _ = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
+}
+
 pub fn deinit(self: *App) void {
+    self.write_queue.deinit(self.alloc);
     _ = std.os.linux.close(self.repeat_fd);
     self.keyboard.deinit();
     self.window.destroy();
@@ -235,10 +254,30 @@ pub fn run(self: *App) !void {
         while (!display.prepareRead()) {
             if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
         }
-        if (display.flush() != .SUCCESS) {
-            display.cancelRead();
-            return error.FlushFailed;
+        flush: while (true) {
+            switch (display.flush()) {
+                .SUCCESS => break :flush,
+                // Socket full: wait until the compositor drains it.
+                .AGAIN => {
+                    var out_fd = [_]posix.pollfd{
+                        .{ .fd = display.getFd(), .events = posix.POLL.OUT, .revents = 0 },
+                    };
+                    _ = posix.poll(&out_fd, -1) catch {
+                        display.cancelRead();
+                        return error.FlushFailed;
+                    };
+                },
+                else => {
+                    display.cancelRead();
+                    return error.FlushFailed;
+                },
+            }
         }
+
+        // Only ask for writability while a backlog exists, otherwise
+        // POLLOUT would make every poll return immediately.
+        pty_fd.events = posix.POLL.IN;
+        if (self.write_queue.items.len > 0) pty_fd.events |= posix.POLL.OUT;
 
         _ = posix.poll(&fds, -1) catch |err| {
             display.cancelRead();
@@ -252,6 +291,9 @@ pub fn run(self: *App) !void {
         }
         if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
 
+        if (pty_fd.revents & posix.POLL.OUT != 0) {
+            self.flushWriteQueue();
+        }
         if (pty_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
             self.readPty();
         }
@@ -269,28 +311,33 @@ pub fn run(self: *App) !void {
     _ = Pty.wait(self.child_pid) catch {};
 }
 
-/// Read one chunk of PTY output into the terminal.
+/// Drain available PTY output into the terminal. Bounded so a
+/// flooding child cannot starve the Wayland side of the loop.
 fn readPty(self: *App) void {
     var buf: [16 * 1024]u8 = undefined;
-    const n = posix.read(self.pty.master, &buf) catch |err| switch (err) {
-        // EIO on the master means the slave side is gone (child exited).
-        error.Unexpected, error.InputOutput => {
+    for (0..16) |_| {
+        const n = posix.read(self.pty.master, &buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            // EIO on the master means the slave side is gone (child exited).
+            error.Unexpected, error.InputOutput => {
+                self.child_eof = true;
+                break;
+            },
+            else => {
+                log.err("pty read failed: {}", .{err});
+                self.child_eof = true;
+                break;
+            },
+        };
+        if (n == 0) {
             self.child_eof = true;
-            return;
-        },
-        else => {
-            log.err("pty read failed: {}", .{err});
-            self.child_eof = true;
-            return;
-        },
-    };
-    if (n == 0) {
-        self.child_eof = true;
-        return;
+            break;
+        }
+        self.stream.nextSlice(buf[0..n]);
+        self.needs_redraw = true;
+        if (n < buf.len) break;
     }
-    self.stream.nextSlice(buf[0..n]);
     self.syncInBandSizeReports();
-    self.needs_redraw = true;
 }
 
 /// DEC mode 2048 (in-band size reports): the terminal must send a size
@@ -419,20 +466,58 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     self.writePty(bytes);
 }
 
+/// Write to the PTY without ever blocking: whatever the kernel won't
+/// take right now is queued and flushed when the master polls writable.
 fn writePty(self: *App, bytes: []const u8) void {
+    // A backlog exists; keep ordering by appending behind it.
+    if (self.write_queue.items.len > 0) {
+        self.queuePtyWrite(bytes);
+        return;
+    }
+    const written = self.tryPtyWrite(bytes);
+    if (written < bytes.len) self.queuePtyWrite(bytes[written..]);
+}
+
+/// Drain the backlog after the master polled writable.
+fn flushWriteQueue(self: *App) void {
+    const written = self.tryPtyWrite(self.write_queue.items);
+    self.write_queue.replaceRange(self.alloc, 0, written, &.{}) catch unreachable; // shrinking
+}
+
+/// Write as much as the kernel accepts; returns the number of bytes
+/// consumed. Never blocks.
+fn tryPtyWrite(self: *App, bytes: []const u8) usize {
     const linux = std.os.linux;
-    var remaining = bytes;
-    while (remaining.len > 0) {
-        const rc = linux.write(self.pty.master, remaining.ptr, remaining.len);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const rc = linux.write(self.pty.master, bytes.ptr + offset, bytes.len - offset);
         switch (linux.errno(rc)) {
-            .SUCCESS => remaining = remaining[rc..],
+            .SUCCESS => offset += rc,
             .INTR => continue,
+            .AGAIN => break,
+            // EIO: child gone; the read side notices and shuts down.
+            .IO => break,
             else => |err| {
                 log.err("pty write failed: {}", .{err});
-                return;
+                break;
             },
         }
     }
+    return offset;
+}
+
+fn queuePtyWrite(self: *App, bytes: []const u8) void {
+    // Cap the backlog: a child that never reads again must not grow the
+    // queue without bound. Dropping input is safe; dropping responses
+    // only affects an unresponsive client.
+    const max_queue = 1024 * 1024;
+    if (self.write_queue.items.len + bytes.len > max_queue) {
+        log.warn("pty write queue full; dropping {d} bytes", .{bytes.len});
+        return;
+    }
+    self.write_queue.appendSlice(self.alloc, bytes) catch |err| {
+        log.err("pty write queue append failed: {}", .{err});
+    };
 }
 
 /// Window render delegate: refresh the render state and draw the grid.
