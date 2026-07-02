@@ -15,16 +15,16 @@ content under it changes.
 
 Sprite rendering (box drawing, blocks, braille, powerline, branch,
 legacy computing) and text decorations landed, vendored from ghostty's
-sprite face onto z2d. Remaining: cursor shape sprites (bar, underline,
-hollow rect from `special.zig` are vendored but unused — the cursor is
-still always a filled block), and wide (2-cell) sprite variants where
-ghostty passes `cell_width > 1`.
+sprite face onto z2d. Cursor shape sprites (bar,
+underline, hollow) landed too. Remaining: wide (2-cell) sprite
+variants where ghostty passes `cell_width > 1`.
 
-## Config file
+## Config polish
 
-Font family and size, colors/palette, scrollback limit, wheel scroll
-lines, default shell. Probably a simple key=value file at
-`$XDG_CONFIG_HOME/vtread/config`.
+The key=value config file landed (font, colors, palette, scrollback,
+shell, wheel speed). Possible follow-ups: live reload on file change,
+configurable keybindings for copy/paste, cursor style/blink defaults,
+and font fallback family overrides.
 
 ## Color emoji
 
