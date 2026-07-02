@@ -33,11 +33,19 @@ height: u31,
 pending_width: u31,
 pending_height: u31,
 running: bool,
+/// A frame callback is outstanding; drawing now would outpace the
+/// compositor. `redraw()` queues instead.
+frame_pending: bool,
+redraw_queued: bool,
 render_ctx: ?*anyopaque,
 render_fn: ?RenderFn,
+resize_fn: ?ResizeFn,
 
 /// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
 pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void;
+
+/// Called when the window size changed, before the next draw.
+pub const ResizeFn = *const fn (ctx: *anyopaque, width: u31, height: u31) anyerror!void;
 
 /// Globals collected during the initial registry roundtrip.
 const Globals = struct {
@@ -79,13 +87,18 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .xdg_surface = xdg_surface,
         .toplevel = toplevel,
         .buffers = .empty,
-        .width = default_width,
-        .height = default_height,
+        // Zero until the first configure so the resize callback always
+        // fires before the first draw.
+        .width = 0,
+        .height = 0,
         .pending_width = default_width,
         .pending_height = default_height,
         .running = true,
+        .frame_pending = false,
+        .redraw_queued = false,
         .render_ctx = null,
         .render_fn = null,
+        .resize_fn = null,
     };
 
     wm_base.setListener(*Window, wmBaseListener, self);
@@ -117,10 +130,23 @@ pub fn dispatch(self: *Window) !bool {
     return self.running;
 }
 
-/// Set the delegate that draws window contents.
-pub fn setRenderCallback(self: *Window, ctx: *anyopaque, render_fn: RenderFn) void {
+/// Set the delegates for drawing window contents and reacting to resizes.
+pub fn setCallbacks(self: *Window, ctx: *anyopaque, render_fn: RenderFn, resize_fn: ?ResizeFn) void {
     self.render_ctx = ctx;
     self.render_fn = render_fn;
+    self.resize_fn = resize_fn;
+}
+
+/// Redraw as soon as the compositor is ready for a new frame: now if no
+/// frame callback is outstanding, otherwise when it fires.
+pub fn redraw(self: *Window) !void {
+    // Not configured yet; the first configure triggers the first draw.
+    if (self.width == 0) return;
+    if (self.frame_pending) {
+        self.redraw_queued = true;
+        return;
+    }
+    try self.draw();
 }
 
 /// Redraw the window contents and commit.
@@ -132,10 +158,34 @@ fn draw(self: *Window) !void {
         @memset(buffer.pixels(), bg_color);
     }
 
+    // Throttle future redraws to the compositor's pace. Configure-driven
+    // draws may run while a callback is already outstanding; don't stack.
+    if (!self.frame_pending) {
+        const frame_cb = try self.surface.frame();
+        frame_cb.setListener(*Window, frameListener, self);
+        self.frame_pending = true;
+    }
+
     self.surface.attach(buffer.wl_buffer, 0, 0);
     self.surface.damageBuffer(0, 0, self.width, self.height);
     self.surface.commit();
     buffer.busy = true;
+}
+
+fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window) void {
+    switch (event) {
+        .done => {
+            frame_cb.destroy();
+            self.frame_pending = false;
+            if (self.redraw_queued) {
+                self.redraw_queued = false;
+                self.draw() catch |err| {
+                    log.err("draw failed: {}", .{err});
+                    self.running = false;
+                };
+            }
+        },
+    }
 }
 
 /// Return a free shm buffer of the requested size, creating one if
@@ -184,8 +234,19 @@ fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, self:
     switch (event) {
         .configure => |configure| {
             xdg_surface.ackConfigure(configure.serial);
+            const resized = self.width != self.pending_width or
+                self.height != self.pending_height;
             self.width = self.pending_width;
             self.height = self.pending_height;
+            if (resized) {
+                if (self.resize_fn) |resize_fn| {
+                    resize_fn(self.render_ctx.?, self.width, self.height) catch |err| {
+                        log.err("resize handler failed: {}", .{err});
+                        self.running = false;
+                        return;
+                    };
+                }
+            }
             self.draw() catch |err| {
                 log.err("draw failed: {}", .{err});
                 self.running = false;

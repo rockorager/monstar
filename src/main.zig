@@ -1,11 +1,13 @@
 //! Application entry point.
 //!
-//! `vtread [command...]` runs a command under terminal emulation and shows
-//! the resulting screen in a Wayland window (milestone 3: static render).
-//! `vtread --dump [command...]` prints the screen as text instead.
+//! `vtread [command...]` runs a command (default: $SHELL) in a Wayland
+//! terminal window with live output.
+//! `vtread --dump [command...]` runs a command to completion headlessly
+//! and prints the emulated screen as text.
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
+const App = @import("App.zig");
 const Font = @import("Font.zig");
 const Pty = @import("Pty.zig");
 const Renderer = @import("Renderer.zig");
@@ -15,7 +17,6 @@ const log = std.log.scoped(.main);
 
 const cols = 80;
 const rows = 24;
-const font_size_px = 16;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -62,40 +63,26 @@ fn runCommand(init: std.process.Init, term: *vt.Terminal, args: []const [:0]cons
     log.debug("child exited with status {d}", .{status});
 }
 
-/// GUI mode: run the command, then show the final screen in a window.
+/// GUI mode: run a live terminal session in a window.
 fn gui(init: std.process.Init, args: []const [:0]const u8) !void {
-    const alloc = init.gpa;
+    const arena = init.arena.allocator();
 
-    var term: vt.Terminal = try .init(init.io, alloc, .{ .cols = cols, .rows = rows });
-    defer term.deinit(alloc);
-    try runCommand(init, &term, args);
-
-    var state: vt.RenderState = .empty;
-    defer state.deinit(alloc);
-    try state.update(alloc, &term);
-
-    var font: Font = try .init("monospace", font_size_px);
-    defer font.deinit(alloc);
-    var renderer: Renderer = try .init(alloc, &font);
-    defer renderer.deinit();
-
-    var ctx: RenderContext = .{ .renderer = &renderer, .state = &state };
-    const window = try Window.create(alloc);
-    defer window.destroy();
-    window.setRenderCallback(&ctx, RenderContext.render);
-
-    while (try window.dispatch()) {}
-}
-
-const RenderContext = struct {
-    renderer: *Renderer,
-    state: *const vt.RenderState,
-
-    fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void {
-        const self: *RenderContext = @ptrCast(@alignCast(ctx));
-        try self.renderer.render(self.state, pixels, width, height);
+    // With arguments, run them as a shell command; otherwise run $SHELL
+    // interactively.
+    const shell: [:0]const u8 = init.minimal.environ.getPosix("SHELL") orelse "/bin/sh";
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    if (args.len > 0) {
+        try argv.appendSlice(arena, &.{ "/bin/sh", "-c", try std.mem.joinZ(arena, " ", args) });
+    } else {
+        try argv.append(arena, shell.ptr);
     }
-};
+    const argv_z = try argv.toOwnedSliceSentinel(arena, null);
+    const envp = try buildEnvp(arena, init.minimal.environ);
+
+    const app = try App.init(init.io, init.gpa, .{}, argv_z[0].?, argv_z.ptr, envp);
+    defer app.deinit();
+    try app.run();
+}
 
 /// Headless mode: run a command under terminal emulation, print the screen.
 fn dump(init: std.process.Init, args: []const [:0]const u8) !void {
@@ -133,6 +120,7 @@ fn buildEnvp(
 }
 
 test {
+    _ = App;
     _ = Font;
     _ = Pty;
     _ = Renderer;

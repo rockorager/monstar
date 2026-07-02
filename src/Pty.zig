@@ -80,6 +80,11 @@ pub fn spawn(
     return pid;
 }
 
+/// Propagate a new window size to the PTY (and thus the child via SIGWINCH).
+pub fn setWinsize(self: *Pty, size: posix.winsize) Error!void {
+    try check(linux.ioctl(self.master, linux.T.IOCSWINSZ, @intFromPtr(&size)));
+}
+
 /// Wait for the child to exit; returns its wait status.
 pub fn wait(pid: posix.pid_t) Error!u32 {
     var status: u32 = undefined;
