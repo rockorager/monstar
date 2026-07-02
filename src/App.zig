@@ -25,7 +25,7 @@ const log = std.log.scoped(.app);
 alloc: std.mem.Allocator,
 config: *const Config,
 term: vt.Terminal,
-stream: vt.TerminalStream,
+stream: AppStream,
 render_state: vt.RenderState,
 /// Complete ARGB8888 backing frame. Dirty-row rendering updates this
 /// buffer, then the window copies it into the Wayland shm buffer it acquired.
@@ -123,6 +123,30 @@ const initial_rows = 24;
 const sync_output_reset_ms = 1000;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
+
+const TerminalHandler = vt.TerminalStream.Handler;
+const AppStream = vt.Stream(AppStreamHandler);
+
+const AppStreamHandler = struct {
+    app: *App,
+    terminal_handler: TerminalHandler,
+
+    pub fn deinit(self: *AppStreamHandler) void {
+        self.terminal_handler.deinit();
+    }
+
+    pub fn vt(
+        self: *AppStreamHandler,
+        comptime action: AppStream.Action.Tag,
+        value: AppStream.Action.Value(action),
+    ) void {
+        self.terminal_handler.vt(action, value);
+        switch (action) {
+            .color_operation => self.app.answerOscColorQueries(&value.requests, value.terminator),
+            else => {},
+        }
+    }
+};
 
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
 /// copies them via execve); `config` must outlive the App.
@@ -249,7 +273,10 @@ pub fn init(
         .paste_fd = -1,
         .paste_buf = .empty,
     };
-    self.stream = self.term.vtStream();
+    self.stream = .initAlloc(alloc, .{
+        .app = self,
+        .terminal_handler = .init(&self.term),
+    });
 
     if (window.data_device) |device| {
         device.setListener(*App, dataDeviceListener, self);
@@ -267,7 +294,7 @@ pub fn init(
     effects.color_scheme = effectColorScheme;
     effects.xtversion = effectXtversion;
     effects.title_changed = effectTitleChanged;
-    self.stream.handler.effects = effects;
+    self.stream.handler.terminal_handler.effects = effects;
 
     window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, scaleChanged);
     return self;
@@ -290,14 +317,14 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     self.needs_redraw = true;
 }
 
-const Handler = vt.TerminalStream.Handler;
+const Handler = TerminalHandler;
 const Effects = Handler.Effects;
 
-/// Effects callbacks only receive the handler; walk back up to the App
-/// through the stream that embeds it.
+/// Effects callbacks only receive the terminal handler; walk back up through
+/// Monstar's wrapper handler.
 fn appFromHandler(handler: *Handler) *App {
-    const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
-    return @alignCast(@fieldParentPtr("stream", stream));
+    const app_handler: *AppStreamHandler = @fieldParentPtr("terminal_handler", handler);
+    return app_handler.app;
 }
 
 /// Return type of an Effects callback, e.g. device_attributes.
@@ -554,6 +581,129 @@ fn readPty(self: *App) void {
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
     self.syncActiveScreen();
+}
+
+fn answerOscColorQueries(
+    self: *App,
+    requests: *const vt.osc.color.List,
+    terminator: vt.osc.Terminator,
+) void {
+    var it = requests.constIterator(0);
+    while (it.next()) |req| {
+        switch (req.*) {
+            .query => |target| self.answerOscColorQuery(target, terminator),
+            else => {},
+        }
+    }
+}
+
+fn answerOscColorQuery(
+    self: *App,
+    target: vt.osc.color.Target,
+    terminator: vt.osc.Terminator,
+) void {
+    switch (target) {
+        .palette => |idx| self.writeOscPaletteReport(idx, terminator),
+        .dynamic => |dynamic| switch (dynamic) {
+            .foreground => self.writeOscDynamicReport(10, self.effectiveForeground(), terminator),
+            .background => self.writeOscDynamicReport(11, self.effectiveBackground(), terminator),
+            .cursor => self.writeOscDynamicReport(
+                12,
+                self.term.colors.cursor.get() orelse self.effectiveForeground(),
+                terminator,
+            ),
+            else => {},
+        },
+        .special => {},
+    }
+}
+
+fn writeOscPaletteReport(self: *App, idx: u8, terminator: vt.osc.Terminator) void {
+    self.writeOscColorReport(.{ .palette = idx }, self.term.colors.palette.current[idx], terminator);
+}
+
+fn writeOscDynamicReport(
+    self: *App,
+    dynamic: u16,
+    color: vt.color.RGB,
+    terminator: vt.osc.Terminator,
+) void {
+    self.writeOscColorReport(.{ .dynamic = dynamic }, color, terminator);
+}
+
+const OscColorReport = union(enum) {
+    palette: u8,
+    dynamic: u16,
+};
+
+fn writeOscColorReport(
+    self: *App,
+    report: OscColorReport,
+    color: vt.color.RGB,
+    terminator: vt.osc.Terminator,
+) void {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    formatOscColorReport(&writer, report, color, terminator) catch return;
+    self.writePty(writer.buffered());
+}
+
+fn formatOscColorReport(
+    writer: *std.Io.Writer,
+    report: OscColorReport,
+    color: vt.color.RGB,
+    terminator: vt.osc.Terminator,
+) !void {
+    switch (report) {
+        .palette => |idx| try writer.print(
+            "\x1b]4;{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
+            .{
+                idx,
+                @as(u16, color.r) * 257,
+                @as(u16, color.g) * 257,
+                @as(u16, color.b) * 257,
+            },
+        ),
+        .dynamic => |dynamic| try writer.print(
+            "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
+            .{
+                dynamic,
+                @as(u16, color.r) * 257,
+                @as(u16, color.g) * 257,
+                @as(u16, color.b) * 257,
+            },
+        ),
+    }
+    try writer.writeAll(terminator.string());
+}
+
+fn effectiveForeground(self: *const App) vt.color.RGB {
+    return self.term.colors.foreground.get() orelse self.term.colors.palette.current[7];
+}
+
+fn effectiveBackground(self: *const App) vt.color.RGB {
+    return self.term.colors.background.get() orelse self.term.colors.palette.current[0];
+}
+
+test "OSC color reports use 16-bit rgb format" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try formatOscColorReport(
+        &writer,
+        .{ .dynamic = 10 },
+        .{ .r = 0x12, .g = 0x34, .b = 0x56 },
+        .st,
+    );
+    try std.testing.expectEqualStrings("\x1b]10;rgb:1212/3434/5656\x1b\\", writer.buffered());
+
+    writer = .fixed(&buf);
+    try formatOscColorReport(
+        &writer,
+        .{ .palette = 7 },
+        .{ .r = 0xab, .g = 0xcd, .b = 0xef },
+        .bel,
+    );
+    try std.testing.expectEqualStrings("\x1b]4;7;rgb:abab/cdcd/efef\x07", writer.buffered());
 }
 
 fn suspendPty(self: *App, err: anyerror) void {
