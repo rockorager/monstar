@@ -37,6 +37,8 @@ window: *Window,
 keyboard: Keyboard,
 /// Terminal contents changed since the last committed frame.
 needs_redraw: bool,
+/// Keyboard focus state; unfocused windows draw a hollow cursor.
+focused: bool,
 /// Cached DEC mode 2048 state, to detect the application enabling
 /// in-band size reports.
 in_band_reports: bool,
@@ -152,6 +154,7 @@ pub fn init(
         .window = window,
         .keyboard = try .init(),
         .needs_redraw = true,
+        .focused = true,
         .in_band_reports = false,
         .write_queue = .empty,
         .child_eof = false,
@@ -1002,8 +1005,25 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             self.repeat_delay = info.delay;
         },
         // Keys held across a focus change must not keep repeating.
-        .leave => self.cancelRepeat(),
-        .enter => {},
+        .leave => {
+            self.cancelRepeat();
+            self.setFocus(false);
+        },
+        .enter => self.setFocus(true),
+    }
+}
+
+fn setFocus(self: *App, focused: bool) void {
+    if (self.focused == focused) return;
+    self.focused = focused;
+    self.needs_redraw = true;
+
+    // Applications with focus reporting (mode 1004) get CSI I / CSI O.
+    if (self.term.modes.get(.focus_event)) {
+        var buf: [vt.input.max_focus_encode_size]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buf);
+        vt.input.encodeFocus(&writer, if (focused) .gained else .lost) catch return;
+        self.writePty(writer.buffered());
     }
 }
 
@@ -1150,6 +1170,7 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 /// Window render delegate: refresh the render state and draw the grid.
 fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
+    self.renderer.focused = self.focused;
     try self.render_state.update(self.alloc, &self.term);
     self.render_state.dirty = .false;
     try self.renderer.render(&self.render_state, pixels, width, height);

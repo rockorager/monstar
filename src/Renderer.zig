@@ -20,6 +20,9 @@ hb_buf: *c.hb_buffer_t,
 /// Selection colors; a null foreground uses the default foreground.
 selection_bg: vt.color.RGB,
 selection_fg: ?vt.color.RGB,
+/// Keyboard focus: unfocused windows draw the cursor as a hollow
+/// rectangle regardless of the requested style. Set by the caller.
+focused: bool = true,
 /// Per-cell resolved foreground colors for the row being rendered.
 fg_scratch: std.ArrayList(vt.color.RGB),
 /// Per-cell font face indices for the row being rendered.
@@ -132,9 +135,12 @@ fn renderRow(
             bg = self.selection_bg;
             fg = self.selection_fg orelse colors.foreground;
         }
-        // Block cursor: swap in the cursor color, invert the glyph.
-        // Other cursor shapes overlay a sprite after drawing instead.
-        if (cursor_x != null and cursor_x.? == x and state.cursor.visual_style == .block) {
+        // Focused block cursor: swap in the cursor color, invert the
+        // glyph. All other cursor shapes (and any unfocused cursor)
+        // overlay a sprite after drawing instead.
+        if (cursor_x != null and cursor_x.? == x and
+            state.cursor.visual_style == .block and self.focused)
+        {
             bg = colors.cursor orelse colors.foreground;
             fg = colors.background;
         }
@@ -209,9 +215,12 @@ fn renderRow(
     }
 
     // Non-block cursor shapes (DECSCUSR bar/underline, hollow block)
-    // overlay the cell rather than recoloring it.
+    // overlay the cell rather than recoloring it. Without keyboard
+    // focus the cursor is always a hollow rectangle.
     if (cursor_x) |cx| {
-        const kind: ?@import("sprite.zig").Decoration = switch (state.cursor.visual_style) {
+        const kind: ?@import("sprite.zig").Decoration = if (!self.focused)
+            .cursor_hollow_rect
+        else switch (state.cursor.visual_style) {
             .block => null, // handled via color swap in the color pass
             .bar => .cursor_bar,
             .underline => .cursor_underline,
