@@ -209,6 +209,17 @@ pub const Face = struct {
             target_width / @as(f64, @floatFromInt(src_width)),
             target_height / @as(f64, @floatFromInt(src_height)),
         );
+
+        // Ghostty's fallback symbol constraint is `.fit`: the extra cell is
+        // permission to avoid clipping oversized symbols, not a request to
+        // grow normal Nerd Font icons to fill the two-cell box.
+        if (scale >= 1.0) {
+            const copy = try alloc.alloc(u8, @as(usize, src_width) * src_height);
+            errdefer alloc.free(copy);
+            try copyGrayRows(copy, bitmap, src_width, src_height);
+            return .{ .bitmap = copy, .format = .alpha, .width = src_width, .height = src_height };
+        }
+
         const width: u31 = @max(1, @as(u31, @intFromFloat(@round(@as(f64, @floatFromInt(src_width)) * scale))));
         const height: u31 = @max(1, @as(u31, @intFromFloat(@round(@as(f64, @floatFromInt(src_height)) * scale))));
         const left: i32 = @intFromFloat(@round(
@@ -781,7 +792,7 @@ test "embedded symbols face serves nerd font codepoints" {
     }
 }
 
-test "alpha symbols honor double-cell constraints" {
+test "alpha symbols do not upscale for double-cell constraints" {
     const alloc = std.testing.allocator;
     var font: Font = try .init(alloc, "monospace", 16);
     defer font.deinit(alloc);
@@ -797,7 +808,8 @@ test "alpha symbols honor double-cell constraints" {
     try std.testing.expectEqual(GlyphFormat.alpha, wide.format);
     try std.testing.expect(wide.width <= font.cell_width * 2);
     try std.testing.expect(wide.height <= font.cell_height);
-    try std.testing.expect(wide.width > narrow.width or wide.height > narrow.height);
+    try std.testing.expectEqual(narrow.width, wide.width);
+    try std.testing.expectEqual(narrow.height, wide.height);
 }
 
 test "fallback face for a codepoint the primary lacks" {
