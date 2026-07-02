@@ -118,6 +118,11 @@ child_exited: bool,
 /// do at startup). Reads are retried on a timer until the child
 /// reopens the tty or exits; EIO alone never shuts the terminal down.
 pty_suspended: bool,
+/// Session bus connection, used for notifications and future desktop settings.
+dbus: ?*c.DBusConnection,
+dbus_fd: posix.fd_t,
+notification_ids: std.AutoHashMapUnmanaged(u32, void),
+notification_tokens: std.AutoHashMapUnmanaged(u32, []u8),
 /// signalfd for SIGCHLD, polled in the event loop.
 sigchld_fd: posix.fd_t,
 /// Key repeat: timerfd armed while a repeating key is held.
@@ -349,6 +354,10 @@ pub fn init(
         .write_queue = .empty,
         .child_exited = false,
         .pty_suspended = false,
+        .dbus = null,
+        .dbus_fd = -1,
+        .notification_ids = .empty,
+        .notification_tokens = .empty,
         .sigchld_fd = sigchld_fd,
         .repeat_fd = repeat_fd,
         .repeat_keycode = null,
@@ -403,6 +412,7 @@ pub fn init(
     effects.bell = effectBell;
     self.stream.handler.terminal_handler.effects = effects;
 
+    self.initDbus();
     window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, scaleChanged);
     return self;
 }
@@ -529,22 +539,65 @@ fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void
     else
         self.term.getTitle() orelse "monstar";
 
-    sendDesktopNotification(self.alloc, effective_title, body) catch |err| {
+    self.sendDesktopNotification(effective_title, body) catch |err| {
         log.warn("failed to send desktop notification: {}", .{err});
     };
 }
 
-fn sendDesktopNotification(alloc: std.mem.Allocator, title: []const u8, body: []const u8) !void {
-    const title_z = try alloc.dupeZ(u8, title);
-    defer alloc.free(title_z);
-    const body_z = try alloc.dupeZ(u8, body);
-    defer alloc.free(body_z);
+fn initDbus(self: *App) void {
+    const connection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null) orelse {
+        log.warn("session dbus unavailable; desktop integration disabled", .{});
+        return;
+    };
 
-    const connection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null) orelse return error.DBusUnavailable;
-    defer {
+    if (c.dbus_connection_add_filter(connection, dbusFilter, self, null) == 0) {
         c.dbus_connection_close(connection);
         c.dbus_connection_unref(connection);
+        return;
     }
+    c.dbus_bus_add_match(connection, "type='signal',interface='org.freedesktop.Notifications'", null);
+
+    var fd: c_int = -1;
+    if (c.dbus_connection_get_unix_fd(connection, &fd) == 0) {
+        c.dbus_connection_remove_filter(connection, dbusFilter, self);
+        c.dbus_connection_close(connection);
+        c.dbus_connection_unref(connection);
+        return;
+    }
+
+    self.dbus = connection;
+    self.dbus_fd = fd;
+}
+
+fn deinitDbus(self: *App) void {
+    self.notification_ids.deinit(self.alloc);
+
+    var it = self.notification_tokens.valueIterator();
+    while (it.next()) |token| self.alloc.free(token.*);
+    self.notification_tokens.deinit(self.alloc);
+
+    if (self.dbus) |connection| {
+        c.dbus_connection_remove_filter(connection, dbusFilter, self);
+        c.dbus_connection_close(connection);
+        c.dbus_connection_unref(connection);
+        self.dbus = null;
+        self.dbus_fd = -1;
+    }
+}
+
+fn dispatchDbus(self: *App) void {
+    const connection = self.dbus orelse return;
+    _ = c.dbus_connection_read_write(connection, 0);
+    while (c.dbus_connection_dispatch(connection) == c.DBUS_DISPATCH_DATA_REMAINS) {}
+}
+
+fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !void {
+    const connection = self.dbus orelse return error.DBusUnavailable;
+
+    const title_z = try self.alloc.dupeZ(u8, title);
+    defer self.alloc.free(title_z);
+    const body_z = try self.alloc.dupeZ(u8, body);
+    defer self.alloc.free(body_z);
 
     const message = c.dbus_message_new_method_call(
         "org.freedesktop.Notifications",
@@ -553,7 +606,6 @@ fn sendDesktopNotification(alloc: std.mem.Allocator, title: []const u8, body: []
         "Notify",
     ) orelse return error.OutOfMemory;
     defer c.dbus_message_unref(message);
-    c.dbus_message_set_no_reply(message, 1);
 
     var iter: c.DBusMessageIter = undefined;
     c.dbus_message_iter_init_append(message, &iter);
@@ -571,6 +623,10 @@ fn sendDesktopNotification(alloc: std.mem.Allocator, title: []const u8, body: []
 
     var actions: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "s", &actions) == 0) return error.OutOfMemory;
+    var default_action_key: [*:0]const u8 = "default";
+    try dbusAppendBasic(&actions, c.DBUS_TYPE_STRING, &default_action_key);
+    var default_action_label: [*:0]const u8 = "Open";
+    try dbusAppendBasic(&actions, c.DBUS_TYPE_STRING, &default_action_label);
     if (c.dbus_message_iter_close_container(&iter, &actions) == 0) return error.OutOfMemory;
 
     var hints: c.DBusMessageIter = undefined;
@@ -580,14 +636,81 @@ fn sendDesktopNotification(alloc: std.mem.Allocator, title: []const u8, body: []
     var expire_timeout: i32 = -1;
     try dbusAppendBasic(&iter, c.DBUS_TYPE_INT32, &expire_timeout);
 
-    var serial: c_uint = 0;
-    if (c.dbus_connection_send(connection, message, &serial) == 0) return error.OutOfMemory;
-    c.dbus_connection_flush(connection);
+    const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return error.DBusUnavailable;
+    defer c.dbus_message_unref(reply);
+
+    const notification_id = dbusMessageUint32(reply) orelse return;
+    try self.notification_ids.put(self.alloc, notification_id, {});
 }
 
 fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void {
     const opaque_value: *const anyopaque = @ptrCast(value);
     if (c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
+}
+
+fn dbusMessageUint32(message: *c.DBusMessage) ?u32 {
+    var iter: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(message, &iter) == 0) return null;
+    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_UINT32) return null;
+    var value: u32 = 0;
+    c.dbus_message_iter_get_basic(&iter, &value);
+    return value;
+}
+
+fn dbusFilter(_: ?*c.DBusConnection, message: ?*c.DBusMessage, user_data: ?*anyopaque) callconv(.c) c.DBusHandlerResult {
+    const self: *App = @ptrCast(@alignCast(user_data orelse return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED));
+    const msg = message orelse return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+    if (c.dbus_message_is_signal(msg, "org.freedesktop.Notifications", "ActivationToken") != 0) {
+        self.handleNotificationActivationToken(msg);
+        return c.DBUS_HANDLER_RESULT_HANDLED;
+    }
+    if (c.dbus_message_is_signal(msg, "org.freedesktop.Notifications", "ActionInvoked") != 0) {
+        self.handleNotificationActionInvoked(msg);
+        return c.DBUS_HANDLER_RESULT_HANDLED;
+    }
+    return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+fn handleNotificationActivationToken(self: *App, message: *c.DBusMessage) void {
+    var iter: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(message, &iter) == 0) return;
+    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_UINT32) return;
+    var notification_id: u32 = 0;
+    c.dbus_message_iter_get_basic(&iter, &notification_id);
+    if (!self.notification_ids.contains(notification_id)) return;
+    if (c.dbus_message_iter_next(&iter) == 0) return;
+    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return;
+    var token_ptr: [*:0]const u8 = undefined;
+    c.dbus_message_iter_get_basic(&iter, @ptrCast(&token_ptr));
+
+    const token = std.mem.span(token_ptr);
+    const owned = self.alloc.dupe(u8, token) catch return;
+    if (self.notification_tokens.fetchPut(self.alloc, notification_id, owned) catch null) |old| {
+        self.alloc.free(old.value);
+    }
+}
+
+fn handleNotificationActionInvoked(self: *App, message: *c.DBusMessage) void {
+    var iter: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(message, &iter) == 0) return;
+    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_UINT32) return;
+    var notification_id: u32 = 0;
+    c.dbus_message_iter_get_basic(&iter, &notification_id);
+    if (!self.notification_ids.remove(notification_id)) return;
+    if (c.dbus_message_iter_next(&iter) == 0) return;
+    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return;
+    var action_ptr: [*:0]const u8 = undefined;
+    c.dbus_message_iter_get_basic(&iter, @ptrCast(&action_ptr));
+    if (!std.mem.eql(u8, std.mem.span(action_ptr), "default")) return;
+
+    const kv = self.notification_tokens.fetchRemove(notification_id) orelse return;
+    defer self.alloc.free(kv.value);
+    if (kv.value.len == 0) return;
+
+    const token_z = self.alloc.dupeZ(u8, kv.value) catch return;
+    defer self.alloc.free(token_z);
+    self.window.activate(token_z);
 }
 
 fn setNonblocking(fd: posix.fd_t) void {
@@ -613,6 +736,7 @@ pub fn deinit(self: *App) void {
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
+    self.deinitDbus();
     _ = std.os.linux.close(self.selection_autoscroll_fd);
     _ = std.os.linux.close(self.sync_output_fd);
     _ = std.os.linux.close(self.repeat_fd);
@@ -641,6 +765,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.sigchld_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.sync_output_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.selection_autoscroll_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pty_fd = &fds[1];
@@ -649,9 +774,11 @@ pub fn run(self: *App) !void {
     const sigchld_fd = &fds[4];
     const sync_output_fd = &fds[5];
     const selection_autoscroll_fd = &fds[6];
+    const dbus_fd = &fds[7];
 
     while (self.window.running and !self.child_exited) {
         wl_fd.events = posix.POLL.IN;
+        dbus_fd.fd = self.dbus_fd;
 
         // Standard libwayland read dance: drain the local queue, flush
         // requests, then sleep until one of the fds is ready.
@@ -717,6 +844,10 @@ pub fn run(self: *App) !void {
 
         if (selection_autoscroll_fd.revents & posix.POLL.IN != 0) {
             self.fireSelectionAutoscroll();
+        }
+
+        if (dbus_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            self.dispatchDbus();
         }
 
         if (self.paste_fd >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {

@@ -303,6 +303,11 @@ pub fn setUrgent(self: *Window, urgent: bool) !void {
     self.activation_token = token;
 }
 
+pub fn activate(self: *Window, token: [:0]const u8) void {
+    const activation = self.activation orelse return;
+    activation.activate(token, self.surface);
+}
+
 fn applyCursorShape(self: *Window) void {
     const serial = self.pointer_enter_serial orelse return;
     const device = self.cursor_shape_device orelse return;
