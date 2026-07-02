@@ -126,7 +126,8 @@ fn renderRow(
             fg = colors.foreground;
         }
         // Block cursor: swap in the cursor color, invert the glyph.
-        if (cursor_x != null and cursor_x.? == x) {
+        // Other cursor shapes overlay a sprite after drawing instead.
+        if (cursor_x != null and cursor_x.? == x and state.cursor.visual_style == .block) {
             bg = colors.cursor orelse colors.foreground;
             fg = colors.background;
         }
@@ -197,6 +198,21 @@ fn renderRow(
         if (style.flags.overline) {
             const color = self.fg_scratch.items[dx];
             try self.blitDecoration(.overline, cell_x, y, argb(color), pixels, width, height);
+        }
+    }
+
+    // Non-block cursor shapes (DECSCUSR bar/underline, hollow block)
+    // overlay the cell rather than recoloring it.
+    if (cursor_x) |cx| {
+        const kind: ?@import("sprite.zig").Decoration = switch (state.cursor.visual_style) {
+            .block => null, // handled via color swap in the color pass
+            .bar => .cursor_bar,
+            .underline => .cursor_underline,
+            .block_hollow => .cursor_hollow_rect,
+        };
+        if (kind) |k| {
+            const color = colors.cursor orelse colors.foreground;
+            try self.blitDecoration(k, cx, y, argb(color), pixels, width, height);
         }
     }
 }

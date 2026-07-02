@@ -109,8 +109,8 @@ pub fn covers(cp: u21) bool {
     return getDrawFn(cp) != null;
 }
 
-/// Text decorations, drawn with the same machinery. Names match the
-/// vendored function names in draw/special.zig.
+/// Text decorations and cursor shapes, drawn with the same machinery.
+/// Names match the vendored function names in draw/special.zig.
 pub const Decoration = enum {
     underline,
     underline_double,
@@ -119,6 +119,9 @@ pub const Decoration = enum {
     underline_curly,
     strikethrough,
     overline,
+    cursor_bar,
+    cursor_underline,
+    cursor_hollow_rect,
 };
 
 /// A rendered sprite in the same shape as a font glyph: tightly packed
