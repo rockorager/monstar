@@ -26,12 +26,6 @@ shell, wheel speed). Possible follow-ups: live reload on file change,
 configurable keybindings for copy/paste, cursor style/blink defaults,
 and font fallback family overrides.
 
-## Color emoji
-
-Fixed-size color faces (Noto Color Emoji) currently fail to load and
-are skipped. Needs FT_LOAD_COLOR, strike selection nearest the cell
-size, BGRA blitting, and scaling into the cell.
-
 ## terminfo entry
 
 Ship a `monstar` terminfo (and stop defaulting TERM to

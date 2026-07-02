@@ -3,4 +3,5 @@
 #include FT_FREETYPE_H
 #include <hb.h>
 #include <hb-ft.h>
+#include "vendor/stb_image_resize.h"
 #include <xkbcommon/xkbcommon.h>

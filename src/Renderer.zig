@@ -27,6 +27,8 @@ focused: bool = true,
 fg_scratch: std.ArrayList(vt.color.RGB),
 /// Per-cell font face indices for the row being rendered.
 face_scratch: std.ArrayList(u16),
+/// Per-cell reverse-video state for color glyphs, including block cursor.
+reverse_scratch: std.ArrayList(bool),
 
 pub const InitOptions = struct {
     selection_background: ?vt.color.RGB = null,
@@ -44,6 +46,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .selection_fg = opts.selection_foreground,
         .fg_scratch = .empty,
         .face_scratch = .empty,
+        .reverse_scratch = .empty,
     };
 }
 
@@ -51,6 +54,7 @@ pub fn deinit(self: *Renderer) void {
     c.hb_buffer_destroy(self.hb_buf);
     self.fg_scratch.deinit(self.alloc);
     self.face_scratch.deinit(self.alloc);
+    self.reverse_scratch.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -110,6 +114,7 @@ fn renderRow(
     // Background + foreground-color + face-resolution pass.
     try self.fg_scratch.resize(self.alloc, cols);
     try self.face_scratch.resize(self.alloc, cols);
+    try self.reverse_scratch.resize(self.alloc, cols);
     for (0..cols) |x| {
         self.face_scratch.items[x] = face: {
             switch (raws[x].content_tag) {
@@ -123,6 +128,7 @@ fn renderRow(
         const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
         var bg = style.bg(&raws[x], &colors.palette);
+        var reverse_color_glyph = false;
         if (style.flags.inverse) {
             const old_fg = fg;
             fg = bg orelse colors.background;
@@ -134,6 +140,7 @@ fn renderRow(
         if (selected) {
             bg = self.selection_bg;
             fg = self.selection_fg orelse colors.foreground;
+            reverse_color_glyph = false;
         }
         // Focused block cursor: swap in the cursor color, invert the
         // glyph. All other cursor shapes (and any unfocused cursor)
@@ -143,8 +150,10 @@ fn renderRow(
         {
             bg = colors.cursor orelse colors.foreground;
             fg = colors.background;
+            reverse_color_glyph = false;
         }
         self.fg_scratch.items[x] = fg;
+        self.reverse_scratch.items[x] = reverse_color_glyph;
         if (bg) |bg_color| {
             fillRect(
                 pixels,
@@ -254,6 +263,7 @@ fn blitDecoration(
         @as(i32, cell_x) * font.cell_width + g.bearing_x,
         baseline_y - g.bearing_y,
         color,
+        false,
     );
 }
 
@@ -291,6 +301,7 @@ fn drawRun(
                 @as(i32, @intCast(x)) * font.cell_width + g.bearing_x,
                 baseline_y - g.bearing_y,
                 argb(self.fg_scratch.items[x]),
+                false,
             );
         }
         return;
@@ -330,7 +341,8 @@ fn drawRun(
             cluster = info.cluster;
             pen_x = @as(i32, @intCast(cluster)) * font.cell_width;
         }
-        const g = try face.glyph(self.alloc, info.codepoint);
+        const constraint_width: u2 = @intCast(@min(cellSpan(raws[cluster]), 2));
+        const g = try face.glyph(self.alloc, info.codepoint, constraint_width);
         blitGlyph(
             pixels,
             width,
@@ -339,6 +351,7 @@ fn drawRun(
             pen_x + (pos.x_offset >> 6) + g.bearing_x,
             baseline_y - (pos.y_offset >> 6) - g.bearing_y,
             argb(self.fg_scratch.items[cluster]),
+            self.reverse_scratch.items[cluster],
         );
         pen_x += pos.x_advance >> 6;
     }
@@ -383,6 +396,25 @@ fn blitGlyph(
     x0: i32,
     y0: i32,
     color: u32,
+    reverse_color_glyph: bool,
+) void {
+    switch (g.format) {
+        .alpha => blitAlphaGlyph(pixels, buf_width, buf_height, g, x0, y0, color),
+        .bgra => if (reverse_color_glyph)
+            blitBgraGlyphAsAlpha(pixels, buf_width, buf_height, g, x0, y0, color)
+        else
+            blitBgraGlyph(pixels, buf_width, buf_height, g, x0, y0),
+    }
+}
+
+fn blitAlphaGlyph(
+    pixels: []u32,
+    buf_width: u31,
+    buf_height: u31,
+    g: *const Font.Glyph,
+    x0: i32,
+    y0: i32,
+    color: u32,
 ) void {
     for (0..g.height) |gy| {
         const py = y0 + @as(i32, @intCast(gy));
@@ -398,6 +430,52 @@ fn blitGlyph(
     }
 }
 
+fn blitBgraGlyph(
+    pixels: []u32,
+    buf_width: u31,
+    buf_height: u31,
+    g: *const Font.Glyph,
+    x0: i32,
+    y0: i32,
+) void {
+    for (0..g.height) |gy| {
+        const py = y0 + @as(i32, @intCast(gy));
+        if (py < 0 or py >= buf_height) continue;
+        for (0..g.width) |gx| {
+            const px = x0 + @as(i32, @intCast(gx));
+            if (px < 0 or px >= buf_width) continue;
+            const src = g.bitmap[(gy * g.width + gx) * 4 ..][0..4];
+            const alpha = src[3];
+            if (alpha == 0) continue;
+            const idx = @as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px));
+            pixels[idx] = blendPremultipliedBgra(src, pixels[idx]);
+        }
+    }
+}
+
+fn blitBgraGlyphAsAlpha(
+    pixels: []u32,
+    buf_width: u31,
+    buf_height: u31,
+    g: *const Font.Glyph,
+    x0: i32,
+    y0: i32,
+    color: u32,
+) void {
+    for (0..g.height) |gy| {
+        const py = y0 + @as(i32, @intCast(gy));
+        if (py < 0 or py >= buf_height) continue;
+        for (0..g.width) |gx| {
+            const px = x0 + @as(i32, @intCast(gx));
+            if (px < 0 or px >= buf_width) continue;
+            const alpha = g.bitmap[(gy * g.width + gx) * 4 + 3];
+            if (alpha == 0) continue;
+            const idx = @as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px));
+            pixels[idx] = blend(color, pixels[idx], alpha);
+        }
+    }
+}
+
 fn blend(fg: u32, bg: u32, alpha: u8) u32 {
     if (alpha == 0xff) return fg;
     const a: u32 = alpha;
@@ -408,9 +486,28 @@ fn blend(fg: u32, bg: u32, alpha: u8) u32 {
     return 0xff000000 | (r << 16) | (g << 8) | b;
 }
 
+fn blendPremultipliedBgra(src: []const u8, bg: u32) u32 {
+    const a: u32 = src[3];
+    if (a == 0xff) {
+        return 0xff000000 |
+            (@as(u32, src[2]) << 16) |
+            (@as(u32, src[1]) << 8) |
+            @as(u32, src[0]);
+    }
+    const na: u32 = 255 - a;
+    const r = @as(u32, src[2]) + ((bg >> 16 & 0xff) * na) / 255;
+    const g = @as(u32, src[1]) + ((bg >> 8 & 0xff) * na) / 255;
+    const b = @as(u32, src[0]) + ((bg & 0xff) * na) / 255;
+    return 0xff000000 | (r << 16) | (g << 8) | b;
+}
+
 test "blend endpoints" {
     try std.testing.expectEqual(@as(u32, 0xffffffff), blend(0xffffffff, 0xff000000, 255));
     try std.testing.expectEqual(@as(u32, 0xff000000), blend(0xffffffff, 0xff000000, 0));
+    try std.testing.expectEqual(
+        @as(u32, 0xff804000),
+        blendPremultipliedBgra(&.{ 0x00, 0x40, 0x80, 0xff }, 0xff000000),
+    );
 }
 
 test "scrollback viewport scrolls and renders older content" {

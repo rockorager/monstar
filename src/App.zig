@@ -42,6 +42,8 @@ focused: bool,
 /// Cached DEC mode 2048 state, to detect the application enabling
 /// in-band size reports.
 in_band_reports: bool,
+/// Cached DEC mode 2026 state, to detect synchronized output boundaries.
+sync_output: bool,
 /// PTY input that couldn't be written yet (master is nonblocking to
 /// avoid deadlocking against a child that has stopped reading while
 /// flooding output). Flushed when the master polls writable.
@@ -61,6 +63,8 @@ repeat_keycode: ?u32,
 /// From wl_keyboard.repeat_info: characters per second and delay in ms.
 repeat_rate: i32,
 repeat_delay: i32,
+/// Safety timer for DEC mode 2026 synchronized output.
+sync_output_fd: posix.fd_t,
 /// Pointer position in logical surface coordinates.
 pointer_x: f64,
 pointer_y: f64,
@@ -97,6 +101,7 @@ const paste_mime = "text/plain;charset=utf-8";
 /// Terminal lines per wheel click.
 const initial_cols = 80;
 const initial_rows = 24;
+const sync_output_reset_ms = 1000;
 
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
 /// copies them via execve); `config` must outlive the App.
@@ -154,6 +159,11 @@ pub fn init(
     const repeat_fd: posix.fd_t = @intCast(repeat_rc);
     errdefer _ = std.os.linux.close(repeat_fd);
 
+    const sync_output_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+    if (std.os.linux.errno(sync_output_rc) != .SUCCESS) return error.TimerFdFailed;
+    const sync_output_fd: posix.fd_t = @intCast(sync_output_rc);
+    errdefer _ = std.os.linux.close(sync_output_fd);
+
     // Self-reference into listeners/streams requires a stable address.
     const self = try alloc.create(App);
     errdefer alloc.destroy(self);
@@ -176,6 +186,7 @@ pub fn init(
         .needs_redraw = true,
         .focused = true,
         .in_band_reports = false,
+        .sync_output = false,
         .write_queue = .empty,
         .child_exited = false,
         .pty_suspended = false,
@@ -184,6 +195,7 @@ pub fn init(
         .repeat_keycode = null,
         .repeat_rate = 25,
         .repeat_delay = 600,
+        .sync_output_fd = sync_output_fd,
         .pointer_x = 0,
         .pointer_y = 0,
         .scroll_pixels = 0,
@@ -315,6 +327,7 @@ pub fn deinit(self: *App) void {
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
+    _ = std.os.linux.close(self.sync_output_fd);
     _ = std.os.linux.close(self.repeat_fd);
     _ = std.os.linux.close(self.sigchld_fd);
     self.keyboard.deinit();
@@ -338,12 +351,14 @@ pub fn run(self: *App) !void {
         // In-flight paste pipe; negative (ignored) while idle.
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.sigchld_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.sync_output_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pty_fd = &fds[1];
     const repeat_fd = &fds[2];
     const paste_fd = &fds[3];
     const sigchld_fd = &fds[4];
+    const sync_output_fd = &fds[5];
 
     while (self.window.running and !self.child_exited) {
         // Standard libwayland read dance: drain the local queue, flush
@@ -413,11 +428,16 @@ pub fn run(self: *App) !void {
             self.fireRepeat();
         }
 
+        if (sync_output_fd.revents & posix.POLL.IN != 0) {
+            self.fireSyncOutputReset();
+        }
+
         if (self.paste_fd >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
             self.readPaste();
         }
 
         if (self.needs_redraw) {
+            if (self.term.modes.get(.synchronized_output)) continue;
             self.needs_redraw = false;
             try self.window.redraw();
         }
@@ -478,6 +498,7 @@ fn readPty(self: *App) void {
         if (n < buf.len) break;
     }
     self.syncInBandSizeReports();
+    self.syncSynchronizedOutput();
     self.syncActiveScreen();
 }
 
@@ -519,6 +540,46 @@ fn sendSizeReport(self: *App) void {
     var writer: std.Io.Writer = .fixed(&buf);
     vt.size_report.encode(&writer, .mode_2048, self.currentSize()) catch return;
     self.writePty(writer.buffered());
+}
+
+/// DEC mode 2026 (synchronized output): while enabled, the terminal
+/// state may change but frames should not expose the intermediate state.
+/// A one-shot timer prevents a misbehaving child from freezing output.
+fn syncSynchronizedOutput(self: *App) void {
+    const enabled = self.term.modes.get(.synchronized_output);
+    if (enabled == self.sync_output) return;
+
+    self.sync_output = enabled;
+    if (enabled) {
+        self.setSyncOutputTimer(.{
+            .it_value = timespecFromNs(sync_output_reset_ms * std.time.ns_per_ms),
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+        });
+    } else {
+        self.setSyncOutputTimer(.{
+            .it_value = .{ .sec = 0, .nsec = 0 },
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+        });
+        self.needs_redraw = true;
+    }
+}
+
+fn setSyncOutputTimer(self: *App, spec: std.os.linux.itimerspec) void {
+    const rc = std.os.linux.timerfd_settime(self.sync_output_fd, .{}, &spec, null);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        log.err("sync output timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
+    }
+}
+
+fn fireSyncOutputReset(self: *App) void {
+    var expirations: u64 = 0;
+    const n = posix.read(self.sync_output_fd, std.mem.asBytes(&expirations)) catch return;
+    if (n != @sizeOf(u64) or expirations == 0) return;
+    if (self.term.modes.get(.synchronized_output)) {
+        log.debug("synchronized output timed out; forcing redraw", .{});
+        self.term.modes.set(.synchronized_output, false);
+    }
+    self.syncSynchronizedOutput();
 }
 
 /// Window pointer delegate: track position and accumulate wheel scroll,
@@ -1247,6 +1308,10 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
     self.renderer.focused = self.focused;
+    if (self.term.modes.get(.synchronized_output)) {
+        try self.renderer.render(&self.render_state, pixels, width, height);
+        return;
+    }
     try self.render_state.update(self.alloc, &self.term);
     self.render_state.dirty = .false;
     try self.renderer.render(&self.render_state, pixels, width, height);

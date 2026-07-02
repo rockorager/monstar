@@ -32,8 +32,14 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
 
+    const ghostty_dep = b.lazyDependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Font stack: fontconfig (discovery) + FreeType (rasterization) +
-    // HarfBuzz (shaping), imported through one translated C header.
+    // HarfBuzz (shaping) + stb_image_resize, imported through one
+    // translated C header.
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
@@ -52,10 +58,7 @@ pub fn build(b: *std.Build) void {
         root_module.addImport("z2d", dep.module("z2d"));
     }
 
-    if (b.lazyDependency("ghostty", .{
-        .target = target,
-        .optimize = optimize,
-    })) |dep| {
+    if (ghostty_dep) |dep| {
         root_module.addImport("ghostty-vt", dep.module("ghostty-vt"));
     }
 
@@ -63,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .name = "monstar",
         .root_module = root_module,
     });
+    root_module.addCSourceFile(.{ .file = b.path("src/vendor/stb_image_resize.c") });
 
     b.installArtifact(exe);
 
