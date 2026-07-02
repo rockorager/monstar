@@ -65,6 +65,8 @@ repeat_rate: i32,
 repeat_delay: i32,
 /// Safety timer for DEC mode 2026 synchronized output.
 sync_output_fd: posix.fd_t,
+/// Timer for ghostty-vt selection autoscroll while dragging past an edge.
+selection_autoscroll_fd: posix.fd_t,
 /// Pointer position in logical surface coordinates.
 pointer_x: f64,
 pointer_y: f64,
@@ -72,15 +74,9 @@ pointer_y: f64,
 scroll_pixels: f64,
 scroll_clicks: i32,
 scroll_had_discrete: bool,
-/// Left-button drag selection. The anchor is a cell-boundary caret:
-/// a tracked pin for the anchored cell plus which of its vertical
-/// edges (0 = left, 1 = right) the press grabbed. The pin belongs to
-/// the screen that was active at press time (`sel_screen`), which is
-/// the only screen it may be untracked on.
+/// True while the left button is down for terminal-side selection.
 selecting: bool,
-sel_anchor: ?*vt.Pin,
-sel_anchor_off: u1,
-sel_screen: vt.ScreenSet.Key,
+selection_gesture: vt.SelectionGesture,
 /// Active screen at the last check, to detect alt screen switches.
 active_screen: vt.ScreenSet.Key,
 /// Serial of the most recent input event, required to claim selections.
@@ -97,11 +93,20 @@ paste_fd: posix.fd_t,
 paste_buf: std.ArrayList(u8),
 
 const paste_mime = "text/plain;charset=utf-8";
+const selection_word_boundaries = [_]u21{
+    0,   ' ', '\t', '\'', '"',
+    '│',
+    '`', '|', ':',  ';',  ',',
+    '(', ')', '[',  ']',  '{',
+    '}', '<', '>',  '$',
+};
 
 /// Terminal lines per wheel click.
 const initial_cols = 80;
 const initial_rows = 24;
 const sync_output_reset_ms = 1000;
+const selection_repeat_ms = 500;
+const selection_autoscroll_ms = 15;
 
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
 /// copies them via execve); `config` must outlive the App.
@@ -164,6 +169,11 @@ pub fn init(
     const sync_output_fd: posix.fd_t = @intCast(sync_output_rc);
     errdefer _ = std.os.linux.close(sync_output_fd);
 
+    const selection_autoscroll_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+    if (std.os.linux.errno(selection_autoscroll_rc) != .SUCCESS) return error.TimerFdFailed;
+    const selection_autoscroll_fd: posix.fd_t = @intCast(selection_autoscroll_rc);
+    errdefer _ = std.os.linux.close(selection_autoscroll_fd);
+
     // Self-reference into listeners/streams requires a stable address.
     const self = try alloc.create(App);
     errdefer alloc.destroy(self);
@@ -196,15 +206,14 @@ pub fn init(
         .repeat_rate = 25,
         .repeat_delay = 600,
         .sync_output_fd = sync_output_fd,
+        .selection_autoscroll_fd = selection_autoscroll_fd,
         .pointer_x = 0,
         .pointer_y = 0,
         .scroll_pixels = 0,
         .scroll_clicks = 0,
         .scroll_had_discrete = false,
         .selecting = false,
-        .sel_anchor = null,
-        .sel_anchor_off = 0,
-        .sel_screen = .primary,
+        .selection_gesture = .init,
         .active_screen = .primary,
         .last_serial = 0,
         .clip_offer = null,
@@ -261,7 +270,7 @@ const Effects = Handler.Effects;
 /// through the stream that embeds it.
 fn appFromHandler(handler: *Handler) *App {
     const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
-    return @fieldParentPtr("stream", stream);
+    return @alignCast(@fieldParentPtr("stream", stream));
 }
 
 /// Return type of an Effects callback, e.g. device_attributes.
@@ -320,6 +329,7 @@ fn setNonblocking(fd: posix.fd_t) void {
 
 pub fn deinit(self: *App) void {
     self.cancelDrag();
+    self.selection_gesture.deinit(&self.term);
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
@@ -327,6 +337,7 @@ pub fn deinit(self: *App) void {
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
+    _ = std.os.linux.close(self.selection_autoscroll_fd);
     _ = std.os.linux.close(self.sync_output_fd);
     _ = std.os.linux.close(self.repeat_fd);
     _ = std.os.linux.close(self.sigchld_fd);
@@ -352,6 +363,7 @@ pub fn run(self: *App) !void {
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.sigchld_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.sync_output_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.selection_autoscroll_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pty_fd = &fds[1];
@@ -359,6 +371,7 @@ pub fn run(self: *App) !void {
     const paste_fd = &fds[3];
     const sigchld_fd = &fds[4];
     const sync_output_fd = &fds[5];
+    const selection_autoscroll_fd = &fds[6];
 
     while (self.window.running and !self.child_exited) {
         // Standard libwayland read dance: drain the local queue, flush
@@ -430,6 +443,10 @@ pub fn run(self: *App) !void {
 
         if (sync_output_fd.revents & posix.POLL.IN != 0) {
             self.fireSyncOutputReset();
+        }
+
+        if (selection_autoscroll_fd.revents & posix.POLL.IN != 0) {
+            self.fireSelectionAutoscroll();
         }
 
         if (self.paste_fd >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
@@ -620,7 +637,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                     .pressed => if (reporting) {
                         self.forwardMouseButton(button);
                     } else {
-                        self.startSelection();
+                        self.startSelection(button.time);
                     },
                     // Routing may have changed since the press (shift
                     // released mid-drag, app toggled mouse mode): an
@@ -665,16 +682,38 @@ fn cellAtPointer(self: *App) struct { x: u16, y: u16 } {
     return .{ .x = x, .y = y };
 }
 
-/// The cell-boundary caret under the pointer: the row under the
-/// pointer and the nearest vertical cell edge (0..=cols), so grabbing
-/// the right half of a cell means "after this cell".
-fn boundaryAtPointer(self: *App) struct { x: u16, y: u16 } {
+fn pinAtPointer(self: *App) ?vt.Pin {
+    const cell = self.cellAtPointer();
+    return self.term.screens.active.pages.pin(.{
+        .viewport = .{ .x = cell.x, .y = cell.y },
+    });
+}
+
+fn pointerPhysical(self: *App) struct { x: f64, y: f64 } {
     const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
-    const fx = @max(0, self.pointer_x * scale) / @as(f64, @floatFromInt(self.font.cell_width));
-    const fy = @max(0, self.pointer_y * scale) / @as(f64, @floatFromInt(self.font.cell_height));
-    const bx: u16 = @intFromFloat(@min(@floor(fx + 0.5), @as(f64, @floatFromInt(self.term.cols))));
-    const by: u16 = @intFromFloat(@min(@floor(fy), @as(f64, @floatFromInt(self.term.rows -| 1))));
-    return .{ .x = bx, .y = by };
+    return .{
+        .x = @max(0, self.pointer_x * scale),
+        .y = @max(0, self.pointer_y * scale),
+    };
+}
+
+fn selectionGeometry(self: *App) vt.SelectionGesture.Drag.Geometry {
+    return .{
+        .columns = self.term.cols,
+        .cell_width = self.font.cell_width,
+        .padding_left = 0,
+        .screen_height = physicalDimension(self.window.height, self.window.scale120),
+    };
+}
+
+fn physicalDimension(logical: u31, scale120: u32) u31 {
+    return @intCast((@as(u64, logical) * scale120 + 60) / 120);
+}
+
+fn selectionTimestamp(ms: u32) std.Io.Timestamp {
+    return std.Io.Timestamp.fromNanoseconds(
+        @as(i96, @intCast(ms)) * @as(i96, @intCast(std.time.ns_per_ms)),
+    );
 }
 
 fn forwardMouseButton(self: *App, button: anytype) void {
@@ -695,96 +734,109 @@ fn forwardMouseButton(self: *App, button: anytype) void {
     });
 }
 
-fn startSelection(self: *App) void {
-    const screen = self.term.screens.active;
-    self.clearSelection();
-
-    // Pin the cell left of the boundary; a boundary past the last
-    // column pins the last cell with its right edge.
-    const boundary = self.boundaryAtPointer();
-    const anchor_x: u16 = @min(boundary.x, self.term.cols - 1);
-    self.sel_anchor_off = @intCast(boundary.x - anchor_x);
-    const anchor = screen.pages.pin(.{
-        .viewport = .{ .x = anchor_x, .y = boundary.y },
-    }) orelse return;
-    self.sel_anchor = screen.pages.trackPin(anchor) catch null;
-    self.sel_screen = self.term.screens.active_key;
-    self.selecting = self.sel_anchor != null;
+fn startSelection(self: *App, time_ms: u32) void {
+    const pin = self.pinAtPointer() orelse return;
+    const pos = self.pointerPhysical();
+    const selection = self.selection_gesture.press(&self.term, .{
+        .time = selectionTimestamp(time_ms),
+        .pin = pin,
+        .xpos = pos.x,
+        .ypos = pos.y,
+        .max_distance = @floatFromInt(self.font.cell_width),
+        .repeat_interval = selection_repeat_ms * std.time.ns_per_ms,
+        .word_boundary_codepoints = &selection_word_boundaries,
+    }) catch return;
+    self.selecting = true;
+    self.applySelection(selection, true);
 }
 
 fn extendSelection(self: *App) void {
-    // A drag never survives a screen switch; the anchor pin belongs
-    // to the other screen's pages.
-    if (self.term.screens.active_key != self.sel_screen) {
-        self.cancelDrag();
-        return;
-    }
-    const screen = self.term.screens.active;
-    const pages = &screen.pages;
-    const anchor = self.sel_anchor orelse return;
-    const cols: u32 = self.term.cols;
-
-    // Both carets in screen coordinates: boundary x in 0..=cols.
-    const anchor_pt = pages.pointFromPin(.screen, anchor.*) orelse return;
-    const a: [2]u32 = .{ anchor_pt.screen.y, anchor_pt.screen.x + self.sel_anchor_off };
-    const boundary = self.boundaryAtPointer();
-    const row_pin = pages.pin(.{ .viewport = .{ .x = 0, .y = boundary.y } }) orelse return;
-    const row_pt = pages.pointFromPin(.screen, row_pin) orelse return;
-    const e: [2]u32 = .{ row_pt.screen.y, boundary.x };
-
-    if (a[0] == e[0] and a[1] == e[1]) {
-        // Empty: no boundary crossed yet.
-        if (screen.selection != null) {
-            screen.clearSelection();
-            self.needs_redraw = true;
-        }
-        return;
-    }
-
-    // Cells strictly between the two carets, in reading order.
-    const a_first = a[0] < e[0] or (a[0] == e[0] and a[1] < e[1]);
-    const first = if (a_first) a else e;
-    const last = if (a_first) e else a;
-    const start: [2]u32 = if (first[1] >= cols) .{ first[0] + 1, 0 } else first;
-    const end: [2]u32 = if (last[1] == 0)
-        .{ last[0] -| 1, cols - 1 }
-    else
-        .{ last[0], last[1] - 1 };
-    if (start[0] > end[0] or (start[0] == end[0] and start[1] > end[1])) {
-        if (screen.selection != null) {
-            screen.clearSelection();
-            self.needs_redraw = true;
-        }
-        return;
-    }
-
-    const start_pin = pages.pin(.{
-        .screen = .{ .x = @intCast(start[1]), .y = start[0] },
-    }) orelse return;
-    const end_pin = pages.pin(.{
-        .screen = .{ .x = @intCast(end[1]), .y = end[0] },
-    }) orelse return;
-    screen.select(.init(start_pin, end_pin, false)) catch return;
-    self.needs_redraw = true;
+    const pin = self.pinAtPointer() orelse return;
+    const pos = self.pointerPhysical();
+    const selection = self.selection_gesture.drag(&self.term, .{
+        .pin = pin,
+        .xpos = pos.x,
+        .ypos = pos.y,
+        .rectangle = false,
+        .word_boundary_codepoints = &selection_word_boundaries,
+        .geometry = self.selectionGeometry(),
+    });
+    self.applySelection(selection, false);
+    self.syncSelectionAutoscrollTimer();
 }
 
 /// Stop any in-progress drag, untracking the anchor pin on the screen
 /// that owns it (which may no longer be the active one).
 fn cancelDrag(self: *App) void {
     self.selecting = false;
-    if (self.sel_anchor) |anchor| {
-        if (self.term.screens.get(self.sel_screen)) |screen| {
-            screen.pages.untrackPin(anchor);
-        }
-        self.sel_anchor = null;
-    }
+    self.selection_gesture.reset(&self.term);
+    self.stopSelectionAutoscrollTimer();
 }
 
 fn finishSelection(self: *App) void {
     if (!self.selecting) return;
-    self.cancelDrag();
+    self.selecting = false;
+    self.selection_gesture.release(&self.term, .{ .pin = self.pinAtPointer() });
+    self.stopSelectionAutoscrollTimer();
     // Finished selections claim the primary selection, X style.
     self.copyToPrimary();
+}
+
+fn applySelection(self: *App, selection: ?vt.Selection, clear_if_null: bool) void {
+    const screen = self.term.screens.active;
+    if (selection) |sel| {
+        screen.select(sel) catch return;
+        self.needs_redraw = true;
+    } else if (clear_if_null and screen.selection != null) {
+        screen.clearSelection();
+        self.needs_redraw = true;
+    }
+}
+
+fn syncSelectionAutoscrollTimer(self: *App) void {
+    if (!self.selecting or self.selection_gesture.left_drag_autoscroll == .none) {
+        self.stopSelectionAutoscrollTimer();
+        return;
+    }
+    const interval = timespecFromNs(selection_autoscroll_ms * std.time.ns_per_ms);
+    self.setSelectionAutoscrollTimer(.{
+        .it_value = interval,
+        .it_interval = interval,
+    });
+}
+
+fn stopSelectionAutoscrollTimer(self: *App) void {
+    self.setSelectionAutoscrollTimer(.{
+        .it_value = .{ .sec = 0, .nsec = 0 },
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    });
+}
+
+fn setSelectionAutoscrollTimer(self: *App, spec: std.os.linux.itimerspec) void {
+    const rc = std.os.linux.timerfd_settime(self.selection_autoscroll_fd, .{}, &spec, null);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        log.err("selection autoscroll timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
+    }
+}
+
+fn fireSelectionAutoscroll(self: *App) void {
+    var expirations: u64 = 0;
+    const n = posix.read(self.selection_autoscroll_fd, std.mem.asBytes(&expirations)) catch return;
+    if (n != @sizeOf(u64) or expirations == 0 or !self.selecting) return;
+
+    const cell = self.cellAtPointer();
+    const pos = self.pointerPhysical();
+    const selection = self.selection_gesture.autoscrollTick(&self.term, .{
+        .viewport = .{ .x = cell.x, .y = cell.y },
+        .xpos = pos.x,
+        .ypos = pos.y,
+        .rectangle = false,
+        .word_boundary_codepoints = &selection_word_boundaries,
+        .geometry = self.selectionGeometry(),
+    });
+    self.applySelection(selection, false);
+    self.needs_redraw = true;
+    self.syncSelectionAutoscrollTimer();
 }
 
 /// Drop the current selection and stop any in-progress drag.

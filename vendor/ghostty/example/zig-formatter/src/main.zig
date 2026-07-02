@@ -1,0 +1,38 @@
+const std = @import("std");
+const ghostty_vt = @import("ghostty-vt");
+
+pub fn main(init: std.process.Init) !void {
+    // Create a terminal
+    var t: ghostty_vt.Terminal = try .init(init.io, init.gpa, .{ .cols = 150, .rows = 80 });
+    defer t.deinit(init.gpa);
+
+    // Create a read-only VT stream for parsing terminal sequences
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    // Read from stdin
+    const stdin = std.Io.File.stdin();
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try stdin.readStreaming(init.io, &.{&buf});
+        if (n == 0) break;
+
+        // Replace \n with \r\n
+        for (buf[0..n]) |byte| {
+            if (byte == '\n') stream.next('\r');
+            stream.next(byte);
+        }
+    }
+
+    // Use TerminalFormatter to emit HTML
+    const formatter: ghostty_vt.formatter.TerminalFormatter = .init(&t, .{
+        .emit = .html,
+        .palette = &t.colors.palette.current,
+    });
+
+    // Write to stdout
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &buf);
+    const stdout = &stdout_writer.interface;
+    try stdout.print("{f}", .{formatter});
+    try stdout.flush();
+}
