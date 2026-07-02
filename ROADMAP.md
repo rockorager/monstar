@@ -11,48 +11,14 @@ edge, mime negotiation from the offer's advertised types instead of
 requesting blindly, and clearing the selection when the screen
 content under it changes.
 
-## Custom drawing for box-drawing and friends
+## Sprite polish
 
-Render "grid glyphs" procedurally instead of from fonts so lines meet
-pixel-perfectly across cells regardless of the font in use. Reference:
-ghostty's sprite face (`src/font/sprite/Face.zig` and
-`src/font/sprite/draw/` in the ghostty repo; see `draw/README.md` for
-the draw-function convention).
-
-Codepoint ranges ghostty covers, one module each:
-
-- `box.zig` — box drawing, U+2500–257F
-- `block.zig` — block elements, U+2580–259F
-- `geometric_shapes.zig` — the cell-sized geometric shapes (triangles etc.)
-- `braille.zig` — braille patterns, U+2800–28FF
-- `powerline.zig` — powerline triangles/half-circles, U+E0B0…
-- `branch.zig` — branch/commit drawing characters (kitty extension)
-- `symbols_for_legacy_computing[_supplement].zig` — U+1FB00… sextants/octants
-- `special.zig` — non-codepoint sprites: underline styles, strikethrough,
-  overline, cursor shapes
-
-Key implementation notes from ghostty:
-
-- The sprite face is consulted *before* real fonts for covered
-  codepoints, and quacks like a normal face so shaping/caching layers
-  don't special-case it. For vtread: intercept in
-  `Font.faceForCodepoint` (these never shape or ligate, so they can
-  bypass HarfBuzz entirely).
-- Draw functions receive the cell size and grid metrics and paint onto
-  a canvas padded by a quarter cell on each edge, so glyphs may
-  intentionally overflow the cell — that overlap is what makes
-  diagonals and corners connect seamlessly between neighboring cells.
-- Sprites are keyed by codepoint + cell size, cached like regular
-  glyphs, and rebuilt on font/scale changes.
-
-`special.zig` overlaps with the underline/strikethrough item below;
-doing them together is natural.
-
-## Text decorations
-
-Underline (single/double/curly/dotted/dashed, colored), strikethrough,
-overline. Style flags are already in `vt.Style`; rendering is missing.
-Best done as sprites (see above).
+Sprite rendering (box drawing, blocks, braille, powerline, branch,
+legacy computing) and text decorations landed, vendored from ghostty's
+sprite face onto z2d. Remaining: cursor shape sprites (bar, underline,
+hollow rect from `special.zig` are vendored but unused — the cursor is
+still always a filled block), and wide (2-cell) sprite variants where
+ghostty passes `cell_width > 1`.
 
 ## Config file
 
