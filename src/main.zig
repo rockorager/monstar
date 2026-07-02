@@ -129,6 +129,13 @@ test {
     _ = @import("sprite/canvas.zig");
     _ = @import("sprite/draw/box.zig");
     _ = @import("sprite/draw/block.zig");
+    _ = @import("sprite/draw/powerline.zig");
+    _ = @import("sprite/draw/braille.zig");
+    _ = @import("sprite/draw/geometric_shapes.zig");
+    _ = @import("sprite/draw/branch.zig");
+    _ = @import("sprite/draw/symbols_for_legacy_computing.zig");
+    _ = @import("sprite/draw/symbols_for_legacy_computing_supplement.zig");
+    _ = @import("sprite/draw/special.zig");
     _ = Window;
 }
 

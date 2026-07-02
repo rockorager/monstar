@@ -40,6 +40,8 @@ embedded_face: ?u16,
 /// Procedural sprite glyphs, keyed by codepoint (metrics are fixed
 /// per Font instance, so no size key is needed).
 sprite_glyphs: std.AutoHashMapUnmanaged(u21, Glyph),
+/// Text decoration sprites (underline styles, strikethrough, overline).
+decoration_glyphs: std.AutoHashMapUnmanaged(sprite.Decoration, Glyph),
 sprite_metrics: sprite.Metrics,
 size_px: u31,
 
@@ -219,16 +221,39 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         family, cell_width, cell_height, baseline, sort_set.*.nfont - 1,
     });
 
-    // Sprite line thickness follows the font's underline thickness
-    // (scaled to pixels), with a sane fallback for fonts lacking one.
-    const box_thickness: u32 = thickness: {
-        const ft_face = primary.ft_face;
+    // Sprite metrics. Line thickness follows the font's underline
+    // thickness (scaled to pixels) with a fallback for fonts lacking
+    // one; positions are expressed from the cell top, like ghostty.
+    const ft_face = primary.ft_face;
+    const y_scale: i64 = ft_face.*.size.*.metrics.y_scale;
+    const thickness: u32 = thickness: {
         const units: i64 = ft_face.*.underline_thickness;
         if (units > 0) {
-            const scaled: i64 = @divTrunc(units * ft_face.*.size.*.metrics.y_scale, 1 << 22);
+            const scaled: i64 = @divTrunc(units * y_scale, 1 << 22);
             if (scaled > 0) break :thickness @intCast(scaled);
         }
         break :thickness @max(1, cell_height / 16);
+    };
+
+    // FreeType underline position: relative to baseline, +up.
+    const underline_position: u32 = position: {
+        const units: i64 = ft_face.*.underline_position;
+        const scaled: i64 = @divTrunc(units * y_scale, 1 << 22);
+        const top: i64 = baseline - scaled;
+        break :position @intCast(std.math.clamp(top, 0, cell_height - thickness));
+    };
+
+    // Center the strikethrough on lowercase text (x-height).
+    const strikethrough_position: u32 = position: {
+        const ex_height: i64 = ex: {
+            const idx = c.FT_Get_Char_Index(ft_face, 'x');
+            if (idx != 0 and c.FT_Load_Glyph(ft_face, idx, c.FT_LOAD_DEFAULT) == 0) {
+                break :ex @intCast(ft_face.*.glyph.*.metrics.horiBearingY >> 6);
+            }
+            break :ex @divTrunc(@as(i64, cell_height) * 3, 10);
+        };
+        const top: i64 = baseline - @divTrunc(ex_height + thickness, 2);
+        break :position @intCast(std.math.clamp(top, 0, cell_height - thickness));
     };
 
     return .{
@@ -239,10 +264,18 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         .codepoint_faces = .empty,
         .embedded_face = embedded_face,
         .sprite_glyphs = .empty,
+        .decoration_glyphs = .empty,
         .sprite_metrics = .{
             .cell_width = cell_width,
             .cell_height = cell_height,
-            .box_thickness = box_thickness,
+            .box_thickness = thickness,
+            .underline_position = underline_position,
+            .underline_thickness = thickness,
+            .strikethrough_position = strikethrough_position,
+            .strikethrough_thickness = thickness,
+            .overline_position = 0,
+            .overline_thickness = thickness,
+            .cursor_thickness = thickness,
         },
         .size_px = size_px,
         .cell_width = cell_width,
@@ -259,6 +292,9 @@ pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
     var sprite_it = self.sprite_glyphs.valueIterator();
     while (sprite_it.next()) |g| alloc.free(g.bitmap);
     self.sprite_glyphs.deinit(alloc);
+    var deco_it = self.decoration_glyphs.valueIterator();
+    while (deco_it.next()) |g| alloc.free(g.bitmap);
+    self.decoration_glyphs.deinit(alloc);
     c.FcFontSetDestroy(self.sort_set);
     _ = c.FT_Done_FreeType(self.ft_lib);
     self.* = undefined;
@@ -276,6 +312,27 @@ pub fn spriteGlyph(self: *Font, alloc: std.mem.Allocator, cp: u21) !*const Glyph
     errdefer _ = self.sprite_glyphs.remove(cp);
 
     const g = try sprite.render(alloc, cp, self.sprite_metrics, self.baseline);
+    gop.value_ptr.* = .{
+        .bitmap = g.bitmap,
+        .width = g.width,
+        .height = g.height,
+        .bearing_x = g.bearing_x,
+        .bearing_y = g.bearing_y,
+    };
+    return gop.value_ptr;
+}
+
+/// Rasterize (or fetch from cache) a text decoration sprite.
+pub fn decorationGlyph(
+    self: *Font,
+    alloc: std.mem.Allocator,
+    kind: sprite.Decoration,
+) !*const Glyph {
+    const gop = try self.decoration_glyphs.getOrPut(alloc, kind);
+    if (gop.found_existing) return gop.value_ptr;
+    errdefer _ = self.decoration_glyphs.remove(kind);
+
+    const g = try sprite.renderDecoration(alloc, kind, self.sprite_metrics, self.baseline);
     gop.value_ptr.* = .{
         .bitmap = g.bitmap,
         .width = g.width,

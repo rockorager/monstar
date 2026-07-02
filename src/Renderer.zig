@@ -164,6 +164,65 @@ fn renderRow(
         }
     }
     try self.drawRun(raws, graphemes, run_start, cols, y, pixels, width, height);
+
+    // Decoration pass: underlines, strikethrough, and overline overlay
+    // the glyphs, in the style's underline color (or the resolved fg).
+    for (0..cols) |dx| {
+        if (raws[dx].style_id == 0) continue;
+        const style = styles[dx];
+        const underline: ?vt.sgr.Attribute.Underline = switch (style.flags.underline) {
+            .none => null,
+            else => |u| u,
+        };
+        if (underline == null and !style.flags.strikethrough and !style.flags.overline)
+            continue;
+
+        const cell_x: u31 = @intCast(dx);
+        if (underline) |u| {
+            const kind: @import("sprite.zig").Decoration = switch (u) {
+                .single => .underline,
+                .double => .underline_double,
+                .curly => .underline_curly,
+                .dotted => .underline_dotted,
+                .dashed => .underline_dashed,
+                .none => unreachable,
+            };
+            const color = style.underlineColor(&colors.palette) orelse self.fg_scratch.items[dx];
+            try self.blitDecoration(kind, cell_x, y, argb(color), pixels, width, height);
+        }
+        if (style.flags.strikethrough) {
+            const color = self.fg_scratch.items[dx];
+            try self.blitDecoration(.strikethrough, cell_x, y, argb(color), pixels, width, height);
+        }
+        if (style.flags.overline) {
+            const color = self.fg_scratch.items[dx];
+            try self.blitDecoration(.overline, cell_x, y, argb(color), pixels, width, height);
+        }
+    }
+}
+
+fn blitDecoration(
+    self: *Renderer,
+    kind: @import("sprite.zig").Decoration,
+    cell_x: u31,
+    y: u31,
+    color: u32,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
+    const font = self.font;
+    const g = try font.decorationGlyph(self.alloc, kind);
+    const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
+    blitGlyph(
+        pixels,
+        width,
+        height,
+        g,
+        @as(i32, cell_x) * font.cell_width + g.bearing_x,
+        baseline_y - g.bearing_y,
+        color,
+    );
 }
 
 /// Shape cells [start, end) as one HarfBuzz run and blit the glyphs.
