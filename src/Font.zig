@@ -13,6 +13,11 @@ const c = @import("c");
 
 const log = std.log.scoped(.font);
 
+/// Bundled Nerd Font symbols (MIT licensed, see assets/): icon glyphs
+/// render identically everywhere without requiring an installed patched
+/// font. Consulted after the primary face, before system fallbacks.
+const embedded_symbols = @embedFile("assets/SymbolsNerdFontMono-Regular.ttf");
+
 /// Marks a sort-list candidate that failed to load.
 const failed_face = std.math.maxInt(u16);
 
@@ -25,6 +30,8 @@ sort_set: *c.FcFontSet,
 sort_faces: std.AutoHashMapUnmanaged(u32, u16),
 /// codepoint -> faces index, for codepoints the primary lacks.
 codepoint_faces: std.AutoHashMapUnmanaged(u21, u16),
+/// faces index of the embedded symbols face, if it loaded.
+embedded_face: ?u16,
 size_px: u31,
 
 /// Fixed cell metrics in pixels, derived from the primary face.
@@ -44,6 +51,18 @@ pub const Face = struct {
     fn load(ft_lib: c.FT_Library, path: [*:0]const u8, index: c_int, size_px: u31) Error!Face {
         var ft_face: c.FT_Face = undefined;
         if (c.FT_New_Face(ft_lib, path, index, &ft_face) != 0) return error.FontLoadFailed;
+        return fromFtFace(ft_face, size_px);
+    }
+
+    /// `bytes` must outlive the face (fine for @embedFile data).
+    fn loadMemory(ft_lib: c.FT_Library, bytes: []const u8, size_px: u31) Error!Face {
+        var ft_face: c.FT_Face = undefined;
+        if (c.FT_New_Memory_Face(ft_lib, bytes.ptr, @intCast(bytes.len), 0, &ft_face) != 0)
+            return error.FontLoadFailed;
+        return fromFtFace(ft_face, size_px);
+    }
+
+    fn fromFtFace(ft_face: c.FT_Face, size_px: u31) Error!Face {
         errdefer _ = c.FT_Done_Face(ft_face);
         // Fails for fixed-size (e.g. color emoji) faces; those are
         // treated as unusable rather than rendered at a wrong size.
@@ -149,8 +168,19 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
     if (c.FT_Init_FreeType(&ft_lib) != 0) return error.FontLoadFailed;
     errdefer _ = c.FT_Done_FreeType(ft_lib);
 
-    var primary = try loadFromPattern(ft_lib, sort_set.*.fonts[0], size_px);
-    errdefer primary.deinit(alloc);
+    // Faces own their resources once appended; the errdefer below is the
+    // single cleanup path for all of them.
+    var faces: std.ArrayList(Face) = .empty;
+    errdefer {
+        for (faces.items) |*f| f.deinit(alloc);
+        faces.deinit(alloc);
+    }
+    {
+        var primary = try loadFromPattern(ft_lib, sort_set.*.fonts[0], size_px);
+        errdefer primary.deinit(alloc);
+        try faces.append(alloc, primary);
+    }
+    const primary = &faces.items[0];
 
     // Cell metrics: advance of a reference glyph for width, font-global
     // ascender/descender for height. 26.6 fixed point.
@@ -165,9 +195,16 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         break :width @intCast(metrics.max_advance >> 6);
     };
 
-    var faces: std.ArrayList(Face) = .empty;
-    errdefer faces.deinit(alloc);
-    try faces.append(alloc, primary);
+    // The embedded symbols face; not fatal if it somehow fails.
+    const embedded_face: ?u16 = embedded: {
+        var embedded = Face.loadMemory(ft_lib, embedded_symbols, size_px) catch |err| {
+            log.warn("embedded symbols font failed to load: {}", .{err});
+            break :embedded null;
+        };
+        errdefer embedded.deinit(alloc);
+        try faces.append(alloc, embedded);
+        break :embedded @intCast(faces.items.len - 1);
+    };
 
     log.info("loaded primary face ({s}) cell {d}x{d} baseline {d}, {d} fallback candidates", .{
         family, cell_width, cell_height, baseline, sort_set.*.nfont - 1,
@@ -179,6 +216,7 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         .sort_set = sort_set,
         .sort_faces = .empty,
         .codepoint_faces = .empty,
+        .embedded_face = embedded_face,
         .size_px = size_px,
         .cell_width = cell_width,
         .cell_height = cell_height,
@@ -201,12 +239,20 @@ pub fn face(self: *Font, index: u16) *Face {
 }
 
 /// The face to render `cp` with: 0 (primary) when the primary covers it
-/// or nothing does, otherwise a lazily-loaded fallback.
+/// or nothing does, otherwise the embedded symbols face or a
+/// lazily-loaded system fallback, in that order. The embedded face wins
+/// over system fonts so icons render identically everywhere; it only
+/// contains symbols, so it never shadows regular text coverage.
 pub fn faceForCodepoint(self: *Font, alloc: std.mem.Allocator, cp: u21) u16 {
     if (self.faces.items[0].hasCodepoint(cp)) return 0;
     if (self.codepoint_faces.get(cp)) |idx| return idx;
 
-    const idx = self.searchFallback(alloc, cp) orelse 0;
+    const idx = idx: {
+        if (self.embedded_face) |embedded| {
+            if (self.faces.items[embedded].hasCodepoint(cp)) break :idx embedded;
+        }
+        break :idx self.searchFallback(alloc, cp) orelse 0;
+    };
     self.codepoint_faces.put(alloc, cp, idx) catch {};
     return idx;
 }
@@ -269,6 +315,26 @@ test "load monospace font and rasterize a glyph" {
     try std.testing.expect(g.width > 0 and g.height > 0);
     // Cached: same pointer on second lookup.
     try std.testing.expectEqual(g, try primary.glyph(alloc, idx));
+}
+
+test "embedded symbols face serves nerd font codepoints" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    const embedded = font.embedded_face orelse return error.SkipZigTest;
+
+    // Powerline separator and folder icon: Nerd Font staples that a
+    // plain monospace primary won't have.
+    for ([_]u21{ 0xE0B0, 0xF07B }) |cp| {
+        if (font.faces.items[0].hasCodepoint(cp)) continue; // patched primary
+        try std.testing.expectEqual(embedded, font.faceForCodepoint(alloc, cp));
+        const g = try font.face(embedded).glyph(
+            alloc,
+            c.FT_Get_Char_Index(font.face(embedded).ft_face, cp),
+        );
+        try std.testing.expect(g.width > 0 and g.height > 0);
+    }
 }
 
 test "fallback face for a codepoint the primary lacks" {
