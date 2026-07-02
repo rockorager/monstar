@@ -27,7 +27,6 @@ and font fallback family overrides.
 - Re-pin the ghostty dependency to upstream main once the Zig 0.16
   migration lands (ghostty 1.4, PR #12726); currently pinned to the
   `vancluever/ghostty#zig-0.16` branch.
-- Server-side decorations via `xdg-decoration-unstable-v1`.
 - Mode 2048 edge: re-enabling the already-enabled mode should resend a
   size report (needs a mode-change hook in ghostty-vt's effects API;
   consider proposing upstream).

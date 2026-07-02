@@ -10,6 +10,7 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const wp = wayland.client.wp;
 const xdg = wayland.client.xdg;
+const zxdg = wayland.client.zxdg;
 const zwp = wayland.client.zwp;
 
 const log = std.log.scoped(.window);
@@ -37,6 +38,8 @@ data_manager: ?*wl.DataDeviceManager,
 data_device: ?*wl.DataDevice,
 primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1,
 primary_device: ?*zwp.PrimarySelectionDeviceV1,
+decoration_manager: ?*zxdg.DecorationManagerV1,
+toplevel_decoration: ?*zxdg.ToplevelDecorationV1,
 viewport: ?*wp.Viewport,
 fractional_scale: ?*wp.FractionalScaleV1,
 surface: *wl.Surface,
@@ -93,6 +96,7 @@ const Globals = struct {
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
     data_manager: ?*wl.DataDeviceManager = null,
     primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1 = null,
+    decoration_manager: ?*zxdg.DecorationManagerV1 = null,
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
@@ -114,6 +118,16 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
     const toplevel = try xdg_surface.getToplevel();
     toplevel.setAppId("monstar");
     toplevel.setTitle("monstar");
+
+    const toplevel_decoration = decoration: {
+        const manager = globals.decoration_manager orelse break :decoration null;
+        const decoration = manager.getToplevelDecoration(toplevel) catch |err| {
+            log.warn("server-side decoration request failed: {}", .{err});
+            break :decoration null;
+        };
+        decoration.setMode(.server_side);
+        break :decoration decoration;
+    };
 
     // Fractional scaling needs both protocols: the scale event and a
     // viewport to map the physical-pixel buffer onto the logical size.
@@ -163,6 +177,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .data_device = data_device,
         .primary_manager = globals.primary_manager,
         .primary_device = primary_device,
+        .decoration_manager = globals.decoration_manager,
+        .toplevel_decoration = toplevel_decoration,
         .viewport = viewport,
         .fractional_scale = fractional_scale,
         .surface = surface,
@@ -188,6 +204,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .scale_fn = null,
     };
 
+    if (toplevel_decoration) |decoration| decoration.setListener(*Window, decorationListener, self);
     if (fractional_scale) |fs| fs.setListener(*Window, fractionalScaleListener, self);
     if (globals.seat) |seat| seat.setListener(*Window, seatListener, self);
     wm_base.setListener(*Window, wmBaseListener, self);
@@ -209,6 +226,8 @@ pub fn destroy(self: *Window) void {
     if (self.data_manager) |manager| manager.destroy();
     if (self.primary_device) |device| device.destroy();
     if (self.primary_manager) |manager| manager.destroy();
+    if (self.toplevel_decoration) |decoration| decoration.destroy();
+    if (self.decoration_manager) |manager| manager.destroy();
     if (self.pointer) |pointer| pointer.release();
     if (self.keyboard) |keyboard| keyboard.release();
     if (self.seat) |seat| seat.release();
@@ -351,6 +370,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.data_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, 3)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zwp.PrimarySelectionDeviceManagerV1.interface.name) == .eq) {
                 globals.primary_manager = registry.bind(global.name, zwp.PrimarySelectionDeviceManagerV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
+                globals.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
             }
         },
         .global_remove => {},
@@ -415,6 +436,16 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) vo
 fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, _: *Window) void {
     switch (event) {
         .ping => |ping| wm_base.pong(ping.serial),
+    }
+}
+
+fn decorationListener(
+    _: *zxdg.ToplevelDecorationV1,
+    event: zxdg.ToplevelDecorationV1.Event,
+    _: *Window,
+) void {
+    switch (event) {
+        .configure => {},
     }
 }
 
