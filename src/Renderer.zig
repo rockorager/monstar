@@ -14,24 +14,31 @@ const Font = @import("Font.zig");
 
 const log = std.log.scoped(.renderer);
 
-/// Selection background. TODO: make configurable alongside the palette.
-const selection_bg: vt.color.RGB = .{ .r = 0x33, .g = 0x46, .b = 0x7c };
-
 alloc: std.mem.Allocator,
 font: *Font,
 hb_buf: *c.hb_buffer_t,
+/// Selection colors; a null foreground uses the default foreground.
+selection_bg: vt.color.RGB,
+selection_fg: ?vt.color.RGB,
 /// Per-cell resolved foreground colors for the row being rendered.
 fg_scratch: std.ArrayList(vt.color.RGB),
 /// Per-cell font face indices for the row being rendered.
 face_scratch: std.ArrayList(u16),
 
-pub fn init(alloc: std.mem.Allocator, font: *Font) !Renderer {
+pub const InitOptions = struct {
+    selection_background: ?vt.color.RGB = null,
+    selection_foreground: ?vt.color.RGB = null,
+};
+
+pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer {
     const hb_buf = c.hb_buffer_create() orelse return error.OutOfMemory;
     if (c.hb_buffer_allocation_successful(hb_buf) == 0) return error.OutOfMemory;
     return .{
         .alloc = alloc,
         .font = font,
         .hb_buf = hb_buf,
+        .selection_bg = opts.selection_background orelse .{ .r = 0x33, .g = 0x46, .b = 0x7c },
+        .selection_fg = opts.selection_foreground,
         .fg_scratch = .empty,
         .face_scratch = .empty,
     };
@@ -122,8 +129,8 @@ fn renderRow(
         // foreground, so selected text reads uniformly.
         const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
         if (selected) {
-            bg = selection_bg;
-            fg = colors.foreground;
+            bg = self.selection_bg;
+            fg = self.selection_fg orelse colors.foreground;
         }
         // Block cursor: swap in the cursor color, invert the glyph.
         // Other cursor shapes overlay a sprite after drawing instead.
@@ -454,7 +461,7 @@ test "render a simple grid" {
 
     var font: Font = try .init(alloc, "monospace", 16);
     defer font.deinit(alloc);
-    var renderer: Renderer = try .init(alloc, &font);
+    var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
 
     const width: u31 = font.cell_width * 8;

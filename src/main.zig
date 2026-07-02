@@ -8,6 +8,7 @@
 const std = @import("std");
 const vt = @import("ghostty-vt");
 const App = @import("App.zig");
+const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Pty = @import("Pty.zig");
 const Renderer = @import("Renderer.zig");
@@ -67,9 +68,13 @@ fn runCommand(init: std.process.Init, term: *vt.Terminal, args: []const [:0]cons
 fn gui(init: std.process.Init, args: []const [:0]const u8) !void {
     const arena = init.arena.allocator();
 
-    // With arguments, run them as a shell command; otherwise run $SHELL
-    // interactively.
-    const shell: [:0]const u8 = init.minimal.environ.getPosix("SHELL") orelse "/bin/sh";
+    const config = Config.load(arena, init.minimal.environ);
+
+    // With arguments, run them as a shell command; otherwise run the
+    // configured shell (falling back to $SHELL) interactively.
+    const shell: [:0]const u8 = config.shell orelse
+        init.minimal.environ.getPosix("SHELL") orelse
+        "/bin/sh";
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     if (args.len > 0) {
         try argv.appendSlice(arena, &.{ "/bin/sh", "-c", try std.mem.joinZ(arena, " ", args) });
@@ -79,7 +84,7 @@ fn gui(init: std.process.Init, args: []const [:0]const u8) !void {
     const argv_z = try argv.toOwnedSliceSentinel(arena, null);
     const envp = try buildEnvp(arena, init.minimal.environ);
 
-    const app = try App.init(init.io, init.gpa, .{}, argv_z[0].?, argv_z.ptr, envp);
+    const app = try App.init(init.io, init.gpa, &config, argv_z[0].?, argv_z.ptr, envp);
     defer app.deinit();
     try app.run();
 }
@@ -121,6 +126,7 @@ fn buildEnvp(
 
 test {
     _ = App;
+    _ = Config;
     _ = Font;
     _ = @import("Keyboard.zig");
     _ = Pty;

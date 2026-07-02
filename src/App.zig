@@ -13,6 +13,7 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
+const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
 const Pty = @import("Pty.zig");
@@ -22,7 +23,7 @@ const Window = @import("Window.zig");
 const log = std.log.scoped(.app);
 
 alloc: std.mem.Allocator,
-opts: Options,
+config: *const Config,
 term: vt.Terminal,
 stream: vt.TerminalStream,
 render_state: vt.RenderState,
@@ -80,32 +81,27 @@ paste_buf: std.ArrayList(u8),
 const paste_mime = "text/plain;charset=utf-8";
 
 /// Terminal lines per wheel click.
-const wheel_lines = 3;
-
 const initial_cols = 80;
 const initial_rows = 24;
 
-pub const Options = struct {
-    font_family: [:0]const u8 = "monospace",
-    font_size_px: u31 = 16,
-};
-
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
-/// copies them via execve).
+/// copies them via execve); `config` must outlive the App.
 pub fn init(
     io: std.Io,
     alloc: std.mem.Allocator,
-    opts: Options,
+    config: *const Config,
     path: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
 ) !*App {
-    var font: Font = try .init(alloc, opts.font_family, opts.font_size_px);
+    var font: Font = try .init(alloc, config.font_family, config.font_size);
     errdefer font.deinit(alloc);
 
     var term: vt.Terminal = try .init(io, alloc, .{
         .cols = initial_cols,
         .rows = initial_rows,
+        .max_scrollback = config.scrollback,
+        .colors = config.terminalColors(),
     });
     errdefer term.deinit(alloc);
 
@@ -136,15 +132,18 @@ pub fn init(
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
-        .opts = opts,
+        .config = config,
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
         .pty = pty,
         .child_pid = child_pid,
         .font = font,
-        .font_size_px = opts.font_size_px,
-        .renderer = try .init(alloc, &self.font),
+        .font_size_px = config.font_size,
+        .renderer = try .init(alloc, &self.font, .{
+            .selection_background = config.selection_background,
+            .selection_foreground = config.selection_foreground,
+        }),
         .window = window,
         .keyboard = try .init(),
         .needs_redraw = true,
@@ -201,10 +200,10 @@ pub fn init(
 /// to the new cell metrics.
 fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const size_px: u31 = @intCast((@as(u64, self.opts.font_size_px) * scale120 + 60) / 120);
+    const size_px: u31 = @intCast((@as(u64, self.config.font_size) * scale120 + 60) / 120);
     if (size_px == 0 or size_px == self.font_size_px) return;
 
-    const new_font: Font = try .init(self.alloc, self.opts.font_family, size_px);
+    const new_font: Font = try .init(self.alloc, self.config.font_family, size_px);
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
@@ -838,7 +837,7 @@ fn finishPaste(self: *App) void {
 fn finishScrollFrame(self: *App) void {
     var lines: i32 = 0;
     if (self.scroll_had_discrete) {
-        lines = self.scroll_clicks * wheel_lines;
+        lines = self.scroll_clicks * @as(i32, @intCast(self.config.wheel_scroll_lines));
     } else if (self.scroll_pixels != 0) {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
