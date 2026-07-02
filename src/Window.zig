@@ -124,7 +124,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
     const surface = try compositor.createSurface();
     const xdg_surface = try wm_base.getXdgSurface(surface);
     const toplevel = try xdg_surface.getToplevel();
-    toplevel.setAppId("monstar");
+    toplevel.setAppId("dev.rockorager.monstar");
     toplevel.setTitle("monstar");
 
     const toplevel_decoration = decoration: {

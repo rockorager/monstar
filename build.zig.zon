@@ -19,6 +19,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "dist",
         "src",
         "vendor/ghostty",
     },

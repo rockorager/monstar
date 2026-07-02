@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Monstar
+Comment=Wayland terminal emulator
+Exec=monstar
+Terminal=false
+StartupNotify=true
+Categories=System;TerminalEmulator;

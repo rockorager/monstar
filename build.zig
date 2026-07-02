@@ -75,6 +75,7 @@ pub fn build(b: *std.Build) void {
     root_module.addCSourceFile(.{ .file = b.path("src/vendor/stb_image.c") });
 
     b.installArtifact(exe);
+    b.installFile("dist/dev.rockorager.monstar.desktop", "share/applications/dev.rockorager.monstar.desktop");
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

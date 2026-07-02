@@ -190,6 +190,8 @@ const selection_word_boundaries = [_]u21{
 /// Terminal lines per wheel click.
 const initial_cols = 80;
 const initial_rows = 24;
+const app_id = "dev.rockorager.monstar";
+const app_name = "Monstar";
 const sync_output_reset_ms = 1000;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
@@ -557,7 +559,7 @@ fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void
     const effective_title = if (title.len > 0)
         title
     else
-        self.term.getTitle() orelse "monstar";
+        self.term.getTitle() orelse app_name;
 
     self.sendDesktopNotification(effective_title, body) catch |err| {
         log.warn("failed to send desktop notification: {}", .{err});
@@ -666,8 +668,8 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
     var iter: c.DBusMessageIter = undefined;
     c.dbus_message_iter_init_append(message, &iter);
 
-    var app_name: [*:0]const u8 = "monstar";
-    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &app_name);
+    var notify_app_name: [*:0]const u8 = app_name;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &notify_app_name);
     var replaces_id: u32 = 0;
     try dbusAppendBasic(&iter, c.DBUS_TYPE_UINT32, &replaces_id);
     var app_icon: [*:0]const u8 = "";
@@ -687,6 +689,7 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
 
     var hints: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &hints) == 0) return error.OutOfMemory;
+    try dbusAppendStringHint(&hints, "desktop-entry", app_id);
     if (c.dbus_message_iter_close_container(&iter, &hints) == 0) return error.OutOfMemory;
 
     var expire_timeout: i32 = -1;
@@ -702,6 +705,21 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
 fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void {
     const opaque_value: *const anyopaque = @ptrCast(value);
     if (c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
+}
+
+fn dbusAppendStringHint(iter: *c.DBusMessageIter, key: [:0]const u8, value: [:0]const u8) !void {
+    var entry: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(iter, c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+    var key_ptr: [*:0]const u8 = key;
+    try dbusAppendBasic(&entry, c.DBUS_TYPE_STRING, &key_ptr);
+
+    var variant: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(&entry, c.DBUS_TYPE_VARIANT, "s", &variant) == 0) return error.OutOfMemory;
+    var value_ptr: [*:0]const u8 = value;
+    try dbusAppendBasic(&variant, c.DBUS_TYPE_STRING, &value_ptr);
+    if (c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
+
+    if (c.dbus_message_iter_close_container(iter, &entry) == 0) return error.OutOfMemory;
 }
 
 fn dbusMessageUint32(message: *c.DBusMessage) ?u32 {
