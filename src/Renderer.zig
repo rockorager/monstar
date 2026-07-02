@@ -181,6 +181,30 @@ fn drawRun(
 ) !void {
     if (start >= end) return;
     const font = self.font;
+
+    // Sprite glyphs are drawn directly, one per cell: they never shape
+    // and their geometry comes from cell metrics, not a font.
+    if (self.face_scratch.items[start] == Font.sprite_face_index) {
+        const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
+        for (start..end) |x| {
+            const raw = raws[x];
+            if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
+            const cp = raw.content.codepoint.data;
+            if (cp == 0) continue;
+            const g = try font.spriteGlyph(self.alloc, cp);
+            blitGlyph(
+                pixels,
+                width,
+                height,
+                g,
+                @as(i32, @intCast(x)) * font.cell_width + g.bearing_x,
+                baseline_y - g.bearing_y,
+                argb(self.fg_scratch.items[x]),
+            );
+        }
+        return;
+    }
+
     const face = font.face(self.face_scratch.items[start]);
 
     c.hb_buffer_clear_contents(self.hb_buf);

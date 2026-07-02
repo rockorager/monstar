@@ -125,6 +125,10 @@ test {
     _ = @import("Keyboard.zig");
     _ = Pty;
     _ = Renderer;
+    _ = @import("sprite.zig");
+    _ = @import("sprite/canvas.zig");
+    _ = @import("sprite/draw/box.zig");
+    _ = @import("sprite/draw/block.zig");
     _ = Window;
 }
 

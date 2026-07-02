@@ -45,6 +45,13 @@ pub fn build(b: *std.Build) void {
     translate_c.linkSystemLibrary("xkbcommon", .{});
     root_module.addImport("c", translate_c.createModule());
 
+    if (b.lazyDependency("z2d", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
+        root_module.addImport("z2d", dep.module("z2d"));
+    }
+
     if (b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,

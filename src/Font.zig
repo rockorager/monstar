@@ -10,8 +10,13 @@ const Font = @This();
 
 const std = @import("std");
 const c = @import("c");
+const sprite = @import("sprite.zig");
 
 const log = std.log.scoped(.font);
+
+/// Virtual face index for procedurally drawn sprite glyphs (box
+/// drawing etc.). Never a valid index into `faces`.
+pub const sprite_face_index: u16 = std.math.maxInt(u16);
 
 /// Bundled Nerd Font symbols (MIT licensed, see assets/): icon glyphs
 /// render identically everywhere without requiring an installed patched
@@ -32,6 +37,10 @@ sort_faces: std.AutoHashMapUnmanaged(u32, u16),
 codepoint_faces: std.AutoHashMapUnmanaged(u21, u16),
 /// faces index of the embedded symbols face, if it loaded.
 embedded_face: ?u16,
+/// Procedural sprite glyphs, keyed by codepoint (metrics are fixed
+/// per Font instance, so no size key is needed).
+sprite_glyphs: std.AutoHashMapUnmanaged(u21, Glyph),
+sprite_metrics: sprite.Metrics,
 size_px: u31,
 
 /// Fixed cell metrics in pixels, derived from the primary face.
@@ -210,6 +219,18 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         family, cell_width, cell_height, baseline, sort_set.*.nfont - 1,
     });
 
+    // Sprite line thickness follows the font's underline thickness
+    // (scaled to pixels), with a sane fallback for fonts lacking one.
+    const box_thickness: u32 = thickness: {
+        const ft_face = primary.ft_face;
+        const units: i64 = ft_face.*.underline_thickness;
+        if (units > 0) {
+            const scaled: i64 = @divTrunc(units * ft_face.*.size.*.metrics.y_scale, 1 << 22);
+            if (scaled > 0) break :thickness @intCast(scaled);
+        }
+        break :thickness @max(1, cell_height / 16);
+    };
+
     return .{
         .ft_lib = ft_lib,
         .faces = faces,
@@ -217,6 +238,12 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         .sort_faces = .empty,
         .codepoint_faces = .empty,
         .embedded_face = embedded_face,
+        .sprite_glyphs = .empty,
+        .sprite_metrics = .{
+            .cell_width = cell_width,
+            .cell_height = cell_height,
+            .box_thickness = box_thickness,
+        },
         .size_px = size_px,
         .cell_width = cell_width,
         .cell_height = cell_height,
@@ -229,13 +256,34 @@ pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
     self.faces.deinit(alloc);
     self.sort_faces.deinit(alloc);
     self.codepoint_faces.deinit(alloc);
+    var sprite_it = self.sprite_glyphs.valueIterator();
+    while (sprite_it.next()) |g| alloc.free(g.bitmap);
+    self.sprite_glyphs.deinit(alloc);
     c.FcFontSetDestroy(self.sort_set);
     _ = c.FT_Done_FreeType(self.ft_lib);
     self.* = undefined;
 }
 
 pub fn face(self: *Font, index: u16) *Face {
+    std.debug.assert(index != sprite_face_index);
     return &self.faces.items[index];
+}
+
+/// Rasterize (or fetch from cache) the sprite glyph for `cp`.
+pub fn spriteGlyph(self: *Font, alloc: std.mem.Allocator, cp: u21) !*const Glyph {
+    const gop = try self.sprite_glyphs.getOrPut(alloc, cp);
+    if (gop.found_existing) return gop.value_ptr;
+    errdefer _ = self.sprite_glyphs.remove(cp);
+
+    const g = try sprite.render(alloc, cp, self.sprite_metrics, self.baseline);
+    gop.value_ptr.* = .{
+        .bitmap = g.bitmap,
+        .width = g.width,
+        .height = g.height,
+        .bearing_x = g.bearing_x,
+        .bearing_y = g.bearing_y,
+    };
+    return gop.value_ptr;
 }
 
 /// The face to render `cp` with: 0 (primary) when the primary covers it
@@ -244,6 +292,8 @@ pub fn face(self: *Font, index: u16) *Face {
 /// over system fonts so icons render identically everywhere; it only
 /// contains symbols, so it never shadows regular text coverage.
 pub fn faceForCodepoint(self: *Font, alloc: std.mem.Allocator, cp: u21) u16 {
+    // Sprites override fonts so grid glyphs are always seamless.
+    if (sprite.covers(cp)) return sprite_face_index;
     if (self.faces.items[0].hasCodepoint(cp)) return 0;
     if (self.codepoint_faces.get(cp)) |idx| return idx;
 

@@ -12,6 +12,10 @@
             .url = "git+https://codeberg.org/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
             .hash = "wayland-0.7.0-dev-lQa1kjT8AQDBstL61Gy3WCMtGwVaMN1p6w5wGfdDvP15",
         },
+        .z2d = .{
+            .url = "git+https://github.com/vancluever/z2d#3edb5d1bba7192352c17592a218eca8b646679dc",
+            .hash = "z2d-0.12.0-j5P_HsE8EQAuRulQMsEkrCevU85rTFl4JIOz7uJdCYA-",
+        },
     },
     .paths = .{
         "build.zig",
