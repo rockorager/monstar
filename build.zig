@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
     translate_c.linkSystemLibrary("freetype2", .{});
     translate_c.linkSystemLibrary("harfbuzz", .{});
     translate_c.linkSystemLibrary("xkbcommon", .{});
+    translate_c.linkSystemLibrary("dbus-1", .{});
     root_module.addImport("c", translate_c.createModule());
 
     if (b.lazyDependency("z2d", .{

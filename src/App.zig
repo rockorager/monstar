@@ -211,6 +211,7 @@ const AppStreamHandler = struct {
             .color_operation => self.app.answerOscColorQueries(&value.requests, value.terminator),
             .kitty_color_report => self.app.answerKittyColorQueries(value),
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
+            .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
             .dcs_hook => self.dcsHook(value),
             .dcs_put => self.dcsPut(value),
             .dcs_unhook => self.dcsUnhook(),
@@ -520,6 +521,73 @@ fn effectBell(handler: *Handler) void {
     self.window.setUrgent(true) catch |err| {
         log.warn("failed to request window attention: {}", .{err});
     };
+}
+
+fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void {
+    const effective_title = if (title.len > 0)
+        title
+    else
+        self.term.getTitle() orelse "monstar";
+
+    sendDesktopNotification(self.alloc, effective_title, body) catch |err| {
+        log.warn("failed to send desktop notification: {}", .{err});
+    };
+}
+
+fn sendDesktopNotification(alloc: std.mem.Allocator, title: []const u8, body: []const u8) !void {
+    const title_z = try alloc.dupeZ(u8, title);
+    defer alloc.free(title_z);
+    const body_z = try alloc.dupeZ(u8, body);
+    defer alloc.free(body_z);
+
+    const connection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null) orelse return error.DBusUnavailable;
+    defer {
+        c.dbus_connection_close(connection);
+        c.dbus_connection_unref(connection);
+    }
+
+    const message = c.dbus_message_new_method_call(
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+        "Notify",
+    ) orelse return error.OutOfMemory;
+    defer c.dbus_message_unref(message);
+    c.dbus_message_set_no_reply(message, 1);
+
+    var iter: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_init_append(message, &iter);
+
+    var app_name: [*:0]const u8 = "monstar";
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &app_name);
+    var replaces_id: u32 = 0;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_UINT32, &replaces_id);
+    var app_icon: [*:0]const u8 = "";
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &app_icon);
+    var summary: [*:0]const u8 = title_z;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &summary);
+    var notification_body: [*:0]const u8 = body_z;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &notification_body);
+
+    var actions: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "s", &actions) == 0) return error.OutOfMemory;
+    if (c.dbus_message_iter_close_container(&iter, &actions) == 0) return error.OutOfMemory;
+
+    var hints: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &hints) == 0) return error.OutOfMemory;
+    if (c.dbus_message_iter_close_container(&iter, &hints) == 0) return error.OutOfMemory;
+
+    var expire_timeout: i32 = -1;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_INT32, &expire_timeout);
+
+    var serial: c_uint = 0;
+    if (c.dbus_connection_send(connection, message, &serial) == 0) return error.OutOfMemory;
+    c.dbus_connection_flush(connection);
+}
+
+fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void {
+    const opaque_value: *const anyopaque = @ptrCast(value);
+    if (c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
 }
 
 fn setNonblocking(fd: posix.fd_t) void {
