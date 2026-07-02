@@ -123,6 +123,7 @@ dbus: ?*c.DBusConnection,
 dbus_fd: posix.fd_t,
 notification_ids: std.AutoHashMapUnmanaged(u32, void),
 notification_tokens: std.AutoHashMapUnmanaged(u32, []u8),
+color_scheme: vt.device_status.ColorScheme,
 /// signalfd for SIGCHLD, polled in the event loop.
 sigchld_fd: posix.fd_t,
 /// Key repeat: timerfd armed while a repeating key is held.
@@ -224,8 +225,19 @@ const AppStreamHandler = struct {
                 self.app.mouse_shape_explicit = true;
                 self.app.syncCursorShape();
             },
-            .set_mode, .reset_mode, .restore_mode, .full_reset => {
-                if (action == .full_reset) self.app.mouse_shape_explicit = false;
+            .set_mode => {
+                if (value.mode == .report_color_scheme) self.app.sendColorSchemeReport();
+                self.app.syncCursorShape();
+            },
+            .restore_mode => {
+                if (value.mode == .report_color_scheme and self.app.term.modes.get(.report_color_scheme)) {
+                    self.app.sendColorSchemeReport();
+                }
+                self.app.syncCursorShape();
+            },
+            .reset_mode => self.app.syncCursorShape(),
+            .full_reset => {
+                self.app.mouse_shape_explicit = false;
                 self.app.syncCursorShape();
             },
             else => {},
@@ -358,6 +370,7 @@ pub fn init(
         .dbus_fd = -1,
         .notification_ids = .empty,
         .notification_tokens = .empty,
+        .color_scheme = .dark,
         .sigchld_fd = sigchld_fd,
         .repeat_fd = repeat_fd,
         .repeat_keycode = null,
@@ -511,8 +524,15 @@ fn currentSize(self: *App) vt.size_report.Size {
     };
 }
 
-fn effectColorScheme(_: *Handler) ?vt.device_status.ColorScheme {
-    return .dark;
+fn effectColorScheme(handler: *Handler) ?vt.device_status.ColorScheme {
+    return appFromHandler(handler).color_scheme;
+}
+
+fn sendColorSchemeReport(self: *App) void {
+    self.writePty(switch (self.color_scheme) {
+        .dark => "\x1B[?997;1n",
+        .light => "\x1B[?997;2n",
+    });
 }
 
 fn effectXtversion(_: *Handler) []const u8 {
@@ -556,6 +576,7 @@ fn initDbus(self: *App) void {
         return;
     }
     c.dbus_bus_add_match(connection, "type='signal',interface='org.freedesktop.Notifications'", null);
+    c.dbus_bus_add_match(connection, "type='signal',interface='org.freedesktop.portal.Settings'", null);
 
     var fd: c_int = -1;
     if (c.dbus_connection_get_unix_fd(connection, &fd) == 0) {
@@ -567,6 +588,7 @@ fn initDbus(self: *App) void {
 
     self.dbus = connection;
     self.dbus_fd = fd;
+    self.readPortalColorScheme();
 }
 
 fn deinitDbus(self: *App) void {
@@ -589,6 +611,40 @@ fn dispatchDbus(self: *App) void {
     const connection = self.dbus orelse return;
     _ = c.dbus_connection_read_write(connection, 0);
     while (c.dbus_connection_dispatch(connection) == c.DBUS_DISPATCH_DATA_REMAINS) {}
+}
+
+fn readPortalColorScheme(self: *App) void {
+    const connection = self.dbus orelse return;
+
+    const message = c.dbus_message_new_method_call(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Settings",
+        "ReadOne",
+    ) orelse return;
+    defer c.dbus_message_unref(message);
+
+    var iter: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_init_append(message, &iter);
+    var namespace: [*:0]const u8 = "org.freedesktop.appearance";
+    dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &namespace) catch return;
+    var key: [*:0]const u8 = "color-scheme";
+    dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &key) catch return;
+
+    const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return;
+    defer c.dbus_message_unref(reply);
+
+    var reply_iter: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(reply, &reply_iter) == 0) return;
+    const value = dbusVariantUint32(&reply_iter) orelse return;
+    self.color_scheme = portalColorScheme(value);
+}
+
+fn portalColorScheme(value: u32) vt.device_status.ColorScheme {
+    return switch (value) {
+        2 => .light,
+        else => .dark,
+    };
 }
 
 fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !void {
@@ -657,6 +713,16 @@ fn dbusMessageUint32(message: *c.DBusMessage) ?u32 {
     return value;
 }
 
+fn dbusVariantUint32(iter: *c.DBusMessageIter) ?u32 {
+    if (c.dbus_message_iter_get_arg_type(iter) != c.DBUS_TYPE_VARIANT) return null;
+    var variant: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_recurse(iter, &variant);
+    if (c.dbus_message_iter_get_arg_type(&variant) != c.DBUS_TYPE_UINT32) return null;
+    var value: u32 = 0;
+    c.dbus_message_iter_get_basic(&variant, &value);
+    return value;
+}
+
 fn dbusFilter(_: ?*c.DBusConnection, message: ?*c.DBusMessage, user_data: ?*anyopaque) callconv(.c) c.DBusHandlerResult {
     const self: *App = @ptrCast(@alignCast(user_data orelse return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED));
     const msg = message orelse return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -669,7 +735,33 @@ fn dbusFilter(_: ?*c.DBusConnection, message: ?*c.DBusMessage, user_data: ?*anyo
         self.handleNotificationActionInvoked(msg);
         return c.DBUS_HANDLER_RESULT_HANDLED;
     }
+    if (c.dbus_message_is_signal(msg, "org.freedesktop.portal.Settings", "SettingChanged") != 0) {
+        self.handlePortalSettingChanged(msg);
+        return c.DBUS_HANDLER_RESULT_HANDLED;
+    }
     return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
+fn handlePortalSettingChanged(self: *App, message: *c.DBusMessage) void {
+    var iter: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(message, &iter) == 0) return;
+    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return;
+    var namespace_ptr: [*:0]const u8 = undefined;
+    c.dbus_message_iter_get_basic(&iter, @ptrCast(&namespace_ptr));
+    if (!std.mem.eql(u8, std.mem.span(namespace_ptr), "org.freedesktop.appearance")) return;
+
+    if (c.dbus_message_iter_next(&iter) == 0) return;
+    if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return;
+    var key_ptr: [*:0]const u8 = undefined;
+    c.dbus_message_iter_get_basic(&iter, @ptrCast(&key_ptr));
+    if (!std.mem.eql(u8, std.mem.span(key_ptr), "color-scheme")) return;
+
+    if (c.dbus_message_iter_next(&iter) == 0) return;
+    const value = dbusVariantUint32(&iter) orelse return;
+    const color_scheme = portalColorScheme(value);
+    if (self.color_scheme == color_scheme) return;
+    self.color_scheme = color_scheme;
+    if (self.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport();
 }
 
 fn handleNotificationActivationToken(self: *App, message: *c.DBusMessage) void {
@@ -1367,6 +1459,13 @@ test "DA1 advertises OSC 52 clipboard support" {
     var writer: std.Io.Writer = .fixed(&buf);
     try deviceAttributes().encode(.primary, &writer);
     try std.testing.expectEqualStrings("\x1b[?62;22;52c", writer.buffered());
+}
+
+test "portal color scheme values map to terminal reports" {
+    try std.testing.expectEqual(vt.device_status.ColorScheme.dark, portalColorScheme(0));
+    try std.testing.expectEqual(vt.device_status.ColorScheme.dark, portalColorScheme(1));
+    try std.testing.expectEqual(vt.device_status.ColorScheme.light, portalColorScheme(2));
+    try std.testing.expectEqual(vt.device_status.ColorScheme.dark, portalColorScheme(99));
 }
 
 test "XTGETTCAP reports hex encoded capabilities" {
