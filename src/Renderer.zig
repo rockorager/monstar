@@ -15,7 +15,8 @@ const Font = @import("Font.zig");
 const log = std.log.scoped(.renderer);
 const KittyImage = vt.kitty.graphics.Image;
 const KittyPlacement = vt.kitty.graphics.ImageStorage.Placement;
-const KittyPlacementKey = vt.kitty.graphics.ImageStorage.PlacementKey;
+const KittyRenderPlacement = vt.kitty.graphics.RenderPlacement;
+const kitty_placeholder = vt.kitty.graphics.unicode.placeholder;
 
 alloc: std.mem.Allocator,
 font: *Font,
@@ -207,27 +208,26 @@ fn renderKittyGraphics(
         const image = storage.imageById(entry.key_ptr.image_id) orelse continue;
         switch (entry.value_ptr.location) {
             .pin => {},
-            // Unicode placeholder placement needs fragment-specific render
-            // geometry; leave it for a separate pass.
             .virtual => continue,
         }
         if (!layer.matches(entry.value_ptr.z)) continue;
+        const viewport = kittyPlacementViewport(terminal, entry.value_ptr.*, image, self.font.cell_width, self.font.cell_height) orelse continue;
+        if (!viewport.visible) continue;
         try placements.append(self.alloc, .{
-            .key = entry.key_ptr.*,
-            .placement = entry.value_ptr.*,
+            .image_id = entry.key_ptr.image_id,
+            .placement_id = entry.key_ptr.placement_id.id,
+            .z = entry.value_ptr.z,
             .image = image,
+            .viewport = viewport,
         });
     }
 
+    if (layer.matches(-1)) {
+        try self.collectKittyVirtualPlacements(terminal, &placements);
+    }
+
     std.mem.sortUnstable(KittyRenderItem, placements.items, {}, kittyRenderItemLessThan);
-    for (placements.items) |item| try self.renderKittyPlacement(
-        terminal,
-        pixels,
-        width,
-        height,
-        item.placement,
-        item.image,
-    );
+    for (placements.items) |item| try self.renderKittyPlacement(pixels, width, height, item.image, item.viewport);
 }
 
 const KittyGraphicsLayer = enum {
@@ -246,30 +246,28 @@ const KittyGraphicsLayer = enum {
 };
 
 const KittyRenderItem = struct {
-    key: KittyPlacementKey,
-    placement: KittyPlacement,
+    image_id: u32,
+    placement_id: u32,
+    z: i32,
     image: KittyImage,
+    viewport: KittyPlacementViewport,
 };
 
 fn kittyRenderItemLessThan(_: void, lhs: KittyRenderItem, rhs: KittyRenderItem) bool {
-    if (lhs.placement.z != rhs.placement.z) return lhs.placement.z < rhs.placement.z;
-    if (lhs.key.image_id != rhs.key.image_id) return lhs.key.image_id < rhs.key.image_id;
-    return lhs.key.placement_id.id < rhs.key.placement_id.id;
+    if (lhs.z != rhs.z) return lhs.z < rhs.z;
+    if (lhs.image_id != rhs.image_id) return lhs.image_id < rhs.image_id;
+    return lhs.placement_id < rhs.placement_id;
 }
 
 fn renderKittyPlacement(
     self: *Renderer,
-    terminal: *const vt.Terminal,
     pixels: []u32,
     width: u31,
     height: u31,
-    placement: KittyPlacement,
     image: KittyImage,
+    viewport: KittyPlacementViewport,
 ) !void {
     if (image.width == 0 or image.height == 0 or image.data.len == 0) return;
-
-    const viewport = kittyPlacementViewport(terminal, placement, image, self.font.cell_width, self.font.cell_height) orelse return;
-    if (!viewport.visible) return;
 
     const dest_width = viewport.pixel_width;
     const dest_height = viewport.pixel_height;
@@ -288,9 +286,9 @@ fn renderKittyPlacement(
     try resizeRgba(source, source_width, source_height, scaled, dest_width, dest_height);
 
     const dest_x = viewport.viewport_col * @as(i32, @intCast(self.font.cell_width)) +
-        @as(i32, @intCast(placement.x_offset));
+        @as(i32, @intCast(viewport.offset_x));
     const dest_y = viewport.viewport_row * @as(i32, @intCast(self.font.cell_height)) +
-        @as(i32, @intCast(placement.y_offset));
+        @as(i32, @intCast(viewport.offset_y));
     blendRgba(pixels, width, height, scaled, dest_width, dest_height, dest_x, dest_y);
 }
 
@@ -298,6 +296,8 @@ const KittyPlacementViewport = struct {
     viewport_col: i32,
     viewport_row: i32,
     visible: bool,
+    offset_x: u32,
+    offset_y: u32,
     pixel_width: u32,
     pixel_height: u32,
     source_x: u32,
@@ -337,12 +337,69 @@ fn kittyPlacementViewport(
         .viewport_col = viewport_col,
         .viewport_row = viewport_row,
         .visible = visible,
+        .offset_x = placement.x_offset,
+        .offset_y = placement.y_offset,
         .pixel_width = pixel_size.width,
         .pixel_height = pixel_size.height,
         .source_x = source_x,
         .source_y = source_y,
         .source_width = @min(if (placement.source_width > 0) placement.source_width else image.width, image.width - source_x),
         .source_height = @min(if (placement.source_height > 0) placement.source_height else image.height, image.height - source_y),
+    };
+}
+
+fn collectKittyVirtualPlacements(
+    self: *Renderer,
+    terminal: *const vt.Terminal,
+    placements: *std.ArrayList(KittyRenderItem),
+) !void {
+    const storage = &terminal.screens.active.kitty_images;
+    const top = terminal.screens.active.pages.getTopLeft(.viewport);
+    const bot = terminal.screens.active.pages.getBottomRight(.viewport) orelse return;
+
+    var it = vt.kitty.graphics.unicode.placementIterator(top, bot);
+    while (it.next()) |virtual_placement| {
+        const image = storage.imageById(virtual_placement.image_id) orelse continue;
+        const render_placement = virtual_placement.renderPlacement(
+            storage,
+            &image,
+            self.font.cell_width,
+            self.font.cell_height,
+        ) catch |err| {
+            log.warn("error rendering kitty virtual placement: {}", .{err});
+            continue;
+        };
+        const viewport = kittyVirtualPlacementViewport(terminal, render_placement) orelse continue;
+        if (!viewport.visible) continue;
+        try placements.append(self.alloc, .{
+            .image_id = virtual_placement.image_id,
+            .placement_id = virtual_placement.placement_id,
+            .z = -1,
+            .image = image,
+            .viewport = viewport,
+        });
+    }
+}
+
+fn kittyVirtualPlacementViewport(
+    terminal: *const vt.Terminal,
+    placement: KittyRenderPlacement,
+) ?KittyPlacementViewport {
+    const viewport = terminal.screens.active.pages.pointFromPin(.viewport, placement.top_left) orelse return null;
+    const source_x = @min(placement.source_x, std.math.maxInt(u32));
+    const source_y = @min(placement.source_y, std.math.maxInt(u32));
+    return .{
+        .viewport_col = @intCast(viewport.viewport.x),
+        .viewport_row = @intCast(viewport.viewport.y),
+        .visible = placement.dest_width > 0 and placement.dest_height > 0,
+        .offset_x = placement.offset_x,
+        .offset_y = placement.offset_y,
+        .pixel_width = placement.dest_width,
+        .pixel_height = placement.dest_height,
+        .source_x = source_x,
+        .source_y = source_y,
+        .source_width = placement.source_width,
+        .source_height = placement.source_height,
     };
 }
 
@@ -577,7 +634,7 @@ fn prepareRow(
                 else => break :face 0,
             }
             const cp = raws[x].content.codepoint.data;
-            if (cp == 0 or cp == ' ') break :face 0;
+            if (cp == 0 or cp == ' ' or cp == kitty_placeholder) break :face 0;
             break :face self.font.faceForCodepointStyle(
                 self.alloc,
                 cp,
@@ -657,7 +714,8 @@ fn renderRowForeground(
     var x: u31 = 0;
     while (x < cols) : (x += 1) {
         const has_text = switch (raws[x].content_tag) {
-            .codepoint, .codepoint_grapheme => raws[x].content.codepoint.data != 0,
+            .codepoint, .codepoint_grapheme => raws[x].content.codepoint.data != 0 and
+                raws[x].content.codepoint.data != kitty_placeholder,
             else => false,
         };
         const breaks_run = !has_text or
@@ -1235,6 +1293,44 @@ test "render kitty image placement" {
     var stream = term.vtStream();
     defer stream.deinit();
     stream.nextSlice("\x1b_Ga=T,t=d,f=24,i=1,s=1,v=1,c=1,r=1;////\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), term.screens.active.kitty_images.placements.count());
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 4;
+    const height: u31 = font.cell_height * 2;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    try renderer.renderWithKittyGraphics(&state, &term, pixels, width, height);
+
+    var white_pixels: usize = 0;
+    for (pixels) |px| {
+        if (px == 0xffffffff) white_pixels += 1;
+    }
+    try std.testing.expect(white_pixels > 0);
+}
+
+test "render kitty unicode placeholder placement" {
+    const alloc = std.testing.allocator;
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer term.deinit(alloc);
+    term.width_px = term.cols * font.cell_width;
+    term.height_px = term.rows * font.cell_height;
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b_Ga=T,t=d,f=24,i=1,s=1,v=1,U=1,c=1,r=1;////\x1b\\");
+    stream.nextSlice("\x1b[38:2::0:0:1m\xf4\x8e\xbb\xae\x1b[0m");
     try std.testing.expectEqual(@as(usize, 1), term.screens.active.kitty_images.placements.count());
 
     var state: vt.RenderState = .empty;

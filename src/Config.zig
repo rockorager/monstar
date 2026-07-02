@@ -6,9 +6,14 @@
 const Config = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 
 const log = std.log.scoped(.config);
+
+fn warn(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) log.warn(fmt, args);
+}
 
 font_family: [:0]const u8 = "monospace",
 /// Font size in logical pixels (scaled by the output's fractional scale).
@@ -53,18 +58,18 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Config {
         if (line.len == 0 or line[0] == '#') continue;
 
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            log.warn("line {d}: missing '=', ignoring: {s}", .{ line_no, line });
+            warn("line {d}: missing '=', ignoring: {s}", .{ line_no, line });
             continue;
         };
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
         if (value.len == 0) {
-            log.warn("line {d}: empty value for '{s}', ignoring", .{ line_no, key });
+            warn("line {d}: empty value for '{s}', ignoring", .{ line_no, key });
             continue;
         }
 
         config.set(arena, key, value) catch {
-            log.warn("line {d}: invalid value for '{s}': {s}", .{ line_no, key, value });
+            warn("line {d}: invalid value for '{s}': {s}", .{ line_no, key, value });
         };
     }
     return config;
@@ -102,7 +107,7 @@ fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []const 
         if (idx >= 16) return error.UnknownKey;
         self.palette[idx] = try parseColor(value);
     } else {
-        log.warn("unknown key '{s}', ignoring", .{key});
+        warn("unknown key '{s}', ignoring", .{key});
     }
 }
 
