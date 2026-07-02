@@ -229,17 +229,30 @@ const AppStreamHandler = struct {
             },
             .set_mode => {
                 if (value.mode == .report_color_scheme) self.app.sendColorSchemeReport();
+                if (value.mode == .in_band_size_reports) {
+                    self.app.in_band_reports = true;
+                    self.app.sendSizeReport();
+                }
                 self.app.syncCursorShape();
             },
             .restore_mode => {
                 if (value.mode == .report_color_scheme and self.app.term.modes.get(.report_color_scheme)) {
                     self.app.sendColorSchemeReport();
                 }
+                if (value.mode == .in_band_size_reports) {
+                    const enabled = self.app.term.modes.get(.in_band_size_reports);
+                    self.app.in_band_reports = enabled;
+                    if (enabled) self.app.sendSizeReport();
+                }
                 self.app.syncCursorShape();
             },
-            .reset_mode => self.app.syncCursorShape(),
+            .reset_mode => {
+                if (value.mode == .in_band_size_reports) self.app.in_band_reports = false;
+                self.app.syncCursorShape();
+            },
             .full_reset => {
                 self.app.mouse_shape_explicit = false;
+                self.app.in_band_reports = false;
                 self.app.syncCursorShape();
             },
             else => {},
@@ -1538,8 +1551,9 @@ fn resumePty(self: *App) void {
 /// resize while it stays enabled. Neovim relies on these instead of
 /// SIGWINCH once DECRQM confirms support.
 ///
-/// Detected by edge-triggering on the mode value after each PTY chunk,
-/// so re-enabling an already-enabled mode sends no duplicate report.
+/// Mode actions send the immediate report, including when an application
+/// re-enables an already-enabled mode. This end-of-chunk sync is a
+/// fallback for any state changes that do not pass through AppStreamHandler.
 fn syncInBandSizeReports(self: *App) void {
     const enabled = self.term.modes.get(.in_band_size_reports);
     if (enabled and !self.in_band_reports) self.sendSizeReport();
