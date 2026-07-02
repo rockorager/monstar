@@ -32,6 +32,8 @@ keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
 cursor_shape_manager: ?*wp.CursorShapeManagerV1,
 cursor_shape_device: ?*wp.CursorShapeDeviceV1,
+cursor_shape: CursorShape,
+pointer_enter_serial: ?u32,
 /// Clipboard: managers create sources (copy); devices carry offers
 /// (paste) and set selections. Null when the compositor lacks them.
 data_manager: ?*wl.DataDeviceManager,
@@ -80,6 +82,8 @@ pub const KeyboardFn = *const fn (ctx: *anyopaque, event: wl.Keyboard.Event) voi
 
 /// Raw wl_pointer events, forwarded as-is.
 pub const PointerFn = *const fn (ctx: *anyopaque, event: wl.Pointer.Event) void;
+
+pub const CursorShape = wp.CursorShapeDeviceV1.Shape;
 
 /// Called when the output scale changed, before the resize/draw that
 /// follows. `scale120` is the scale in 1/120ths (120 == 1.0).
@@ -173,6 +177,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .pointer = null,
         .cursor_shape_manager = globals.cursor_shape_manager,
         .cursor_shape_device = null,
+        .cursor_shape = .text,
+        .pointer_enter_serial = null,
         .data_manager = globals.data_manager,
         .data_device = data_device,
         .primary_manager = globals.primary_manager,
@@ -265,6 +271,18 @@ pub fn setCallbacks(
     self.keyboard_fn = keyboard_fn;
     self.pointer_fn = pointer_fn;
     self.scale_fn = scale_fn;
+}
+
+pub fn setCursorShape(self: *Window, shape: CursorShape) void {
+    if (self.cursor_shape == shape) return;
+    self.cursor_shape = shape;
+    self.applyCursorShape();
+}
+
+fn applyCursorShape(self: *Window) void {
+    const serial = self.pointer_enter_serial orelse return;
+    const device = self.cursor_shape_device orelse return;
+    device.setShape(serial, self.cursor_shape);
 }
 
 /// Convert a logical dimension to physical pixels (rounded).
@@ -421,9 +439,11 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
 fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *Window) void {
     // The cursor image is undefined on enter until the client sets one.
     switch (event) {
-        .enter => |enter| if (self.cursor_shape_device) |device| {
-            device.setShape(enter.serial, .text);
+        .enter => |enter| {
+            self.pointer_enter_serial = enter.serial;
+            self.applyCursorShape();
         },
+        .leave => self.pointer_enter_serial = null,
         else => {},
     }
     if (self.pointer_fn) |pointer_fn| pointer_fn(self.render_ctx.?, event);

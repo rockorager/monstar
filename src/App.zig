@@ -84,6 +84,9 @@ selecting: bool,
 selection_gesture: vt.SelectionGesture,
 /// Button press currently owned by application mouse reporting.
 mouse_button: ?vt.input.MouseButton,
+/// True after OSC 22 explicitly set the pointer shape; otherwise mouse
+/// reporting uses an arrow and normal terminal selection uses I-beam.
+mouse_shape_explicit: bool,
 /// Active screen at the last check, to detect alt screen switches.
 active_screen: vt.ScreenSet.Key,
 /// Serial of the most recent input event, required to claim selections.
@@ -143,6 +146,14 @@ const AppStreamHandler = struct {
         self.terminal_handler.vt(action, value);
         switch (action) {
             .color_operation => self.app.answerOscColorQueries(&value.requests, value.terminator),
+            .mouse_shape => {
+                self.app.mouse_shape_explicit = true;
+                self.app.syncCursorShape();
+            },
+            .set_mode, .reset_mode, .restore_mode, .full_reset => {
+                if (action == .full_reset) self.app.mouse_shape_explicit = false;
+                self.app.syncCursorShape();
+            },
             else => {},
         }
     }
@@ -262,6 +273,7 @@ pub fn init(
         .selecting = false,
         .selection_gesture = .init,
         .mouse_button = null,
+        .mouse_shape_explicit = false,
         .active_screen = .primary,
         .last_serial = 0,
         .clip_offer = null,
@@ -683,6 +695,54 @@ fn effectiveForeground(self: *const App) vt.color.RGB {
 
 fn effectiveBackground(self: *const App) vt.color.RGB {
     return self.term.colors.background.get() orelse self.term.colors.palette.current[0];
+}
+
+fn syncCursorShape(self: *App) void {
+    self.window.setCursorShape(self.currentCursorShape());
+}
+
+fn currentCursorShape(self: *const App) Window.CursorShape {
+    if (self.mouse_shape_explicit) return cursorShapeFromMouseShape(self.term.mouse_shape);
+    return if (self.term.flags.mouse_event != .none) .default else .text;
+}
+
+fn cursorShapeFromMouseShape(shape: vt.MouseShape) Window.CursorShape {
+    return switch (shape) {
+        .default => .default,
+        .context_menu => .context_menu,
+        .help => .help,
+        .pointer => .pointer,
+        .progress => .progress,
+        .wait => .wait,
+        .cell => .cell,
+        .crosshair => .crosshair,
+        .text => .text,
+        .vertical_text => .vertical_text,
+        .alias => .alias,
+        .copy => .copy,
+        .move => .move,
+        .no_drop => .no_drop,
+        .not_allowed => .not_allowed,
+        .grab => .grab,
+        .grabbing => .grabbing,
+        .all_scroll => .all_scroll,
+        .col_resize => .col_resize,
+        .row_resize => .row_resize,
+        .n_resize => .n_resize,
+        .e_resize => .e_resize,
+        .s_resize => .s_resize,
+        .w_resize => .w_resize,
+        .ne_resize => .ne_resize,
+        .nw_resize => .nw_resize,
+        .se_resize => .se_resize,
+        .sw_resize => .sw_resize,
+        .ew_resize => .ew_resize,
+        .ns_resize => .ns_resize,
+        .nesw_resize => .nesw_resize,
+        .nwse_resize => .nwse_resize,
+        .zoom_in => .zoom_in,
+        .zoom_out => .zoom_out,
+    };
 }
 
 test "OSC color reports use 16-bit rgb format" {
