@@ -62,6 +62,7 @@ fatal_error: ?anyerror,
 /// compositor. `redraw()` queues instead.
 frame_pending: bool,
 redraw_queued: bool,
+suspended: bool,
 render_ctx: ?*anyopaque,
 render_fn: ?RenderFn,
 resize_fn: ?ResizeFn,
@@ -202,6 +203,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .fatal_error = null,
         .frame_pending = false,
         .redraw_queued = false,
+        .suspended = false,
         .render_ctx = null,
         .render_fn = null,
         .resize_fn = null,
@@ -295,6 +297,10 @@ fn physical(self: *const Window, logical: u31) u31 {
 pub fn redraw(self: *Window) !void {
     // Not configured yet; the first configure triggers the first draw.
     if (self.width == 0) return;
+    if (self.suspended) {
+        self.redraw_queued = true;
+        return;
+    }
     if (self.frame_pending) {
         self.redraw_queued = true;
         return;
@@ -335,6 +341,7 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
             frame_cb.destroy();
             self.frame_pending = false;
             if (self.redraw_queued) {
+                if (self.suspended) return;
                 self.redraw_queued = false;
                 self.draw() catch |err| {
                     log.err("draw failed: {}", .{err});
@@ -375,9 +382,9 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
             } else if (std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
                 globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
-                globals.wm_base = registry.bind(global.name, xdg.WmBase, 2) catch return;
+                globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, 6)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
-                globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 5)) catch return;
+                globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
                 globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
@@ -498,6 +505,10 @@ fn geometryChanged(self: *Window, resized: bool) void {
             };
         }
     }
+    if (self.suspended) {
+        self.redraw_queued = true;
+        return;
+    }
     self.draw() catch |err| {
         log.err("draw failed: {}", .{err});
         self.fatal_error = err;
@@ -535,9 +546,19 @@ fn toplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, self: *Window) 
             // Zero means "client decides"; keep the current size then.
             if (configure.width > 0) self.pending_width = @intCast(configure.width);
             if (configure.height > 0) self.pending_height = @intCast(configure.height);
+            self.suspended = toplevelState(configure.states, .suspended);
         },
         .close => self.running = false,
+        .configure_bounds, .wm_capabilities => {},
     }
+}
+
+fn toplevelState(states: anytype, needle: xdg.Toplevel.State) bool {
+    const raw_needle: u32 = @intCast(@intFromEnum(needle));
+    for (states.slice(u32)) |state| {
+        if (state == raw_needle) return true;
+    }
+    return false;
 }
 
 /// A wl_shm backed pixel buffer. `busy` is true while the compositor

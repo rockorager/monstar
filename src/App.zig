@@ -78,7 +78,10 @@ pointer_y: f64,
 /// Wheel state accumulated between pointer frame events.
 scroll_pixels: f64,
 scroll_clicks: i32,
+scroll_value120: i32,
+scroll_value120_remainder: i32,
 scroll_had_discrete: bool,
+scroll_had_value120: bool,
 /// True while the left button is down for terminal-side selection.
 selecting: bool,
 selection_gesture: vt.SelectionGesture,
@@ -269,7 +272,10 @@ pub fn init(
         .pointer_y = 0,
         .scroll_pixels = 0,
         .scroll_clicks = 0,
+        .scroll_value120 = 0,
+        .scroll_value120_remainder = 0,
         .scroll_had_discrete = false,
+        .scroll_had_value120 = false,
         .selecting = false,
         .selection_gesture = .init,
         .mouse_button = null,
@@ -870,7 +876,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             }
         },
         .axis => |axis| {
-            if (axis.axis == .vertical_scroll and !self.scroll_had_discrete) {
+            if (axis.axis == .vertical_scroll and !self.scroll_had_discrete and !self.scroll_had_value120) {
                 self.scroll_pixels += axis.value.toDouble();
             }
         },
@@ -878,6 +884,12 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             if (discrete.axis == .vertical_scroll) {
                 self.scroll_clicks += discrete.discrete;
                 self.scroll_had_discrete = true;
+            }
+        },
+        .axis_value120 => |axis| {
+            if (axis.axis == .vertical_scroll) {
+                self.scroll_value120 += axis.value120;
+                self.scroll_had_value120 = true;
             }
         },
         .frame => self.finishScrollFrame(),
@@ -1497,7 +1509,12 @@ fn finishPaste(self: *App) void {
 /// count fixed lines, smooth (touchpad) scroll counts cell heights.
 fn finishScrollFrame(self: *App) void {
     var lines: i32 = 0;
-    if (self.scroll_had_discrete) {
+    if (self.scroll_had_value120) {
+        const scaled = self.scroll_value120 * @as(i32, @intCast(self.config.wheel_scroll_lines)) +
+            self.scroll_value120_remainder;
+        lines = @divTrunc(scaled, 120);
+        self.scroll_value120_remainder = @rem(scaled, 120);
+    } else if (self.scroll_had_discrete) {
         lines = self.scroll_clicks * @as(i32, @intCast(self.config.wheel_scroll_lines));
     } else if (self.scroll_pixels != 0) {
         // Logical pixels per row: physical cell height descaled.
@@ -1507,8 +1524,11 @@ fn finishScrollFrame(self: *App) void {
         lines = @intFromFloat(whole);
         self.scroll_pixels -= whole * cell;
     }
+    if (self.scroll_had_value120 or self.scroll_had_discrete) self.scroll_pixels = 0;
     self.scroll_clicks = 0;
+    self.scroll_value120 = 0;
     self.scroll_had_discrete = false;
+    self.scroll_had_value120 = false;
     if (lines != 0) self.scrollLines(lines);
 }
 

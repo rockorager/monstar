@@ -15,8 +15,8 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
     scanner.generate("wl_compositor", 4);
     scanner.generate("wl_shm", 1);
-    scanner.generate("wl_seat", 5);
-    scanner.generate("xdg_wm_base", 2);
+    scanner.generate("wl_seat", 8);
+    scanner.generate("xdg_wm_base", 6);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 1);
