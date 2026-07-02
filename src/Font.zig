@@ -125,8 +125,13 @@ pub const Face = struct {
         alloc: std.mem.Allocator,
         index: u32,
         constraint_width: u2,
+        constrain_alpha: bool,
     ) Error!*const Glyph {
-        const key: GlyphKey = .{ .index = index, .constraint_width = constraint_width };
+        const key: GlyphKey = .{
+            .index = index,
+            .constraint_width = constraint_width,
+            .constrain_alpha = constrain_alpha,
+        };
         const gop = try self.glyphs.getOrPut(alloc, key);
         if (gop.found_existing) return gop.value_ptr;
         errdefer _ = self.glyphs.remove(key);
@@ -140,14 +145,17 @@ pub const Face = struct {
         const slot = self.ft_face.*.glyph;
         const bitmap = slot.*.bitmap;
         const rendered = switch (bitmap.pixel_mode) {
-            c.FT_PIXEL_MODE_GRAY => try copyGrayBitmap(alloc, bitmap),
+            c.FT_PIXEL_MODE_GRAY => try self.copyGrayBitmap(alloc, bitmap, constraint_width, constrain_alpha),
             c.FT_PIXEL_MODE_BGRA => try self.copyBgraBitmap(alloc, bitmap, constraint_width),
             else => return error.FontLoadFailed,
         };
         errdefer alloc.free(rendered.bitmap);
 
         const bearing_x, const bearing_y = switch (rendered.format) {
-            .alpha => .{
+            .alpha => if (rendered.constrained) .{
+                rendered.left,
+                @as(i32, @intCast(self.baseline)) - rendered.top,
+            } else .{
                 slot.*.bitmap_left,
                 slot.*.bitmap_top,
             },
@@ -166,6 +174,63 @@ pub const Face = struct {
             .bearing_y = bearing_y,
         };
         return gop.value_ptr;
+    }
+
+    fn copyGrayBitmap(
+        self: *const Face,
+        alloc: std.mem.Allocator,
+        bitmap: c.FT_Bitmap,
+        constraint_width: u2,
+        constrain_alpha: bool,
+    ) Error!RenderedBitmap {
+        const src_width: u31 = @intCast(bitmap.width);
+        const src_height: u31 = @intCast(bitmap.rows);
+        if (src_width == 0 or src_height == 0) {
+            return .{
+                .bitmap = try alloc.alloc(u8, 0),
+                .format = .alpha,
+                .width = 0,
+                .height = 0,
+            };
+        }
+
+        if (!constrain_alpha or constraint_width <= 1) {
+            const copy = try alloc.alloc(u8, @as(usize, src_width) * src_height);
+            errdefer alloc.free(copy);
+            try copyGrayRows(copy, bitmap, src_width, src_height);
+            return .{ .bitmap = copy, .format = .alpha, .width = src_width, .height = src_height };
+        }
+
+        const available_width = @as(u31, constraint_width) * self.cell_width;
+        const target_width = @as(f64, @floatFromInt(available_width)) -
+            @as(f64, @floatFromInt(self.cell_width)) * 0.05;
+        const target_height: f64 = @floatFromInt(self.cell_height);
+        const scale = @min(
+            target_width / @as(f64, @floatFromInt(src_width)),
+            target_height / @as(f64, @floatFromInt(src_height)),
+        );
+        const width: u31 = @max(1, @as(u31, @intFromFloat(@round(@as(f64, @floatFromInt(src_width)) * scale))));
+        const height: u31 = @max(1, @as(u31, @intFromFloat(@round(@as(f64, @floatFromInt(src_height)) * scale))));
+        const left: i32 = @intFromFloat(@round(
+            (@as(f64, @floatFromInt(available_width)) - @as(f64, @floatFromInt(width))) / 2,
+        ));
+        const top: i32 = @intFromFloat(@round(
+            (@as(f64, @floatFromInt(self.cell_height)) - @as(f64, @floatFromInt(height))) / 2,
+        ));
+
+        const copy = try alloc.alloc(u8, @as(usize, width) * height);
+        errdefer alloc.free(copy);
+        try resizeGrayWithStbir(alloc, copy, width, height, bitmap, src_width, src_height);
+
+        return .{
+            .bitmap = copy,
+            .format = .alpha,
+            .width = width,
+            .height = height,
+            .left = left,
+            .top = top,
+            .constrained = true,
+        };
     }
 
     fn copyBgraBitmap(
@@ -220,6 +285,7 @@ pub const Face = struct {
 const GlyphKey = struct {
     index: u32,
     constraint_width: u2,
+    constrain_alpha: bool,
 };
 
 const SpriteGlyphKey = struct {
@@ -242,6 +308,7 @@ const RenderedBitmap = struct {
     height: u31,
     left: i32 = 0,
     top: i32 = 0,
+    constrained: bool = false,
 };
 
 /// A rasterized glyph: either an 8-bit coverage bitmap or premultiplied
@@ -277,22 +344,51 @@ fn selectNearestStrike(ft_face: c.FT_Face, size_px: u31) bool {
     return c.FT_Select_Size(ft_face, best) == 0;
 }
 
-fn copyGrayBitmap(alloc: std.mem.Allocator, bitmap: c.FT_Bitmap) Error!RenderedBitmap {
-    const width: u31 = @intCast(bitmap.width);
-    const height: u31 = @intCast(bitmap.rows);
-    const copy = try alloc.alloc(u8, @as(usize, width) * height);
-    errdefer alloc.free(copy);
+fn copyGrayRows(dst: []u8, bitmap: c.FT_Bitmap, width: u31, height: u31) Error!void {
+    if (height == 0) return;
 
-    if (height > 0) {
-        const pitch: usize = @intCast(@abs(bitmap.pitch));
-        for (0..height) |y| {
-            const src_y = bitmapRow(bitmap, height, y);
-            const src = bitmap.buffer[src_y * pitch ..][0..width];
-            @memcpy(copy[y * width ..][0..width], src);
-        }
+    const pitch: usize = @intCast(@abs(bitmap.pitch));
+    for (0..height) |y| {
+        const src_y = bitmapRow(bitmap, height, y);
+        const src = bitmap.buffer[src_y * pitch ..][0..width];
+        @memcpy(dst[y * width ..][0..width], src);
     }
+}
 
-    return .{ .bitmap = copy, .format = .alpha, .width = width, .height = height };
+fn resizeGrayWithStbir(
+    alloc: std.mem.Allocator,
+    dst: []u8,
+    dst_width: u31,
+    dst_height: u31,
+    bitmap: c.FT_Bitmap,
+    src_width: u31,
+    src_height: u31,
+) Error!void {
+    if (dst_height == 0) return;
+
+    const pitch: usize = @intCast(@abs(bitmap.pitch));
+    const src, const src_pitch = src: {
+        if (bitmap.pitch >= 0) break :src .{ bitmap.buffer, pitch };
+
+        const packed_pitch = @as(usize, src_width);
+        const packed_buf = try alloc.alloc(u8, packed_pitch * src_height);
+        errdefer alloc.free(packed_buf);
+        try copyGrayRows(packed_buf, bitmap, src_width, src_height);
+        break :src .{ packed_buf.ptr, packed_pitch };
+    };
+    defer if (bitmap.pitch < 0) alloc.free(src[0 .. src_pitch * src_height]);
+
+    if (c.stbir_resize_uint8(
+        src,
+        @intCast(src_width),
+        @intCast(src_height),
+        @intCast(src_pitch),
+        dst.ptr,
+        @intCast(dst_width),
+        @intCast(dst_height),
+        @intCast(dst_width),
+        1,
+    ) == 0) return error.GlyphResizeFailed;
 }
 
 fn resizeBgraWithStbir(
@@ -657,10 +753,10 @@ test "load monospace font and rasterize a glyph" {
     const primary = font.face(0);
     const idx = c.FT_Get_Char_Index(primary.ft_face, 'A');
     try std.testing.expect(idx != 0);
-    const g = try primary.glyph(alloc, idx, 1);
+    const g = try primary.glyph(alloc, idx, 1, false);
     try std.testing.expect(g.width > 0 and g.height > 0);
     // Cached: same pointer on second lookup.
-    try std.testing.expectEqual(g, try primary.glyph(alloc, idx, 1));
+    try std.testing.expectEqual(g, try primary.glyph(alloc, idx, 1, false));
 }
 
 test "embedded symbols face serves nerd font codepoints" {
@@ -679,9 +775,29 @@ test "embedded symbols face serves nerd font codepoints" {
             alloc,
             c.FT_Get_Char_Index(font.face(embedded).ft_face, cp),
             1,
+            false,
         );
         try std.testing.expect(g.width > 0 and g.height > 0);
     }
+}
+
+test "alpha symbols honor double-cell constraints" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    const embedded = font.embedded_face orelse return error.SkipZigTest;
+    const glyph_face = font.face(embedded);
+    const glyph_index = c.FT_Get_Char_Index(glyph_face.ft_face, 0xF07B); // nf-fa-folder
+    try std.testing.expect(glyph_index != 0);
+
+    const narrow = try glyph_face.glyph(alloc, glyph_index, 1, false);
+    const wide = try glyph_face.glyph(alloc, glyph_index, 2, true);
+    try std.testing.expectEqual(GlyphFormat.alpha, narrow.format);
+    try std.testing.expectEqual(GlyphFormat.alpha, wide.format);
+    try std.testing.expect(wide.width <= font.cell_width * 2);
+    try std.testing.expect(wide.height <= font.cell_height);
+    try std.testing.expect(wide.width > narrow.width or wide.height > narrow.height);
 }
 
 test "fallback face for a codepoint the primary lacks" {
@@ -718,7 +834,7 @@ test "color emoji fallback rasterizes as scaled BGRA" {
     const fallback = font.face(idx);
     const glyph_index = c.FT_Get_Char_Index(fallback.ft_face, cp);
     try std.testing.expect(glyph_index != 0);
-    const g = try fallback.glyph(alloc, glyph_index, 2);
+    const g = try fallback.glyph(alloc, glyph_index, 2, false);
     try std.testing.expectEqual(GlyphFormat.bgra, g.format);
     try std.testing.expect(g.width <= font.cell_width * 2);
     try std.testing.expect(g.height <= font.cell_height);
