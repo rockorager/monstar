@@ -292,7 +292,8 @@ fn drawRun(
             if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
             const cp = raw.content.codepoint.data;
             if (cp == 0) continue;
-            const g = try font.spriteGlyph(self.alloc, cp);
+            const cell_span: u2 = @intCast(@min(cellSpan(raw), 2));
+            const g = try font.spriteGlyph(self.alloc, cp, cell_span);
             blitGlyph(
                 pixels,
                 width,

@@ -144,9 +144,11 @@ pub fn render(
     cp: u21,
     metrics: Metrics,
     baseline: u31,
+    cell_span: u2,
 ) !Glyph {
+    std.debug.assert(cell_span >= 1);
     const draw = getDrawFn(cp) orelse unreachable; // covers() gates this
-    return renderWith(alloc, draw, cp, metrics, baseline);
+    return renderWith(alloc, draw, cp, metrics, baseline, cell_span);
 }
 
 /// Render a text decoration sprite.
@@ -163,6 +165,7 @@ pub fn renderDecoration(
             0,
             metrics,
             baseline,
+            1,
         ),
     };
 }
@@ -173,19 +176,22 @@ fn renderWith(
     cp: u21,
     metrics: Metrics,
     baseline: u31,
+    cell_span: u2,
 ) !Glyph {
+    var draw_metrics = metrics;
+    draw_metrics.cell_width *= cell_span;
     const pad_x = metrics.cell_width / 4;
     const pad_y = metrics.cell_height / 4;
     var canvas: canvas_mod.Canvas = try .init(
         alloc,
-        metrics.cell_width,
+        draw_metrics.cell_width,
         metrics.cell_height,
         pad_x,
         pad_y,
     );
     defer canvas.deinit();
 
-    try draw(cp, &canvas, metrics.cell_width, metrics.cell_height, metrics);
+    try draw(cp, &canvas, draw_metrics.cell_width, metrics.cell_height, draw_metrics);
 
     const bitmap = try canvas.toBitmap(alloc);
     // Bitmap top relative to the cell top: clip_top - pad_y.
@@ -227,7 +233,7 @@ test "render box drawing sprites" {
 
     // Horizontal line: full cell width, thin, vertically centered.
     {
-        const g = try render(alloc, 0x2500, test_metrics, 15);
+        const g = try render(alloc, 0x2500, test_metrics, 15, 1);
         defer alloc.free(g.bitmap);
         try std.testing.expectEqual(@as(u31, 10), g.width);
         try std.testing.expect(g.height < 5);
@@ -236,9 +242,20 @@ test "render box drawing sprites" {
         try std.testing.expect(sum > 0);
     }
 
+    // Wide variants use the occupied cell span while preserving vertical metrics.
+    {
+        const g = try render(alloc, 0x2500, test_metrics, 15, 2);
+        defer alloc.free(g.bitmap);
+        try std.testing.expectEqual(@as(u31, 20), g.width);
+        try std.testing.expect(g.height < 5);
+        var sum: usize = 0;
+        for (g.bitmap) |px| sum += px;
+        try std.testing.expect(sum > 0);
+    }
+
     // Full block: covers the whole cell exactly.
     {
-        const g = try render(alloc, 0x2588, test_metrics, 15);
+        const g = try render(alloc, 0x2588, test_metrics, 15, 1);
         defer alloc.free(g.bitmap);
         try std.testing.expectEqual(@as(u31, 10), g.width);
         try std.testing.expectEqual(@as(u31, 20), g.height);
@@ -249,7 +266,7 @@ test "render box drawing sprites" {
 
     // Rounded corner: uses the z2d path rasterizer.
     {
-        const g = try render(alloc, 0x256D, test_metrics, 15); // ╭
+        const g = try render(alloc, 0x256D, test_metrics, 15, 1); // ╭
         defer alloc.free(g.bitmap);
         var sum: usize = 0;
         for (g.bitmap) |px| sum += px;

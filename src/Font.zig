@@ -37,9 +37,9 @@ sort_faces: std.AutoHashMapUnmanaged(u32, u16),
 codepoint_faces: std.AutoHashMapUnmanaged(u21, u16),
 /// faces index of the embedded symbols face, if it loaded.
 embedded_face: ?u16,
-/// Procedural sprite glyphs, keyed by codepoint (metrics are fixed
-/// per Font instance, so no size key is needed).
-sprite_glyphs: std.AutoHashMapUnmanaged(u21, Glyph),
+/// Procedural sprite glyphs, keyed by codepoint and occupied cell span
+/// (metrics are fixed per Font instance, so no size key is needed).
+sprite_glyphs: std.AutoHashMapUnmanaged(SpriteGlyphKey, Glyph),
 /// Text decoration sprites (underline styles, strikethrough, overline).
 decoration_glyphs: std.AutoHashMapUnmanaged(sprite.Decoration, Glyph),
 sprite_metrics: sprite.Metrics,
@@ -220,6 +220,11 @@ pub const Face = struct {
 const GlyphKey = struct {
     index: u32,
     constraint_width: u2,
+};
+
+const SpriteGlyphKey = struct {
+    cp: u21,
+    cell_span: u2,
 };
 
 const GlyphMetrics = struct {
@@ -495,12 +500,19 @@ pub fn face(self: *Font, index: u16) *Face {
 }
 
 /// Rasterize (or fetch from cache) the sprite glyph for `cp`.
-pub fn spriteGlyph(self: *Font, alloc: std.mem.Allocator, cp: u21) !*const Glyph {
-    const gop = try self.sprite_glyphs.getOrPut(alloc, cp);
+pub fn spriteGlyph(
+    self: *Font,
+    alloc: std.mem.Allocator,
+    cp: u21,
+    cell_span: u2,
+) !*const Glyph {
+    std.debug.assert(cell_span >= 1);
+    const key: SpriteGlyphKey = .{ .cp = cp, .cell_span = cell_span };
+    const gop = try self.sprite_glyphs.getOrPut(alloc, key);
     if (gop.found_existing) return gop.value_ptr;
-    errdefer _ = self.sprite_glyphs.remove(cp);
+    errdefer _ = self.sprite_glyphs.remove(key);
 
-    const g = try sprite.render(alloc, cp, self.sprite_metrics, self.baseline);
+    const g = try sprite.render(alloc, cp, self.sprite_metrics, self.baseline, cell_span);
     gop.value_ptr.* = .{
         .bitmap = g.bitmap,
         .width = g.width,
