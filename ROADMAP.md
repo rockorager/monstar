@@ -2,13 +2,14 @@
 
 Rough priority order. Items link to reference implementations where useful.
 
-## Selection and clipboard
+## Selection and clipboard polish
 
-Mouse-drag selection over the grid, rendered via ghostty-vt's
-`Selection`/`RenderState.Row.selection`, with copy to clipboard
-(`wl_data_device`) and primary selection
-(`zwp_primary_selection_device_manager_v1`). Middle-click paste; paste
-goes through `vt.input.encodePaste` (bracketed paste, safety checks).
+Basic drag selection, clipboard, and primary selection are done.
+Remaining: double/triple-click word/line selection (ghostty-vt's
+`selectWord`/`selectLine`), auto-scroll when dragging past the window
+edge, mime negotiation from the offer's advertised types instead of
+requesting blindly, and clearing the selection when the screen
+content under it changes.
 
 ## Custom drawing for box-drawing and friends
 
