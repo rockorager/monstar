@@ -38,9 +38,16 @@ pub fn open(size: posix.winsize) Error!Pty {
 }
 
 pub fn deinit(self: *Pty) void {
-    _ = linux.close(self.master);
+    self.closeMaster();
     if (self.slave >= 0) _ = linux.close(self.slave);
     self.* = undefined;
+}
+
+pub fn closeMaster(self: *Pty) void {
+    if (self.master >= 0) {
+        _ = linux.close(self.master);
+        self.master = -1;
+    }
 }
 
 /// Fork and exec `path` with the slave side as the child's controlling

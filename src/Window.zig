@@ -52,6 +52,7 @@ pending_height: u31,
 /// Buffers are sized in physical pixels: logical * scale120 / 120.
 scale120: u32,
 running: bool,
+fatal_error: ?anyerror,
 /// A frame callback is outstanding; drawing now would outpace the
 /// compositor. `redraw()` queues instead.
 frame_pending: bool,
@@ -176,6 +177,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .pending_height = default_height,
         .scale120 = 120,
         .running = true,
+        .fatal_error = null,
         .frame_pending = false,
         .redraw_queued = false,
         .render_ctx = null,
@@ -299,6 +301,7 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
                 self.redraw_queued = false;
                 self.draw() catch |err| {
                     log.err("draw failed: {}", .{err});
+                    self.fatal_error = err;
                     self.running = false;
                 };
             }
@@ -438,6 +441,7 @@ fn geometryChanged(self: *Window, resized: bool) void {
                 self.physical(self.height),
             ) catch |err| {
                 log.err("resize handler failed: {}", .{err});
+                self.fatal_error = err;
                 self.running = false;
                 return;
             };
@@ -445,6 +449,7 @@ fn geometryChanged(self: *Window, resized: bool) void {
     }
     self.draw() catch |err| {
         log.err("draw failed: {}", .{err});
+        self.fatal_error = err;
         self.running = false;
     };
 }
@@ -462,6 +467,7 @@ fn fractionalScaleListener(
             if (self.scale_fn) |scale_fn| {
                 scale_fn(self.render_ctx.?, self.scale120) catch |err| {
                     log.err("scale handler failed: {}", .{err});
+                    self.fatal_error = err;
                     self.running = false;
                     return;
                 };

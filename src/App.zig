@@ -77,13 +77,17 @@ scroll_had_discrete: bool,
 /// True while the left button is down for terminal-side selection.
 selecting: bool,
 selection_gesture: vt.SelectionGesture,
+/// Button press currently owned by application mouse reporting.
+mouse_button: ?vt.input.MouseButton,
 /// Active screen at the last check, to detect alt screen switches.
 active_screen: vt.ScreenSet.Key,
 /// Serial of the most recent input event, required to claim selections.
 last_serial: u32,
 /// Current clipboard/primary offers from other clients (paste sources).
-clip_offer: ?*wl.DataOffer,
-primary_offer: ?*zwp.PrimarySelectionOfferV1,
+clip_offer: ?*ClipboardOffer,
+clip_pending_offer: ?*ClipboardOffer,
+primary_offer: ?*PrimaryOffer,
+primary_pending_offer: ?*PrimaryOffer,
 /// Our own outgoing selection sources, so exit can reclaim them if the
 /// compositor never cancels them (nobody else took the selection).
 clip_source: ?*SourceCtx,
@@ -93,6 +97,13 @@ paste_fd: posix.fd_t,
 paste_buf: std.ArrayList(u8),
 
 const paste_mime = "text/plain;charset=utf-8";
+const paste_mime_preference = [_][:0]const u8{
+    paste_mime,
+    "text/plain",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+};
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
     '│',
@@ -218,10 +229,13 @@ pub fn init(
         .scroll_had_discrete = false,
         .selecting = false,
         .selection_gesture = .init,
+        .mouse_button = null,
         .active_screen = .primary,
         .last_serial = 0,
         .clip_offer = null,
+        .clip_pending_offer = null,
         .primary_offer = null,
+        .primary_pending_offer = null,
         .clip_source = null,
         .primary_source = null,
         .paste_fd = -1,
@@ -332,12 +346,16 @@ fn setNonblocking(fd: posix.fd_t) void {
 }
 
 pub fn deinit(self: *App) void {
+    self.hangupChild();
+    self.pty.deinit();
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
+    if (self.clip_pending_offer) |offer| offer.destroy();
     if (self.primary_offer) |offer| offer.destroy();
+    if (self.primary_pending_offer) |offer| offer.destroy();
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
@@ -351,13 +369,14 @@ pub fn deinit(self: *App) void {
     self.render_state.deinit(self.alloc);
     self.stream.deinit();
     self.term.deinit(self.alloc);
-    self.pty.deinit();
     self.font.deinit(self.alloc);
     self.alloc.destroy(self);
 }
 
 /// Run until the window is closed or the child exits.
 pub fn run(self: *App) !void {
+    errdefer self.hangupChild();
+
     const display = self.window.display;
     var fds = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
@@ -378,29 +397,22 @@ pub fn run(self: *App) !void {
     const selection_autoscroll_fd = &fds[6];
 
     while (self.window.running and !self.child_exited) {
+        wl_fd.events = posix.POLL.IN;
+
         // Standard libwayland read dance: drain the local queue, flush
         // requests, then sleep until one of the fds is ready.
         while (!display.prepareRead()) {
             if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
         }
-        flush: while (true) {
-            switch (display.flush()) {
-                .SUCCESS => break :flush,
-                // Socket full: wait until the compositor drains it.
-                .AGAIN => {
-                    var out_fd = [_]posix.pollfd{
-                        .{ .fd = display.getFd(), .events = posix.POLL.OUT, .revents = 0 },
-                    };
-                    _ = posix.poll(&out_fd, -1) catch {
-                        display.cancelRead();
-                        return error.FlushFailed;
-                    };
-                },
-                else => {
-                    display.cancelRead();
-                    return error.FlushFailed;
-                },
-            }
+        switch (display.flush()) {
+            .SUCCESS => {},
+            // Socket full: wait for writability in the main poll set so
+            // PTY output still drains while the compositor catches up.
+            .AGAIN => wl_fd.events |= posix.POLL.OUT,
+            else => {
+                display.cancelRead();
+                return error.FlushFailed;
+            },
         }
 
         // Only ask for writability while a backlog exists, otherwise
@@ -415,9 +427,9 @@ pub fn run(self: *App) !void {
         pty_fd.fd = if (self.pty_suspended) -1 else self.pty.master;
         const timeout: i32 = if (self.pty_suspended) 100 else -1;
 
-        const ready = posix.poll(&fds, timeout) catch |err| {
+        const ready = posix.poll(&fds, timeout) catch {
             display.cancelRead();
-            return err;
+            return error.PollFailed;
         };
         _ = ready;
 
@@ -458,21 +470,33 @@ pub fn run(self: *App) !void {
         }
 
         if (self.needs_redraw) {
-            if (self.term.modes.get(.synchronized_output)) continue;
-            self.needs_redraw = false;
-            try self.window.redraw();
+            if (!self.term.modes.get(.synchronized_output)) {
+                self.needs_redraw = false;
+                try self.window.redraw();
+            }
         }
     }
 
-    // Window closed while the child is alive: hang it up like a real
-    // terminal whose master side went away, then reap. The child is
-    // its own session leader (setsid in spawn), so it owns SIGHUP
-    // delivery to its jobs. An exited child was already reaped by
-    // drainSigchld.
-    if (!self.child_exited) {
-        _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
-        _ = Pty.wait(self.child_pid) catch {};
+    if (self.window.fatal_error != null) {
+        self.hangupChild();
+        return error.WindowFatal;
     }
+
+    // Window closed while the child is alive: hang it up like a real
+    // terminal whose master side went away. Do not synchronously wait
+    // here: shells can wait on foreground jobs that still hold the
+    // slave side open, which would wedge the terminal process.
+    if (!self.child_exited) {
+        self.hangupChild();
+    }
+}
+
+fn hangupChild(self: *App) void {
+    if (self.child_exited) {
+        return;
+    }
+    self.pty.closeMaster();
+    _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
 }
 
 /// SIGCHLD arrived: reap the child if it actually exited. This is the
@@ -516,7 +540,6 @@ fn readPty(self: *App) void {
         self.resumePty();
         self.stream.nextSlice(buf[0..n]);
         self.needs_redraw = true;
-        if (n < buf.len) break;
     }
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
@@ -615,7 +638,16 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
-            if (self.selecting) self.extendSelection();
+            if (self.selecting) {
+                self.extendSelection();
+            } else if (self.mouse_button != null or self.reportingMouse()) {
+                self.sendMouseEvent(.{
+                    .action = .motion,
+                    .button = self.mouse_button,
+                    .mods = self.keyboard.currentMods(),
+                    .pos = self.pointerPosPhysical(),
+                });
+            }
         },
         .axis => |axis| {
             if (axis.axis == .vertical_scroll and !self.scroll_had_discrete) {
@@ -635,11 +667,12 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             // except that shift bypasses it for terminal-side selection.
             const reporting = self.term.flags.mouse_event != .none and
                 !self.keyboard.currentMods().shift;
+            const mouse_button = mouseButtonFromEvdev(button.button);
 
             if (button.button == 272) { // BTN_LEFT
                 switch (button.state) {
                     .pressed => if (reporting) {
-                        self.forwardMouseButton(button);
+                        self.forwardMouseButton(button, mouse_button.?);
                     } else {
                         self.startSelection(button.time);
                     },
@@ -649,16 +682,18 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                     // saw get their release.
                     .released => if (self.selecting) {
                         self.finishSelection();
+                    } else if (self.mouse_button == mouse_button) {
+                        self.forwardMouseButton(button, mouse_button.?);
                     } else if (reporting) {
-                        self.forwardMouseButton(button);
+                        self.forwardMouseButton(button, mouse_button.?);
                     },
                     else => {},
                 }
                 return;
             }
 
-            if (reporting) {
-                self.forwardMouseButton(button);
+            if (reporting and mouse_button != null) {
+                self.forwardMouseButton(button, mouse_button.?);
                 return;
             }
             if (button.button == 274 and button.state == .pressed) {
@@ -720,22 +755,31 @@ fn selectionTimestamp(ms: u32) std.Io.Timestamp {
     );
 }
 
-fn forwardMouseButton(self: *App, button: anytype) void {
-    const mouse_button: vt.input.MouseButton = switch (button.button) {
+fn mouseButtonFromEvdev(button: u32) ?vt.input.MouseButton {
+    return switch (button) {
         272 => .left, // BTN_LEFT
         273 => .right, // BTN_RIGHT
         274 => .middle, // BTN_MIDDLE
-        else => return,
+        else => null,
     };
+}
+
+fn reportingMouse(self: *App) bool {
+    return self.term.flags.mouse_event != .none and !self.keyboard.currentMods().shift;
+}
+
+fn forwardMouseButton(self: *App, button: anytype, mouse_button: vt.input.MouseButton) void {
     // Buttons owned by the application dismiss any terminal-side
     // selection; the application handles the event its own way.
     self.clearSelection();
+    if (button.state == .pressed) self.mouse_button = mouse_button;
     self.sendMouseEvent(.{
         .action = if (button.state == .pressed) .press else .release,
         .button = mouse_button,
         .mods = self.keyboard.currentMods(),
         .pos = self.pointerPosPhysical(),
     });
+    if (button.state == .released and self.mouse_button == mouse_button) self.mouse_button = null;
 }
 
 fn startSelection(self: *App, time_ms: u32) void {
@@ -863,6 +907,69 @@ fn syncActiveScreen(self: *App) void {
     self.cancelDrag();
 }
 
+const MimeMask = u32;
+
+fn mimeBit(mime_type: [*:0]const u8) ?MimeMask {
+    const offered = std.mem.span(mime_type);
+    inline for (paste_mime_preference, 0..) |candidate, i| {
+        if (std.mem.eql(u8, offered, candidate[0..candidate.len])) {
+            return @as(MimeMask, 1) << @intCast(i);
+        }
+    }
+    return null;
+}
+
+fn bestPasteMime(mask: MimeMask) ?[*:0]const u8 {
+    inline for (paste_mime_preference, 0..) |candidate, i| {
+        if (mask & (@as(MimeMask, 1) << @intCast(i)) != 0) return candidate.ptr;
+    }
+    return null;
+}
+
+const ClipboardOffer = struct {
+    app: *App,
+    offer: *wl.DataOffer,
+    mimes: MimeMask = 0,
+
+    fn noteMime(self: *ClipboardOffer, mime_type: [*:0]const u8) void {
+        if (mimeBit(mime_type)) |bit| self.mimes |= bit;
+    }
+
+    fn bestMime(self: *const ClipboardOffer) ?[*:0]const u8 {
+        return bestPasteMime(self.mimes);
+    }
+
+    fn destroy(self: *ClipboardOffer) void {
+        const app = self.app;
+        if (app.clip_offer == self) app.clip_offer = null;
+        if (app.clip_pending_offer == self) app.clip_pending_offer = null;
+        self.offer.destroy();
+        app.alloc.destroy(self);
+    }
+};
+
+const PrimaryOffer = struct {
+    app: *App,
+    offer: *zwp.PrimarySelectionOfferV1,
+    mimes: MimeMask = 0,
+
+    fn noteMime(self: *PrimaryOffer, mime_type: [*:0]const u8) void {
+        if (mimeBit(mime_type)) |bit| self.mimes |= bit;
+    }
+
+    fn bestMime(self: *const PrimaryOffer) ?[*:0]const u8 {
+        return bestPasteMime(self.mimes);
+    }
+
+    fn destroy(self: *PrimaryOffer) void {
+        const app = self.app;
+        if (app.primary_offer == self) app.primary_offer = null;
+        if (app.primary_pending_offer == self) app.primary_pending_offer = null;
+        self.offer.destroy();
+        app.alloc.destroy(self);
+    }
+};
+
 /// Heap context for an outgoing selection source: owns the text and the
 /// source proxy. Destroyed when the compositor cancels the source
 /// (someone else took the selection), when we replace it with a new
@@ -929,11 +1036,83 @@ fn primarySourceListener(
     }
 }
 
+fn dataOfferListener(_: *wl.DataOffer, event: wl.DataOffer.Event, offer: *ClipboardOffer) void {
+    switch (event) {
+        .offer => |ev| offer.noteMime(ev.mime_type),
+        else => {},
+    }
+}
+
+fn primaryOfferListener(
+    _: *zwp.PrimarySelectionOfferV1,
+    event: zwp.PrimarySelectionOfferV1.Event,
+    offer: *PrimaryOffer,
+) void {
+    switch (event) {
+        .offer => |ev| offer.noteMime(ev.mime_type),
+    }
+}
+
+fn createClipboardOffer(self: *App, proxy: *wl.DataOffer) ?*ClipboardOffer {
+    if (self.clip_pending_offer) |old| old.destroy();
+    const offer = self.alloc.create(ClipboardOffer) catch {
+        proxy.destroy();
+        return null;
+    };
+    offer.* = .{ .app = self, .offer = proxy };
+    proxy.setListener(*ClipboardOffer, dataOfferListener, offer);
+    self.clip_pending_offer = offer;
+    return offer;
+}
+
+fn takeClipboardOffer(self: *App, proxy: *wl.DataOffer) ?*ClipboardOffer {
+    const offer = self.clip_pending_offer orelse return null;
+    if (offer.offer != proxy) return null;
+    self.clip_pending_offer = null;
+    return offer;
+}
+
+fn createPrimaryOffer(self: *App, proxy: *zwp.PrimarySelectionOfferV1) ?*PrimaryOffer {
+    if (self.primary_pending_offer) |old| old.destroy();
+    const offer = self.alloc.create(PrimaryOffer) catch {
+        proxy.destroy();
+        return null;
+    };
+    offer.* = .{ .app = self, .offer = proxy };
+    proxy.setListener(*PrimaryOffer, primaryOfferListener, offer);
+    self.primary_pending_offer = offer;
+    return offer;
+}
+
+fn takePrimaryOffer(self: *App, proxy: *zwp.PrimarySelectionOfferV1) ?*PrimaryOffer {
+    const offer = self.primary_pending_offer orelse return null;
+    if (offer.offer != proxy) return null;
+    self.primary_pending_offer = null;
+    return offer;
+}
+
 fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *App) void {
     switch (event) {
+        .data_offer => |data_offer| {
+            _ = self.createClipboardOffer(data_offer.id);
+        },
         .selection => |selection| {
+            const offer = if (selection.id) |id| offer: {
+                break :offer self.takeClipboardOffer(id) orelse {
+                    id.destroy();
+                    break :offer null;
+                };
+            } else null;
             if (self.clip_offer) |old| old.destroy();
-            self.clip_offer = selection.id;
+            self.clip_offer = offer;
+        },
+        .enter => |enter| {
+            const id = enter.id orelse return;
+            if (self.takeClipboardOffer(id)) |offer| {
+                offer.destroy();
+            } else {
+                id.destroy();
+            }
         },
         // Drag and drop is unsupported; those offers are ignored.
         else => {},
@@ -946,11 +1125,19 @@ fn primaryDeviceListener(
     self: *App,
 ) void {
     switch (event) {
-        .selection => |selection| {
-            if (self.primary_offer) |old| old.destroy();
-            self.primary_offer = selection.id;
+        .data_offer => |data_offer| {
+            _ = self.createPrimaryOffer(data_offer.offer);
         },
-        .data_offer => {},
+        .selection => |selection| {
+            const offer = if (selection.id) |id| offer: {
+                break :offer self.takePrimaryOffer(id) orelse {
+                    id.destroy();
+                    break :offer null;
+                };
+            } else null;
+            if (self.primary_offer) |old| old.destroy();
+            self.primary_offer = offer;
+        },
     }
 }
 
@@ -978,9 +1165,7 @@ fn copyToPrimary(self: *App) void {
     };
     ctx.* = .{ .app = self, .text = text, .source = .{ .primary = source } };
 
-    source.offer(paste_mime);
-    source.offer("text/plain");
-    source.offer("UTF8_STRING");
+    inline for (paste_mime_preference) |mime| source.offer(mime.ptr);
     source.setListener(*SourceCtx, primarySourceListener, ctx);
     device.setSelection(source, self.last_serial);
 
@@ -1009,9 +1194,7 @@ fn copyToClipboard(self: *App) void {
     };
     ctx.* = .{ .app = self, .text = text, .source = .{ .clipboard = source } };
 
-    source.offer(paste_mime);
-    source.offer("text/plain");
-    source.offer("UTF8_STRING");
+    inline for (paste_mime_preference) |mime| source.offer(mime.ptr);
     source.setListener(*SourceCtx, dataSourceListener, ctx);
     device.setSelection(source, self.last_serial);
 
@@ -1034,7 +1217,12 @@ fn beginPaste(self: *App, comptime which: enum { clipboard, primary }) void {
                 _ = std.os.linux.close(fds[1]);
                 return;
             };
-            offer.receive(paste_mime, fds[1]);
+            const mime = offer.bestMime() orelse {
+                _ = std.os.linux.close(fds[0]);
+                _ = std.os.linux.close(fds[1]);
+                return;
+            };
+            offer.offer.receive(mime, fds[1]);
         },
         .primary => {
             const offer = self.primary_offer orelse {
@@ -1042,7 +1230,12 @@ fn beginPaste(self: *App, comptime which: enum { clipboard, primary }) void {
                 _ = std.os.linux.close(fds[1]);
                 return;
             };
-            offer.receive(paste_mime, fds[1]);
+            const mime = offer.bestMime() orelse {
+                _ = std.os.linux.close(fds[0]);
+                _ = std.os.linux.close(fds[1]);
+                return;
+            };
+            offer.offer.receive(mime, fds[1]);
         },
     }
     _ = std.os.linux.close(fds[1]);
@@ -1137,14 +1330,16 @@ fn scrollLines(self: *App, lines_down: i32) void {
 fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
     var buf: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
-    vt.input.encodeMouse(&writer, event, .fromTerminal(&self.term, .{
+    var opts = vt.input.MouseEncodeOptions.fromTerminal(&self.term, .{
         .screen = .{
             .width = @intCast(self.term.cols * self.font.cell_width),
             .height = @intCast(self.term.rows * self.font.cell_height),
         },
         .cell = .{ .width = self.font.cell_width, .height = self.font.cell_height },
         .padding = .{},
-    })) catch return;
+    });
+    opts.any_button_pressed = event.action == .press or self.mouse_button != null;
+    vt.input.encodeMouse(&writer, event, opts) catch return;
     self.writePty(writer.buffered());
 }
 
