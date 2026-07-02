@@ -20,6 +20,8 @@
         "build.zig",
         "build.zig.zon",
         "dist",
+        "LICENSE",
+        "README.md",
         "src",
         "vendor/ghostty",
     },
