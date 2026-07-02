@@ -27,6 +27,8 @@ registry: *wl.Registry,
 compositor: *wl.Compositor,
 shm: *wl.Shm,
 wm_base: *xdg.WmBase,
+activation: ?*xdg.ActivationV1,
+activation_token: ?*xdg.ActivationTokenV1,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
@@ -95,6 +97,7 @@ const Globals = struct {
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
     wm_base: ?*xdg.WmBase = null,
+    activation: ?*xdg.ActivationV1 = null,
     seat: ?*wl.Seat = null,
     viewporter: ?*wp.Viewporter = null,
     fractional_manager: ?*wp.FractionalScaleManagerV1 = null,
@@ -173,6 +176,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .compositor = compositor,
         .shm = shm,
         .wm_base = wm_base,
+        .activation = globals.activation,
+        .activation_token = null,
         .seat = globals.seat,
         .keyboard = null,
         .pointer = null,
@@ -236,6 +241,8 @@ pub fn destroy(self: *Window) void {
     if (self.primary_manager) |manager| manager.destroy();
     if (self.toplevel_decoration) |decoration| decoration.destroy();
     if (self.decoration_manager) |manager| manager.destroy();
+    if (self.activation_token) |token| token.destroy();
+    if (self.activation) |activation| activation.destroy();
     if (self.pointer) |pointer| pointer.release();
     if (self.keyboard) |keyboard| keyboard.release();
     if (self.seat) |seat| seat.release();
@@ -279,6 +286,21 @@ pub fn setCursorShape(self: *Window, shape: CursorShape) void {
     if (self.cursor_shape == shape) return;
     self.cursor_shape = shape;
     self.applyCursorShape();
+}
+
+pub fn setUrgent(self: *Window, urgent: bool) !void {
+    const activation = self.activation orelse return;
+
+    if (self.activation_token) |token| token.destroy();
+    self.activation_token = null;
+
+    if (!urgent) return;
+
+    const token = try activation.getActivationToken();
+    token.setSurface(self.surface);
+    token.setListener(*Window, activationTokenListener, self);
+    token.commit();
+    self.activation_token = token;
 }
 
 fn applyCursorShape(self: *Window) void {
@@ -383,6 +405,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
                 globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, 6)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, xdg.ActivationV1.interface.name) == .eq) {
+                globals.activation = registry.bind(global.name, xdg.ActivationV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
                 globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
@@ -463,6 +487,26 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) vo
 fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, _: *Window) void {
     switch (event) {
         .ping => |ping| wm_base.pong(ping.serial),
+    }
+}
+
+fn activationTokenListener(
+    token: *xdg.ActivationTokenV1,
+    event: xdg.ActivationTokenV1.Event,
+    self: *Window,
+) void {
+    const current_token = self.activation_token orelse return;
+    if (token.getId() != current_token.getId()) {
+        log.warn("received event for stale activation token", .{});
+        return;
+    }
+
+    switch (event) {
+        .done => |done| {
+            if (self.activation) |activation| activation.activate(done.token, self.surface);
+            token.destroy();
+            self.activation_token = null;
+        },
     }
 }
 

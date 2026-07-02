@@ -399,6 +399,7 @@ pub fn init(
     effects.color_scheme = effectColorScheme;
     effects.xtversion = effectXtversion;
     effects.title_changed = effectTitleChanged;
+    effects.bell = effectBell;
     self.stream.handler.terminal_handler.effects = effects;
 
     window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, scaleChanged);
@@ -511,6 +512,14 @@ fn effectTitleChanged(handler: *Handler) void {
     const self = appFromHandler(handler);
     const title = self.term.getTitle() orelse return;
     self.window.toplevel.setTitle(title.ptr);
+}
+
+fn effectBell(handler: *Handler) void {
+    const self = appFromHandler(handler);
+    if (self.focused) return;
+    self.window.setUrgent(true) catch |err| {
+        log.warn("failed to request window attention: {}", .{err});
+    };
 }
 
 fn setNonblocking(fd: posix.fd_t) void {
@@ -2081,6 +2090,11 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
 fn setFocus(self: *App, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
+    if (focused) {
+        self.window.setUrgent(false) catch |err| {
+            log.warn("failed to clear window attention: {}", .{err});
+        };
+    }
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 
