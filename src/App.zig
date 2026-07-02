@@ -22,6 +22,46 @@ const Window = @import("Window.zig");
 
 const log = std.log.scoped(.app);
 
+const xtgettcap_map = std.StaticStringMap([]const u8).initComptime(&.{
+    .{ hexEncodeComptime("TN"), "xterm-ghostty" },
+    .{ hexEncodeComptime("Co"), "256" },
+    .{ hexEncodeComptime("RGB"), "8" },
+    .{ hexEncodeComptime("am"), "" },
+    .{ hexEncodeComptime("bce"), "" },
+    .{ hexEncodeComptime("ccc"), "" },
+    .{ hexEncodeComptime("hs"), "" },
+    .{ hexEncodeComptime("km"), "" },
+    .{ hexEncodeComptime("mc5i"), "" },
+    .{ hexEncodeComptime("mir"), "" },
+    .{ hexEncodeComptime("msgr"), "" },
+    .{ hexEncodeComptime("npc"), "" },
+    .{ hexEncodeComptime("xenl"), "" },
+    .{ hexEncodeComptime("AX"), "" },
+    .{ hexEncodeComptime("Tc"), "" },
+    .{ hexEncodeComptime("Su"), "" },
+    .{ hexEncodeComptime("XT"), "" },
+    .{ hexEncodeComptime("fullkbd"), "" },
+    .{ hexEncodeComptime("colors"), "256" },
+    .{ hexEncodeComptime("cols"), "80" },
+    .{ hexEncodeComptime("it"), "8" },
+    .{ hexEncodeComptime("lines"), "24" },
+    .{ hexEncodeComptime("pairs"), "32767" },
+    .{ hexEncodeComptime("Smulx"), "\\E[4:%p1%dm" },
+    .{ hexEncodeComptime("Setulc"), "\\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m" },
+    .{ hexEncodeComptime("Ss"), "\\E[%p1%d q" },
+    .{ hexEncodeComptime("Se"), "\\E[0 q" },
+    .{ hexEncodeComptime("Ms"), "\\E]52;%p1%s;%p2%s\\007" },
+    .{ hexEncodeComptime("Sync"), "\\E[?2026%?%p1%{1}%-%tl%eh%;" },
+    .{ hexEncodeComptime("BD"), "\\E[?2004l" },
+    .{ hexEncodeComptime("BE"), "\\E[?2004h" },
+    .{ hexEncodeComptime("PS"), "\\E[200~" },
+    .{ hexEncodeComptime("PE"), "\\E[201~" },
+});
+
+fn hexEncodeComptime(comptime input: []const u8) []const u8 {
+    return comptime &(std.fmt.bytesToHex(input, .upper));
+}
+
 alloc: std.mem.Allocator,
 config: *const Config,
 term: vt.Terminal,
@@ -136,8 +176,10 @@ const AppStream = vt.Stream(AppStreamHandler);
 const AppStreamHandler = struct {
     app: *App,
     terminal_handler: TerminalHandler,
+    dcs: @import("ghostty-vt").dcs.Handler = .{},
 
     pub fn deinit(self: *AppStreamHandler) void {
+        self.dcs.deinit();
         self.terminal_handler.deinit();
     }
 
@@ -149,6 +191,9 @@ const AppStreamHandler = struct {
         self.terminal_handler.vt(action, value);
         switch (action) {
             .color_operation => self.app.answerOscColorQueries(&value.requests, value.terminator),
+            .dcs_hook => self.dcsHook(value),
+            .dcs_put => self.dcsPut(value),
+            .dcs_unhook => self.dcsUnhook(),
             .mouse_shape => {
                 self.app.mouse_shape_explicit = true;
                 self.app.syncCursorShape();
@@ -159,6 +204,24 @@ const AppStreamHandler = struct {
             },
             else => {},
         }
+    }
+
+    fn dcsHook(self: *AppStreamHandler, dcs: @import("ghostty-vt").DCS) void {
+        var cmd = self.dcs.hook(self.app.alloc, dcs) orelse return;
+        defer cmd.deinit();
+        self.app.answerDcsCommand(&cmd);
+    }
+
+    fn dcsPut(self: *AppStreamHandler, byte: u8) void {
+        var cmd = self.dcs.put(byte) orelse return;
+        defer cmd.deinit();
+        self.app.answerDcsCommand(&cmd);
+    }
+
+    fn dcsUnhook(self: *AppStreamHandler) void {
+        var cmd = self.dcs.unhook() orelse return;
+        defer cmd.deinit();
+        self.app.answerDcsCommand(&cmd);
     }
 };
 
@@ -615,6 +678,85 @@ fn answerOscColorQueries(
     }
 }
 
+fn answerDcsCommand(self: *App, cmd: *vt.dcs.Command) void {
+    switch (cmd.*) {
+        .xtgettcap => |*gettcap| self.answerXtgettcap(gettcap),
+        .decrqss => |decrqss| self.answerDecrqss(decrqss),
+        .tmux => {},
+    }
+}
+
+fn answerXtgettcap(self: *App, gettcap: *vt.dcs.Command.XTGETTCAP) void {
+    while (gettcap.next()) |key| {
+        const value = xtgettcap_map.get(key) orelse continue;
+        var response: [512]u8 = undefined;
+        const len = formatXtgettcapResponse(&response, key, value) catch return;
+        self.writePty(response[0..len]);
+    }
+}
+
+fn formatXtgettcapResponse(response: []u8, key: []const u8, value: []const u8) !usize {
+    var writer: std.Io.Writer = .fixed(response);
+    try writer.print("\x1bP1+r{s}", .{key});
+    if (value.len > 0) {
+        try writer.writeByte('=');
+        for (value) |byte| try writer.print("{X:0>2}", .{byte});
+    }
+    try writer.writeAll("\x1b\\");
+    return writer.end;
+}
+
+fn answerDecrqss(self: *App, decrqss: vt.dcs.Command.DECRQSS) void {
+    var response: [128]u8 = undefined;
+    const len = formatDecrqssResponse(&response, &self.term, decrqss) catch return;
+    self.writePty(response[0..len]);
+}
+
+fn formatDecrqssResponse(
+    response: []u8,
+    term: *vt.Terminal,
+    decrqss: vt.dcs.Command.DECRQSS,
+) !usize {
+    var writer: std.Io.Writer = .fixed(response);
+
+    const prefix_fmt = "\x1bP{d}$r";
+    const prefix_len = std.fmt.comptimePrint(prefix_fmt, .{0}).len;
+    writer.end = prefix_len;
+
+    switch (decrqss) {
+        .none => {},
+        .sgr => {
+            const attrs = try term.printAttributes(writer.buffer[writer.end..]);
+            writer.end += attrs.len;
+            try writer.writeByte('m');
+        },
+        .decscusr => {
+            const blink = term.modes.get(.cursor_blinking);
+            const style: u8 = switch (term.screens.active.cursor.cursor_style) {
+                .block, .block_hollow => if (blink) 1 else 2,
+                .underline => if (blink) 3 else 4,
+                .bar => if (blink) 5 else 6,
+            };
+            try writer.print("{d} q", .{style});
+        },
+        .decstbm => try writer.print("{d};{d}r", .{
+            term.scrolling_region.top + 1,
+            term.scrolling_region.bottom + 1,
+        }),
+        .decslrm => if (term.modes.get(.enable_left_and_right_margin)) {
+            try writer.print("{d};{d}s", .{
+                term.scrolling_region.left + 1,
+                term.scrolling_region.right + 1,
+            });
+        },
+    }
+
+    const valid = writer.end > prefix_len;
+    try writer.writeAll("\x1b\\");
+    _ = try std.fmt.bufPrint(response[0..prefix_len], prefix_fmt, .{@intFromBool(valid)});
+    return writer.end;
+}
+
 fn answerOscColorQuery(
     self: *App,
     target: vt.osc.color.Target,
@@ -770,6 +912,22 @@ test "OSC color reports use 16-bit rgb format" {
         .bel,
     );
     try std.testing.expectEqualStrings("\x1b]4;7;rgb:abab/cdcd/efef\x07", writer.buffered());
+}
+
+test "XTGETTCAP reports hex encoded capabilities" {
+    var buf: [512]u8 = undefined;
+
+    const bool_len = try formatXtgettcapResponse(&buf, hexEncodeComptime("Tc"), "");
+    try std.testing.expectEqualStrings("\x1bP1+r5463\x1b\\", buf[0..bool_len]);
+
+    const num_len = try formatXtgettcapResponse(&buf, hexEncodeComptime("RGB"), "8");
+    try std.testing.expectEqualStrings("\x1bP1+r524742=38\x1b\\", buf[0..num_len]);
+
+    const str_len = try formatXtgettcapResponse(&buf, hexEncodeComptime("Smulx"), "\\E[4:%p1%dm");
+    try std.testing.expectEqualStrings(
+        "\x1bP1+r536D756C78=5C455B343A25703125646D\x1b\\",
+        buf[0..str_len],
+    );
 }
 
 fn suspendPty(self: *App, err: anyerror) void {
