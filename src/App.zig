@@ -50,6 +50,16 @@ repeat_keycode: ?u32,
 /// From wl_keyboard.repeat_info: characters per second and delay in ms.
 repeat_rate: i32,
 repeat_delay: i32,
+/// Pointer position in logical surface coordinates.
+pointer_x: f64,
+pointer_y: f64,
+/// Wheel state accumulated between pointer frame events.
+scroll_pixels: f64,
+scroll_clicks: i32,
+scroll_had_discrete: bool,
+
+/// Terminal lines per wheel click.
+const wheel_lines = 3;
 
 const initial_cols = 80;
 const initial_rows = 24;
@@ -124,6 +134,11 @@ pub fn init(
         .repeat_keycode = null,
         .repeat_rate = 25,
         .repeat_delay = 600,
+        .pointer_x = 0,
+        .pointer_y = 0,
+        .scroll_pixels = 0,
+        .scroll_clicks = 0,
+        .scroll_had_discrete = false,
     };
     self.stream = self.term.vtStream();
 
@@ -138,7 +153,7 @@ pub fn init(
     effects.title_changed = effectTitleChanged;
     self.stream.handler.effects = effects;
 
-    window.setCallbacks(self, render, resize, keyboardEvent, scaleChanged);
+    window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, scaleChanged);
     return self;
 }
 
@@ -367,6 +382,124 @@ fn sendSizeReport(self: *App) void {
     self.writePty(writer.buffered());
 }
 
+/// Window pointer delegate: track position and accumulate wheel scroll,
+/// applying it at frame boundaries.
+fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .enter => |enter| {
+            self.pointer_x = enter.surface_x.toDouble();
+            self.pointer_y = enter.surface_y.toDouble();
+        },
+        .motion => |motion| {
+            self.pointer_x = motion.surface_x.toDouble();
+            self.pointer_y = motion.surface_y.toDouble();
+        },
+        .axis => |axis| {
+            if (axis.axis == .vertical_scroll and !self.scroll_had_discrete) {
+                self.scroll_pixels += axis.value.toDouble();
+            }
+        },
+        .axis_discrete => |discrete| {
+            if (discrete.axis == .vertical_scroll) {
+                self.scroll_clicks += discrete.discrete;
+                self.scroll_had_discrete = true;
+            }
+        },
+        .frame => self.finishScrollFrame(),
+        .button => |button| {
+            // Buttons only matter to applications with mouse reporting
+            // enabled; selection is not implemented yet.
+            if (self.term.flags.mouse_event == .none) return;
+            const mouse_button: vt.input.MouseButton = switch (button.button) {
+                272 => .left, // BTN_LEFT
+                273 => .right, // BTN_RIGHT
+                274 => .middle, // BTN_MIDDLE
+                else => return,
+            };
+            self.sendMouseEvent(.{
+                .action = if (button.state == .pressed) .press else .release,
+                .button = mouse_button,
+                .mods = self.keyboard.currentMods(),
+                .pos = self.pointerPosPhysical(),
+            });
+        },
+        .leave, .axis_source, .axis_stop => {},
+    }
+}
+
+/// Convert accumulated wheel movement into scrolled lines: wheel clicks
+/// count fixed lines, smooth (touchpad) scroll counts cell heights.
+fn finishScrollFrame(self: *App) void {
+    var lines: i32 = 0;
+    if (self.scroll_had_discrete) {
+        lines = self.scroll_clicks * wheel_lines;
+    } else if (self.scroll_pixels != 0) {
+        // Logical pixels per row: physical cell height descaled.
+        const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
+            @as(f64, @floatFromInt(self.window.scale120));
+        const whole = @divTrunc(self.scroll_pixels, cell);
+        lines = @intFromFloat(whole);
+        self.scroll_pixels -= whole * cell;
+    }
+    self.scroll_clicks = 0;
+    self.scroll_had_discrete = false;
+    if (lines != 0) self.scrollLines(lines);
+}
+
+/// Route wheel scrolling (positive = towards newer content): mouse
+/// reports when the application asked for them, arrow keys on the
+/// alternate screen, otherwise the scrollback viewport.
+fn scrollLines(self: *App, lines_down: i32) void {
+    const lines_abs: u32 = @abs(lines_down);
+    if (self.term.flags.mouse_event != .none) {
+        const button: vt.input.MouseButton = if (lines_down < 0) .four else .five;
+        for (0..lines_abs) |_| {
+            self.sendMouseEvent(.{
+                .action = .press,
+                .button = button,
+                .mods = self.keyboard.currentMods(),
+                .pos = self.pointerPosPhysical(),
+            });
+        }
+        return;
+    }
+
+    if (self.term.screens.active_key == .alternate) {
+        // Full-screen apps without mouse support (pagers, editors)
+        // expect cursor keys instead of viewport scrolling.
+        const key: vt.input.Key = if (lines_down < 0) .arrow_up else .arrow_down;
+        for (0..lines_abs) |_| self.encodeAndWriteKey(.{ .key = key, .action = .press });
+        return;
+    }
+
+    self.term.screens.active.pages.scroll(.{ .delta_row = lines_down });
+    self.needs_redraw = true;
+}
+
+fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    vt.input.encodeMouse(&writer, event, .fromTerminal(&self.term, .{
+        .screen = .{
+            .width = @intCast(self.term.cols * self.font.cell_width),
+            .height = @intCast(self.term.rows * self.font.cell_height),
+        },
+        .cell = .{ .width = self.font.cell_width, .height = self.font.cell_height },
+        .padding = .{},
+    })) catch return;
+    self.writePty(writer.buffered());
+}
+
+/// Pointer position in physical (buffer) pixels, as mouse encoding expects.
+fn pointerPosPhysical(self: *App) vt.input.MouseEncodeEvent.Pos {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    return .{
+        .x = @floatCast(self.pointer_x * scale),
+        .y = @floatCast(self.pointer_y * scale),
+    };
+}
+
 /// Window keyboard delegate: track xkb state and encode key presses
 /// into PTY input.
 fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
@@ -462,6 +595,16 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
 
+    // Typing snaps a scrolled-back viewport to the bottom.
+    if (action == .press and self.term.screens.active.pages.viewport != .active) {
+        self.term.screens.active.pages.scroll(.active);
+        self.needs_redraw = true;
+    }
+
+    self.encodeAndWriteKey(event);
+}
+
+fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) void {
     var out_buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&out_buf);
     vt.input.encodeKey(&writer, event, .fromTerminal(&self.term)) catch |err| {

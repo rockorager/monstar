@@ -140,7 +140,7 @@ pub fn translate(
     };
 }
 
-fn currentMods(self: *Keyboard) vt.input.KeyMods {
+pub fn currentMods(self: *Keyboard) vt.input.KeyMods {
     const state = self.state orelse return .{};
     const mask = c.xkb_state_serialize_mods(state, c.XKB_STATE_MODS_EFFECTIVE);
     return self.modsFromMask(mask);

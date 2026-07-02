@@ -278,6 +278,48 @@ test "blend endpoints" {
     try std.testing.expectEqual(@as(u32, 0xff000000), blend(0xffffffff, 0xff000000, 0));
 }
 
+test "scrollback viewport scrolls and renders older content" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    for (0..20) |i| {
+        var buf: [16]u8 = undefined;
+        stream.nextSlice(std.fmt.bufPrint(&buf, "line{d}\r\n", .{i}) catch unreachable);
+    }
+
+    const pages = &term.screens.active.pages;
+    try std.testing.expect(pages.viewport == .active);
+
+    // At the bottom: the viewport shows the most recent lines.
+    const bottom = try term.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(bottom);
+    try std.testing.expect(std.mem.indexOf(u8, bottom, "line19") != null);
+
+    // Scroll up six lines: older content, no longer pinned to active.
+    pages.scroll(.{ .delta_row = -6 });
+    try std.testing.expect(pages.viewport != .active);
+    const scrolled = try term.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
+    defer alloc.free(scrolled);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "line19") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scrolled, "line13") != null);
+
+    // RenderState follows the scrolled viewport.
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    const rows = state.row_data.slice();
+    const first_cells = rows.items(.cells)[0].slice();
+    // First visible row should start with 'l' of a line label.
+    try std.testing.expectEqual(@as(u21, 'l'), first_cells.items(.raw)[0].content.codepoint.data);
+
+    // Scrolling back to active restores the bottom.
+    pages.scroll(.active);
+    try std.testing.expect(pages.viewport == .active);
+}
+
 test "render a simple grid" {
     const alloc = std.testing.allocator;
 

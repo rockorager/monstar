@@ -27,6 +27,9 @@ shm: *wl.Shm,
 wm_base: *xdg.WmBase,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
+pointer: ?*wl.Pointer,
+cursor_shape_manager: ?*wp.CursorShapeManagerV1,
+cursor_shape_device: ?*wp.CursorShapeDeviceV1,
 viewport: ?*wp.Viewport,
 fractional_scale: ?*wp.FractionalScaleV1,
 surface: *wl.Surface,
@@ -50,6 +53,7 @@ render_ctx: ?*anyopaque,
 render_fn: ?RenderFn,
 resize_fn: ?ResizeFn,
 keyboard_fn: ?KeyboardFn,
+pointer_fn: ?PointerFn,
 scale_fn: ?ScaleFn,
 
 /// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
@@ -63,6 +67,9 @@ pub const ResizeFn = *const fn (ctx: *anyopaque, width: u31, height: u31) anyerr
 /// Raw wl_keyboard events, forwarded as-is.
 pub const KeyboardFn = *const fn (ctx: *anyopaque, event: wl.Keyboard.Event) void;
 
+/// Raw wl_pointer events, forwarded as-is.
+pub const PointerFn = *const fn (ctx: *anyopaque, event: wl.Pointer.Event) void;
+
 /// Called when the output scale changed, before the resize/draw that
 /// follows. `scale120` is the scale in 1/120ths (120 == 1.0).
 pub const ScaleFn = *const fn (ctx: *anyopaque, scale120: u32) anyerror!void;
@@ -75,6 +82,7 @@ const Globals = struct {
     seat: ?*wl.Seat = null,
     viewporter: ?*wp.Viewporter = null,
     fractional_manager: ?*wp.FractionalScaleManagerV1 = null,
+    cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
@@ -126,6 +134,9 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .wm_base = wm_base,
         .seat = globals.seat,
         .keyboard = null,
+        .pointer = null,
+        .cursor_shape_manager = globals.cursor_shape_manager,
+        .cursor_shape_device = null,
         .viewport = viewport,
         .fractional_scale = fractional_scale,
         .surface = surface,
@@ -146,6 +157,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .render_fn = null,
         .resize_fn = null,
         .keyboard_fn = null,
+        .pointer_fn = null,
         .scale_fn = null,
     };
 
@@ -164,6 +176,9 @@ pub fn destroy(self: *Window) void {
     self.buffers.deinit(self.alloc);
     if (self.fractional_scale) |fs| fs.destroy();
     if (self.viewport) |viewport| viewport.destroy();
+    if (self.cursor_shape_device) |device| device.destroy();
+    if (self.cursor_shape_manager) |manager| manager.destroy();
+    if (self.pointer) |pointer| pointer.release();
     if (self.keyboard) |keyboard| keyboard.release();
     if (self.seat) |seat| seat.release();
     self.toplevel.destroy();
@@ -184,19 +199,21 @@ pub fn dispatch(self: *Window) !bool {
     return self.running;
 }
 
-/// Set the delegates for drawing, resizing, keyboard input, and scale.
+/// Set the delegates for drawing, resizing, input, and scale.
 pub fn setCallbacks(
     self: *Window,
     ctx: *anyopaque,
     render_fn: RenderFn,
     resize_fn: ?ResizeFn,
     keyboard_fn: ?KeyboardFn,
+    pointer_fn: ?PointerFn,
     scale_fn: ?ScaleFn,
 ) void {
     self.render_ctx = ctx;
     self.render_fn = render_fn;
     self.resize_fn = resize_fn;
     self.keyboard_fn = keyboard_fn;
+    self.pointer_fn = pointer_fn;
     self.scale_fn = scale_fn;
 }
 
@@ -296,6 +313,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
                 globals.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
+                globals.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
             }
         },
         .global_remove => {},
@@ -318,9 +337,39 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
                 self.keyboard.?.release();
                 self.keyboard = null;
             }
+
+            const has_pointer = caps.capabilities.pointer;
+            if (has_pointer and self.pointer == null) {
+                self.pointer = seat.getPointer() catch |err| pointer: {
+                    log.err("getPointer failed: {}", .{err});
+                    break :pointer null;
+                };
+                if (self.pointer) |pointer| {
+                    pointer.setListener(*Window, pointerListener, self);
+                    if (self.cursor_shape_manager) |manager| {
+                        self.cursor_shape_device = manager.getPointer(pointer) catch null;
+                    }
+                }
+            } else if (!has_pointer and self.pointer != null) {
+                if (self.cursor_shape_device) |device| device.destroy();
+                self.cursor_shape_device = null;
+                self.pointer.?.release();
+                self.pointer = null;
+            }
         },
         .name => {},
     }
+}
+
+fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *Window) void {
+    // The cursor image is undefined on enter until the client sets one.
+    switch (event) {
+        .enter => |enter| if (self.cursor_shape_device) |device| {
+            device.setShape(enter.serial, .text);
+        },
+        else => {},
+    }
+    if (self.pointer_fn) |pointer_fn| pointer_fn(self.render_ctx.?, event);
 }
 
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) void {
