@@ -191,6 +191,7 @@ const AppStreamHandler = struct {
         self.terminal_handler.vt(action, value);
         switch (action) {
             .color_operation => self.app.answerOscColorQueries(&value.requests, value.terminator),
+            .kitty_color_report => self.app.answerKittyColorQueries(value),
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .dcs_hook => self.dcsHook(value),
             .dcs_put => self.dcsPut(value),
@@ -686,6 +687,84 @@ fn answerOscColorQueries(
     }
 }
 
+fn answerKittyColorQueries(self: *App, request: vt.kitty.color.OSC) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+
+    const wrote_response = self.formatKittyColorResponse(&writer.writer, request) catch return;
+    if (!wrote_response) return;
+
+    const response = writer.toOwnedSlice() catch return;
+    defer self.alloc.free(response);
+    self.writePty(response);
+}
+
+fn formatKittyColorResponse(
+    self: *const App,
+    writer: *std.Io.Writer,
+    request: vt.kitty.color.OSC,
+) !bool {
+    var wrote_response = false;
+    for (request.list.items) |item| {
+        switch (item) {
+            .query => |key| {
+                if (!wrote_response) {
+                    try writer.writeAll("\x1b]21");
+                    wrote_response = true;
+                }
+                try writeKittyColorReport(writer, key, self.kittyColorValue(key));
+            },
+            else => {},
+        }
+    }
+    if (wrote_response) try writer.writeAll(request.terminator.string());
+    return wrote_response;
+}
+
+const KittyColorValue = union(enum) {
+    color: vt.color.RGB,
+    unset,
+};
+
+fn kittyColorValue(self: *const App, key: vt.kitty.color.Kind) KittyColorValue {
+    return switch (key) {
+        .palette => |idx| .{ .color = self.term.colors.palette.current[idx] },
+        .special => |special| switch (special) {
+            .foreground => .{ .color = self.effectiveForeground() },
+            .background => .{ .color = self.effectiveBackground() },
+            .selection_background => .{ .color = self.renderer.selection_bg },
+            .selection_foreground => if (self.renderer.selection_fg) |color|
+                .{ .color = color }
+            else
+                .unset,
+            .cursor => if (self.term.colors.cursor.get()) |color|
+                .{ .color = color }
+            else
+                .unset,
+            .cursor_text,
+            .visual_bell,
+            .second_transparent_background,
+            => .unset,
+        },
+    };
+}
+
+fn writeKittyColorReport(
+    writer: *std.Io.Writer,
+    key: vt.kitty.color.Kind,
+    value: KittyColorValue,
+) !void {
+    try writer.print(";{f}=", .{key});
+    switch (value) {
+        .color => |color| try writeKittyColorValue(writer, color),
+        .unset => {},
+    }
+}
+
+fn writeKittyColorValue(writer: *std.Io.Writer, color: vt.color.RGB) !void {
+    try writer.print("rgb:{x:0>2}/{x:0>2}/{x:0>2}", .{ color.r, color.g, color.b });
+}
+
 fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
     if (data.len == 1 and data[0] == '?') {
         log.debug("ignoring unsupported OSC 52 clipboard read", .{});
@@ -961,6 +1040,30 @@ test "OSC color reports use 16-bit rgb format" {
         .bel,
     );
     try std.testing.expectEqualStrings("\x1b]4;7;rgb:abab/cdcd/efef\x07", writer.buffered());
+}
+
+test "kitty color reports use OSC 21 key value format" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    try writer.writeAll("\x1b]21");
+    try writeKittyColorReport(
+        &writer,
+        .{ .special = .foreground },
+        .{ .color = .{ .r = 0x12, .g = 0x34, .b = 0x56 } },
+    );
+    try writeKittyColorReport(&writer, .{ .special = .cursor }, .unset);
+    try writeKittyColorReport(
+        &writer,
+        .{ .palette = 7 },
+        .{ .color = .{ .r = 0xab, .g = 0xcd, .b = 0xef } },
+    );
+    try writer.writeAll(vt.osc.Terminator.st.string());
+
+    try std.testing.expectEqualStrings(
+        "\x1b]21;foreground=rgb:12/34/56;cursor=;7=rgb:ab/cd/ef\x1b\\",
+        writer.buffered(),
+    );
 }
 
 test "OSC 52 set decodes clipboard payload" {
