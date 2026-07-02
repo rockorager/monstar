@@ -21,12 +21,15 @@ const Window = @import("Window.zig");
 const log = std.log.scoped(.app);
 
 alloc: std.mem.Allocator,
+opts: Options,
 term: vt.Terminal,
 stream: vt.TerminalStream,
 render_state: vt.RenderState,
 pty: Pty,
 child_pid: posix.pid_t,
 font: Font,
+/// The physical pixel size the font is currently loaded at.
+font_size_px: u31,
 renderer: Renderer,
 window: *Window,
 keyboard: Keyboard,
@@ -93,12 +96,14 @@ pub fn init(
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
+        .opts = opts,
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
         .pty = pty,
         .child_pid = child_pid,
         .font = font,
+        .font_size_px = opts.font_size_px,
         .renderer = try .init(alloc, &self.font),
         .window = window,
         .keyboard = try .init(),
@@ -123,8 +128,24 @@ pub fn init(
     effects.title_changed = effectTitleChanged;
     self.stream.handler.effects = effects;
 
-    window.setCallbacks(self, render, resize, keyboardEvent);
+    window.setCallbacks(self, render, resize, keyboardEvent, scaleChanged);
     return self;
+}
+
+/// Window scale delegate: reload the font at the physical pixel size so
+/// glyphs are rasterized crisply instead of upscaled by the compositor.
+/// The window calls the resize delegate right after, re-fitting the grid
+/// to the new cell metrics.
+fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    const size_px: u31 = @intCast((@as(u64, self.opts.font_size_px) * scale120 + 60) / 120);
+    if (size_px == 0 or size_px == self.font_size_px) return;
+
+    const new_font: Font = try .init(self.opts.font_family, size_px);
+    self.font.deinit(self.alloc);
+    self.font = new_font;
+    self.font_size_px = size_px;
+    self.needs_redraw = true;
 }
 
 const Handler = vt.TerminalStream.Handler;

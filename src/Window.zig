@@ -8,6 +8,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
+const wp = wayland.client.wp;
 const xdg = wayland.client.xdg;
 
 const log = std.log.scoped(.window);
@@ -26,14 +27,20 @@ shm: *wl.Shm,
 wm_base: *xdg.WmBase,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
+viewport: ?*wp.Viewport,
+fractional_scale: ?*wp.FractionalScaleV1,
 surface: *wl.Surface,
 xdg_surface: *xdg.Surface,
 toplevel: *xdg.Toplevel,
 buffers: std.ArrayList(*Buffer),
+/// Window size in logical (surface-local) coordinates.
 width: u31,
 height: u31,
 pending_width: u31,
 pending_height: u31,
+/// Output scale in 1/120ths (wp_fractional_scale unit); 120 == 1.0.
+/// Buffers are sized in physical pixels: logical * scale120 / 120.
+scale120: u32,
 running: bool,
 /// A frame callback is outstanding; drawing now would outpace the
 /// compositor. `redraw()` queues instead.
@@ -43,15 +50,22 @@ render_ctx: ?*anyopaque,
 render_fn: ?RenderFn,
 resize_fn: ?ResizeFn,
 keyboard_fn: ?KeyboardFn,
+scale_fn: ?ScaleFn,
 
 /// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
+/// Dimensions are physical pixels.
 pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void;
 
 /// Called when the window size changed, before the next draw.
+/// Dimensions are physical pixels.
 pub const ResizeFn = *const fn (ctx: *anyopaque, width: u31, height: u31) anyerror!void;
 
 /// Raw wl_keyboard events, forwarded as-is.
 pub const KeyboardFn = *const fn (ctx: *anyopaque, event: wl.Keyboard.Event) void;
+
+/// Called when the output scale changed, before the resize/draw that
+/// follows. `scale120` is the scale in 1/120ths (120 == 1.0).
+pub const ScaleFn = *const fn (ctx: *anyopaque, scale120: u32) anyerror!void;
 
 /// Globals collected during the initial registry roundtrip.
 const Globals = struct {
@@ -59,6 +73,8 @@ const Globals = struct {
     shm: ?*wl.Shm = null,
     wm_base: ?*xdg.WmBase = null,
     seat: ?*wl.Seat = null,
+    viewporter: ?*wp.Viewporter = null,
+    fractional_manager: ?*wp.FractionalScaleManagerV1 = null,
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
@@ -81,6 +97,24 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
     toplevel.setAppId("vtread");
     toplevel.setTitle("vtread");
 
+    // Fractional scaling needs both protocols: the scale event and a
+    // viewport to map the physical-pixel buffer onto the logical size.
+    // Without them we render 1:1 and let the compositor scale.
+    var viewport: ?*wp.Viewport = null;
+    var fractional_scale: ?*wp.FractionalScaleV1 = null;
+    if (globals.viewporter) |viewporter| {
+        defer viewporter.destroy(); // per-surface objects outlive the manager
+        if (globals.fractional_manager) |manager| {
+            defer manager.destroy();
+            viewport = viewporter.getViewport(surface) catch null;
+            if (viewport != null) {
+                fractional_scale = manager.getFractionalScale(surface) catch null;
+            }
+        }
+    } else if (globals.fractional_manager) |manager| {
+        manager.destroy();
+    }
+
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
     self.* = .{
@@ -92,6 +126,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .wm_base = wm_base,
         .seat = globals.seat,
         .keyboard = null,
+        .viewport = viewport,
+        .fractional_scale = fractional_scale,
         .surface = surface,
         .xdg_surface = xdg_surface,
         .toplevel = toplevel,
@@ -102,6 +138,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .height = 0,
         .pending_width = default_width,
         .pending_height = default_height,
+        .scale120 = 120,
         .running = true,
         .frame_pending = false,
         .redraw_queued = false,
@@ -109,8 +146,10 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .render_fn = null,
         .resize_fn = null,
         .keyboard_fn = null,
+        .scale_fn = null,
     };
 
+    if (fractional_scale) |fs| fs.setListener(*Window, fractionalScaleListener, self);
     if (globals.seat) |seat| seat.setListener(*Window, seatListener, self);
     wm_base.setListener(*Window, wmBaseListener, self);
     xdg_surface.setListener(*Window, xdgSurfaceListener, self);
@@ -123,6 +162,8 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
 pub fn destroy(self: *Window) void {
     for (self.buffers.items) |buffer| buffer.destroy(self.alloc);
     self.buffers.deinit(self.alloc);
+    if (self.fractional_scale) |fs| fs.destroy();
+    if (self.viewport) |viewport| viewport.destroy();
     if (self.keyboard) |keyboard| keyboard.release();
     if (self.seat) |seat| seat.release();
     self.toplevel.destroy();
@@ -143,18 +184,25 @@ pub fn dispatch(self: *Window) !bool {
     return self.running;
 }
 
-/// Set the delegates for drawing, resizing, and keyboard input.
+/// Set the delegates for drawing, resizing, keyboard input, and scale.
 pub fn setCallbacks(
     self: *Window,
     ctx: *anyopaque,
     render_fn: RenderFn,
     resize_fn: ?ResizeFn,
     keyboard_fn: ?KeyboardFn,
+    scale_fn: ?ScaleFn,
 ) void {
     self.render_ctx = ctx;
     self.render_fn = render_fn;
     self.resize_fn = resize_fn;
     self.keyboard_fn = keyboard_fn;
+    self.scale_fn = scale_fn;
+}
+
+/// Convert a logical dimension to physical pixels (rounded).
+fn physical(self: *const Window, logical: u31) u31 {
+    return @intCast((@as(u64, logical) * self.scale120 + 60) / 120);
 }
 
 /// Redraw as soon as the compositor is ready for a new frame: now if no
@@ -169,14 +217,18 @@ pub fn redraw(self: *Window) !void {
     try self.draw();
 }
 
-/// Redraw the window contents and commit.
+/// Redraw the window contents and commit. The buffer is sized in
+/// physical pixels; the viewport (if any) maps it to the logical size.
 fn draw(self: *Window) !void {
-    const buffer = try self.acquireBuffer(self.width, self.height);
+    const phys_width = self.physical(self.width);
+    const phys_height = self.physical(self.height);
+    const buffer = try self.acquireBuffer(phys_width, phys_height);
     if (self.render_fn) |render_fn| {
-        try render_fn(self.render_ctx.?, buffer.pixels(), self.width, self.height);
+        try render_fn(self.render_ctx.?, buffer.pixels(), phys_width, phys_height);
     } else {
         @memset(buffer.pixels(), bg_color);
     }
+    if (self.viewport) |viewport| viewport.setDestination(self.width, self.height);
 
     // Throttle future redraws to the compositor's pace. Configure-driven
     // draws may run while a callback is already outstanding; don't stack.
@@ -187,7 +239,7 @@ fn draw(self: *Window) !void {
     }
 
     self.surface.attach(buffer.wl_buffer, 0, 0);
-    self.surface.damageBuffer(0, 0, self.width, self.height);
+    self.surface.damageBuffer(0, 0, phys_width, phys_height);
     self.surface.commit();
     buffer.busy = true;
 }
@@ -240,6 +292,10 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.wm_base = registry.bind(global.name, xdg.WmBase, 2) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
                 globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 5)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
+                globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
+                globals.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
             }
         },
         .global_remove => {},
@@ -285,19 +341,51 @@ fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, self:
                 self.height != self.pending_height;
             self.width = self.pending_width;
             self.height = self.pending_height;
-            if (resized) {
-                if (self.resize_fn) |resize_fn| {
-                    resize_fn(self.render_ctx.?, self.width, self.height) catch |err| {
-                        log.err("resize handler failed: {}", .{err});
-                        self.running = false;
-                        return;
-                    };
-                }
-            }
-            self.draw() catch |err| {
-                log.err("draw failed: {}", .{err});
+            self.geometryChanged(resized);
+        },
+    }
+}
+
+/// Notify the resize delegate (if the grid geometry changed) and redraw.
+fn geometryChanged(self: *Window, resized: bool) void {
+    if (resized) {
+        if (self.resize_fn) |resize_fn| {
+            resize_fn(
+                self.render_ctx.?,
+                self.physical(self.width),
+                self.physical(self.height),
+            ) catch |err| {
+                log.err("resize handler failed: {}", .{err});
                 self.running = false;
+                return;
             };
+        }
+    }
+    self.draw() catch |err| {
+        log.err("draw failed: {}", .{err});
+        self.running = false;
+    };
+}
+
+fn fractionalScaleListener(
+    _: *wp.FractionalScaleV1,
+    event: wp.FractionalScaleV1.Event,
+    self: *Window,
+) void {
+    switch (event) {
+        .preferred_scale => |preferred| {
+            if (preferred.scale == self.scale120) return;
+            log.debug("scale changed to {d}/120", .{preferred.scale});
+            self.scale120 = preferred.scale;
+            if (self.scale_fn) |scale_fn| {
+                scale_fn(self.render_ctx.?, self.scale120) catch |err| {
+                    log.err("scale handler failed: {}", .{err});
+                    self.running = false;
+                    return;
+                };
+            }
+            // Before the first configure there is nothing to redraw yet.
+            if (self.width > 0) self.geometryChanged(true);
         },
     }
 }
