@@ -46,8 +46,15 @@ in_band_reports: bool,
 /// avoid deadlocking against a child that has stopped reading while
 /// flooding output). Flushed when the master polls writable.
 write_queue: std.ArrayList(u8),
-/// The child hung up; drain and quit.
-child_eof: bool,
+/// The child has exited and been reaped (via SIGCHLD); quit.
+child_exited: bool,
+/// The pty master returned EIO/EOF while the child is still alive
+/// (e.g. the child transiently closed every slave fd, as some shells
+/// do at startup). Reads are retried on a timer until the child
+/// reopens the tty or exits; EIO alone never shuts the terminal down.
+pty_suspended: bool,
+/// signalfd for SIGCHLD, polled in the event loop.
+sigchld_fd: posix.fd_t,
 /// Key repeat: timerfd armed while a repeating key is held.
 repeat_fd: posix.fd_t,
 repeat_keycode: ?u32,
@@ -112,6 +119,19 @@ pub fn init(
     });
     errdefer term.deinit(alloc);
 
+    // Child-exit detection is driven by SIGCHLD, not pty EOF: block the
+    // signal and receive it through a signalfd in the poll loop. This
+    // must happen before the fork so an early exit cannot be missed.
+    var sigmask = posix.sigemptyset();
+    posix.sigaddset(&sigmask, .CHLD);
+    posix.sigprocmask(std.os.linux.SIG.BLOCK, &sigmask, null);
+    const sigchld_fd = posix.signalfd(
+        -1,
+        &sigmask,
+        std.os.linux.SFD.CLOEXEC | std.os.linux.SFD.NONBLOCK,
+    ) catch return error.SignalFdFailed;
+    errdefer _ = std.os.linux.close(sigchld_fd);
+
     var pty: Pty = try .open(.{
         .row = initial_rows,
         .col = initial_cols,
@@ -157,7 +177,9 @@ pub fn init(
         .focused = true,
         .in_band_reports = false,
         .write_queue = .empty,
-        .child_eof = false,
+        .child_exited = false,
+        .pty_suspended = false,
+        .sigchld_fd = sigchld_fd,
         .repeat_fd = repeat_fd,
         .repeat_keycode = null,
         .repeat_rate = 25,
@@ -294,6 +316,7 @@ pub fn deinit(self: *App) void {
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
     _ = std.os.linux.close(self.repeat_fd);
+    _ = std.os.linux.close(self.sigchld_fd);
     self.keyboard.deinit();
     self.window.destroy();
     self.renderer.deinit();
@@ -314,13 +337,15 @@ pub fn run(self: *App) !void {
         .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
         // In-flight paste pipe; negative (ignored) while idle.
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.sigchld_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pty_fd = &fds[1];
     const repeat_fd = &fds[2];
     const paste_fd = &fds[3];
+    const sigchld_fd = &fds[4];
 
-    while (self.window.running and !self.child_eof) {
+    while (self.window.running and !self.child_exited) {
         // Standard libwayland read dance: drain the local queue, flush
         // requests, then sleep until one of the fds is ready.
         while (!display.prepareRead()) {
@@ -352,10 +377,17 @@ pub fn run(self: *App) !void {
         if (self.write_queue.items.len > 0) pty_fd.events |= posix.POLL.OUT;
         paste_fd.fd = self.paste_fd;
 
-        _ = posix.poll(&fds, -1) catch |err| {
+        // A suspended pty would report POLLHUP continuously; drop it
+        // from the set and probe on a timer instead until the child
+        // reopens the tty (or exits, via SIGCHLD).
+        pty_fd.fd = if (self.pty_suspended) -1 else self.pty.master;
+        const timeout: i32 = if (self.pty_suspended) 100 else -1;
+
+        const ready = posix.poll(&fds, timeout) catch |err| {
             display.cancelRead();
             return err;
         };
+        _ = ready;
 
         if (wl_fd.revents & posix.POLL.IN != 0) {
             if (display.readEvents() != .SUCCESS) return error.ReadEventsFailed;
@@ -364,10 +396,16 @@ pub fn run(self: *App) !void {
         }
         if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
 
+        if (sigchld_fd.revents & posix.POLL.IN != 0) {
+            self.drainSigchld();
+        }
+
         if (pty_fd.revents & posix.POLL.OUT != 0) {
             self.flushWriteQueue();
         }
-        if (pty_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+        if (self.pty_suspended or
+            pty_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0)
+        {
             self.readPty();
         }
 
@@ -386,43 +424,81 @@ pub fn run(self: *App) !void {
     }
 
     // Window closed while the child is alive: hang it up like a real
-    // terminal whose master side went away. The child is its own
-    // session leader (setsid in spawn), so it owns SIGHUP delivery to
-    // its jobs.
-    if (!self.child_eof) {
+    // terminal whose master side went away, then reap. The child is
+    // its own session leader (setsid in spawn), so it owns SIGHUP
+    // delivery to its jobs. An exited child was already reaped by
+    // drainSigchld.
+    if (!self.child_exited) {
         _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
+        _ = Pty.wait(self.child_pid) catch {};
     }
-    _ = Pty.wait(self.child_pid) catch {};
+}
+
+/// SIGCHLD arrived: reap the child if it actually exited. This is the
+/// only place the terminal decides the session is over.
+fn drainSigchld(self: *App) void {
+    var info: std.os.linux.signalfd_siginfo = undefined;
+    while (true) {
+        const n = posix.read(self.sigchld_fd, std.mem.asBytes(&info)) catch break;
+        if (n == 0) break;
+    }
+    if (Pty.tryWait(self.child_pid)) |status| {
+        log.debug("child exited with status {d}", .{status});
+        self.child_exited = true;
+    }
 }
 
 /// Drain available PTY output into the terminal. Bounded so a
 /// flooding child cannot starve the Wayland side of the loop.
+///
+/// EIO/EOF on the master only means no process currently holds a
+/// slave fd, which can be transient (some shells reopen their tty at
+/// startup): reads suspend until the master is usable again, and only
+/// SIGCHLD ends the session.
 fn readPty(self: *App) void {
     var buf: [16 * 1024]u8 = undefined;
     for (0..16) |_| {
         const n = posix.read(self.pty.master, &buf) catch |err| switch (err) {
-            error.WouldBlock => break,
-            // EIO on the master means the slave side is gone (child exited).
-            error.Unexpected, error.InputOutput => {
-                self.child_eof = true;
+            error.WouldBlock => {
+                self.resumePty();
                 break;
             },
             else => {
-                log.err("pty read failed: {}", .{err});
-                self.child_eof = true;
+                self.suspendPty(err);
                 break;
             },
         };
         if (n == 0) {
-            self.child_eof = true;
+            self.suspendPty(error.EndOfStream);
             break;
         }
+        self.resumePty();
         self.stream.nextSlice(buf[0..n]);
         self.needs_redraw = true;
         if (n < buf.len) break;
     }
     self.syncInBandSizeReports();
     self.syncActiveScreen();
+}
+
+fn suspendPty(self: *App, err: anyerror) void {
+    if (self.pty_suspended or self.child_exited) return;
+    // Most of the time this is a real child exit; the SIGCHLD arriving
+    // right after ends the session. Reap eagerly to avoid one poll
+    // round trip.
+    if (Pty.tryWait(self.child_pid)) |status| {
+        log.debug("child exited with status {d}", .{status});
+        self.child_exited = true;
+        return;
+    }
+    log.debug("pty read failed ({}) with child alive; suspending reads", .{err});
+    self.pty_suspended = true;
+}
+
+fn resumePty(self: *App) void {
+    if (!self.pty_suspended) return;
+    log.debug("pty readable again; resuming reads", .{});
+    self.pty_suspended = false;
 }
 
 /// DEC mode 2048 (in-band size reports): the terminal must send a size

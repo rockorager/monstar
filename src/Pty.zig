@@ -63,6 +63,10 @@ pub fn spawn(
 
     if (pid == 0) {
         // Child. Only async-signal-safe calls from here on.
+        // The parent blocks SIGCHLD for its signalfd; the child must
+        // start with a clean signal mask (shells need SIGCHLD).
+        const empty_mask = posix.sigemptyset();
+        posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
         _ = linux.setsid();
         _ = linux.ioctl(self.slave, linux.T.IOCSCTTY, 0);
         _ = linux.dup2(self.slave, 0);
@@ -90,6 +94,17 @@ pub fn wait(pid: posix.pid_t) Error!u32 {
     var status: u32 = undefined;
     try check(linux.wait4(pid, &status, 0, null));
     return status;
+}
+
+/// Reap the child if it has exited; null while it is still running.
+pub fn tryWait(pid: posix.pid_t) ?u32 {
+    var status: u32 = undefined;
+    const rc = linux.wait4(pid, &status, linux.W.NOHANG, null);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => if (rc == 0) null else status,
+        // ECHILD and friends: nothing left to wait for.
+        else => 0,
+    };
 }
 
 fn openRw(path: [*:0]const u8) ?posix.fd_t {
