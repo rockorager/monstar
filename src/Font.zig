@@ -33,9 +33,13 @@ faces: std.ArrayList(Face),
 sort_sets: [style_count]*c.FcFontSet,
 /// Primary face index for each style; 0 means fall back to regular.
 primary_faces: [style_count]u16,
+/// Whether the resolved primary face for each style covers printable ASCII.
+/// This makes the common terminal text path avoid repeated FreeType coverage
+/// probes without assuming every configured font is well-formed.
+primary_ascii: [style_count]bool,
 /// styled sort_set index -> faces index (or failed_face).
 sort_faces: std.AutoHashMapUnmanaged(SortFaceKey, u16),
-/// styled codepoint -> faces index, for codepoints the primary lacks.
+/// styled codepoint -> resolved faces index, including primary hits.
 codepoint_faces: std.AutoHashMapUnmanaged(CodepointFaceKey, u16),
 /// faces index of the embedded symbols face, if it loaded.
 embedded_face: ?u16,
@@ -628,6 +632,12 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
             primary_faces[field.value] = idx;
         }
     }
+    var primary_ascii: [style_count]bool = undefined;
+    inline for (std.meta.fields(FaceStyle)) |field| {
+        const style: FaceStyle = @enumFromInt(field.value);
+        const face_idx = primary_faces[@intFromEnum(style)];
+        primary_ascii[field.value] = faceCoversPrintableAscii(&faces.items[face_idx]);
+    }
 
     log.info("loaded primary face ({s}) cell {d}x{d} baseline {d}, {d} fallback candidates", .{
         family,
@@ -677,6 +687,7 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
         .faces = faces,
         .sort_sets = sort_sets,
         .primary_faces = primary_faces,
+        .primary_ascii = primary_ascii,
         .sort_faces = .empty,
         .codepoint_faces = .empty,
         .embedded_face = embedded_face,
@@ -720,6 +731,13 @@ pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
 pub fn face(self: *Font, index: u16) *Face {
     std.debug.assert(index != sprite_face_index);
     return &self.faces.items[index];
+}
+
+fn faceCoversPrintableAscii(candidate: *const Face) bool {
+    for (0x20..0x7f) |cp| {
+        if (!candidate.hasCodepoint(@intCast(cp))) return false;
+    }
+    return true;
 }
 
 /// Rasterize (or fetch from cache) the sprite glyph for `cp`.
@@ -787,11 +805,19 @@ pub fn faceForCodepointStyle(
     if (sprite.covers(cp)) return sprite_face_index;
 
     const primary_idx = self.primary_faces[@intFromEnum(style)];
-    if (primary_idx != 0 and self.faces.items[primary_idx].hasCodepoint(cp)) return primary_idx;
-    if (self.faces.items[0].hasCodepoint(cp)) return 0;
+    if (cp >= 0x20 and cp < 0x7f and self.primary_ascii[@intFromEnum(style)]) return primary_idx;
 
     const key: CodepointFaceKey = .{ .style = style, .cp = cp };
     if (self.codepoint_faces.get(key)) |idx| return idx;
+
+    if (primary_idx != 0 and self.faces.items[primary_idx].hasCodepoint(cp)) {
+        self.codepoint_faces.put(alloc, key, primary_idx) catch {};
+        return primary_idx;
+    }
+    if (self.faces.items[0].hasCodepoint(cp)) {
+        self.codepoint_faces.put(alloc, key, 0) catch {};
+        return 0;
+    }
 
     const idx = idx: {
         if (self.embedded_face) |embedded| {
@@ -934,6 +960,7 @@ test "embedded symbols face serves nerd font codepoints" {
     // Powerline separator and folder icon: Nerd Font staples that a
     // plain monospace primary won't have.
     for ([_]u21{ 0xE0B0, 0xF07B }) |cp| {
+        if (sprite.covers(cp)) continue; // sprites intentionally override fonts
         if (font.faces.items[0].hasCodepoint(cp)) continue; // patched primary
         try std.testing.expectEqual(embedded, font.faceForCodepoint(alloc, cp));
         const g = try font.face(embedded).glyph(

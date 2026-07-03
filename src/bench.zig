@@ -211,18 +211,180 @@ pub fn run(init: std.process.Init) !void {
         }
         try report(w, "copy 3-row span", nowNs(init.io) - start, iters, span_len * 4);
     }
+
+    try w.writeAll("\n4K-ish stress cases\n");
+    try benchFullGrid(init.io, alloc, config, &renderer, w, 384, 112, "full render 384x112");
+    try benchShapePrefixChurn(init.io, alloc, config, &renderer, w, 384, 112);
+    try benchCopies(init.io, alloc, w, 3840, 2160, "copy 3840x2160");
+}
+
+fn benchFullGrid(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    config: Config,
+    renderer: *Renderer,
+    w: *std.Io.Writer,
+    comptime bench_cols: u16,
+    comptime bench_rows: u16,
+    comptime name: []const u8,
+) !void {
+    const width: u31 = renderer.font.cell_width * bench_cols;
+    const height: u31 = renderer.font.cell_height * bench_rows;
+    var term: vt.Terminal = try .init(io, alloc, .{
+        .cols = bench_cols,
+        .rows = bench_rows,
+        .max_scrollback = config.scrollback,
+        .colors = config.terminalColors(),
+    });
+    defer term.deinit(alloc);
+    term.width_px = width;
+    term.height_px = height;
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    var render_state: vt.RenderState = .empty;
+    defer render_state.deinit(alloc);
+
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    try fillScreenDims(alloc, &stream, bench_cols, bench_rows);
+    try render_state.update(alloc, &term);
+    try renderer.render(&render_state, pixels, width, height);
+    clearDirty(&render_state);
+
+    try w.print(
+        "{s}: grid {d}x{d}, {d}x{d} px ({d:.1} MB frame)\n",
+        .{
+            name,
+            bench_cols,
+            bench_rows,
+            width,
+            height,
+            @as(f64, @floatFromInt(pixels.len * 4)) / 1e6,
+        },
+    );
+
+    const iters = 30;
+    const start = nowNs(io);
+    for (0..iters) |_| {
+        try renderer.render(&render_state, pixels, width, height);
+    }
+    try report(w, name, nowNs(io) - start, iters, null);
+}
+
+fn benchCopies(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    w: *std.Io.Writer,
+    comptime width: usize,
+    comptime height: usize,
+    comptime name: []const u8,
+) !void {
+    const pixels = try alloc.alloc(u32, width * height);
+    defer alloc.free(pixels);
+    const shm = try alloc.alloc(u32, pixels.len);
+    defer alloc.free(shm);
+    @memset(pixels, 0xff1a1b26);
+
+    const bytes = pixels.len * 4;
+    try w.print("{s}: {d}x{d} px ({d:.1} MB frame)\n", .{
+        name,
+        width,
+        height,
+        @as(f64, @floatFromInt(bytes)) / 1e6,
+    });
+    {
+        const iters = 60;
+        const start = nowNs(io);
+        for (0..iters) |_| {
+            @memcpy(shm, pixels);
+            std.mem.doNotOptimizeAway(shm);
+        }
+        try report(w, "copy 4K frame", nowNs(io) - start, iters, bytes);
+    }
+    {
+        const iters = 60;
+        const start = nowNs(io);
+        for (0..iters) |_| {
+            _ = memcpy(shm.ptr, pixels.ptr, bytes);
+            std.mem.doNotOptimizeAway(shm);
+        }
+        try report(w, "copy 4K frame (libc)", nowNs(io) - start, iters, bytes);
+    }
+    {
+        const iters = 60;
+        const start = nowNs(io);
+        for (0..iters) |_| {
+            Renderer.copyPixels(shm, pixels);
+            std.mem.doNotOptimizeAway(shm);
+        }
+        try report(w, "copy 4K frame (NT stores)", nowNs(io) - start, iters, bytes);
+        if (!std.mem.eql(u32, shm, pixels)) try w.writeAll("  (!) NT copy MISMATCH\n");
+    }
+}
+
+fn benchShapePrefixChurn(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    config: Config,
+    renderer: *Renderer,
+    w: *std.Io.Writer,
+    comptime bench_cols: u16,
+    comptime bench_rows: u16,
+) !void {
+    const width: u31 = renderer.font.cell_width * bench_cols;
+    const height: u31 = renderer.font.cell_height * bench_rows;
+    var term: vt.Terminal = try .init(io, alloc, .{
+        .cols = bench_cols,
+        .rows = bench_rows,
+        .max_scrollback = config.scrollback,
+        .colors = config.terminalColors(),
+    });
+    defer term.deinit(alloc);
+    term.width_px = width;
+    term.height_px = height;
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    var render_state: vt.RenderState = .empty;
+    defer render_state.deinit(alloc);
+
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    try fillPrefixChurnFrame(alloc, &stream, bench_cols, bench_rows, 0);
+    try render_state.update(alloc, &term);
+    try renderer.render(&render_state, pixels, width, height);
+    clearDirty(&render_state);
+
+    renderer.resetShapeStats();
+    const iters = 30;
+    const start = nowNs(io);
+    for (0..iters) |frame| {
+        try fillPrefixChurnFrame(alloc, &stream, bench_cols, bench_rows, frame + 1);
+        try render_state.update(alloc, &term);
+        try renderer.renderDirty(&render_state, pixels, width, height);
+        clearDirty(&render_state);
+    }
+    try report(w, "prefix-churn frame 384x112", nowNs(io) - start, iters, null);
+    try reportShapeStats(w, renderer.shapeStats());
 }
 
 /// Fill every grid row with colored words and park the cursor at the
 /// bottom so later newlines scroll.
 fn fillScreen(alloc: std.mem.Allocator, stream: anytype) !void {
+    try fillScreenDims(alloc, stream, cols, rows);
+}
+
+fn fillScreenDims(alloc: std.mem.Allocator, stream: anytype, fill_cols: usize, fill_rows: usize) !void {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
-    for (0..rows) |y| {
+    for (0..fill_rows) |y| {
         if (y > 0) try aw.writer.writeAll("\r\n");
         var col: usize = 0;
         var color: u8 = 1;
-        while (col + 8 <= cols) : (col += 8) {
+        while (col + 8 <= fill_cols) : (col += 8) {
             // "mÔnstar": the accented capital overhangs its cell top in
             // many fonts, exercising the renderer's overhang tracking.
             try aw.writer.print("\x1b[3{d}mm\u{d4}nstar ", .{color});
@@ -236,18 +398,44 @@ fn fillScreen(alloc: std.mem.Allocator, stream: anytype) !void {
 /// Fill every grid row with words carrying colored backgrounds, like a
 /// full-screen TUI.
 fn fillScreenBg(alloc: std.mem.Allocator, stream: anytype) !void {
+    try fillScreenBgDims(alloc, stream, cols, rows);
+}
+
+fn fillScreenBgDims(alloc: std.mem.Allocator, stream: anytype, fill_cols: usize, fill_rows: usize) !void {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
     try aw.writer.writeAll("\x1b[H");
-    for (0..rows) |y| {
+    for (0..fill_rows) |y| {
         if (y > 0) try aw.writer.writeAll("\r\n");
         var col: usize = 0;
         var color: u8 = 1;
-        while (col + 8 <= cols) : (col += 8) {
+        while (col + 8 <= fill_cols) : (col += 8) {
             try aw.writer.print("\x1b[4{d};30mpanels  ", .{color});
             color = if (color == 6) 1 else color + 1;
         }
         try aw.writer.writeAll("\x1b[0m");
+    }
+    stream.nextSlice(aw.writer.buffered());
+}
+
+fn fillPrefixChurnFrame(
+    alloc: std.mem.Allocator,
+    stream: anytype,
+    fill_cols: usize,
+    fill_rows: usize,
+    frame: usize,
+) !void {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try aw.writer.writeAll("\x1b[H");
+    for (0..fill_rows) |y| {
+        if (y > 0) try aw.writer.writeAll("\r\n");
+        try aw.writer.print("{d:0>6} ", .{frame});
+        var col: usize = 7;
+        while (col + 16 <= fill_cols) : (col += 16) {
+            try aw.writer.print("stable row {d:0>3} ", .{y});
+        }
+        try aw.writer.writeAll("\x1b[K");
     }
     stream.nextSlice(aw.writer.buffered());
 }
@@ -288,4 +476,20 @@ fn report(
         try w.print("  {d:>7.2} GB/s", .{@as(f64, @floatFromInt(bytes)) / ns_per});
     }
     try w.writeAll("\n");
+}
+
+fn reportShapeStats(w: *std.Io.Writer, stats: Renderer.ShapeStats) !void {
+    const total = stats.cache_hits + stats.cache_misses;
+    const hit_rate: f64 = if (total == 0)
+        0
+    else
+        @as(f64, @floatFromInt(stats.cache_hits)) * 100 / @as(f64, @floatFromInt(total));
+    const cells_per_miss: f64 = if (stats.cache_misses == 0)
+        0
+    else
+        @as(f64, @floatFromInt(stats.shaped_cells)) / @as(f64, @floatFromInt(stats.cache_misses));
+    try w.print(
+        "  shape cache: {d} hits, {d} misses ({d:.1}% hit), {d:.1} cells/miss, {d} clears\n",
+        .{ stats.cache_hits, stats.cache_misses, hit_rate, cells_per_miss, stats.cache_clears },
+    );
 }

@@ -61,6 +61,9 @@ repainted: std.DynamicBitSetUnmanaged,
 shape_cache: std.StringHashMapUnmanaged([]ShapedGlyph),
 /// Scratch for the current run's cache key.
 shape_key: std.ArrayList(u32),
+/// Shape cache counters for benchmarks/profiling. Production rendering does
+/// not read these, so they stay deliberately cheap and approximate.
+shape_stats: ShapeStats = .{},
 
 /// Shape cache entry limit; at ~300 bytes per typical entry the cache
 /// tops out around a few megabytes before it resets.
@@ -81,6 +84,13 @@ pub const InitOptions = struct {
     selection_foreground: ?vt.color.RGB = null,
 };
 
+pub const ShapeStats = struct {
+    cache_hits: usize = 0,
+    cache_misses: usize = 0,
+    shaped_cells: usize = 0,
+    cache_clears: usize = 0,
+};
+
 pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer {
     const hb_buf = c.hb_buffer_create() orelse return error.OutOfMemory;
     if (c.hb_buffer_allocation_successful(hb_buf) == 0) return error.OutOfMemory;
@@ -99,6 +109,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .repainted = .{},
         .shape_cache = .empty,
         .shape_key = .empty,
+        .shape_stats = .{},
     };
 }
 
@@ -126,6 +137,14 @@ pub fn clearShapeCache(self: *Renderer) void {
         self.alloc.free(entry.value_ptr.*);
     }
     self.shape_cache.clearRetainingCapacity();
+}
+
+pub fn resetShapeStats(self: *Renderer) void {
+    self.shape_stats = .{};
+}
+
+pub fn shapeStats(self: *const Renderer) ShapeStats {
+    return self.shape_stats;
 }
 
 /// Draw the full render state into `pixels` (width*height, stride == width).
@@ -1178,7 +1197,10 @@ fn renderRowForeground(
     var x: u31 = 0;
     while (x < cols) : (x += 1) {
         const has_text = switch (raws[x].content_tag) {
-            .codepoint, .codepoint_grapheme => raws[x].content.codepoint.data != 0 and
+            .codepoint => raws[x].content.codepoint.data != 0 and
+                raws[x].content.codepoint.data != ' ' and
+                raws[x].content.codepoint.data != kitty_placeholder,
+            .codepoint_grapheme => raws[x].content.codepoint.data != 0 and
                 raws[x].content.codepoint.data != kitty_placeholder,
             else => false,
         };
@@ -1340,7 +1362,7 @@ fn drawRun(
         const raw = raws[x];
         if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
         const cp = raw.content.codepoint.data;
-        if (cp != ' ') non_space = true;
+        if (cp != ' ' or raw.content_tag == .codepoint_grapheme) non_space = true;
         const rel: u32 = @intCast(x - start);
         try self.shape_key.appendSlice(self.alloc, &.{ rel, cp });
         if (raw.content_tag == .codepoint_grapheme) {
@@ -1351,8 +1373,14 @@ fn drawRun(
     }
     if (!non_space) return;
 
-    const shaped = self.shape_cache.get(std.mem.sliceAsBytes(self.shape_key.items)) orelse
-        try self.shapeRun(face);
+    const shaped = if (self.shape_cache.get(std.mem.sliceAsBytes(self.shape_key.items))) |cached| shaped: {
+        self.shape_stats.cache_hits += 1;
+        break :shaped cached;
+    } else shaped: {
+        self.shape_stats.cache_misses += 1;
+        self.shape_stats.shaped_cells += end - start;
+        break :shaped try self.shapeRun(face);
+    };
 
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
     var pen_x: i32 = 0;
@@ -1421,7 +1449,10 @@ fn shapeRun(self: *Renderer, face: *Font.Face) ![]ShapedGlyph {
 
     // Full cache: reset wholesale. Terminal content is repetitive
     // enough that the working set repopulates within a frame or two.
-    if (self.shape_cache.count() >= shape_cache_max_entries) self.clearShapeCache();
+    if (self.shape_cache.count() >= shape_cache_max_entries) {
+        self.shape_stats.cache_clears += 1;
+        self.clearShapeCache();
+    }
     const owned_key = try self.alloc.dupe(u8, std.mem.sliceAsBytes(key));
     errdefer self.alloc.free(owned_key);
     try self.shape_cache.put(self.alloc, owned_key, shaped);
@@ -1708,6 +1739,10 @@ fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) 
     while (i + 4 <= dst.len) : (i += 4) {
         const cov: @Vector(4, u8) = coverage[i..][0..4].*;
         if (@reduce(.Or, cov) == 0) continue;
+        if (@reduce(.And, cov == @as(@Vector(4, u8), @splat(0xff)))) {
+            dst[i..][0..4].* = @as(@Vector(4, u32), @splat(color));
+            continue;
+        }
         const a: V = @shuffle(u8, cov, undefined, expand);
         const na = @as(V, @splat(255)) - a;
         const bg: V = @as(@Vector(16, u8), @bitCast(dst[i..][0..4].*));
