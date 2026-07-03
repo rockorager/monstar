@@ -2,8 +2,6 @@
 //!
 //! `monstar [command...]` runs a command (default: $SHELL) in a Wayland
 //! terminal window with live output.
-//! `monstar --dump [command...]` runs a command to completion headlessly
-//! and prints the emulated screen as text.
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
@@ -16,55 +14,14 @@ const Window = @import("Window.zig");
 
 const log = std.log.scoped(.main);
 
-const cols = 80;
-const rows = 24;
-
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--dump")) {
-        return dump(init, args[2..]);
-    }
     if (args.len > 1 and std.mem.eql(u8, args[1], "--bench")) {
         return @import("bench.zig").run(init);
     }
     return gui(init, args[1..]);
-}
-
-/// Run a command to completion under terminal emulation, filling `term`.
-fn runCommand(init: std.process.Init, term: *vt.Terminal, args: []const [:0]const u8) !void {
-    const arena = init.arena.allocator();
-
-    // Command to run: CLI args joined, or a colorful default.
-    const cmd: [:0]const u8 = if (args.len > 0)
-        try std.mem.joinZ(arena, " ", args)
-    else
-        "ls --color=auto /";
-
-    var stream = term.vtStream();
-    defer stream.deinit();
-
-    var pty: Pty = try .open(.{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 });
-    defer pty.deinit();
-
-    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd };
-    const envp = try buildEnvp(arena, init.minimal.environ);
-    const pid = try pty.spawn("/bin/sh", &argv, envp, .{});
-
-    // Drain PTY output into the terminal until the child hangs up.
-    var read_buf: [4096]u8 = undefined;
-    while (true) {
-        const n = std.posix.read(pty.master, &read_buf) catch |err| switch (err) {
-            // EIO on the master means the slave side is gone (child exited).
-            error.Unexpected, error.InputOutput => break,
-            else => return err,
-        };
-        if (n == 0) break;
-        stream.nextSlice(read_buf[0..n]);
-    }
-    const status = try Pty.wait(pid);
-    log.debug("child exited with status {d}", .{status});
 }
 
 /// GUI mode: run a live terminal session in a window.
@@ -90,23 +47,6 @@ fn gui(init: std.process.Init, args: []const [:0]const u8) !void {
     const app = try App.init(init.io, init.gpa, config, init.minimal.environ, argv_z[0].?, argv_z.ptr, envp);
     defer app.deinit();
     try app.run();
-}
-
-/// Headless mode: run a command under terminal emulation, print the screen.
-fn dump(init: std.process.Init, args: []const [:0]const u8) !void {
-    const alloc = init.gpa;
-
-    var term: vt.Terminal = try .init(init.io, alloc, .{ .cols = cols, .rows = rows });
-    defer term.deinit(alloc);
-    try runCommand(init, &term, args);
-
-    const text = try term.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} });
-    defer alloc.free(text);
-
-    var out_buf: [4096]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(init.io, &out_buf);
-    defer writer.interface.flush() catch {};
-    try writer.interface.print("{s}\n", .{text});
 }
 
 /// Build an envp block for the child: the inherited environment with
