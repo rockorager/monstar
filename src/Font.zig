@@ -801,11 +801,13 @@ pub fn faceForCodepointStyle(
     cp: u21,
     style: FaceStyle,
 ) u16 {
-    // Sprites override fonts so grid glyphs are always seamless.
-    if (sprite.covers(cp)) return sprite_face_index;
-
     const primary_idx = self.primary_faces[@intFromEnum(style)];
     if (cp >= 0x20 and cp < 0x7f and self.primary_ascii[@intFromEnum(style)]) return primary_idx;
+
+    // Sprites override fonts so grid glyphs are always seamless. There are no
+    // printable ASCII sprites, so the common text path above skips this range
+    // lookup entirely.
+    if (sprite.covers(cp)) return sprite_face_index;
 
     const key: CodepointFaceKey = .{ .style = style, .cp = cp };
     if (self.codepoint_faces.get(key)) |idx| return idx;
