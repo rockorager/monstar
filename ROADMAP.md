@@ -6,11 +6,6 @@ queries, kitty graphics, selection/clipboard basics, styled font faces,
 pointer shapes, notifications, Wayland activation/decorations/suspend,
 high-resolution wheel scrolling, and text-input-v3 IME support.
 
-## Open issues to revisit
-
-- Runtime font size changes: add keybindings to increase/decrease/reset
-  font size. Tracked in GitHub.
-
 ## Dependency maintenance
 
 - Re-pin the Ghostty dependency to upstream main once the Zig 0.16

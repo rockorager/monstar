@@ -98,6 +98,8 @@ child_pid: posix.pid_t,
 font: Font,
 /// The physical pixel size the font is currently loaded at.
 font_size_px: u31,
+/// Runtime-only logical font-size override from keyboard shortcuts.
+runtime_font_size: ?u31,
 renderer: Renderer,
 window: *Window,
 keyboard: Keyboard,
@@ -405,6 +407,7 @@ pub fn init(
         .child_pid = child_pid,
         .font = font,
         .font_size_px = config.font_size,
+        .runtime_font_size = null,
         .renderer = try .init(alloc, &self.font, .{
             .selection_background = config.selection_background,
             .selection_foreground = config.selection_foreground,
@@ -520,7 +523,7 @@ fn decodePng(alloc: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.s
 /// to the new cell metrics.
 fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const size_px: u31 = @intCast((@as(u64, self.config.font_size) * scale120 + 60) / 120);
+    const size_px = scaledFontSize(self.effectiveFontSize(), scale120);
     if (size_px == 0 or size_px == self.font_size_px) return;
 
     const new_font: Font = try .init(self.alloc, self.config.font_family, size_px);
@@ -1123,7 +1126,7 @@ fn reloadConfig(self: *App) void {
 }
 
 fn applyConfig(self: *App, new_config: Config) !void {
-    const desired_font_size: u31 = @intCast((@as(u64, new_config.font_size) * self.window.scale120 + 60) / 120);
+    const desired_font_size = scaledFontSize(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
     const new_font: Font = try .init(self.alloc, new_config.font_family, desired_font_size);
 
     const colors = new_config.terminalColors();
@@ -1152,6 +1155,49 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
     self.render_state.dirty = .full;
     self.needs_redraw = true;
+}
+
+fn effectiveFontSize(self: *const App) u31 {
+    return self.runtime_font_size orelse self.config.font_size;
+}
+
+fn scaledFontSize(logical_size: u31, scale120: u32) u31 {
+    return @max(1, @as(u31, @intCast((@as(u64, logical_size) * scale120 + 60) / 120)));
+}
+
+fn setRuntimeFontSize(self: *App, logical_size: ?u31) void {
+    const next_size = logical_size orelse self.config.font_size;
+    const size_px = scaledFontSize(next_size, self.window.scale120);
+    const new_font: Font = Font.init(self.alloc, self.config.font_family, size_px) catch |err| {
+        log.warn("font size change failed: {}", .{err});
+        return;
+    };
+
+    self.runtime_font_size = logical_size;
+    self.font.deinit(self.alloc);
+    self.font = new_font;
+    self.font_size_px = size_px;
+    resize(
+        self,
+        physicalDimension(self.window.width, self.window.scale120),
+        physicalDimension(self.window.height, self.window.scale120),
+    ) catch |err| {
+        log.warn("font size change resize failed: {}", .{err});
+    };
+    self.render_state.dirty = .full;
+    self.needs_redraw = true;
+}
+
+fn adjustRuntimeFontSize(self: *App, delta: i32) void {
+    const current: i32 = @intCast(self.effectiveFontSize());
+    const next: u31 = @intCast(std.math.clamp(current + delta, 1, 512));
+    if (next == self.effectiveFontSize()) return;
+    self.setRuntimeFontSize(next);
+}
+
+fn resetRuntimeFontSize(self: *App) void {
+    if (self.runtime_font_size == null) return;
+    self.setRuntimeFontSize(null);
 }
 
 /// Drain available PTY output into the terminal. Bounded so a
@@ -2730,6 +2776,15 @@ fn fireRepeat(self: *App) void {
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
+
+    if (action == .press and event.mods.ctrl) {
+        switch (event.key) {
+            .equal => return self.adjustRuntimeFontSize(1),
+            .minus => return self.adjustRuntimeFontSize(-1),
+            .digit_0 => return self.resetRuntimeFontSize(),
+            else => {},
+        }
+    }
 
     // Copy/paste bindings take priority over the application.
     if (action == .press and event.mods.ctrl and event.mods.shift) {

@@ -28,4 +28,7 @@ pkill -USR1 monstar
 | `Ctrl+Shift+C` | Copy selection to clipboard |
 | `Ctrl+Shift+V` | Paste from clipboard |
 | `Ctrl+Shift+,` | Reload config |
+| `Ctrl++` / `Ctrl+=` | Increase font size for this window |
+| `Ctrl+-` | Decrease font size for this window |
+| `Ctrl+0` | Reset font size for this window |
 | `Ctrl` + left click | Open OSC 8 hyperlink |
