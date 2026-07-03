@@ -1655,8 +1655,19 @@ fn fillRect(
     const x_end = @min(x + w, buf_width);
     const y_end = @min(y + h, buf_height);
     for (y..y_end) |row| {
-        @memset(pixels[row * buf_width + x .. row * buf_width + x_end], color);
+        fillSpan(pixels[row * buf_width + x .. row * buf_width + x_end], color);
     }
+}
+
+/// Fill a pixel span with explicit wide stores. `@memset` here lowers
+/// to a scalar dword loop (LLVM unrolls the enclosing row loop instead
+/// of vectorizing), capping background fills at 4 bytes per store.
+fn fillSpan(dst: []u32, color: u32) void {
+    const V = @Vector(8, u32);
+    const splat: V = @splat(color);
+    var i: usize = 0;
+    while (i + 8 <= dst.len) : (i += 8) dst[i..][0..8].* = splat;
+    for (dst[i..]) |*px| px.* = color;
 }
 
 /// Alpha-blend an 8-bit coverage bitmap in `color` over the buffer.
