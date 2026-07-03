@@ -39,3 +39,4 @@ pkill -USR1 monstar
 | `Ctrl+-` | Decrease font size for this window |
 | `Ctrl+0` | Reset font size for this window |
 | `Ctrl` + left click | Open OSC 8 hyperlink |
+| `Ctrl` + drag | Rectangular text selection |

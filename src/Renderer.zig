@@ -1736,6 +1736,63 @@ test "render a simple grid" {
     try std.testing.expect(non_bg > 0);
 }
 
+test "render rectangular selection spans" {
+    const alloc = std.testing.allocator;
+    const selection_bg: vt.color.RGB = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 5 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l");
+
+    const screen = term.screens.active;
+    try screen.select(vt.Selection.init(
+        screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 4, .y = 3 } }).?,
+        true,
+    ));
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    const rows = state.row_data.slice();
+    const selections = rows.items(.selection);
+    try std.testing.expectEqual(null, selections[0]);
+    try std.testing.expectEqualSlices(vt.size.CellCountInt, &.{ 2, 4 }, &selections[1].?);
+    try std.testing.expectEqualSlices(vt.size.CellCountInt, &.{ 2, 4 }, &selections[2].?);
+    try std.testing.expectEqualSlices(vt.size.CellCountInt, &.{ 2, 4 }, &selections[3].?);
+    try std.testing.expectEqual(null, selections[4]);
+
+    var renderer: Renderer = try .init(alloc, &font, .{ .selection_background = selection_bg });
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 8;
+    const height: u31 = font.cell_height * 5;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    try renderer.render(&state, pixels, width, height);
+
+    const selected = argb(selection_bg);
+    const background = argb(state.colors.background);
+    for (0..5) |y| {
+        for (0..8) |x| {
+            const px = (y * font.cell_height + font.cell_height / 2) * width +
+                (x * font.cell_width + font.cell_width / 2);
+            const expected = if (y >= 1 and y <= 3 and x >= 2 and x <= 4)
+                selected
+            else
+                background;
+            try std.testing.expectEqual(expected, pixels[px]);
+        }
+    }
+}
+
 test "render kitty image placement" {
     const alloc = std.testing.allocator;
 
