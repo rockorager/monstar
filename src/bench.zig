@@ -81,19 +81,47 @@ pub fn run(init: std.process.Init) !void {
         try report(w, "full render", nowNs(init.io) - start, iters, null);
     }
 
-    // End-to-end scroll frame: one new line, full update + full render.
+    // End-to-end scroll frame: one new line fed, then the same path
+    // App.render takes (scroll detection, update, blit or full render).
     // This is the hot path when a program streams output.
     {
         const scroll_line = comptime scrollLine();
         const iters = 100;
+        var blitted: usize = 0;
         const start = nowNs(init.io);
         for (0..iters) |_| {
             stream.nextSlice(scroll_line);
+            const scroll = try renderer.detectScroll(&render_state, &term);
+            const old_cursor = render_state.cursor;
             try render_state.update(alloc, &term);
-            try renderer.render(&render_state, pixels, width, height);
+            if (scroll) |s| {
+                const old_cursor_row: ?usize = if (old_cursor.viewport) |viewport| viewport.y else null;
+                try renderer.renderScrolled(&render_state, pixels, width, height, s, old_cursor_row);
+                blitted += 1;
+            } else {
+                try renderer.render(&render_state, pixels, width, height);
+            }
             clearDirty(&render_state);
         }
         try report(w, "scroll frame (feed+update+render)", nowNs(init.io) - start, iters, null);
+        if (blitted != iters) try w.print("  (!) only {d}/{d} frames took the blit path\n", .{ blitted, iters });
+
+        // Verify the blit path is pixel-identical to a full render of
+        // the same state (using the shm buffer as scratch).
+        stream.nextSlice(scroll_line);
+        const scroll = try renderer.detectScroll(&render_state, &term);
+        const old_cursor = render_state.cursor;
+        try render_state.update(alloc, &term);
+        if (scroll) |s| {
+            const old_cursor_row: ?usize = if (old_cursor.viewport) |viewport| viewport.y else null;
+            try renderer.renderScrolled(&render_state, pixels, width, height, s, old_cursor_row);
+            try renderer.render(&render_state, shm, width, height);
+            const ok = std.mem.eql(u32, pixels, shm);
+            try w.print("scroll blit matches full render: {s}\n", .{if (ok) "OK" else "MISMATCH"});
+        } else {
+            try w.writeAll("scroll blit verification: no scroll detected\n");
+        }
+        clearDirty(&render_state);
     }
 
     // Steady-state frame: one row changes (cursor line, status bar).

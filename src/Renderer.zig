@@ -35,6 +35,12 @@ fg_scratch: std.ArrayList(vt.color.RGB),
 face_scratch: std.ArrayList(u16),
 /// Per-cell reverse-video state for color glyphs, including block cursor.
 reverse_scratch: std.ArrayList(bool),
+/// Scroll detection scratch: the new viewport's row pins.
+scroll_pins: std.ArrayList(vt.Pin),
+/// Scroll detection scratch: rows the terminal wrote beyond the
+/// scroll itself, captured before RenderState.update consumes the
+/// dirty flags. Valid between detectScroll and renderScrolled.
+scroll_predirty: std.DynamicBitSetUnmanaged,
 
 pub const InitOptions = struct {
     selection_background: ?vt.color.RGB = null,
@@ -53,6 +59,8 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .fg_scratch = .empty,
         .face_scratch = .empty,
         .reverse_scratch = .empty,
+        .scroll_pins = .empty,
+        .scroll_predirty = .{},
     };
 }
 
@@ -61,6 +69,8 @@ pub fn deinit(self: *Renderer) void {
     self.fg_scratch.deinit(self.alloc);
     self.face_scratch.deinit(self.alloc);
     self.reverse_scratch.deinit(self.alloc);
+    self.scroll_pins.deinit(self.alloc);
+    self.scroll_predirty.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -187,6 +197,157 @@ pub fn renderDirty(
         }
         rendered_until = @max(rendered_until, end);
     }
+}
+
+pub const Scroll = struct {
+    /// Rows the content moved: positive moves content up (new output
+    /// scrolled in at the bottom), negative moves it down (scrollback).
+    shift: isize,
+};
+
+/// Detect a pure viewport scroll between the previous frame's render
+/// state and the terminal's current viewport. Must be called before
+/// RenderState.update: it needs last frame's row pins and the
+/// terminal's not-yet-consumed dirty flags. Returns null when the
+/// frame is not a clean scroll (global state changed, a selection is
+/// involved, or the rows don't line up). On success the scratch
+/// records which rows changed beyond the scroll; renderScrolled
+/// consumes it after update.
+pub fn detectScroll(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    term: *const vt.Terminal,
+) !?Scroll {
+    if (state.dirty != .false) return null;
+    const rows: usize = state.rows;
+    if (rows == 0 or state.row_data.len != rows) return null;
+    const screen = term.screens.active;
+    if (term.screens.active_key != state.screen) return null;
+    if (rows != screen.pages.rows or state.cols != screen.pages.cols) return null;
+
+    // Global dirty state (palette, clear, hyperlink hover, ...) needs
+    // a real full render.
+    {
+        const Int = @typeInfo(vt.Terminal.Dirty).@"struct".backing_integer.?;
+        if (@as(Int, @bitCast(term.flags.dirty)) != 0) return null;
+    }
+    {
+        const Int = @typeInfo(vt.Screen.Dirty).@"struct".backing_integer.?;
+        if (@as(Int, @bitCast(screen.dirty)) != 0) return null;
+    }
+
+    // Selection highlights are painted at viewport positions; shifted
+    // pixels would carry them to the wrong rows.
+    if (screen.selection != null) return null;
+    for (state.row_data.items(.selection)) |sel| {
+        if (sel != null) return null;
+    }
+
+    const old_viewport = state.viewport_pin orelse return null;
+    const new_viewport = screen.pages.getTopLeft(.viewport);
+    if (old_viewport.eql(new_viewport)) return null;
+
+    // Snapshot the new viewport's pins and per-row dirty state before
+    // update() consumes the dirty flags.
+    try self.scroll_pins.resize(self.alloc, rows);
+    try self.scroll_predirty.resize(self.alloc, rows, false);
+    self.scroll_predirty.unsetAll();
+    var it = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+    var y: usize = 0;
+    while (it.next()) |pin| : (y += 1) {
+        if (y >= rows) return null;
+        self.scroll_pins.items[y] = pin;
+        if (pin.node.data.dirty or pin.rowAndCell().row.dirty) self.scroll_predirty.set(y);
+    }
+    if (y != rows) return null;
+
+    const old_pins = state.row_data.items(.pin);
+    const new_pins = self.scroll_pins.items;
+
+    // Content moved up: today's row 0 was row n last frame.
+    if (findPin(new_pins[0], old_pins)) |n| {
+        if (pinsMatch(new_pins[0 .. rows - n], old_pins[n..rows])) {
+            return .{ .shift = @intCast(n) };
+        }
+    }
+    // Content moved down: last frame's row 0 is row n today.
+    if (findPin(old_pins[0], new_pins)) |n| {
+        if (pinsMatch(new_pins[n..rows], old_pins[0 .. rows - n])) {
+            return .{ .shift = -@as(isize, @intCast(n)) };
+        }
+    }
+    return null;
+}
+
+fn findPin(needle: vt.Pin, pins: []const vt.Pin) ?usize {
+    for (pins[1..], 1..) |pin, n| {
+        if (needle.eql(pin)) return n;
+    }
+    return null;
+}
+
+fn pinsMatch(a: []const vt.Pin, b: []const vt.Pin) bool {
+    std.debug.assert(a.len == b.len);
+    for (a, b) |pin_a, pin_b| if (!pin_a.eql(pin_b)) return false;
+    return true;
+}
+
+/// Finish a frame detected by detectScroll, after RenderState.update:
+/// shift last frame's pixels by whole rows, then re-render only the
+/// rows with new content (rows that entered the viewport, rows the
+/// terminal wrote, and the cursor's old and new rows).
+pub fn renderScrolled(
+    self: *Renderer,
+    state: *vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    scroll: Scroll,
+    old_cursor_row: ?usize,
+) !void {
+    std.debug.assert(pixels.len == @as(usize, width) * height);
+    const rows: usize = state.rows;
+    const shift: usize = @abs(scroll.shift);
+    std.debug.assert(shift > 0 and shift < rows);
+    std.debug.assert(self.scroll_predirty.bit_length == rows);
+    const shift_px = shift * self.font.cell_height;
+    const grid_px = @min(rows * self.font.cell_height, height);
+    const keep_px = grid_px - shift_px;
+
+    // Shift the previous frame's grid pixels by whole rows. The
+    // leftover strip below the grid only holds background; it stays.
+    if (scroll.shift > 0) {
+        std.mem.copyForwards(
+            u32,
+            pixels[0 .. keep_px * width],
+            pixels[shift_px * width .. grid_px * width],
+        );
+    } else {
+        std.mem.copyBackwards(
+            u32,
+            pixels[shift_px * width .. grid_px * width],
+            pixels[0 .. keep_px * width],
+        );
+    }
+
+    // update() marked every row dirty for the full redraw; narrow that
+    // to the rows whose pixels are not covered by the shift.
+    const row_dirties = state.row_data.items(.dirty);
+    for (row_dirties[0..rows], 0..) |*dirty, y| {
+        const entered = if (scroll.shift > 0) y >= rows - shift else y < shift;
+        dirty.* = entered or self.scroll_predirty.isSet(y);
+    }
+    // The cursor is drawn into its cell: erase it at the shifted
+    // position of its old row and draw it at its current row.
+    if (old_cursor_row) |old_y| {
+        const moved = @as(isize, @intCast(old_y)) - scroll.shift;
+        if (moved >= 0 and moved < rows) row_dirties[@intCast(moved)] = true;
+    }
+    if (state.cursor.viewport) |viewport| {
+        if (viewport.y < rows) row_dirties[viewport.y] = true;
+    }
+    state.dirty = .partial;
+    try self.renderDirty(state, pixels, width, height);
 }
 
 pub fn renderPreedit(

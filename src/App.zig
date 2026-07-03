@@ -3461,15 +3461,34 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
         return self.flushFrame(pixels, width, height, age);
     }
     const old_cursor = self.render_state.cursor;
+    // A pure scroll can reuse most of last frame's pixels; overlays
+    // (kitty graphics, preedit, link hints) disqualify the frame since
+    // they draw outside the grid rows the shift accounts for.
+    const scroll: ?Renderer.Scroll = scroll: {
+        if (resized or has_kitty_graphics or self.ime_preedit != null) break :scroll null;
+        if (self.keyboard.currentMods().ctrl) break :scroll null;
+        break :scroll try self.renderer.detectScroll(&self.render_state, &self.term);
+    };
     try self.render_state.update(self.alloc, &self.term);
     self.dirtyCursorRows(old_cursor);
     const kitty_graphics_dirty = self.term.screens.active.kitty_images.dirty;
     if (self.ime_preedit != null) self.render_state.dirty = .full;
     if (resized or kitty_graphics_dirty or has_kitty_graphics) self.render_state.dirty = .full;
+    // A detected scroll implies the viewport pin changed, which update
+    // always answers with a full redraw.
+    std.debug.assert(scroll == null or self.render_state.dirty == .full);
+    var scrolled = false;
     switch (self.render_state.dirty) {
         .false => {},
         .full => if (has_kitty_graphics) {
             try self.renderer.renderWithKittyGraphics(&self.render_state, &self.term, self.render_pixels.items, width, height);
+        } else if (scroll) |s| {
+            const old_cursor_row: ?usize = if (old_cursor.visible)
+                if (old_cursor.viewport) |viewport| viewport.y else null
+            else
+                null;
+            try self.renderer.renderScrolled(&self.render_state, self.render_pixels.items, width, height, s, old_cursor_row);
+            scrolled = true;
         } else {
             try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
         },
@@ -3487,8 +3506,9 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
     }
     self.syncTextInputCursorRect();
     if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
-    // Record what changed before the dirty flags are cleared.
-    try self.recordFrameDamage(damage, hint_drawn);
+    // Record what changed before the dirty flags are cleared. A scroll
+    // moved every pixel, so its entry keeps the claimed full damage.
+    if (!scrolled) try self.recordFrameDamage(damage, hint_drawn);
     self.clearRenderDirty();
     return self.flushFrame(pixels, width, height, age);
 }
