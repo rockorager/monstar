@@ -45,6 +45,7 @@ const CliOptions = struct {
     working_directory: ?[:0]const u8 = null,
     title: [:0]const u8 = "monstar",
     initial_size: App.InitialSize = .default,
+    hold: bool = false,
     command_mode: CommandMode = .shell,
     command: []const [:0]const u8 = &.{},
 };
@@ -88,6 +89,8 @@ const CliParser = struct {
                 continue;
             } else if (try self.pathOption(arg, "--working-directory", &self.cli.working_directory)) {
                 continue;
+            } else if (std.mem.eql(u8, arg, "--hold")) {
+                self.cli.hold = true;
             } else if (try self.configOption(arg, "--app-id", "app-id")) {
                 continue;
             } else if (try self.configOption(arg, "--font", "font-family")) {
@@ -213,6 +216,7 @@ fn printUsage(init: std.process.Init) !void {
         \\      --title TITLE                  Set initial window title
         \\      --app-id APP_ID                Override app-id config
         \\      --working-directory DIR        Run the child in DIR
+        \\      --hold                         Keep window open after command exits
         \\      --window-size-chars COLSxROWS  Set initial grid size
         \\      --window-size-pixels WxH       Set initial window size
         \\      --font FAMILY                  Override font-family config
@@ -269,6 +273,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
             .working_directory = cli.working_directory,
             .title = cli.title,
             .initial_size = cli.initial_size,
+            .hold = cli.hold,
         },
     );
     defer app.deinit();
@@ -389,14 +394,15 @@ test "parse CLI options and config overrides" {
         "-o",                  "scrollback=42",
         "--window-size-chars", "100x40",
         "--working-directory", "/tmp",
-        "-e",                  "env",
-        "A=B",
+        "--hold",              "-e",
+        "env",                 "A=B",
     };
     const cli = try parseCli(arena, &args);
 
     try std.testing.expectEqualStrings("/tmp/monstar.conf", cli.config_path.?);
     try std.testing.expectEqualStrings("Scratch", cli.title);
     try std.testing.expectEqualStrings("/tmp", cli.working_directory.?);
+    try std.testing.expect(cli.hold);
     try std.testing.expectEqual(.exec, cli.command_mode);
     try std.testing.expectEqualStrings("env", cli.command[0]);
     try std.testing.expectEqualStrings("A=B", cli.command[1]);

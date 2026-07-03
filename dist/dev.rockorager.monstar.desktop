@@ -10,3 +10,4 @@ X-TerminalArgExec=-e
 X-TerminalArgAppId=--app-id=
 X-TerminalArgTitle=--title=
 X-TerminalArgDir=--working-directory=
+X-TerminalArgHold=--hold

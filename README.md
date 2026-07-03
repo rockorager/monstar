@@ -38,10 +38,16 @@ Set the child's working directory:
 monstar --working-directory /tmp -e env A=B
 ```
 
+Keep the window open after a command exits:
+
+```sh
+monstar --hold -e make test
+```
+
 Useful launcher/scripting options include:
 
 ```sh
-monstar --title scratch --app-id com.example.scratchpad \
+monstar --title scratch --app-id com.example.scratchpad --hold \
   --window-size-chars 100x32 --font "Iosevka" \
   -o scrollback=20000 -e fish
 ```

@@ -139,8 +139,10 @@ sync_output: bool,
 /// avoid deadlocking against a child that has stopped reading while
 /// flooding output). Flushed when the master polls writable.
 write_queue: std.ArrayList(u8),
-/// The child has exited and been reaped (via SIGCHLD); quit.
+/// The child has exited and been reaped (via SIGCHLD).
 child_exited: bool,
+/// Keep the window open after the child exits.
+hold: bool,
 /// The pty master returned EIO/EOF while the child is still alive
 /// (e.g. the child transiently closed every slave fd, as some shells
 /// do at startup). Reads are retried on a timer until the child
@@ -273,6 +275,7 @@ pub const InitOptions = struct {
     working_directory: ?[:0]const u8 = null,
     title: [:0]const u8 = "monstar",
     initial_size: InitialSize = .default,
+    hold: bool = false,
 };
 
 const StartupSize = struct {
@@ -584,6 +587,7 @@ pub fn init(
         .sync_output = false,
         .write_queue = .empty,
         .child_exited = false,
+        .hold = options.hold,
         .pty_suspended = false,
         .dbus = dbus_connection,
         .dbus_fd = -1,
@@ -1264,7 +1268,7 @@ pub fn deinit(self: *App) void {
     self.alloc.destroy(self);
 }
 
-/// Run until the window is closed or the child exits.
+/// Run until the window is closed or, without hold mode, the child exits.
 pub fn run(self: *App) !void {
     errdefer self.hangupChild();
 
@@ -1291,7 +1295,7 @@ pub fn run(self: *App) !void {
     const taskbar_progress_fd = &fds[7];
     const dbus_fd = &fds[8];
 
-    while (self.window.running and !self.child_exited) {
+    while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
 
@@ -1321,7 +1325,7 @@ pub fn run(self: *App) !void {
         // from the set and probe on a timer instead until the child
         // reopens the tty (or exits, via SIGCHLD).
         pty_fd.fd = if (self.pty_suspended) -1 else self.pty.master;
-        const timeout: i32 = if (self.pty_suspended) 100 else -1;
+        const timeout: i32 = if (self.pty_suspended and !self.child_exited) 100 else -1;
 
         const ready = posix.poll(&fds, timeout) catch {
             display.cancelRead();
@@ -2434,7 +2438,11 @@ test "XTGETTCAP string values decode tcap escapes unless parameterized" {
 }
 
 fn suspendPty(self: *App, err: anyerror) void {
-    if (self.pty_suspended or self.child_exited) return;
+    if (self.pty_suspended) return;
+    if (self.child_exited) {
+        self.pty_suspended = true;
+        return;
+    }
     // Most of the time this is a real child exit; the SIGCHLD arriving
     // right after ends the session. Reap eagerly to avoid one poll
     // round trip.
