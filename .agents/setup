@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Provision the orb with the tools needed to build Monstar and debug it in a
+# headless Wayland compositor. This script is intentionally idempotent: new
+# orbs can run it during setup, and existing orbs can rerun it safely.
+
+ZIG_VERSION=0.16.0
+ZIG_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+ZIG_DIR="${HOME}/.local/opt/zig-${ZIG_VERSION}"
+
+WAYLAND_PROTOCOLS_VERSION=1.49
+WAYLAND_PROTOCOLS_URL="https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/${WAYLAND_PROTOCOLS_VERSION}/downloads/wayland-protocols-${WAYLAND_PROTOCOLS_VERSION}.tar.xz"
+WAYLAND_PROTOCOLS_DIR="/opt/wayland-protocols-${WAYLAND_PROTOCOLS_VERSION}"
+
+WLR_VIRTUAL_POINTER_XML_URL="https://gitlab.freedesktop.org/wlroots/wlroots/-/raw/0.15.1/protocol/wlr-virtual-pointer-unstable-v1.xml"
+
+if command -v sudo >/dev/null 2>&1; then
+  SUDO=(sudo)
+else
+  SUDO=()
+fi
+
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  "${SUDO[@]}" apt-get update
+  "${SUDO[@]}" apt-get install -y \
+    build-essential \
+    ca-certificates \
+    curl \
+    dbus \
+    foot \
+    grim \
+    libdbus-1-dev \
+    libfontconfig-dev \
+    libfreetype-dev \
+    libharfbuzz-dev \
+    libwayland-dev \
+    libxkbcommon-dev \
+    pkg-config \
+    sway \
+    wayland-utils \
+    wf-recorder \
+    wtype \
+    xz-utils
+fi
+
+mkdir -p "${HOME}/.local/bin" "${HOME}/.local/opt"
+
+if [ ! -x "${ZIG_DIR}/zig" ]; then
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "${tmpdir}"' EXIT
+  curl -fsSLo "${tmpdir}/zig.tar.xz" "${ZIG_URL}"
+  printf '%s  %s\n' "${ZIG_SHA256}" "${tmpdir}/zig.tar.xz" | sha256sum -c -
+  tar -C "${tmpdir}" -xf "${tmpdir}/zig.tar.xz"
+  rm -rf "${ZIG_DIR}"
+  mv "${tmpdir}/zig-x86_64-linux-${ZIG_VERSION}" "${ZIG_DIR}"
+  rm -rf "${tmpdir}"
+  trap - EXIT
+fi
+
+ln -sfn "${ZIG_DIR}/zig" "${HOME}/.local/bin/zig"
+
+# Debian bookworm ships wayland-protocols 1.31, but Monstar's build expects
+# newer stable/tablet protocol paths. Install a newer protocol data directory
+# and a pkg-config override in a default pkg-config search path.
+if [ ! -f "${WAYLAND_PROTOCOLS_DIR}/stable/tablet/tablet-v2.xml" ]; then
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "${tmpdir}"' EXIT
+  curl -fsSLo "${tmpdir}/wayland-protocols.tar.xz" "${WAYLAND_PROTOCOLS_URL}"
+  tar -C "${tmpdir}" -xf "${tmpdir}/wayland-protocols.tar.xz"
+  "${SUDO[@]}" rm -rf "${WAYLAND_PROTOCOLS_DIR}"
+  "${SUDO[@]}" mv "${tmpdir}/wayland-protocols-${WAYLAND_PROTOCOLS_VERSION}" "${WAYLAND_PROTOCOLS_DIR}"
+  rm -rf "${tmpdir}"
+  trap - EXIT
+fi
+
+"${SUDO[@]}" mkdir -p /usr/local/share/pkgconfig
+cat > /tmp/wayland-protocols.pc <<EOF
+prefix=${WAYLAND_PROTOCOLS_DIR}
+pkgdatadir=\${prefix}
+
+Name: Wayland Protocols
+Description: Wayland protocol files
+Version: ${WAYLAND_PROTOCOLS_VERSION}
+EOF
+"${SUDO[@]}" install -m 0644 /tmp/wayland-protocols.pc /usr/local/share/pkgconfig/wayland-protocols.pc
+rm -f /tmp/wayland-protocols.pc
+
+# wlroots ships a virtual-pointer demo, but it creates a new virtual pointer
+# per command. This helper keeps one pointer alive long enough to perform an
+# absolute move and click, which is useful for repeatable GUI tests.
+if [ ! -x "${HOME}/.local/bin/wl-vptr-click" ]; then
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "${tmpdir}"' EXIT
+  curl -fsSLo "${tmpdir}/wlr-virtual-pointer-unstable-v1.xml" "${WLR_VIRTUAL_POINTER_XML_URL}"
+  wayland-scanner client-header \
+    "${tmpdir}/wlr-virtual-pointer-unstable-v1.xml" \
+    "${tmpdir}/wlr-virtual-pointer-unstable-v1-client-protocol.h"
+  wayland-scanner private-code \
+    "${tmpdir}/wlr-virtual-pointer-unstable-v1.xml" \
+    "${tmpdir}/wlr-virtual-pointer-unstable-v1-protocol.c"
+  cat > "${tmpdir}/wl-vptr-click.c" <<'EOF'
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <wayland-client.h>
+#include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
+
+struct state {
+    struct zwlr_virtual_pointer_manager_v1 *manager;
+    struct wl_seat *seat;
+    struct wl_output *output;
+};
+
+static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
+        const char *interface, uint32_t version) {
+    struct state *state = data;
+    if (strcmp(interface, zwlr_virtual_pointer_manager_v1_interface.name) == 0) {
+        state->manager = wl_registry_bind(registry, name,
+            &zwlr_virtual_pointer_manager_v1_interface, version < 2 ? version : 2);
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        state->seat = wl_registry_bind(registry, name, &wl_seat_interface, version < 7 ? version : 7);
+    } else if (strcmp(interface, wl_output_interface.name) == 0 && state->output == NULL) {
+        state->output = wl_registry_bind(registry, name, &wl_output_interface, version < 4 ? version : 4);
+    }
+}
+
+static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
+    (void)data;
+    (void)registry;
+    (void)name;
+}
+
+static const struct wl_registry_listener registry_listener = {
+    .global = registry_global,
+    .global_remove = registry_global_remove,
+};
+
+static uint32_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
+static uint32_t parse_u32(const char *s, const char *name) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(s, &end, 10);
+    if (errno || end == s || *end != '\0' || value > UINT32_MAX) {
+        fprintf(stderr, "invalid %s: %s\n", name, s);
+        exit(2);
+    }
+    return (uint32_t)value;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3 && argc != 5) {
+        fprintf(stderr, "usage: %s <x> <y> [width height]\n", argv[0]);
+        return 2;
+    }
+
+    uint32_t x = parse_u32(argv[1], "x");
+    uint32_t y = parse_u32(argv[2], "y");
+    uint32_t width = argc == 5 ? parse_u32(argv[3], "width") : 1280;
+    uint32_t height = argc == 5 ? parse_u32(argv[4], "height") : 720;
+
+    struct wl_display *display = wl_display_connect(NULL);
+    if (!display) {
+        fprintf(stderr, "failed to connect to Wayland display\n");
+        return 1;
+    }
+
+    struct state state = {0};
+    struct wl_registry *registry = wl_display_get_registry(display);
+    wl_registry_add_listener(registry, &registry_listener, &state);
+    wl_display_roundtrip(display);
+    wl_display_roundtrip(display);
+
+    if (!state.manager) {
+        fprintf(stderr, "compositor does not expose zwlr_virtual_pointer_manager_v1\n");
+        return 1;
+    }
+
+    struct zwlr_virtual_pointer_v1 *pointer = state.output
+        ? zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(state.manager, state.seat, state.output)
+        : zwlr_virtual_pointer_manager_v1_create_virtual_pointer(state.manager, state.seat);
+
+    uint32_t t = now_ms();
+    zwlr_virtual_pointer_v1_motion_absolute(pointer, t, x, y, width, height);
+    zwlr_virtual_pointer_v1_frame(pointer);
+    wl_display_flush(display);
+    wl_display_roundtrip(display);
+    usleep(100 * 1000);
+
+    t = now_ms();
+    zwlr_virtual_pointer_v1_button(pointer, t, 272, WL_POINTER_BUTTON_STATE_PRESSED);
+    zwlr_virtual_pointer_v1_frame(pointer);
+    wl_display_flush(display);
+    wl_display_roundtrip(display);
+    usleep(100 * 1000);
+
+    t = now_ms();
+    zwlr_virtual_pointer_v1_button(pointer, t, 272, WL_POINTER_BUTTON_STATE_RELEASED);
+    zwlr_virtual_pointer_v1_frame(pointer);
+    wl_display_flush(display);
+    wl_display_roundtrip(display);
+    usleep(100 * 1000);
+
+    zwlr_virtual_pointer_v1_destroy(pointer);
+    if (state.output) wl_output_destroy(state.output);
+    if (state.seat) wl_seat_destroy(state.seat);
+    zwlr_virtual_pointer_manager_v1_destroy(state.manager);
+    wl_registry_destroy(registry);
+    wl_display_disconnect(display);
+    return 0;
+}
+EOF
+  cc -Wall -Wextra -O2 \
+    -o "${tmpdir}/wl-vptr-click" \
+    "${tmpdir}/wl-vptr-click.c" \
+    "${tmpdir}/wlr-virtual-pointer-unstable-v1-protocol.c" \
+    $(pkg-config --cflags --libs wayland-client)
+  install -m 0755 "${tmpdir}/wl-vptr-click" "${HOME}/.local/bin/wl-vptr-click"
+  rm -rf "${tmpdir}"
+  trap - EXIT
+fi
+
+cat > "${HOME}/.local/bin/monstar-sway-headless" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/monstar-wayland-run}"
+export WLR_BACKENDS="${WLR_BACKENDS:-headless}"
+export WLR_LIBINPUT_NO_DEVICES="${WLR_LIBINPUT_NO_DEVICES:-1}"
+export WLR_RENDERER="${WLR_RENDERER:-pixman}"
+
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+
+config=$(mktemp)
+trap 'rm -f "${config}"' EXIT
+cat > "${config}" <<'CONFIG'
+set $mod Mod4
+font pango:monospace 8
+output * bg #202020 solid_color
+CONFIG
+
+exec dbus-run-session -- sway -d -c "${config}" --unsupported-gpu
+EOF
+chmod 0755 "${HOME}/.local/bin/monstar-sway-headless"
+
+echo "Monstar orb setup complete."
+echo "Start headless Sway with:"
+echo "  monstar-sway-headless"
