@@ -1570,10 +1570,38 @@ fn blitAlphaGlyph(
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
         const src = g.bitmap[gy * g.width + clip.gx_start .. gy * g.width + clip.gx_end];
         const dst = pixels[py * buf_width + px_start ..][0..src.len];
-        for (src, dst) |coverage, *pixel| {
-            if (coverage == 0) continue;
-            pixel.* = blend(color, pixel.*, coverage);
-        }
+        blendAlphaSpan(dst, src, color);
+    }
+}
+
+/// Blend a constant color over a pixel span with per-pixel 8-bit
+/// coverage, four pixels per iteration. Produces the same value as
+/// scalar `blend` for every pixel; zero-coverage pixels keep their
+/// background (all-zero groups skip the store entirely).
+fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) void {
+    std.debug.assert(dst.len == coverage.len);
+    // Scalar `blend` returns `fg` unmasked at full coverage; the
+    // vector path always forces an opaque alpha byte. Identical only
+    // for opaque colors, which is all `argb` produces.
+    std.debug.assert(color >> 24 == 0xff);
+    const V = @Vector(16, u16);
+    const fg: V = @as(@Vector(16, u8), @bitCast([_]u32{color} ** 4));
+    // Broadcast each pixel's coverage across its four channel lanes.
+    const expand: [16]i32 = .{ 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3 };
+    var i: usize = 0;
+    while (i + 4 <= dst.len) : (i += 4) {
+        const cov: @Vector(4, u8) = coverage[i..][0..4].*;
+        if (@reduce(.Or, cov) == 0) continue;
+        const a: V = @shuffle(u8, cov, undefined, expand);
+        const na = @as(V, @splat(255)) - a;
+        const bg: V = @as(@Vector(16, u8), @bitCast(dst[i..][0..4].*));
+        const mixed = (fg * a + bg * na) / @as(V, @splat(255));
+        const px: @Vector(4, u32) = @bitCast(@as(@Vector(16, u8), @intCast(mixed)));
+        dst[i..][0..4].* = px | @as(@Vector(4, u32), @splat(0xff000000));
+    }
+    for (dst[i..], coverage[i..]) |*pixel, cov| {
+        if (cov == 0) continue;
+        pixel.* = blend(color, pixel.*, cov);
     }
 }
 
@@ -1654,6 +1682,33 @@ test "blend endpoints" {
         @as(u32, 0xff804000),
         blendPremultipliedBgra(&.{ 0x00, 0x40, 0x80, 0xff }, 0xff000000),
     );
+}
+
+test "blendAlphaSpan matches scalar blend" {
+    var prng: std.Random.DefaultPrng = .init(0xb1e4d);
+    const random = prng.random();
+    // Odd lengths exercise both the vector body and the scalar tail.
+    for ([_]usize{ 1, 3, 4, 7, 16, 21 }) |len| {
+        var coverage: [21]u8 = undefined;
+        var got: [21]u32 = undefined;
+        var want: [21]u32 = undefined;
+        for (0..10) |_| {
+            const color = random.int(u32) | 0xff000000;
+            for (coverage[0..len], got[0..len], want[0..len]) |*cov, *g, *w| {
+                // Weight the endpoints: real coverage is mostly 0/255.
+                cov.* = switch (random.int(u2)) {
+                    0 => 0,
+                    1 => 0xff,
+                    else => random.int(u8),
+                };
+                const bg = random.int(u32) | 0xff000000;
+                g.* = bg;
+                w.* = if (cov.* == 0) bg else blend(color, bg, cov.*);
+            }
+            blendAlphaSpan(got[0..len], coverage[0..len], color);
+            try std.testing.expectEqualSlices(u32, want[0..len], got[0..len]);
+        }
+    }
 }
 
 test "symbol glyph constraint widths match Ghostty" {
