@@ -199,6 +199,7 @@ const app_name = "Monstar";
 const sync_output_reset_ms = 1000;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
+const precision_scroll_multiplier = 10.0;
 
 const TerminalHandler = vt.TerminalStream.Handler;
 const AppStream = vt.Stream(AppStreamHandler);
@@ -2305,9 +2306,13 @@ fn finishScrollFrame(self: *App) void {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
             @as(f64, @floatFromInt(self.window.scale120));
-        const whole = @divTrunc(self.scroll_pixels, cell);
+        // Touchpad scroll deltas are surface-local distances. Ghostty boosts
+        // precision scrolls before converting them to rows; without that,
+        // Wayland touchpads require a large gesture to move a terminal line.
+        const pixels = self.scroll_pixels * precision_scroll_multiplier;
+        const whole = @divTrunc(pixels, cell);
         lines = @intFromFloat(whole);
-        self.scroll_pixels -= whole * cell;
+        self.scroll_pixels -= whole * cell / precision_scroll_multiplier;
     }
     if (self.scroll_had_value120 or self.scroll_had_discrete) self.scroll_pixels = 0;
     self.scroll_clicks = 0;
