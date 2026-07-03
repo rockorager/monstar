@@ -168,6 +168,8 @@ scroll_had_discrete: bool,
 scroll_had_value120: bool,
 /// True while the left button is down for terminal-side selection.
 selecting: bool,
+/// True when the active drag should produce a rectangular selection.
+selection_rectangle: bool,
 selection_gesture: vt.SelectionGesture,
 /// Button press currently owned by application mouse reporting.
 mouse_button: ?vt.input.MouseButton,
@@ -523,6 +525,7 @@ pub fn init(
         .scroll_had_discrete = false,
         .scroll_had_value120 = false,
         .selecting = false,
+        .selection_rectangle = false,
         .selection_gesture = .init,
         .mouse_button = null,
         .mouse_shape_explicit = false,
@@ -2464,6 +2467,7 @@ fn forwardMouseButton(self: *App, button: anytype, mouse_button: vt.input.MouseB
 fn startSelection(self: *App, time_ms: u32) void {
     const pin = self.pinAtPointer() orelse return;
     const pos = self.pointerPhysical();
+    self.selection_rectangle = self.keyboard.currentMods().ctrl;
     const selection = self.selection_gesture.press(&self.term, .{
         .time = selectionTimestamp(time_ms),
         .pin = pin,
@@ -2484,7 +2488,7 @@ fn extendSelection(self: *App) void {
         .pin = pin,
         .xpos = pos.x,
         .ypos = pos.y,
-        .rectangle = false,
+        .rectangle = self.selection_rectangle,
         .word_boundary_codepoints = &selection_word_boundaries,
         .geometry = self.selectionGeometry(),
     });
@@ -2496,6 +2500,7 @@ fn extendSelection(self: *App) void {
 /// that owns it (which may no longer be the active one).
 fn cancelDrag(self: *App) void {
     self.selecting = false;
+    self.selection_rectangle = false;
     self.selection_gesture.reset(&self.term);
     self.stopSelectionAutoscrollTimer();
 }
@@ -2504,6 +2509,7 @@ fn finishSelection(self: *App) void {
     if (!self.selecting) return;
     self.selecting = false;
     self.selection_gesture.release(&self.term, .{ .pin = self.pinAtPointer() });
+    self.selection_rectangle = false;
     self.stopSelectionAutoscrollTimer();
     // Finished selections claim the primary selection, X style.
     self.copyToPrimary();
@@ -2557,7 +2563,7 @@ fn fireSelectionAutoscroll(self: *App) void {
         .viewport = .{ .x = cell.x, .y = cell.y },
         .xpos = pos.x,
         .ypos = pos.y,
-        .rectangle = false,
+        .rectangle = self.selection_rectangle,
         .word_boundary_codepoints = &selection_word_boundaries,
         .geometry = self.selectionGeometry(),
     });
