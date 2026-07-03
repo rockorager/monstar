@@ -102,6 +102,10 @@ keyboard: Keyboard,
 needs_redraw: bool,
 /// Keyboard focus state; unfocused windows draw a hollow cursor.
 focused: bool,
+ime_focused: bool,
+ime_preedit: ?[]u8,
+ime_pending_preedit: ?[]u8,
+ime_pending_commit: ?[]u8,
 /// Cached DEC mode 2048 state, to detect the application enabling
 /// in-band size reports.
 in_band_reports: bool,
@@ -376,6 +380,10 @@ pub fn init(
         .keyboard = try .init(),
         .needs_redraw = true,
         .focused = true,
+        .ime_focused = false,
+        .ime_preedit = null,
+        .ime_pending_preedit = null,
+        .ime_pending_commit = null,
         .in_band_reports = false,
         .sync_output = false,
         .write_queue = .empty,
@@ -441,7 +449,7 @@ pub fn init(
     self.stream.handler.terminal_handler.effects = effects;
 
     self.initDbus();
-    window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, scaleChanged);
+    window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged);
     return self;
 }
 
@@ -850,6 +858,7 @@ pub fn deinit(self: *App) void {
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
     self.render_pixels.deinit(self.alloc);
+    self.clearImeText();
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
@@ -2437,6 +2446,74 @@ fn setFocus(self: *App, focused: bool) void {
     }
 }
 
+fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    switch (event) {
+        .enter => {
+            self.ime_focused = true;
+            self.window.enableTextInput(self.textInputCursorRect());
+        },
+        .leave => {
+            self.ime_focused = false;
+            self.window.disableTextInput();
+            self.setImePreedit(null);
+            self.resetPendingIme();
+        },
+        .preedit_string => |preedit| {
+            self.replaceImeText(&self.ime_pending_preedit, if (preedit.text) |text| std.mem.sliceTo(text, 0) else null);
+        },
+        .commit_string => |commit| {
+            self.replaceImeText(&self.ime_pending_commit, if (commit.text) |text| std.mem.sliceTo(text, 0) else null);
+        },
+        .delete_surrounding_text => {},
+        .done => {
+            self.applyPendingIme();
+        },
+    }
+}
+
+fn applyPendingIme(self: *App) void {
+    if (self.ime_pending_commit) |commit| {
+        if (commit.len > 0) {
+            self.writePty(commit);
+            self.clearSelection();
+            if (self.term.screens.active.pages.viewport != .active) {
+                self.term.screens.active.pages.scroll(.active);
+            }
+        }
+    }
+    self.setImePreedit(self.ime_pending_preedit);
+    self.resetPendingIme();
+    self.syncTextInputCursorRect();
+}
+
+fn setImePreedit(self: *App, text: ?[]const u8) void {
+    self.replaceImeText(&self.ime_preedit, text);
+    self.render_state.dirty = .full;
+    self.needs_redraw = true;
+}
+
+fn replaceImeText(self: *App, slot: *?[]u8, text: ?[]const u8) void {
+    if (slot.*) |old| self.alloc.free(old);
+    slot.* = null;
+    const value = text orelse return;
+    if (value.len == 0) return;
+    slot.* = self.alloc.dupe(u8, value) catch |err| {
+        log.warn("failed to copy IME text: {}", .{err});
+        return;
+    };
+}
+
+fn resetPendingIme(self: *App) void {
+    self.replaceImeText(&self.ime_pending_preedit, null);
+    self.replaceImeText(&self.ime_pending_commit, null);
+}
+
+fn clearImeText(self: *App) void {
+    self.replaceImeText(&self.ime_preedit, null);
+    self.resetPendingIme();
+}
+
 /// Start (or move) key repeat to the given key: first fire after the
 /// configured delay, then at the configured rate.
 fn armRepeat(self: *App, evdev_keycode: u32) void {
@@ -2592,6 +2669,7 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void
     try self.render_state.update(self.alloc, &self.term);
     self.dirtyCursorRows(old_cursor);
     const kitty_graphics_dirty = self.term.screens.active.kitty_images.dirty;
+    if (self.ime_preedit != null) self.render_state.dirty = .full;
     if (resized or kitty_graphics_dirty or has_kitty_graphics) self.render_state.dirty = .full;
     switch (self.render_state.dirty) {
         .false => {},
@@ -2602,9 +2680,43 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void
         },
         .partial => try self.renderer.renderDirty(&self.render_state, self.render_pixels.items, width, height),
     }
+    if (self.ime_preedit) |preedit| {
+        try self.renderer.renderPreedit(&self.render_state, self.render_pixels.items, width, height, preedit);
+    }
+    self.syncTextInputCursorRect();
     if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
     self.clearRenderDirty();
     @memcpy(pixels, self.render_pixels.items);
+}
+
+fn syncTextInputCursorRect(self: *App) void {
+    if (!self.ime_focused) return;
+    self.window.setTextInputCursorRect(self.textInputCursorRect());
+}
+
+fn textInputCursorRect(self: *App) Window.TextInputRect {
+    const cursor = self.render_state.cursor.viewport;
+    const x_cells: u32 = if (cursor) |cpos| @intCast(cpos.x -| @intFromBool(cpos.wide_tail)) else 0;
+    const y_cells: u32 = if (cursor) |cpos| @intCast(cpos.y) else 0;
+    return physicalRectToLogical(self.window.scale120, .{
+        .x = @intCast(x_cells * self.font.cell_width),
+        .y = @intCast(y_cells * self.font.cell_height),
+        .width = @intCast(self.font.cell_width),
+        .height = @intCast(self.font.cell_height),
+    });
+}
+
+fn physicalRectToLogical(scale120: u32, rect: Window.TextInputRect) Window.TextInputRect {
+    return .{
+        .x = scaledPhysicalToLogical(scale120, rect.x),
+        .y = scaledPhysicalToLogical(scale120, rect.y),
+        .width = @max(1, scaledPhysicalToLogical(scale120, rect.width)),
+        .height = @max(1, scaledPhysicalToLogical(scale120, rect.height)),
+    };
+}
+
+fn scaledPhysicalToLogical(scale120: u32, value: i32) i32 {
+    return @intCast(@divTrunc(@as(i64, value) * 120 + @divTrunc(@as(i64, scale120), 2), @as(i64, scale120)));
 }
 
 fn dirtyCursorRows(self: *App, old_cursor: vt.RenderState.Cursor) void {

@@ -187,6 +187,60 @@ pub fn renderDirty(
     }
 }
 
+pub fn renderPreedit(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    text: []const u8,
+) !void {
+    if (text.len == 0) return;
+    const cursor = state.cursor.viewport orelse return;
+    if (cursor.y >= state.rows) return;
+
+    var x: u31 = @intCast(cursor.x -| @intFromBool(cursor.wide_tail));
+    const y: u31 = @intCast(cursor.y);
+    const baseline_y: i32 = @as(i32, y) * self.font.cell_height + self.font.baseline;
+    var it = (try std.unicode.Utf8View.init(text)).iterator();
+    while (it.nextCodepoint()) |cp| {
+        const span = codepointCellWidth(cp);
+        if (span == 0) continue;
+        if (x >= state.cols) break;
+        const clipped_span: u31 = @min(span, state.cols - x);
+
+        fillRect(
+            pixels,
+            width,
+            height,
+            x * self.font.cell_width,
+            y * self.font.cell_height,
+            clipped_span * self.font.cell_width,
+            self.font.cell_height,
+            argb(state.colors.background),
+        );
+
+        const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+        const face = self.font.face(face_idx);
+        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+        if (glyph_idx != 0) {
+            const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), isSymbol(cp));
+            blitGlyph(
+                pixels,
+                width,
+                height,
+                g,
+                @as(i32, x) * self.font.cell_width + g.bearing_x,
+                baseline_y - g.bearing_y,
+                argb(state.colors.foreground),
+                false,
+            );
+        }
+        try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), pixels, width, height);
+        x += span;
+    }
+}
+
 fn renderKittyGraphics(
     self: *Renderer,
     terminal: *const vt.Terminal,
@@ -907,6 +961,35 @@ fn drawRun(
 /// How many cells a cell's background covers (wide chars span two).
 fn cellSpan(cell: vt.Cell) u31 {
     return if (cell.wide == .wide) 2 else 1;
+}
+
+fn codepointCellWidth(cp: u21) u31 {
+    if (cp < 0x20) return 0;
+    if (isCombiningCodepoint(cp)) return 0;
+    return if (isWideCodepoint(cp)) 2 else 1;
+}
+
+fn isCombiningCodepoint(cp: u21) bool {
+    return (cp >= 0x0300 and cp <= 0x036f) or
+        (cp >= 0x1ab0 and cp <= 0x1aff) or
+        (cp >= 0x1dc0 and cp <= 0x1dff) or
+        (cp >= 0x20d0 and cp <= 0x20ff) or
+        (cp >= 0xfe20 and cp <= 0xfe2f);
+}
+
+fn isWideCodepoint(cp: u21) bool {
+    return (cp >= 0x1100 and cp <= 0x115f) or
+        cp == 0x2329 or cp == 0x232a or
+        (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
+        (cp >= 0xac00 and cp <= 0xd7a3) or
+        (cp >= 0xf900 and cp <= 0xfaff) or
+        (cp >= 0xfe10 and cp <= 0xfe19) or
+        (cp >= 0xfe30 and cp <= 0xfe6f) or
+        (cp >= 0xff00 and cp <= 0xff60) or
+        (cp >= 0xffe0 and cp <= 0xffe6) or
+        (cp >= 0x1f300 and cp <= 0x1f64f) or
+        (cp >= 0x1f900 and cp <= 0x1f9ff) or
+        (cp >= 0x20000 and cp <= 0x3fffd);
 }
 
 /// Renderer-only glyph constraint width, matching Ghostty's symbol heuristic:

@@ -42,6 +42,10 @@ data_manager: ?*wl.DataDeviceManager,
 data_device: ?*wl.DataDevice,
 primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1,
 primary_device: ?*zwp.PrimarySelectionDeviceV1,
+text_input_manager: ?*zwp.TextInputManagerV3,
+text_input: ?*zwp.TextInputV3,
+text_input_enabled: bool,
+text_input_rect: ?TextInputRect,
 decoration_manager: ?*zxdg.DecorationManagerV1,
 toplevel_decoration: ?*zxdg.ToplevelDecorationV1,
 viewport: ?*wp.Viewport,
@@ -70,6 +74,7 @@ render_fn: ?RenderFn,
 resize_fn: ?ResizeFn,
 keyboard_fn: ?KeyboardFn,
 pointer_fn: ?PointerFn,
+text_input_fn: ?TextInputFn,
 scale_fn: ?ScaleFn,
 
 /// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
@@ -86,7 +91,18 @@ pub const KeyboardFn = *const fn (ctx: *anyopaque, event: wl.Keyboard.Event) voi
 /// Raw wl_pointer events, forwarded as-is.
 pub const PointerFn = *const fn (ctx: *anyopaque, event: wl.Pointer.Event) void;
 
+/// Raw text-input-v3 events, forwarded as-is. String pointers are only
+/// valid for the duration of the callback.
+pub const TextInputFn = *const fn (ctx: *anyopaque, event: zwp.TextInputV3.Event) void;
+
 pub const CursorShape = wp.CursorShapeDeviceV1.Shape;
+
+pub const TextInputRect = struct {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+};
 
 /// Called when the output scale changed, before the resize/draw that
 /// follows. `scale120` is the scale in 1/120ths (120 == 1.0).
@@ -104,6 +120,7 @@ const Globals = struct {
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
     data_manager: ?*wl.DataDeviceManager = null,
     primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1 = null,
+    text_input_manager: ?*zwp.TextInputManagerV3 = null,
     decoration_manager: ?*zxdg.DecorationManagerV1 = null,
 };
 
@@ -158,12 +175,19 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
     // Clipboard devices only need the seat, not its capabilities.
     var data_device: ?*wl.DataDevice = null;
     var primary_device: ?*zwp.PrimarySelectionDeviceV1 = null;
+    var text_input: ?*zwp.TextInputV3 = null;
     if (globals.seat) |seat| {
         if (globals.data_manager) |manager| {
             data_device = manager.getDataDevice(seat) catch null;
         }
         if (globals.primary_manager) |manager| {
             primary_device = manager.getDevice(seat) catch null;
+        }
+        if (globals.text_input_manager) |manager| {
+            text_input = manager.getTextInput(seat) catch |err| text_input: {
+                log.warn("text-input-v3 setup failed: {}", .{err});
+                break :text_input null;
+            };
         }
     }
 
@@ -189,6 +213,10 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .data_device = data_device,
         .primary_manager = globals.primary_manager,
         .primary_device = primary_device,
+        .text_input_manager = globals.text_input_manager,
+        .text_input = text_input,
+        .text_input_enabled = false,
+        .text_input_rect = null,
         .decoration_manager = globals.decoration_manager,
         .toplevel_decoration = toplevel_decoration,
         .viewport = viewport,
@@ -214,11 +242,13 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .resize_fn = null,
         .keyboard_fn = null,
         .pointer_fn = null,
+        .text_input_fn = null,
         .scale_fn = null,
     };
 
     if (toplevel_decoration) |decoration| decoration.setListener(*Window, decorationListener, self);
     if (fractional_scale) |fs| fs.setListener(*Window, fractionalScaleListener, self);
+    if (text_input) |ti| ti.setListener(*Window, textInputListener, self);
     if (globals.seat) |seat| seat.setListener(*Window, seatListener, self);
     wm_base.setListener(*Window, wmBaseListener, self);
     xdg_surface.setListener(*Window, xdgSurfaceListener, self);
@@ -239,6 +269,8 @@ pub fn destroy(self: *Window) void {
     if (self.data_manager) |manager| manager.destroy();
     if (self.primary_device) |device| device.destroy();
     if (self.primary_manager) |manager| manager.destroy();
+    if (self.text_input) |text_input| text_input.destroy();
+    if (self.text_input_manager) |manager| manager.destroy();
     if (self.toplevel_decoration) |decoration| decoration.destroy();
     if (self.decoration_manager) |manager| manager.destroy();
     if (self.activation_token) |token| token.destroy();
@@ -272,6 +304,7 @@ pub fn setCallbacks(
     resize_fn: ?ResizeFn,
     keyboard_fn: ?KeyboardFn,
     pointer_fn: ?PointerFn,
+    text_input_fn: ?TextInputFn,
     scale_fn: ?ScaleFn,
 ) void {
     self.render_ctx = ctx;
@@ -279,6 +312,7 @@ pub fn setCallbacks(
     self.resize_fn = resize_fn;
     self.keyboard_fn = keyboard_fn;
     self.pointer_fn = pointer_fn;
+    self.text_input_fn = text_input_fn;
     self.scale_fn = scale_fn;
 }
 
@@ -306,6 +340,36 @@ pub fn setUrgent(self: *Window, urgent: bool) !void {
 pub fn activate(self: *Window, token: [:0]const u8) void {
     const activation = self.activation orelse return;
     activation.activate(token, self.surface);
+}
+
+pub fn enableTextInput(self: *Window, rect: TextInputRect) void {
+    const text_input = self.text_input orelse return;
+    text_input.enable();
+    text_input.setContentType(.{}, .terminal);
+    text_input.setCursorRectangle(rect.x, rect.y, rect.width, rect.height);
+    text_input.commit();
+    self.text_input_enabled = true;
+    self.text_input_rect = rect;
+}
+
+pub fn disableTextInput(self: *Window) void {
+    const text_input = self.text_input orelse return;
+    if (!self.text_input_enabled) return;
+    text_input.disable();
+    text_input.commit();
+    self.text_input_enabled = false;
+    self.text_input_rect = null;
+}
+
+pub fn setTextInputCursorRect(self: *Window, rect: TextInputRect) void {
+    const text_input = self.text_input orelse return;
+    if (!self.text_input_enabled) return;
+    if (self.text_input_rect) |old| {
+        if (std.meta.eql(old, rect)) return;
+    }
+    text_input.setCursorRectangle(rect.x, rect.y, rect.width, rect.height);
+    text_input.commit();
+    self.text_input_rect = rect;
 }
 
 fn applyCursorShape(self: *Window) void {
@@ -424,6 +488,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.data_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, 3)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zwp.PrimarySelectionDeviceManagerV1.interface.name) == .eq) {
                 globals.primary_manager = registry.bind(global.name, zwp.PrimarySelectionDeviceManagerV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, zwp.TextInputManagerV3.interface.name) == .eq) {
+                globals.text_input_manager = registry.bind(global.name, zwp.TextInputManagerV3, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
                 globals.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
             }
@@ -487,6 +553,21 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *Window) void 
 
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) void {
     if (self.keyboard_fn) |keyboard_fn| keyboard_fn(self.render_ctx.?, event);
+}
+
+fn textInputListener(_: *zwp.TextInputV3, event: zwp.TextInputV3.Event, self: *Window) void {
+    switch (event) {
+        .enter => |enter| {
+            if (enter.surface != self.surface) return;
+        },
+        .leave => |leave| {
+            if (leave.surface != self.surface) return;
+            self.text_input_enabled = false;
+            self.text_input_rect = null;
+        },
+        else => {},
+    }
+    if (self.text_input_fn) |text_input_fn| text_input_fn(self.render_ctx.?, event);
 }
 
 fn wmBaseListener(wm_base: *xdg.WmBase, event: xdg.WmBase.Event, _: *Window) void {
