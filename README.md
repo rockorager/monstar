@@ -8,6 +8,12 @@ Monstar is a small Wayland terminal emulator written in Zig, built on Ghostty's 
 zig build
 ```
 
+## Installing
+
+```sh
+zig build -Doptimize=ReleaseFast install --prefix $HOME/.local
+```
+
 ## Running
 
 ```sh
