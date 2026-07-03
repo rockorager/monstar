@@ -23,16 +23,57 @@ pub fn systemdBooted() bool {
     return linux.errno(rc) == .SUCCESS;
 }
 
-/// Ask systemd to create a transient scope containing `pid`, then wait
-/// until the migration is visible in /proc. The caller is expected to
-/// keep the child gated (see Pty.SpawnOptions.gate_child) until this
-/// returns so grandchildren cannot escape into the terminal's cgroup.
-pub fn moveIntoScope(connection: *c.DBusConnection, pid: u32) Error!void {
+/// An in-flight StartTransientUnit request. Created by
+/// `startMoveIntoScope`; the caller must consume it with either
+/// `finish` (confirm the migration, then release the gated child) or
+/// `cancel` (abandon it on an error path).
+pub const Pending = struct {
+    call: *c.DBusPendingCall,
+    pid: u32,
+
+    /// Wait for systemd's reply and for the pid migration to become
+    /// visible in /proc. Both typically completed while the caller was
+    /// doing other setup, so this rarely blocks. The caller is expected
+    /// to keep the child gated (see Pty.SpawnOptions.gate_child) until
+    /// this returns so grandchildren cannot escape into the terminal's
+    /// cgroup.
+    pub fn finish(self: Pending) Error!void {
+        defer c.dbus_pending_call_unref(self.call);
+        c.dbus_pending_call_block(self.call);
+        const reply = c.dbus_pending_call_steal_reply(self.call) orelse
+            return error.ScopeFailed;
+        defer c.dbus_message_unref(reply);
+
+        var name_buf: [scope_name_max + 1]u8 = undefined;
+        const name = fmtScope(&name_buf, self.pid);
+        if (c.dbus_message_get_type(reply) == c.DBUS_MESSAGE_TYPE_ERROR) {
+            const error_name = c.dbus_message_get_error_name(reply);
+            log.warn("StartTransientUnit {s} failed: {s}", .{
+                name,
+                if (error_name) |e| std.mem.span(e) else "unknown error",
+            });
+            return error.ScopeFailed;
+        }
+
+        try waitForMigration(self.pid, name);
+        log.debug("child {d} moved into {s}", .{ self.pid, name });
+    }
+
+    pub fn cancel(self: Pending) void {
+        c.dbus_pending_call_cancel(self.call);
+        c.dbus_pending_call_unref(self.call);
+    }
+};
+
+/// Ask systemd to create a transient scope containing `pid`, without
+/// waiting for the reply: the round trip to systemd and the cgroup
+/// migration proceed while the caller does other setup. Confirm with
+/// `Pending.finish` before releasing the gated child.
+pub fn startMoveIntoScope(connection: *c.DBusConnection, pid: u32) Error!Pending {
     var name_buf: [scope_name_max + 1]u8 = undefined;
     const name = fmtScope(&name_buf, pid);
-    try startTransientUnit(connection, name, pid);
-    try waitForMigration(pid, name);
-    log.debug("child {d} moved into {s}", .{ pid, name });
+    const call = try startTransientUnit(connection, name, pid);
+    return .{ .call = call, .pid = pid };
 }
 
 /// Unit name for the child's scope. Follows the XDG cgroup naming
@@ -42,7 +83,7 @@ fn fmtScope(buf: []u8, pid: u32) [:0]const u8 {
     return std.fmt.bufPrintZ(buf, scope_prefix ++ "{d}" ++ scope_suffix, .{pid}) catch unreachable;
 }
 
-fn startTransientUnit(connection: *c.DBusConnection, name: [:0]const u8, pid: u32) Error!void {
+fn startTransientUnit(connection: *c.DBusConnection, name: [:0]const u8, pid: u32) Error!*c.DBusPendingCall {
     const message = c.dbus_message_new_method_call(
         "org.freedesktop.systemd1",
         "/org/freedesktop/systemd1",
@@ -76,27 +117,37 @@ fn startTransientUnit(connection: *c.DBusConnection, name: [:0]const u8, pid: u3
         return error.ScopeFailed;
     if (c.dbus_message_iter_close_container(&iter, &aux) == 0) return error.ScopeFailed;
 
-    const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse {
-        log.warn("StartTransientUnit {s} failed", .{name});
+    // Async send: the reply is collected later by Pending.finish. The
+    // flush pushes the request onto the socket now so systemd starts
+    // working while the caller continues setup.
+    var call: ?*c.DBusPendingCall = null;
+    if (c.dbus_connection_send_with_reply(connection, message, &call, 1000) == 0)
         return error.ScopeFailed;
-    };
-    c.dbus_message_unref(reply);
+    const pending = call orelse return error.ScopeFailed;
+    c.dbus_connection_flush(connection);
+    return pending;
 }
 
-/// StartTransientUnit returns when the job is queued, not when the PID
+/// StartTransientUnit's reply means the job is queued, not that the PID
 /// has been written into the new cgroup, so poll /proc until the move
-/// is visible (or give up after ~250ms).
+/// is visible (or give up after ~250ms). Migration typically lands
+/// within a few ms, so back off exponentially from 200µs: the common
+/// case waits roughly the true latency instead of a coarse quantum.
 fn waitForMigration(pid: u32, name: []const u8) Error!void {
-    var attempt: usize = 0;
-    while (attempt < 25) : (attempt += 1) {
+    const budget_ns = 250 * std.time.ns_per_ms;
+    var sleep_ns: u64 = 200 * std.time.ns_per_us;
+    var waited_ns: u64 = 0;
+    while (waited_ns < budget_ns) {
         var buf: [4096]u8 = undefined;
         if (readCgroupFile(&buf, pid)) |data| {
             if (leafCgroup(data)) |current| {
                 if (std.mem.eql(u8, current, name)) return;
             }
         }
-        const ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+        const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(sleep_ns) };
         _ = linux.nanosleep(&ts, null);
+        waited_ns += sleep_ns;
+        sleep_ns = @min(sleep_ns * 2, 10 * std.time.ns_per_ms);
     }
     log.warn("migration into {s} not observed in time", .{name});
     return error.ScopeFailed;

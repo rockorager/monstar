@@ -424,15 +424,21 @@ pub fn init(
     // exec: OOM kills then apply to the shell's process tree instead of
     // the whole terminal. The gate holds the child so grandchildren
     // cannot be spawned into our cgroup; on failure, releasing the gate
-    // lets the child proceed un-isolated.
+    // lets the child proceed un-isolated. Only the request is sent here:
+    // systemd's reply and the pid migration land while we set up the
+    // window, and the gate is released once both are confirmed below.
     const use_cgroup_scope = dbus_connection != null and cgroup.systemdBooted();
     const child_pid = try pty.spawn(path, argv, envp, .{ .gate_child = use_cgroup_scope });
+    var pending_scope: ?cgroup.Pending = null;
     if (use_cgroup_scope) {
-        cgroup.moveIntoScope(dbus_connection.?, @intCast(child_pid)) catch {
+        pending_scope = cgroup.startMoveIntoScope(dbus_connection.?, @intCast(child_pid)) catch blk: {
             log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+            break :blk null;
         };
     }
-    pty.releaseChild();
+    // On error paths the errdefer'd pty.deinit releases the gate.
+    errdefer if (pending_scope) |pending| pending.cancel();
+    if (pending_scope == null) pty.releaseChild();
 
     // Nonblocking master: a blocking write can deadlock the whole loop
     // when the child floods output (echoed responses need output-queue
@@ -465,6 +471,17 @@ pub fn init(
     if (std.os.linux.errno(taskbar_progress_rc) != .SUCCESS) return error.TimerFdFailed;
     const taskbar_progress_fd: posix.fd_t = @intCast(taskbar_progress_rc);
     errdefer _ = std.os.linux.close(taskbar_progress_fd);
+
+    // Scope confirmation ran concurrently with the window setup above,
+    // so this rarely waits; the child stays gated until its migration
+    // is confirmed (or abandoned).
+    if (pending_scope) |pending| {
+        pending_scope = null;
+        pending.finish() catch {
+            log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+        };
+        pty.releaseChild();
+    }
 
     // Self-reference into listeners/streams requires a stable address.
     const self = try alloc.create(App);
