@@ -15,6 +15,7 @@ zig build run
 ```
 
 Configuration is read from `$XDG_CONFIG_HOME/monstar/config` or `~/.config/monstar/config`.
+Press `Ctrl+Shift+,` to reload the config in a running window.
 Send `SIGUSR1` to reload the config for a running process:
 
 ```sh

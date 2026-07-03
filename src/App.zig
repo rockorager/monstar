@@ -2643,6 +2643,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
         switch (event.key) {
             .key_c => return self.copyToClipboard(),
             .key_v => return self.beginPaste(.clipboard),
+            .comma => return self.reloadConfig(),
             else => {},
         }
     }
