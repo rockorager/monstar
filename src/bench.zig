@@ -14,6 +14,8 @@ const Renderer = @import("Renderer.zig");
 const cols = 240;
 const rows = 64;
 
+extern fn memcpy(noalias dest: ?*anyopaque, noalias src: ?*const anyopaque, n: usize) ?*anyopaque;
+
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
     const arena = init.arena.allocator();
@@ -163,6 +165,25 @@ pub fn run(init: std.process.Init) !void {
             std.mem.doNotOptimizeAway(shm);
         }
         try report(w, "copy full frame", nowNs(init.io) - start, iters, pixels.len * 4);
+    }
+    {
+        const iters = 300;
+        const start = nowNs(init.io);
+        for (0..iters) |_| {
+            _ = memcpy(shm.ptr, pixels.ptr, pixels.len * 4);
+            std.mem.doNotOptimizeAway(shm);
+        }
+        try report(w, "copy full frame (libc)", nowNs(init.io) - start, iters, pixels.len * 4);
+    }
+    {
+        const iters = 300;
+        const start = nowNs(init.io);
+        for (0..iters) |_| {
+            Renderer.copyPixels(shm, pixels);
+            std.mem.doNotOptimizeAway(shm);
+        }
+        try report(w, "copy full frame (NT stores)", nowNs(init.io) - start, iters, pixels.len * 4);
+        if (!std.mem.eql(u32, shm, pixels)) try w.writeAll("  (!) NT copy MISMATCH\n");
     }
     {
         // A typical partial frame: one dirty row expanded to three.

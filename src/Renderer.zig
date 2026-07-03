@@ -8,6 +8,7 @@
 const Renderer = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
@@ -1427,6 +1428,63 @@ fn isPowerline(cp: u21) bool {
         0xE0B0...0xE0D7 => true,
         else => false,
     };
+}
+
+/// Copy pixels into a buffer the CPU will not read back (a wl_shm
+/// buffer). Large copies use non-temporal stores on x86_64: they skip
+/// the read-for-ownership of every destination cache line (about a
+/// third of the bus traffic) and keep the copy from evicting the
+/// render working set.
+pub fn copyPixels(noalias dst: []u32, noalias src: []const u32) void {
+    std.debug.assert(dst.len == src.len);
+    // Below this size the fence and alignment fixup outweigh the saved
+    // traffic, and freshly written destination lines may still be hot.
+    const nt_threshold = 256 * 1024 / @sizeOf(u32);
+    // The self-hosted backend's assembler can't parse the SSE memory
+    // operands, so the non-temporal path is LLVM-only (all release
+    // builds; debug performance doesn't matter).
+    if (comptime builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm) {
+        if (dst.len >= nt_threshold) return copyNonTemporal(dst, src);
+    }
+    @memcpy(dst, src);
+}
+
+fn copyNonTemporal(noalias dst: []u32, noalias src: []const u32) void {
+    var d: [*]u8 = @ptrCast(dst.ptr);
+    var s: [*]const u8 = @ptrCast(src.ptr);
+    var n: usize = dst.len * @sizeOf(u32);
+
+    // movntdq requires a 16-byte-aligned destination.
+    const misalign = @intFromPtr(d) & 15;
+    if (misalign != 0) {
+        const head = @min(16 - misalign, n);
+        @memcpy(d[0..head], s[0..head]);
+        d += head;
+        s += head;
+        n -= head;
+    }
+    while (n >= 64) {
+        asm volatile (
+            \\movdqu  (%%rsi), %%xmm0
+            \\movdqu 16(%%rsi), %%xmm1
+            \\movdqu 32(%%rsi), %%xmm2
+            \\movdqu 48(%%rsi), %%xmm3
+            \\movntdq %%xmm0,  (%%rdi)
+            \\movntdq %%xmm1, 16(%%rdi)
+            \\movntdq %%xmm2, 32(%%rdi)
+            \\movntdq %%xmm3, 48(%%rdi)
+            :
+            : [s] "{rsi}" (s),
+              [d] "{rdi}" (d),
+            : .{ .xmm0 = true, .xmm1 = true, .xmm2 = true, .xmm3 = true, .memory = true });
+        d += 64;
+        s += 64;
+        n -= 64;
+    }
+    if (n != 0) @memcpy(d[0..n], s[0..n]);
+    // Non-temporal stores are weakly ordered; publish them before the
+    // buffer is handed to the compositor.
+    asm volatile ("sfence" ::: .{ .memory = true });
 }
 
 fn argb(rgb: vt.color.RGB) u32 {

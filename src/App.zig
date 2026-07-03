@@ -3592,7 +3592,7 @@ fn flushFrame(self: *App, pixels: []u32, width: u31, height: u31, age: usize) !W
     };
 
     if (copy_all) {
-        @memcpy(pixels, self.render_pixels.items);
+        Renderer.copyPixels(pixels, self.render_pixels.items);
     } else {
         var y: usize = 0;
         while (y < grid_rows) {
@@ -3606,11 +3606,11 @@ fn flushFrame(self: *App, pixels: []u32, width: u31, height: u31, age: usize) !W
             const px_end = @min(y * cell_height, height);
             const offset = px_start * width;
             const len = (px_end - px_start) * width;
-            @memcpy(pixels[offset..][0..len], self.render_pixels.items[offset..][0..len]);
+            Renderer.copyPixels(pixels[offset..][0..len], self.render_pixels.items[offset..][0..len]);
         }
         if (height >= cell_height and self.bottomStripSince(age)) {
             const offset = (height - cell_height) * width;
-            @memcpy(pixels[offset..], self.render_pixels.items[offset..]);
+            Renderer.copyPixels(pixels[offset..], self.render_pixels.items[offset..]);
         }
     }
 
