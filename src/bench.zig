@@ -168,8 +168,8 @@ pub fn run(init: std.process.Init) !void {
         try report(w, "full render (bg-heavy)", nowNs(init.io) - start, iters, null);
     }
 
-    // Frame copy strategies: what App.render pays to move render_pixels
-    // into the wl_shm buffer, before and after damage tracking.
+    // Frame copy strategies: still useful for comparing stale-buffer
+    // repair costs and direct-SHM write tradeoffs.
     {
         const iters = 300;
         const start = nowNs(init.io);

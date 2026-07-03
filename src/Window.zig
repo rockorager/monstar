@@ -54,6 +54,9 @@ surface: *wl.Surface,
 xdg_surface: *xdg.Surface,
 toplevel: *xdg.Toplevel,
 buffers: std.ArrayList(*Buffer),
+/// Most recently committed buffer. Its memory may still be busy with the
+/// compositor, but wl_shm memory remains readable and can seed stale buffers.
+newest_buffer: ?*Buffer,
 /// Window size in logical (surface-local) coordinates.
 width: u31,
 height: u31,
@@ -93,11 +96,12 @@ pub const Damage = union(enum) {
 };
 
 /// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
-/// Dimensions are physical pixels. `age` is how many frames ago this
-/// buffer was last drawn: 0 means its content is unknown and the whole
-/// buffer must be written; N means it holds the frame drawn N frames
-/// ago. Returns the damage of this frame relative to the previous one.
-pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) anyerror!Damage;
+/// Dimensions are physical pixels. `source_pixels` is the newest same-size
+/// committed buffer, if any; it may alias `pixels`. `age` is how many frames
+/// ago `pixels` was last drawn: 0 means its content is unknown, N means it
+/// holds the frame drawn N frames ago. Returns this frame's surface damage
+/// relative to the previous commit.
+pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, source_pixels: ?[]const u32, width: u31, height: u31, age: usize) anyerror!Damage;
 
 /// Called when the window size changed, before the next draw.
 /// Dimensions are physical pixels.
@@ -243,6 +247,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .xdg_surface = xdg_surface,
         .toplevel = toplevel,
         .buffers = .empty,
+        .newest_buffer = null,
         // Zero until the first configure so the resize callback always
         // fires before the first draw.
         .width = 0,
@@ -430,12 +435,20 @@ fn draw(self: *Window) !void {
             0
         else
             @intCast(self.frame_counter - buffer.frame);
-        break :damage try render_fn(self.render_ctx.?, buffer.pixels(), phys_width, phys_height, age);
+        const source_pixels: ?[]const u32 = if (self.newest_buffer) |newest|
+            if (newest.frame != 0 and newest.width == phys_width and newest.height == phys_height)
+                newest.pixels()
+            else
+                null
+        else
+            null;
+        break :damage try render_fn(self.render_ctx.?, buffer.pixels(), source_pixels, phys_width, phys_height, age);
     } else damage: {
         @memset(buffer.pixels(), bg_color);
         break :damage .full;
     };
     buffer.frame = self.frame_counter;
+    self.newest_buffer = buffer;
     if (self.viewport) |viewport| viewport.setDestination(self.width, self.height);
 
     // Throttle future redraws to the compositor's pace. Configure-driven
@@ -486,6 +499,7 @@ fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
             continue;
         }
         if (buffer.width == width and buffer.height == height) return buffer;
+        if (self.newest_buffer == buffer) self.newest_buffer = null;
         buffer.destroy(self.alloc);
         _ = self.buffers.swapRemove(i);
     }

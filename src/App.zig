@@ -89,29 +89,23 @@ environ: std.process.Environ,
 term: vt.Terminal,
 stream: AppStream,
 render_state: vt.RenderState,
-/// Complete ARGB8888 backing frame. Dirty-row rendering updates this
-/// buffer; each frame copies the rows a (possibly stale) shm buffer
-/// missed, guided by the damage history below.
-render_pixels: std.ArrayList(u32),
-render_width: u31,
-render_height: u31,
 /// Ring of per-frame damage records: what changed in each of the last
-/// N frames. A reused shm buffer of age N needs the union of the last
-/// N entries copied in; older buffers get a full copy.
+/// N frames. Stale shm buffers use this to copy missed rows from the
+/// newest rendered shm buffer before this frame's dirty rows are drawn.
 frame_damage: [frame_damage_len]FrameDamage,
 /// Ring index of the current frame's entry.
 frame_damage_index: usize,
 /// Scratch for the damage spans reported to the window each frame.
 damage_spans: std.ArrayList(Window.RowSpan),
 /// Monotonic nanoseconds taken at render() entry when the frame
-/// timer is enabled; consumed by flushFrame.
+/// timer is enabled; consumed by finishFrame.
 frame_start: i96,
 /// Timestamp after render-state update, splitting the frame log's
 /// `update` (state snapshot) from `draw` (pixel work). Stays at
 /// frame_start on paths that skip the update.
 frame_update_done: i96,
 /// The previous frame's total CPU cost. The overlay shows this
-/// rather than the current frame's so the shm copy is included.
+/// rather than the current frame's so the final overlay work is included.
 last_frame_ns: u64,
 /// Rows repainted this frame, for the frame log ("all" when the
 /// whole grid was redrawn or blitted).
@@ -266,8 +260,8 @@ const precision_scroll_multiplier = 10.0;
 /// Damage history length; shm buffers older than this get a full copy.
 const frame_damage_len = 8;
 
-/// What one frame changed in `render_pixels`, recorded so stale shm
-/// buffers can be brought current without copying the whole frame.
+/// What one frame changed, recorded so stale shm buffers can be brought
+/// current from the newest rendered shm buffer without copying everything.
 const FrameDamage = struct {
     /// Everything changed (or rendering failed partway); ignore `rows`.
     full: bool,
@@ -484,9 +478,6 @@ pub fn init(
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
-        .render_pixels = .empty,
-        .render_width = 0,
-        .render_height = 0,
         .frame_damage = @splat(.{
             .full = true,
             .rows = .{},
@@ -1169,7 +1160,6 @@ pub fn deinit(self: *App) void {
     self.pty.deinit();
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
-    self.render_pixels.deinit(self.alloc);
     for (&self.frame_damage) |*damage| damage.rows.deinit(self.alloc);
     self.damage_spans.deinit(self.alloc);
     self.clearImeText();
@@ -3620,8 +3610,16 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 
 /// Window render delegate: refresh the render state and draw the grid.
 /// `age` is how many frames ago `pixels` was last drawn (0 = unknown).
-fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) anyerror!Window.Damage {
+fn render(
+    ctx: *anyopaque,
+    pixels: []u32,
+    source_pixels: ?[]const u32,
+    width: u31,
+    height: u31,
+    age: usize,
+) anyerror!Window.Damage {
     const self: *App = @ptrCast(@alignCast(ctx));
+    std.debug.assert(pixels.len == @as(usize, width) * height);
     if (self.config.frame_timer != .off) {
         self.frame_start = self.nowNs();
         self.frame_update_done = self.frame_start;
@@ -3631,24 +3629,23 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
     const damage = self.beginFrameDamage(width, height);
     self.renderer.focused = self.focused;
     self.renderer.hyperlink_hints = self.keyboard.currentMods().ctrl;
-    const resized = try self.ensureRenderPixels(width, height);
     const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
     if (self.term.modes.get(.synchronized_output)) {
-        if (resized) {
-            try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
+        if (!try self.repairToPreviousFrame(pixels, source_pixels, width, height, age)) {
+            try self.renderer.render(&self.render_state, pixels, width, height);
             self.frame_rows = .all;
         } else {
             try self.recordFrameDamage(damage, false);
             self.frame_rows = .{ .count = 0 };
         }
-        return self.flushFrame(pixels, width, height, age);
+        return self.finishFrame(pixels, width, height);
     }
     const old_cursor = self.render_state.cursor;
     // A pure scroll can reuse most of last frame's pixels; overlays
     // (kitty graphics, preedit, link hints) disqualify the frame since
     // they draw outside the grid rows the shift accounts for.
-    const scroll: ?Renderer.Scroll = scroll: {
-        if (resized or has_kitty_graphics or self.ime_preedit != null) break :scroll null;
+    var scroll: ?Renderer.Scroll = scroll: {
+        if (has_kitty_graphics or self.ime_preedit != null) break :scroll null;
         if (self.keyboard.currentMods().ctrl) break :scroll null;
         break :scroll try self.renderer.detectScroll(&self.render_state, &self.term);
     };
@@ -3656,40 +3653,67 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
     self.dirtyCursorRows(old_cursor);
     const kitty_graphics_dirty = self.term.screens.active.kitty_images.dirty;
     if (self.ime_preedit != null) self.render_state.dirty = .full;
-    if (resized or kitty_graphics_dirty or has_kitty_graphics) self.render_state.dirty = .full;
+    if (kitty_graphics_dirty or has_kitty_graphics) self.render_state.dirty = .full;
+    if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) self.render_state.dirty = .full;
     // A detected scroll implies the viewport pin changed, which update
     // always answers with a full redraw.
     std.debug.assert(scroll == null or self.render_state.dirty == .full);
     if (self.config.frame_timer != .off) self.frame_update_done = self.nowNs();
-    var scrolled = false;
-    switch (self.render_state.dirty) {
-        .false => {},
-        .full => if (has_kitty_graphics) {
-            try self.renderer.renderWithKittyGraphics(&self.render_state, &self.term, self.render_pixels.items, width, height);
-        } else if (scroll) |s| {
-            const old_cursor_row: ?usize = if (old_cursor.visible)
-                if (old_cursor.viewport) |viewport| viewport.y else null
-            else
-                null;
-            try self.renderer.renderScrolled(&self.render_state, self.render_pixels.items, width, height, s, old_cursor_row);
-            scrolled = true;
-        } else {
-            try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
-        },
-        .partial => try self.renderer.renderDirty(&self.render_state, self.render_pixels.items, width, height),
-    }
-    self.frame_rows = switch (self.render_state.dirty) {
-        .false => .{ .count = 0 },
-        .full => .all,
-        .partial => .{ .count = self.renderer.repainted.count() },
+
+    const needs_previous_pixels = switch (self.render_state.dirty) {
+        .false, .partial => true,
+        .full => scroll != null,
     };
+    var force_full_render = false;
+    if (needs_previous_pixels) {
+        if (!try self.repairToPreviousFrame(pixels, source_pixels, width, height, age)) {
+            force_full_render = true;
+            scroll = null;
+        }
+    }
+
+    var scrolled = false;
+    if (force_full_render) {
+        if (has_kitty_graphics) {
+            try self.renderer.renderWithKittyGraphics(&self.render_state, &self.term, pixels, width, height);
+        } else {
+            try self.renderer.render(&self.render_state, pixels, width, height);
+        }
+    } else {
+        switch (self.render_state.dirty) {
+            .false => {},
+            .full => if (has_kitty_graphics) {
+                try self.renderer.renderWithKittyGraphics(&self.render_state, &self.term, pixels, width, height);
+            } else if (scroll) |s| {
+                const old_cursor_row: ?usize = if (old_cursor.visible)
+                    if (old_cursor.viewport) |viewport| viewport.y else null
+                else
+                    null;
+                try self.renderer.renderScrolled(&self.render_state, pixels, width, height, s, old_cursor_row);
+                scrolled = true;
+            } else {
+                try self.renderer.render(&self.render_state, pixels, width, height);
+            },
+            .partial => try self.renderer.renderDirty(&self.render_state, pixels, width, height),
+        }
+    }
+
+    if (force_full_render) {
+        self.frame_rows = .all;
+    } else {
+        self.frame_rows = switch (self.render_state.dirty) {
+            .false => .{ .count = 0 },
+            .full => .all,
+            .partial => .{ .count = self.renderer.repainted.count() },
+        };
+    }
     if (self.ime_preedit) |preedit| {
-        try self.renderer.renderPreedit(&self.render_state, self.render_pixels.items, width, height, preedit);
+        try self.renderer.renderPreedit(&self.render_state, pixels, width, height, preedit);
     }
     var hint_drawn = false;
     if (self.keyboard.currentMods().ctrl) {
         if (self.hyperlinkAtPointer()) |uri| {
-            try self.renderer.renderLinkHint(&self.render_state, self.render_pixels.items, width, height, uri);
+            try self.renderer.renderLinkHint(&self.render_state, pixels, width, height, uri);
             hint_drawn = true;
         }
     }
@@ -3697,9 +3721,9 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
     if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
     // Record what changed before the dirty flags are cleared. A scroll
     // moved every pixel, so its entry keeps the claimed full damage.
-    if (!scrolled) try self.recordFrameDamage(damage, hint_drawn);
+    if (!force_full_render and !scrolled) try self.recordFrameDamage(damage, hint_drawn);
     self.clearRenderDirty();
-    return self.flushFrame(pixels, width, height, age);
+    return self.finishFrame(pixels, width, height);
 }
 
 /// Advance the damage ring and reset the new current entry to full.
@@ -3736,47 +3760,60 @@ fn frameDamageBack(self: *const App, back: usize) *const FrameDamage {
     return &self.frame_damage[(self.frame_damage_index + frame_damage_len - back) % frame_damage_len];
 }
 
-fn rowDamagedSince(self: *const App, row: usize, age: usize) bool {
-    for (0..age) |back| {
+fn rowDamagedBetween(self: *const App, row: usize, first_back: usize, end_back: usize) bool {
+    var back = first_back;
+    while (back < end_back) : (back += 1) {
         if (self.frameDamageBack(back).rows.isSet(row)) return true;
     }
     return false;
 }
 
-fn bottomStripSince(self: *const App, age: usize) bool {
-    for (0..age) |back| {
+fn bottomStripBetween(self: *const App, first_back: usize, end_back: usize) bool {
+    var back = first_back;
+    while (back < end_back) : (back += 1) {
         if (self.frameDamageBack(back).bottom_strip) return true;
     }
     return false;
 }
 
-/// Copy this frame into the shm buffer and report surface damage. The
-/// buffer needs every row that changed in the `age` frames it missed;
-/// the reported damage is only what changed since the previous frame.
-fn flushFrame(self: *App, pixels: []u32, width: u31, height: u31, age: usize) !Window.Damage {
-    std.debug.assert(pixels.len == self.render_pixels.items.len);
+fn allRenderRowsDirty(self: *const App) bool {
+    const rows: usize = self.render_state.rows;
+    if (rows == 0) return false;
+    for (self.render_state.row_data.items(.dirty)[0..rows]) |dirty| {
+        if (!dirty) return false;
+    }
+    return true;
+}
+
+fn currentPartialFrameWillRepaintRow(self: *const App, row: usize) bool {
+    return self.render_state.dirty == .partial and self.render_state.row_data.items(.dirty)[row];
+}
+
+/// Bring `pixels` up to the previous committed frame before current dirty
+/// rows are drawn into it. Returns false when no safe repair source exists;
+/// the caller must then repaint the whole current frame.
+fn repairToPreviousFrame(
+    self: *App,
+    pixels: []u32,
+    source_pixels: ?[]const u32,
+    width: u31,
+    height: u31,
+    age: usize,
+) !bool {
+    std.debug.assert(pixels.len == @as(usize, width) * height);
+    if (age == 1) return true;
+
+    const source = source_pixels orelse return false;
+    std.debug.assert(source.len == pixels.len);
+    if (source.ptr == pixels.ptr) return true;
+
     const cell_height: usize = self.font.cell_height;
     const grid_rows: usize = self.render_state.rows;
 
-    const frame_timer = self.config.frame_timer;
-    const render_done: i96 = if (frame_timer != .off) self.nowNs() else 0;
-    if (frame_timer == .overlay or frame_timer == .both) {
-        try self.renderer.renderFrameTimer(
-            &self.render_state,
-            self.render_pixels.items,
-            width,
-            height,
-            self.last_frame_ns,
-        );
-        // The overlay occupies the top cell row; make partial copies
-        // and reported surface damage carry it every frame.
-        const entry = &self.frame_damage[self.frame_damage_index];
-        if (!entry.full and entry.rows.bit_length > 0) entry.rows.set(0);
-    }
-
     const copy_all = copy_all: {
         if (age == 0 or age > frame_damage_len) break :copy_all true;
-        for (0..age) |back| {
+        var back: usize = 1;
+        while (back < age) : (back += 1) {
             const entry = self.frameDamageBack(back);
             if (entry.full) break :copy_all true;
             if (entry.width != width or entry.height != height) break :copy_all true;
@@ -3786,26 +3823,49 @@ fn flushFrame(self: *App, pixels: []u32, width: u31, height: u31, age: usize) !W
     };
 
     if (copy_all) {
-        Renderer.copyPixels(pixels, self.render_pixels.items);
-    } else {
-        var y: usize = 0;
-        while (y < grid_rows) {
-            if (!self.rowDamagedSince(y, age)) {
-                y += 1;
-                continue;
-            }
-            const start = y;
-            while (y < grid_rows and self.rowDamagedSince(y, age)) y += 1;
-            const px_start = @min(start * cell_height, height);
-            const px_end = @min(y * cell_height, height);
-            const offset = px_start * width;
-            const len = (px_end - px_start) * width;
-            Renderer.copyPixels(pixels[offset..][0..len], self.render_pixels.items[offset..][0..len]);
+        Renderer.copyPixels(pixels, source);
+        return true;
+    }
+
+    var y: usize = 0;
+    while (y < grid_rows) {
+        if (!self.rowDamagedBetween(y, 1, age) or self.currentPartialFrameWillRepaintRow(y)) {
+            y += 1;
+            continue;
         }
-        if (height >= cell_height and self.bottomStripSince(age)) {
-            const offset = (height - cell_height) * width;
-            Renderer.copyPixels(pixels[offset..], self.render_pixels.items[offset..]);
-        }
+        const start = y;
+        while (y < grid_rows and self.rowDamagedBetween(y, 1, age) and !self.currentPartialFrameWillRepaintRow(y)) y += 1;
+        const px_start = @min(start * cell_height, height);
+        const px_end = @min(y * cell_height, height);
+        const offset = px_start * width;
+        const len = (px_end - px_start) * width;
+        Renderer.copyPixels(pixels[offset..][0..len], source[offset..][0..len]);
+    }
+    if (height >= cell_height and self.bottomStripBetween(1, age)) {
+        const offset = (height - cell_height) * width;
+        Renderer.copyPixels(pixels[offset..], source[offset..]);
+    }
+    return true;
+}
+
+/// Finish this frame after rendering directly into the target shm buffer.
+fn finishFrame(self: *App, pixels: []u32, width: u31, height: u31) !Window.Damage {
+    std.debug.assert(pixels.len == @as(usize, width) * height);
+
+    const frame_timer = self.config.frame_timer;
+    const render_done: i96 = if (frame_timer != .off) self.nowNs() else 0;
+    if (frame_timer == .overlay or frame_timer == .both) {
+        try self.renderer.renderFrameTimer(
+            &self.render_state,
+            pixels,
+            width,
+            height,
+            self.last_frame_ns,
+        );
+        // The overlay occupies the top cell row; make reported surface
+        // damage carry it every frame.
+        const entry = &self.frame_damage[self.frame_damage_index];
+        if (!entry.full and entry.rows.bit_length > 0) entry.rows.set(0);
     }
 
     if (frame_timer != .off) {
@@ -3914,19 +3974,6 @@ fn dirtyCursorRow(self: *App, viewport: ?vt.RenderState.Cursor.Viewport) void {
 
     self.render_state.row_data.items(.dirty)[row.y] = true;
     if (self.render_state.dirty == .false) self.render_state.dirty = .partial;
-}
-
-fn ensureRenderPixels(self: *App, width: u31, height: u31) !bool {
-    const len = @as(usize, width) * height;
-    if (self.render_width == width and self.render_height == height and
-        self.render_pixels.items.len == len)
-    {
-        return false;
-    }
-    try self.render_pixels.resize(self.alloc, len);
-    self.render_width = width;
-    self.render_height = height;
-    return true;
 }
 
 fn clearRenderDirty(self: *App) void {
