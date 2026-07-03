@@ -225,7 +225,7 @@ pub const Face = struct {
             };
         }
 
-        if (!constrain_alpha or constraint_width <= 1) {
+        if (!constrain_alpha) {
             const copy = try alloc.alloc(u8, @as(usize, src_width) * src_height);
             errdefer alloc.free(copy);
             try copyGrayRows(copy, bitmap, src_width, src_height);
@@ -964,6 +964,25 @@ test "alpha symbols do not upscale for double-cell constraints" {
     try std.testing.expect(wide.height <= font.cell_height);
     try std.testing.expectEqual(narrow.width, wide.width);
     try std.testing.expectEqual(narrow.height, wide.height);
+}
+
+test "alpha symbols fit within single-cell constraints" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    const embedded = font.embedded_face orelse return error.SkipZigTest;
+    const glyph_face = font.face(embedded);
+    const glyph_index = c.FT_Get_Char_Index(glyph_face.ft_face, 0xF07B); // nf-fa-folder
+    try std.testing.expect(glyph_index != 0);
+
+    const unconstrained = try glyph_face.glyph(alloc, glyph_index, 1, false);
+    const constrained = try glyph_face.glyph(alloc, glyph_index, 1, true);
+    try std.testing.expectEqual(GlyphFormat.alpha, constrained.format);
+    try std.testing.expect(constrained.width <= font.cell_width);
+    try std.testing.expect(constrained.height <= font.cell_height);
+    try std.testing.expect(constrained.width <= unconstrained.width);
+    try std.testing.expect(constrained.height <= unconstrained.height);
 }
 
 test "fallback face for a codepoint the primary lacks" {

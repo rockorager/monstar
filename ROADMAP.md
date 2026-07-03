@@ -1,34 +1,33 @@
 # Roadmap
 
-Rough priority order. Items link to reference implementations where useful.
+Short list of known follow-ups. Most early terminal compatibility work
+has landed: OSC/XTGETTCAP/DECRQSS responses, OSC 52 writes, kitty color
+queries, kitty graphics, selection/clipboard basics, styled font faces,
+pointer shapes, notifications, Wayland activation/decorations/suspend,
+high-resolution wheel scrolling, and text-input-v3 IME support.
 
-## Selection and clipboard polish
+## Open issues to revisit
 
-Basic drag selection, double/triple-click word/line selection,
-selection auto-scroll, clipboard, primary selection, paste MIME
-negotiation, and stale-selection clearing are done.
+- Nerd Font rendering when an icon is not followed by a space: the
+  current Ghostty-style widening/scaling path does not always shrink
+  single-cell icons enough in that case. Tracked in GitHub.
+- Config reload: support the signal used by Omarchy (likely `SIGUSR1`)
+  to reload config without restarting. Tracked in GitHub.
+- Runtime font size changes: add keybindings to increase/decrease/reset
+  font size. Tracked in GitHub.
 
-## Sprite polish
+## Dependency maintenance
 
-Sprite rendering (box drawing, blocks, braille, powerline, branch,
-legacy computing) and text decorations landed, vendored from ghostty's
-sprite face onto z2d. Cursor shape sprites (bar,
-underline, hollow) and wide (2-cell) sprite variants landed too.
+- Re-pin the Ghostty dependency to upstream main once the Zig 0.16
+  migration lands in an upstream release. We are currently using the
+  vendored dependency needed for Zig 0.16 compatibility.
 
-## Config polish
+## Not planned for now
 
-The key=value config file landed (font, colors, palette, scrollback,
-shell, wheel speed). Possible follow-ups: live reload on file change,
-configurable keybindings for copy/paste, cursor style/blink defaults,
-and font fallback family overrides.
-
-## Smaller items
-
-- Re-pin the ghostty dependency to upstream main once the Zig 0.16
-  migration lands (ghostty 1.4, PR #12726); currently pinned to the
-  `vancluever/ghostty#zig-0.16` branch.
-- Mode 2048 edge: re-enabling the already-enabled mode should resend a
-  size report (needs a mode-change hook in ghostty-vt's effects API;
-  consider proposing upstream).
-- Nerd Font "Mono" variant renders icons at single-cell size; consider
-  double-width icon handling.
+- Custom terminfo entry: intentionally skipped; Monstar currently sets
+  `TERM=xterm-ghostty`.
+- Config/keybinding polish beyond the existing key=value config: skipped
+  for now unless a concrete need comes up.
+- Extra text-input polish such as surrounding-text deletion: skipped for
+  now because terminals generally do not have editable surrounding text;
+  committed IME text and preedit display are implemented.
