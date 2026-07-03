@@ -19,6 +19,7 @@ const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
 const Pty = @import("Pty.zig");
 const Renderer = @import("Renderer.zig");
+const cgroup = @import("cgroup.zig");
 const Window = @import("Window.zig");
 
 const log = std.log.scoped(.app);
@@ -327,6 +328,16 @@ pub fn init(
     ) catch return error.SignalFdFailed;
     errdefer _ = std.os.linux.close(signal_fd);
 
+    // Connect to dbus before the fork so the child can be moved into
+    // its own systemd scope before it execs. Filter and fd wiring happen
+    // in initDbus once the App has a stable address.
+    const dbus_connection: ?*c.DBusConnection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null);
+    if (dbus_connection == null) log.warn("session dbus unavailable; desktop integration disabled", .{});
+    errdefer if (dbus_connection) |connection| {
+        c.dbus_connection_close(connection);
+        c.dbus_connection_unref(connection);
+    };
+
     var pty: Pty = try .open(.{
         .row = initial_rows,
         .col = initial_cols,
@@ -334,7 +345,20 @@ pub fn init(
         .ypixel = @intCast(initial_rows * font.cell_height),
     });
     errdefer pty.deinit();
-    const child_pid = try pty.spawn(path, argv, envp);
+
+    // Move the child into its own transient systemd scope before it can
+    // exec: OOM kills then apply to the shell's process tree instead of
+    // the whole terminal. The gate holds the child so grandchildren
+    // cannot be spawned into our cgroup; on failure, releasing the gate
+    // lets the child proceed un-isolated.
+    const use_cgroup_scope = dbus_connection != null and cgroup.systemdBooted();
+    const child_pid = try pty.spawn(path, argv, envp, .{ .gate_child = use_cgroup_scope });
+    if (use_cgroup_scope) {
+        cgroup.moveIntoScope(dbus_connection.?, @intCast(child_pid)) catch {
+            log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+        };
+    }
+    pty.releaseChild();
 
     // Nonblocking master: a blocking write can deadlock the whole loop
     // when the child floods output (echoed responses need output-queue
@@ -398,7 +422,7 @@ pub fn init(
         .write_queue = .empty,
         .child_exited = false,
         .pty_suspended = false,
-        .dbus = null,
+        .dbus = dbus_connection,
         .dbus_fd = -1,
         .notification_ids = .empty,
         .notification_tokens = .empty,
@@ -596,15 +620,16 @@ fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void
     };
 }
 
+/// Finish setting up the session bus connection made in init (filter,
+/// matches, poll fd); the connection itself is created before the child
+/// fork so that cgroup scope creation can use it.
 fn initDbus(self: *App) void {
-    const connection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null) orelse {
-        log.warn("session dbus unavailable; desktop integration disabled", .{});
-        return;
-    };
+    const connection = self.dbus orelse return;
 
     if (c.dbus_connection_add_filter(connection, dbusFilter, self, null) == 0) {
         c.dbus_connection_close(connection);
         c.dbus_connection_unref(connection);
+        self.dbus = null;
         return;
     }
     c.dbus_bus_add_match(connection, "type='signal',interface='org.freedesktop.Notifications'", null);
@@ -615,10 +640,10 @@ fn initDbus(self: *App) void {
         c.dbus_connection_remove_filter(connection, dbusFilter, self);
         c.dbus_connection_close(connection);
         c.dbus_connection_unref(connection);
+        self.dbus = null;
         return;
     }
 
-    self.dbus = connection;
     self.dbus_fd = fd;
     self.readPortalColorScheme();
 }

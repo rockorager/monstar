@@ -11,8 +11,18 @@ const log = std.log.scoped(.pty);
 
 master: posix.fd_t,
 slave: posix.fd_t,
+/// Write end of the spawn gate pipe (-1 when unused): the child blocks
+/// just before exec until `releaseChild` closes it.
+gate: posix.fd_t,
 
 pub const Error = error{PtyFailed};
+
+pub const SpawnOptions = struct {
+    /// Hold the child just before exec until `releaseChild` is called
+    /// (or the Pty is deinitialized). Lets the parent move the child
+    /// into a cgroup before it can spawn grandchildren.
+    gate_child: bool = false,
+};
 
 /// Open a master/slave PTY pair with the given window size.
 pub fn open(size: posix.winsize) Error!Pty {
@@ -34,13 +44,23 @@ pub fn open(size: posix.winsize) Error!Pty {
 
     try check(linux.ioctl(master, linux.T.IOCSWINSZ, @intFromPtr(&size)));
 
-    return .{ .master = master, .slave = slave };
+    return .{ .master = master, .slave = slave, .gate = -1 };
 }
 
 pub fn deinit(self: *Pty) void {
+    self.releaseChild();
     self.closeMaster();
     if (self.slave >= 0) _ = linux.close(self.slave);
     self.* = undefined;
+}
+
+/// Release a gated child (see SpawnOptions.gate_child): the child sees
+/// EOF on the gate pipe and proceeds to exec.
+pub fn releaseChild(self: *Pty) void {
+    if (self.gate >= 0) {
+        _ = linux.close(self.gate);
+        self.gate = -1;
+    }
 }
 
 pub fn closeMaster(self: *Pty) void {
@@ -61,11 +81,24 @@ pub fn spawn(
     path: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
+    options: SpawnOptions,
 ) Error!posix.pid_t {
     std.debug.assert(self.slave >= 0);
+    std.debug.assert(self.gate == -1);
+
+    var gate_fds: [2]posix.fd_t = .{ -1, -1 };
+    if (options.gate_child) {
+        try check(linux.pipe2(&gate_fds, .{ .CLOEXEC = true }));
+    }
 
     const fork_rc = linux.fork();
-    if (linux.errno(fork_rc) != .SUCCESS) return error.PtyFailed;
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        if (options.gate_child) {
+            _ = linux.close(gate_fds[0]);
+            _ = linux.close(gate_fds[1]);
+        }
+        return error.PtyFailed;
+    }
     const pid: posix.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
@@ -81,6 +114,18 @@ pub fn spawn(
         _ = linux.dup2(self.slave, 2);
         _ = linux.close(self.master);
         if (self.slave > 2) _ = linux.close(self.slave);
+        if (options.gate_child) {
+            // Close our copy of the write end so the parent closing
+            // its end is observable as EOF. A byte or EOF both mean go;
+            // retry on signal interruption.
+            _ = linux.close(gate_fds[1]);
+            var byte: [1]u8 = undefined;
+            while (true) {
+                const rc = linux.read(gate_fds[0], &byte, 1);
+                if (linux.errno(rc) != .INTR) break;
+            }
+            _ = linux.close(gate_fds[0]);
+        }
         _ = linux.execve(path, argv, envp);
         linux.exit(127); // exec failed
     }
@@ -88,6 +133,10 @@ pub fn spawn(
     // Parent: the slave belongs to the child now.
     _ = linux.close(self.slave);
     self.slave = -1;
+    if (options.gate_child) {
+        _ = linux.close(gate_fds[0]);
+        self.gate = gate_fds[1];
+    }
     return pid;
 }
 

@@ -47,7 +47,7 @@ fn runCommand(init: std.process.Init, term: *vt.Terminal, args: []const [:0]cons
 
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd };
     const envp = try buildEnvp(arena, init.minimal.environ);
-    const pid = try pty.spawn("/bin/sh", &argv, envp);
+    const pid = try pty.spawn("/bin/sh", &argv, envp, .{});
 
     // Drain PTY output into the terminal until the child hangs up.
     var read_buf: [4096]u8 = undefined;
@@ -127,6 +127,7 @@ test {
     _ = App;
     _ = Config;
     _ = Font;
+    _ = @import("cgroup.zig");
     _ = @import("Keyboard.zig");
     _ = Pty;
     _ = Renderer;
