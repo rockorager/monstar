@@ -20,6 +20,8 @@ font_family: [:0]const u8 = "monospace",
 font_size: u31 = 16,
 /// Shell to run; unset falls back to $SHELL, then /bin/sh.
 shell: ?[:0]const u8 = null,
+/// Shell command that receives the last semantic command output on stdin.
+pipe_command_output: ?[:0]const u8 = null,
 scrollback: usize = 10_000,
 wheel_scroll_lines: u31 = 3,
 
@@ -86,6 +88,8 @@ fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []const 
         self.font_size = size;
     } else if (std.mem.eql(u8, key, "shell")) {
         self.shell = try arena.dupeZ(u8, value);
+    } else if (std.mem.eql(u8, key, "pipe-command-output")) {
+        self.pipe_command_output = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "scrollback")) {
         self.scrollback = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "wheel-scroll-lines")) {
@@ -162,6 +166,7 @@ test "defaults" {
     try std.testing.expectEqualStrings("monospace", config.font_family);
     try std.testing.expectEqual(@as(u31, 16), config.font_size);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.shell);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), config.pipe_command_output);
 }
 
 test "parse config" {
@@ -174,6 +179,7 @@ test "parse config" {
         \\font-family = Fira Code
         \\font-size = 14
         \\shell = /usr/bin/fish
+        \\pipe-command-output = cat > /tmp/monstar-output
         \\scrollback = 5000
         \\wheel-scroll-lines = 5
         \\background = #1a1b26
@@ -188,6 +194,7 @@ test "parse config" {
     // invalid re-assignment keeps the previous valid value
     try std.testing.expectEqual(@as(u31, 14), config.font_size);
     try std.testing.expectEqualStrings("/usr/bin/fish", config.shell.?);
+    try std.testing.expectEqualStrings("cat > /tmp/monstar-output", config.pipe_command_output.?);
     try std.testing.expectEqual(@as(usize, 5000), config.scrollback);
     try std.testing.expectEqual(@as(u31, 5), config.wheel_scroll_lines);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);

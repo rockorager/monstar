@@ -1412,6 +1412,152 @@ fn spawnNewWindow(self: *App) void {
     _ = linux.wait4(pid, &status, 0, null);
 }
 
+/// Ctrl+Shift+Z/X: move the scrollback viewport between OSC 133 prompt marks.
+fn jumpPrompt(self: *App, delta: isize) void {
+    const screen = self.term.screens.active;
+    if (!screen.semantic_prompt.seen) return;
+    screen.pages.scroll(.{ .delta_prompt = delta });
+    self.clearSelection();
+    self.needs_redraw = true;
+}
+
+/// Ctrl+Shift+G: pipe the most recent OSC 133-delimited command output to
+/// the configured shell command. The command runs as `/bin/sh -c <value>`.
+fn pipeCommandOutput(self: *App) void {
+    const command = self.config.pipe_command_output orelse return;
+    const output = self.lastCommandOutput() orelse return;
+    defer self.alloc.free(output);
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pwd: ?[:0]const u8 = pwd: {
+        const url = self.term.getPwd() orelse break :pwd null;
+        break :pwd osc7Path(arena, url) catch null;
+    };
+    const envp = self.spawnEnvp(arena, pwd) catch |err| {
+        log.err("pipe command env setup failed: {}", .{err});
+        return;
+    };
+
+    spawnPipeCommand(command, output, envp, pwd);
+}
+
+fn lastCommandOutput(self: *App) ?[:0]const u8 {
+    return semanticCommandOutputText(self.alloc, self.term.screens.active);
+}
+
+fn semanticCommandOutputText(alloc: std.mem.Allocator, screen: *vt.Screen) ?[:0]const u8 {
+    if (!screen.semantic_prompt.seen) return null;
+
+    var it = screen.pages.promptIterator(.left_up, .{ .screen = .{} }, null);
+    while (it.next()) |prompt_pin| {
+        const hl = screen.pages.highlightSemanticContent(prompt_pin, .output) orelse continue;
+        const sel = vt.Selection.init(hl.start, hl.end, false);
+        return screen.selectionString(alloc, .{ .sel = sel, .trim = false }) catch null;
+    }
+    return null;
+}
+
+fn spawnPipeCommand(
+    command: [:0]const u8,
+    output: []const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    pwd: ?[:0]const u8,
+) void {
+    const linux = std.os.linux;
+
+    var fds: [2]posix.fd_t = undefined;
+    const pipe_rc = linux.pipe2(&fds, .{ .CLOEXEC = true });
+    if (linux.errno(pipe_rc) != .SUCCESS) {
+        log.err("pipe command pipe failed: {}", .{linux.errno(pipe_rc)});
+        return;
+    }
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        log.err("pipe command fork failed: {}", .{linux.errno(fork_rc)});
+        return;
+    }
+    const pid: posix.pid_t = @intCast(fork_rc);
+
+    if (pid == 0) {
+        const empty_mask = posix.sigemptyset();
+        posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
+        _ = linux.setsid();
+
+        const runner_rc = linux.fork();
+        if (linux.errno(runner_rc) == .SUCCESS and runner_rc == 0) {
+            runPipeCommandChild(command, envp, pwd, fds[0], fds[1]);
+        }
+
+        const writer_rc = linux.fork();
+        if (linux.errno(writer_rc) == .SUCCESS and writer_rc == 0) {
+            writePipeCommandChild(output, fds[0], fds[1]);
+        }
+
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        linux.exit(0);
+    }
+
+    var status: u32 = undefined;
+    _ = linux.wait4(pid, &status, 0, null);
+}
+
+fn runPipeCommandChild(
+    command: [:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    pwd: ?[:0]const u8,
+    read_fd: posix.fd_t,
+    write_fd: posix.fd_t,
+) noreturn {
+    const linux = std.os.linux;
+    if (pwd) |p| _ = linux.chdir(p.ptr);
+    _ = linux.dup2(read_fd, 0);
+    _ = linux.close(read_fd);
+    _ = linux.close(write_fd);
+
+    const devnull = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    if (linux.errno(devnull) == .SUCCESS) {
+        const fd: posix.fd_t = @intCast(devnull);
+        _ = linux.dup2(fd, 1);
+        _ = linux.dup2(fd, 2);
+        if (fd > 2) _ = linux.close(fd);
+    }
+
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command.ptr };
+    _ = linux.execve("/bin/sh", &argv, envp);
+    linux.exit(127);
+}
+
+fn writePipeCommandChild(output: []const u8, read_fd: posix.fd_t, write_fd: posix.fd_t) noreturn {
+    const linux = std.os.linux;
+    _ = linux.close(read_fd);
+    writeAllFd(write_fd, output);
+    _ = linux.close(write_fd);
+    linux.exit(0);
+}
+
+fn writeAllFd(fd: posix.fd_t, data: []const u8) void {
+    const linux = std.os.linux;
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const rc = linux.write(fd, data.ptr + offset, data.len - offset);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return;
+                offset += rc;
+            },
+            .INTR => {},
+            else => return,
+        }
+    }
+}
+
 /// Environment for a spawned window: our own environment with PWD
 /// rewritten to match the child's starting directory.
 fn spawnEnvp(
@@ -3362,8 +3508,11 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     if (action == .press and event.mods.ctrl and event.mods.shift) {
         switch (event.key) {
             .key_c => return self.copyToClipboard(),
+            .key_g => return self.pipeCommandOutput(),
             .key_n => return self.spawnNewWindow(),
             .key_v => return self.beginPaste(.clipboard),
+            .key_x => return self.jumpPrompt(1),
+            .key_z => return self.jumpPrompt(-1),
             .comma => return self.reloadConfig(),
             else => {},
         }
@@ -3743,4 +3892,31 @@ fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
     });
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.needs_redraw = true;
+}
+
+test "semantic command output extracts most recent completed output" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 20, .rows = 6 });
+    defer term.deinit(alloc);
+
+    try term.semanticPrompt(.init(.fresh_line_new_prompt));
+    try term.printString("$ ");
+    try term.semanticPrompt(.init(.end_prompt_start_input));
+    try term.printString("printf");
+    try term.semanticPrompt(.init(.end_input_start_output));
+    term.carriageReturn();
+    try term.linefeed();
+    try term.printString("one");
+    term.carriageReturn();
+    try term.linefeed();
+    try term.printString("two");
+    try term.semanticPrompt(.init(.end_command));
+    term.carriageReturn();
+    try term.linefeed();
+    try term.semanticPrompt(.init(.fresh_line_new_prompt));
+    try term.printString("$ ");
+
+    const output = semanticCommandOutputText(alloc, term.screens.active).?;
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings("one\ntwo", output);
 }
