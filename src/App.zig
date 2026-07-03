@@ -608,6 +608,7 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const new_font: Font = try .init(self.alloc, self.config.font_family, size_px);
     self.font.deinit(self.alloc);
     self.font = new_font;
+    self.renderer.clearShapeCache();
     self.font_size_px = size_px;
     self.render_state.dirty = .full;
     self.needs_redraw = true;
@@ -1542,6 +1543,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     // to notify the pty and DEC 2048 in-band size-report listeners.
     self.font.deinit(self.alloc);
     self.font = new_font;
+    self.renderer.clearShapeCache();
     self.font_size_px = desired_font_size;
     resize(
         self,
@@ -1574,6 +1576,7 @@ fn setRuntimeFontSize(self: *App, logical_size: ?u31) void {
     self.runtime_font_size = logical_size;
     self.font.deinit(self.alloc);
     self.font = new_font;
+    self.renderer.clearShapeCache();
     self.font_size_px = size_px;
     resize(
         self,

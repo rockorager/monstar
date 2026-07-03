@@ -41,6 +41,27 @@ scroll_pins: std.ArrayList(vt.Pin),
 /// scroll itself, captured before RenderState.update consumes the
 /// dirty flags. Valid between detectScroll and renderScrolled.
 scroll_predirty: std.DynamicBitSetUnmanaged,
+/// Shaped-run cache: HarfBuzz output keyed by face and run content
+/// (codepoints with run-relative clusters), so repeated text shapes
+/// once no matter where it appears on screen. Cleared wholesale when
+/// full and on font changes.
+shape_cache: std.StringHashMapUnmanaged([]ShapedGlyph),
+/// Scratch for the current run's cache key.
+shape_key: std.ArrayList(u32),
+
+/// Shape cache entry limit; at ~300 bytes per typical entry the cache
+/// tops out around a few megabytes before it resets.
+const shape_cache_max_entries = 8192;
+
+/// One glyph of a shaped run, positions already in pixels.
+const ShapedGlyph = struct {
+    glyph: u32,
+    /// Cell offset from the run start.
+    cluster: u32,
+    x_advance: i32,
+    x_offset: i32,
+    y_offset: i32,
+};
 
 pub const InitOptions = struct {
     selection_background: ?vt.color.RGB = null,
@@ -61,6 +82,8 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .reverse_scratch = .empty,
         .scroll_pins = .empty,
         .scroll_predirty = .{},
+        .shape_cache = .empty,
+        .shape_key = .empty,
     };
 }
 
@@ -71,7 +94,21 @@ pub fn deinit(self: *Renderer) void {
     self.reverse_scratch.deinit(self.alloc);
     self.scroll_pins.deinit(self.alloc);
     self.scroll_predirty.deinit(self.alloc);
+    self.clearShapeCache();
+    self.shape_cache.deinit(self.alloc);
+    self.shape_key.deinit(self.alloc);
     self.* = undefined;
+}
+
+/// Drop all cached shaping results. Must be called when the font (and
+/// with it the face set and metrics) changes.
+pub fn clearShapeCache(self: *Renderer) void {
+    var it = self.shape_cache.iterator();
+    while (it.next()) |entry| {
+        self.alloc.free(entry.key_ptr.*);
+        self.alloc.free(entry.value_ptr.*);
+    }
+    self.shape_cache.clearRetainingCapacity();
 }
 
 /// Draw the full render state into `pixels` (width*height, stride == width).
@@ -1173,45 +1210,49 @@ fn drawRun(
         return;
     }
 
-    const face = font.face(self.face_scratch.items[start]);
+    const face_index = self.face_scratch.items[start];
+    const face = font.face(face_index);
 
-    c.hb_buffer_clear_contents(self.hb_buf);
+    // Build the run's cache key: the face plus (run-relative cluster,
+    // codepoint) pairs. Relative clusters make the shape result
+    // position-independent, so the same text hits one entry anywhere
+    // on screen.
+    self.shape_key.clearRetainingCapacity();
+    try self.shape_key.append(self.alloc, face_index);
     var non_space = false;
     for (start..end) |x| {
         const raw = raws[x];
         if (raw.wide == .spacer_tail or raw.wide == .spacer_head) continue;
         const cp = raw.content.codepoint.data;
         if (cp != ' ') non_space = true;
-        c.hb_buffer_add(self.hb_buf, cp, @intCast(x));
+        const rel: u32 = @intCast(x - start);
+        try self.shape_key.appendSlice(self.alloc, &.{ rel, cp });
         if (raw.content_tag == .codepoint_grapheme) {
-            for (graphemes[x]) |extra| c.hb_buffer_add(self.hb_buf, extra, @intCast(x));
+            for (graphemes[x]) |extra| {
+                try self.shape_key.appendSlice(self.alloc, &.{ rel, extra });
+            }
         }
     }
     if (!non_space) return;
 
-    c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
-    c.hb_buffer_guess_segment_properties(self.hb_buf);
-    c.hb_shape(face.hb_font, self.hb_buf, null, 0);
-
-    var glyph_count: c_uint = 0;
-    const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
-    const positions = c.hb_buffer_get_glyph_positions(self.hb_buf, &glyph_count);
-    if (glyph_count == 0) return;
+    const shaped = self.shape_cache.get(std.mem.sliceAsBytes(self.shape_key.items)) orelse
+        try self.shapeRun(face);
 
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
     var pen_x: i32 = 0;
     var cluster: u32 = std.math.maxInt(u32);
-    for (infos[0..glyph_count], positions[0..glyph_count]) |info, pos| {
+    for (shaped) |sg| {
+        const abs_cluster: u32 = start + sg.cluster;
         // Snap each new cluster to its cell so the grid stays aligned.
-        if (info.cluster != cluster) {
-            cluster = info.cluster;
+        if (abs_cluster != cluster) {
+            cluster = abs_cluster;
             pen_x = @as(i32, @intCast(cluster)) * font.cell_width;
         }
         const cluster_x: usize = @intCast(cluster);
         const constraint_width = constraintWidth(raws, cluster_x, raws.len);
         const g = try face.glyph(
             self.alloc,
-            info.codepoint,
+            sg.glyph,
             constraint_width,
             isSymbol(cellCodepoint(raws[cluster_x])),
         );
@@ -1220,13 +1261,54 @@ fn drawRun(
             width,
             height,
             g,
-            pen_x + (pos.x_offset >> 6) + g.bearing_x,
-            baseline_y - (pos.y_offset >> 6) - g.bearing_y,
+            pen_x + sg.x_offset + g.bearing_x,
+            baseline_y - sg.y_offset - g.bearing_y,
             argb(self.fg_scratch.items[cluster]),
             self.reverse_scratch.items[cluster],
         );
-        pen_x += pos.x_advance >> 6;
+        pen_x += sg.x_advance;
     }
+}
+
+/// Shape the run described by shape_key with HarfBuzz and cache the
+/// result under a copy of the key.
+fn shapeRun(self: *Renderer, face: *Font.Face) ![]ShapedGlyph {
+    const key = self.shape_key.items;
+
+    c.hb_buffer_clear_contents(self.hb_buf);
+    var i: usize = 1;
+    while (i + 1 < key.len) : (i += 2) {
+        c.hb_buffer_add(self.hb_buf, key[i + 1], key[i]);
+    }
+    c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
+    c.hb_buffer_guess_segment_properties(self.hb_buf);
+    c.hb_shape(face.hb_font, self.hb_buf, null, 0);
+
+    var glyph_count: c_uint = 0;
+    const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
+    const positions = c.hb_buffer_get_glyph_positions(self.hb_buf, &glyph_count);
+
+    const shaped = try self.alloc.alloc(ShapedGlyph, glyph_count);
+    errdefer self.alloc.free(shaped);
+    if (glyph_count > 0) {
+        for (shaped, infos[0..glyph_count], positions[0..glyph_count]) |*sg, info, pos| {
+            sg.* = .{
+                .glyph = info.codepoint,
+                .cluster = info.cluster,
+                .x_advance = pos.x_advance >> 6,
+                .x_offset = pos.x_offset >> 6,
+                .y_offset = pos.y_offset >> 6,
+            };
+        }
+    }
+
+    // Full cache: reset wholesale. Terminal content is repetitive
+    // enough that the working set repopulates within a frame or two.
+    if (self.shape_cache.count() >= shape_cache_max_entries) self.clearShapeCache();
+    const owned_key = try self.alloc.dupe(u8, std.mem.sliceAsBytes(key));
+    errdefer self.alloc.free(owned_key);
+    try self.shape_cache.put(self.alloc, owned_key, shaped);
+    return shaped;
 }
 
 /// How many cells a cell's background covers (wide chars span two).
