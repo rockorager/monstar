@@ -253,6 +253,7 @@ const sync_output_reset_ms = 1000;
 const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
+const default_selection_bg: vt.color.RGB = .{ .r = 0x33, .g = 0x46, .b = 0x7c };
 const precision_scroll_multiplier = 10.0;
 
 /// Damage history length; shm buffers older than this get a full copy.
@@ -295,7 +296,7 @@ const AppStreamHandler = struct {
     ) void {
         self.terminal_handler.vt(action, value);
         switch (action) {
-            .color_operation => self.app.answerOscColorQueries(&value.requests, value.terminator),
+            .color_operation => self.app.handleOscColorOperation(&value.requests, value.terminator),
             .kitty_color_report => self.app.answerKittyColorQueries(value),
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
@@ -1709,7 +1710,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.term.colors.cursor.default = colors.cursor.default;
     self.term.colors.palette.changeDefault(colors.palette.original);
 
-    self.renderer.selection_bg = new_config.selection_background orelse .{ .r = 0x33, .g = 0x46, .b = 0x7c };
+    self.renderer.selection_bg = new_config.selection_background orelse default_selection_bg;
     self.renderer.selection_fg = new_config.selection_foreground;
     self.window.toplevel.setAppId(new_config.app_id);
 
@@ -1810,7 +1811,7 @@ fn readPty(self: *App) void {
     self.syncActiveScreen();
 }
 
-fn answerOscColorQueries(
+fn handleOscColorOperation(
     self: *App,
     requests: *const vt.osc.color.List,
     terminator: vt.osc.Terminator,
@@ -1818,10 +1819,38 @@ fn answerOscColorQueries(
     var it = requests.constIterator(0);
     while (it.next()) |req| {
         switch (req.*) {
+            .set => |set| self.setOscColor(set),
             .query => |target| self.answerOscColorQuery(target, terminator),
+            .reset => |target| self.resetOscColor(target),
             else => {},
         }
     }
+}
+
+fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
+    switch (set.target) {
+        .dynamic => |dynamic| switch (dynamic) {
+            .highlight_background => self.renderer.selection_bg = set.color,
+            .highlight_foreground => self.renderer.selection_fg = set.color,
+            else => return,
+        },
+        else => return,
+    }
+    self.render_state.dirty = .full;
+    self.needs_redraw = true;
+}
+
+fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
+    switch (target) {
+        .dynamic => |dynamic| switch (dynamic) {
+            .highlight_background => self.renderer.selection_bg = self.config.selection_background orelse default_selection_bg,
+            .highlight_foreground => self.renderer.selection_fg = self.config.selection_foreground,
+            else => return,
+        },
+        else => return,
+    }
+    self.render_state.dirty = .full;
+    self.needs_redraw = true;
 }
 
 fn answerKittyColorQueries(self: *App, request: vt.kitty.color.OSC) void {
@@ -2077,6 +2106,12 @@ fn answerOscColorQuery(
             .cursor => self.writeOscDynamicReport(
                 12,
                 self.term.colors.cursor.get() orelse self.effectiveForeground(),
+                terminator,
+            ),
+            .highlight_background => self.writeOscDynamicReport(17, self.renderer.selection_bg, terminator),
+            .highlight_foreground => self.writeOscDynamicReport(
+                19,
+                self.renderer.selection_fg orelse self.effectiveForeground(),
                 terminator,
             ),
             else => {},
