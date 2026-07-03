@@ -257,8 +257,8 @@ const frame_damage_len = 8;
 const FrameDamage = struct {
     /// Everything changed (or rendering failed partway); ignore `rows`.
     full: bool,
-    /// Changed cell rows, expanded by one row on each side to cover
-    /// glyph overhang, matching Renderer.renderDirty.
+    /// The rows Renderer.renderDirty repainted: dirty rows plus the
+    /// neighbors its overhang tracking chose to include.
     rows: std.DynamicBitSetUnmanaged,
     /// The bottom link-hint strip was drawn this frame. It straddles
     /// cell rows (it hugs the window's bottom edge), so it is tracked
@@ -3691,14 +3691,12 @@ fn recordFrameDamage(self: *App, damage: *FrameDamage, hint_drawn: bool) !void {
     try damage.rows.resize(self.alloc, rows, false);
     damage.rows.unsetAll();
     damage.full = false;
-    if (self.render_state.dirty == .false) return;
-    const all_dirty = self.render_state.row_data.items(.dirty);
-    for (all_dirty[0..rows], 0..) |dirty, y| {
-        if (!dirty) continue;
-        const start = if (y == 0) y else y - 1;
-        const end = @min(rows, y + 2);
-        damage.rows.setRangeValue(.{ .start = start, .end = end }, true);
-    }
+    if (self.render_state.dirty == .false or rows == 0) return;
+    // Mirror exactly the rows renderDirty repainted (dirty rows plus
+    // the neighbors its overhang tracking chose to include).
+    std.debug.assert(self.renderer.repainted.bit_length == rows);
+    var it = self.renderer.repainted.iterator(.{});
+    while (it.next()) |y| damage.rows.set(y);
 }
 
 /// The damage entry recorded `back` frames ago (0 = current frame).

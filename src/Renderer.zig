@@ -42,6 +42,18 @@ scroll_pins: std.ArrayList(vt.Pin),
 /// scroll itself, captured before RenderState.update consumes the
 /// dirty flags. Valid between detectScroll and renderScrolled.
 scroll_predirty: std.DynamicBitSetUnmanaged,
+/// Per-row flag: the row's last render blitted ink above its own
+/// pixel strip (accented capitals exceed the font ascender in many
+/// fonts). renderDirty repaints a dirty row's neighbors only when
+/// these bits demand it. Descender overshoot is not tracked: rows
+/// render top to bottom, so ink below a row's strip has never
+/// survived a neighboring repaint.
+row_overhang: std.DynamicBitSetUnmanaged,
+/// Whether the row currently being rendered blitted above its strip.
+overhang_scratch: bool = false,
+/// The rows the last renderDirty call actually repainted, for the
+/// caller's damage bookkeeping.
+repainted: std.DynamicBitSetUnmanaged,
 /// Shaped-run cache: HarfBuzz output keyed by face and run content
 /// (codepoints with run-relative clusters), so repeated text shapes
 /// once no matter where it appears on screen. Cleared wholesale when
@@ -83,6 +95,8 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .reverse_scratch = .empty,
         .scroll_pins = .empty,
         .scroll_predirty = .{},
+        .row_overhang = .{},
+        .repainted = .{},
         .shape_cache = .empty,
         .shape_key = .empty,
     };
@@ -95,6 +109,8 @@ pub fn deinit(self: *Renderer) void {
     self.reverse_scratch.deinit(self.alloc);
     self.scroll_pins.deinit(self.alloc);
     self.scroll_predirty.deinit(self.alloc);
+    self.row_overhang.deinit(self.alloc);
+    self.repainted.deinit(self.alloc);
     self.clearShapeCache();
     self.shape_cache.deinit(self.alloc);
     self.shape_key.deinit(self.alloc);
@@ -126,6 +142,7 @@ pub fn render(
         @memset(pixels, argb(state.colors.background));
         return;
     }
+    try self.row_overhang.resize(self.alloc, state.rows, false);
 
     const rows = state.row_data.slice();
     const all_cells = rows.items(.cells);
@@ -208,8 +225,11 @@ pub fn renderWithKittyGraphics(
 }
 
 /// Draw only rows marked dirty in `state`, preserving other pixels.
-/// Dirty rows are expanded by one neighboring row to cover glyph and
-/// sprite overhang from the previous frame.
+/// A dirty row's neighbors are repainted only when the row_overhang
+/// bits demand it: the row above when the dirty row's previous
+/// content inked into it, the row below when its ink reaches into the
+/// dirty row's freshly cleared strip. The rows actually repainted are
+/// recorded in `repainted` for the caller's damage bookkeeping.
 pub fn renderDirty(
     self: *Renderer,
     state: *vt.RenderState,
@@ -219,6 +239,9 @@ pub fn renderDirty(
 ) !void {
     std.debug.assert(pixels.len == @as(usize, width) * height);
     if (state.rows == 0 or state.cols == 0) return;
+    try self.row_overhang.resize(self.alloc, state.rows, false);
+    try self.repainted.resize(self.alloc, state.rows, false);
+    self.repainted.unsetAll();
 
     const rows = state.row_data.slice();
     const all_cells = rows.items(.cells);
@@ -227,10 +250,13 @@ pub fn renderDirty(
     var rendered_until: usize = 0;
     for (all_dirty[0..state.rows], 0..) |dirty, y| {
         if (!dirty) continue;
-        const start = if (y == 0) y else y - 1;
-        const end = @min(@as(usize, state.rows), y + 2);
+        const expand_up = y > 0 and self.row_overhang.isSet(y);
+        const expand_down = y + 1 < state.rows and self.row_overhang.isSet(y + 1);
+        const start = y - @intFromBool(expand_up);
+        const end = y + 1 + @intFromBool(expand_down);
         var row = @max(start, rendered_until);
         while (row < end) : (row += 1) {
+            self.repainted.set(row);
             try self.renderRow(
                 state,
                 all_cells[row].slice(),
@@ -374,6 +400,24 @@ pub fn renderScrolled(
             pixels[shift_px * width .. grid_px * width],
             pixels[0 .. keep_px * width],
         );
+    }
+
+    // The overhang bits describe row content, so they move with the
+    // shifted pixels; entered rows are conservatively marked until
+    // their first render.
+    if (self.row_overhang.bit_length != rows) {
+        try self.row_overhang.resize(self.alloc, rows, true);
+        self.row_overhang.setRangeValue(.{ .start = 0, .end = rows }, true);
+    } else if (scroll.shift > 0) {
+        for (0..rows - shift) |y| self.row_overhang.setValue(y, self.row_overhang.isSet(y + shift));
+        self.row_overhang.setRangeValue(.{ .start = rows - shift, .end = rows }, true);
+    } else {
+        var y: usize = rows;
+        while (y > shift) {
+            y -= 1;
+            self.row_overhang.setValue(y, self.row_overhang.isSet(y - shift));
+        }
+        self.row_overhang.setRangeValue(.{ .start = 0, .end = shift }, true);
     }
 
     // update() marked every row dirty for the full redraw; narrow that
@@ -1070,6 +1114,10 @@ fn renderRowForeground(
     const styles = cells.items(.style);
     const graphemes = cells.items(.grapheme);
     const cols: u31 = @min(state.cols, cells.len);
+    self.overhang_scratch = false;
+    defer if (y < self.row_overhang.bit_length) {
+        self.row_overhang.setValue(y, self.overhang_scratch);
+    };
 
     const cursor_x: ?u31 = cursor: {
         if (!state.cursor.visible) break :cursor null;
@@ -1158,6 +1206,13 @@ fn renderRowForeground(
     }
 }
 
+/// Record a glyph blit whose ink starts above the current row's strip
+/// (`rel_top` is relative to the strip top). Feeds row_overhang via
+/// renderRowForeground.
+fn noteOverhang(self: *Renderer, rel_top: i32, glyph_height: u31) void {
+    if (glyph_height > 0 and rel_top < 0) self.overhang_scratch = true;
+}
+
 fn blitDecoration(
     self: *Renderer,
     kind: @import("sprite.zig").Decoration,
@@ -1170,6 +1225,7 @@ fn blitDecoration(
 ) !void {
     const font = self.font;
     const g = try font.decorationGlyph(self.alloc, kind);
+    self.noteOverhang(@as(i32, font.baseline) - g.bearing_y, g.height);
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
     blitGlyph(
         pixels,
@@ -1210,6 +1266,7 @@ fn drawRun(
             if (cp == 0) continue;
             const cell_span: u2 = @intCast(@min(cellSpan(raw), 2));
             const g = try font.spriteGlyph(self.alloc, cp, cell_span);
+            self.noteOverhang(@as(i32, font.baseline) - g.bearing_y, g.height);
             blitGlyph(
                 pixels,
                 width,
@@ -1270,6 +1327,7 @@ fn drawRun(
             constraint_width,
             isSymbol(cellCodepoint(raws[cluster_x])),
         );
+        self.noteOverhang(@as(i32, font.baseline) - sg.y_offset - g.bearing_y, g.height);
         blitGlyph(
             pixels,
             width,

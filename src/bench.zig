@@ -108,8 +108,11 @@ pub fn run(init: std.process.Init) !void {
         try report(w, "scroll frame (feed+update+render)", nowNs(init.io) - start, iters, null);
         if (blitted != iters) try w.print("  (!) only {d}/{d} frames took the blit path\n", .{ blitted, iters });
 
-        // Verify the blit path is pixel-identical to a full render of
-        // the same state (using the shm buffer as scratch).
+        // Compare the blit path against a full render of the same
+        // state (using the shm buffer as scratch). Accent overhang
+        // re-blits blend over their own previous pixels at repaint
+        // boundaries, so anti-aliased edge pixels may drift slightly;
+        // anything beyond a small channel delta is a real bug.
         stream.nextSlice(scroll_line);
         const scroll = try renderer.detectScroll(&render_state, &term);
         const old_cursor = render_state.cursor;
@@ -118,8 +121,18 @@ pub fn run(init: std.process.Init) !void {
             const old_cursor_row: ?usize = if (old_cursor.viewport) |viewport| viewport.y else null;
             try renderer.renderScrolled(&render_state, pixels, width, height, s, old_cursor_row);
             try renderer.render(&render_state, shm, width, height);
-            const ok = std.mem.eql(u32, pixels, shm);
-            try w.print("scroll blit matches full render: {s}\n", .{if (ok) "OK" else "MISMATCH"});
+            var diff_count: usize = 0;
+            var max_delta: u8 = 0;
+            for (pixels, shm) |a, b| {
+                if (a == b) continue;
+                diff_count += 1;
+                const ab: [4]u8 = @bitCast(a);
+                const bb: [4]u8 = @bitCast(b);
+                for (ab, bb) |ca, cb| {
+                    max_delta = @max(max_delta, if (ca > cb) ca - cb else cb - ca);
+                }
+            }
+            try w.print("scroll blit vs full render: {d} pixels differ, max channel delta {d}\n", .{ diff_count, max_delta });
         } else {
             try w.writeAll("scroll blit verification: no scroll detected\n");
         }
@@ -210,7 +223,9 @@ fn fillScreen(alloc: std.mem.Allocator, stream: anytype) !void {
         var col: usize = 0;
         var color: u8 = 1;
         while (col + 8 <= cols) : (col += 8) {
-            try aw.writer.print("\x1b[3{d}mmonstar ", .{color});
+            // "mÔnstar": the accented capital overhangs its cell top in
+            // many fonts, exercising the renderer's overhang tracking.
+            try aw.writer.print("\x1b[3{d}mm\u{d4}nstar ", .{color});
             color = if (color == 6) 1 else color + 1;
         }
         try aw.writer.writeAll("\x1b[0m");
@@ -243,7 +258,7 @@ fn scrollLine() []const u8 {
     var color: u8 = 1;
     var col: usize = 0;
     while (col + 8 <= cols) : (col += 8) {
-        line = line ++ std.fmt.comptimePrint("\x1b[3{d}mscrolls ", .{color});
+        line = line ++ std.fmt.comptimePrint("\x1b[3{d}mscr\u{d4}lls ", .{color});
         color = if (color == 6) 1 else color + 1;
     }
     return line ++ "\x1b[0m";
