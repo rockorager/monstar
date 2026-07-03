@@ -138,6 +138,21 @@ pub fn run(init: std.process.Init) !void {
         try report(w, "one-row frame (feed+update+render)", nowNs(init.io) - start, iters, null);
     }
 
+    // Background-heavy content: TUIs paint most cell backgrounds, which
+    // exercises the per-cell fill path in prepareRow.
+    {
+        try fillScreenBg(alloc, &stream);
+        try render_state.update(alloc, &term);
+        try renderer.render(&render_state, pixels, width, height);
+        clearDirty(&render_state);
+        const iters = 100;
+        const start = nowNs(init.io);
+        for (0..iters) |_| {
+            try renderer.render(&render_state, pixels, width, height);
+        }
+        try report(w, "full render (bg-heavy)", nowNs(init.io) - start, iters, null);
+    }
+
     // Frame copy strategies: what App.render pays to move render_pixels
     // into the wl_shm buffer, before and after damage tracking.
     {
@@ -175,6 +190,25 @@ fn fillScreen(alloc: std.mem.Allocator, stream: anytype) !void {
         var color: u8 = 1;
         while (col + 8 <= cols) : (col += 8) {
             try aw.writer.print("\x1b[3{d}mmonstar ", .{color});
+            color = if (color == 6) 1 else color + 1;
+        }
+        try aw.writer.writeAll("\x1b[0m");
+    }
+    stream.nextSlice(aw.writer.buffered());
+}
+
+/// Fill every grid row with words carrying colored backgrounds, like a
+/// full-screen TUI.
+fn fillScreenBg(alloc: std.mem.Allocator, stream: anytype) !void {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try aw.writer.writeAll("\x1b[H");
+    for (0..rows) |y| {
+        if (y > 0) try aw.writer.writeAll("\r\n");
+        var col: usize = 0;
+        var color: u8 = 1;
+        while (col + 8 <= cols) : (col += 8) {
+            try aw.writer.print("\x1b[4{d};30mpanels  ", .{color});
             color = if (color == 6) 1 else color + 1;
         }
         try aw.writer.writeAll("\x1b[0m");

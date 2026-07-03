@@ -920,10 +920,13 @@ fn prepareRow(
         break :cursor @intCast(viewport.x -| @intFromBool(viewport.wide_tail));
     };
 
-    // Background + foreground-color + face-resolution pass.
+    // Background + foreground-color + face-resolution pass. Adjacent
+    // cells sharing a background color coalesce into one fill.
     try self.fg_scratch.resize(self.alloc, cols);
     try self.face_scratch.resize(self.alloc, cols);
     try self.reverse_scratch.resize(self.alloc, cols);
+    const y_px: u31 = y * font.cell_height;
+    var bg_run: BgRun = .{};
     for (0..cols) |x| {
         const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         self.face_scratch.items[x] = face: {
@@ -967,21 +970,40 @@ fn prepareRow(
         }
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
-        if (draw_backgrounds and bg != null) {
-            const bg_color = bg.?;
-            fillRect(
-                pixels,
-                width,
-                height,
-                @as(u31, @intCast(x)) * font.cell_width,
-                y * font.cell_height,
-                font.cell_width * cellSpan(raws[x]),
-                font.cell_height,
-                argb(bg_color),
-            );
+        if (draw_backgrounds) {
+            if (bg) |bg_color| {
+                const color = argb(bg_color);
+                const px_start = @as(u31, @intCast(x)) * font.cell_width;
+                const px_end = px_start + font.cell_width * cellSpan(raws[x]);
+                // Wide heads overlap their spacer tail; extend instead
+                // of restarting when the color holds.
+                if (bg_run.active and color == bg_run.color and px_start <= bg_run.end_px) {
+                    bg_run.end_px = @max(bg_run.end_px, px_end);
+                } else {
+                    bg_run.flush(pixels, width, height, y_px, font.cell_height);
+                    bg_run = .{ .active = true, .color = color, .start_px = px_start, .end_px = px_end };
+                }
+            } else {
+                bg_run.flush(pixels, width, height, y_px, font.cell_height);
+            }
         }
     }
+    bg_run.flush(pixels, width, height, y_px, font.cell_height);
 }
+
+/// A pending run of adjacent equal-color cell backgrounds.
+const BgRun = struct {
+    active: bool = false,
+    color: u32 = 0,
+    start_px: u31 = 0,
+    end_px: u31 = 0,
+
+    fn flush(run: *BgRun, pixels: []u32, buf_width: u31, buf_height: u31, y_px: u31, h: u31) void {
+        if (!run.active) return;
+        fillRect(pixels, buf_width, buf_height, run.start_px, y_px, run.end_px - run.start_px, h, run.color);
+        run.active = false;
+    }
+};
 
 fn renderRowForeground(
     self: *Renderer,
