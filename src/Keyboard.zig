@@ -14,6 +14,7 @@ context: *c.xkb_context,
 keymap: ?*c.xkb_keymap,
 state: ?*c.xkb_state,
 mod_indices: ModIndices,
+mod_sides: ModSides,
 
 /// Resolved xkb modifier indices for the current keymap.
 const ModIndices = struct {
@@ -25,6 +26,17 @@ const ModIndices = struct {
     num_lock: c.xkb_mod_index_t = c.XKB_MOD_INVALID,
 };
 
+const ModSides = struct {
+    shift_left: bool = false,
+    shift_right: bool = false,
+    ctrl_left: bool = false,
+    ctrl_right: bool = false,
+    alt_left: bool = false,
+    alt_right: bool = false,
+    super_left: bool = false,
+    super_right: bool = false,
+};
+
 pub fn init() !Keyboard {
     const context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse
         return error.XkbInitFailed;
@@ -33,6 +45,7 @@ pub fn init() !Keyboard {
         .keymap = null,
         .state = null,
         .mod_indices = .{},
+        .mod_sides = .{},
     };
 }
 
@@ -72,6 +85,7 @@ fn installKeymap(self: *Keyboard, keymap: *c.xkb_keymap) !void {
     if (self.keymap) |old| c.xkb_keymap_unref(old);
     self.keymap = keymap;
     self.state = state;
+    self.mod_sides = .{};
     self.mod_indices = .{
         .shift = c.xkb_keymap_mod_get_index(keymap, c.XKB_MOD_NAME_SHIFT),
         .ctrl = c.xkb_keymap_mod_get_index(keymap, c.XKB_MOD_NAME_CTRL),
@@ -105,6 +119,8 @@ pub fn translate(
     const state = self.state orelse return null;
     const keymap = self.keymap orelse return null;
     const keycode: c.xkb_keycode_t = evdev_keycode + 8;
+    const key = evdevToKey(evdev_keycode);
+    self.updateModSides(key, action);
 
     const utf8_len_c = c.xkb_state_key_get_utf8(state, keycode, utf8_buf.ptr, utf8_buf.len);
     const utf8_len: usize = if (utf8_len_c > 0) @intCast(utf8_len_c) else 0;
@@ -133,8 +149,8 @@ pub fn translate(
 
     return .{
         .action = action,
-        .key = evdevToKey(evdev_keycode),
-        .mods = self.currentMods(),
+        .key = key,
+        .mods = self.currentModsForKey(key, action),
         .consumed_mods = self.modsFromMask(consumed_mask),
         .composing = false,
         .utf8 = utf8,
@@ -145,7 +161,72 @@ pub fn translate(
 pub fn currentMods(self: *Keyboard) vt.input.KeyMods {
     const state = self.state orelse return .{};
     const mask = c.xkb_state_serialize_mods(state, c.XKB_STATE_MODS_EFFECTIVE);
-    return self.modsFromMask(mask);
+    var mods = self.modsFromMask(mask);
+    self.applyTrackedSides(&mods);
+    return mods;
+}
+
+fn currentModsForKey(self: *Keyboard, key: vt.input.Key, action: vt.input.KeyAction) vt.input.KeyMods {
+    var mods = self.currentMods();
+    const pressed = action != .release;
+    switch (key) {
+        .shift_left => {
+            mods.shift = pressed;
+            mods.sides.shift = .left;
+        },
+        .shift_right => {
+            mods.shift = pressed;
+            mods.sides.shift = .right;
+        },
+        .control_left => {
+            mods.ctrl = pressed;
+            mods.sides.ctrl = .left;
+        },
+        .control_right => {
+            mods.ctrl = pressed;
+            mods.sides.ctrl = .right;
+        },
+        .alt_left => {
+            mods.alt = pressed;
+            mods.sides.alt = .left;
+        },
+        .alt_right => {
+            mods.alt = pressed;
+            mods.sides.alt = .right;
+        },
+        .meta_left => {
+            mods.super = pressed;
+            mods.sides.super = .left;
+        },
+        .meta_right => {
+            mods.super = pressed;
+            mods.sides.super = .right;
+        },
+        else => {},
+    }
+    return mods;
+}
+
+fn updateModSides(self: *Keyboard, key: vt.input.Key, action: vt.input.KeyAction) void {
+    const pressed = action != .release;
+    switch (key) {
+        .shift_left => self.mod_sides.shift_left = pressed,
+        .shift_right => self.mod_sides.shift_right = pressed,
+        .control_left => self.mod_sides.ctrl_left = pressed,
+        .control_right => self.mod_sides.ctrl_right = pressed,
+        .alt_left => self.mod_sides.alt_left = pressed,
+        .alt_right => self.mod_sides.alt_right = pressed,
+        .meta_left => self.mod_sides.super_left = pressed,
+        .meta_right => self.mod_sides.super_right = pressed,
+        else => {},
+    }
+}
+
+fn applyTrackedSides(self: *Keyboard, mods: *vt.input.KeyMods) void {
+    if (mods.shift) mods.sides.shift = if (self.mod_sides.shift_right) .right else .left;
+    if (mods.ctrl) mods.sides.ctrl = if (self.mod_sides.ctrl_right) .right else .left;
+    if (mods.alt) mods.sides.alt = if (self.mod_sides.alt_right) .right else .left;
+    if (mods.super) mods.sides.super = if (self.mod_sides.super_right) .right else .left;
 }
 
 fn modsFromMask(self: *Keyboard, mask: c.xkb_mod_mask_t) vt.input.KeyMods {
@@ -325,10 +406,12 @@ test "translate and encode: plain, shifted, control" {
     {
         _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_DOWN);
         defer _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_UP);
+        _ = kb.translate(&utf8_buf, 42, .press).?;
 
         const event = kb.translate(&utf8_buf, 30, .press).?;
         try std.testing.expectEqualStrings("A", event.utf8);
         try std.testing.expect(event.mods.shift);
+        try std.testing.expectEqual(.left, event.mods.sides.shift);
         try std.testing.expect(event.consumed_mods.shift);
 
         var writer: std.Io.Writer = .fixed(&out_buf);
@@ -373,9 +456,26 @@ test "translate and encode: plain, shifted, control" {
     {
         _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_DOWN);
         defer _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_UP);
+        _ = kb.translate(&utf8_buf, 42, .press).?;
 
         const event = kb.translate(&utf8_buf, 15, .press).?;
         try std.testing.expect(event.mods.shift);
+        try std.testing.expectEqual(.left, event.mods.sides.shift);
+
+        var writer: std.Io.Writer = .fixed(&out_buf);
+        try vt_input.encodeKey(&writer, event, .{});
+        try std.testing.expectEqualStrings("\x1b[Z", writer.buffered());
+    }
+
+    // Right Shift is preserved in the side metadata too.
+    {
+        _ = c.xkb_state_update_key(kb.state.?, 54 + 8, c.XKB_KEY_DOWN);
+        defer _ = c.xkb_state_update_key(kb.state.?, 54 + 8, c.XKB_KEY_UP);
+        _ = kb.translate(&utf8_buf, 54, .press).?;
+
+        const event = kb.translate(&utf8_buf, 15, .press).?;
+        try std.testing.expect(event.mods.shift);
+        try std.testing.expectEqual(.right, event.mods.sides.shift);
 
         var writer: std.Io.Writer = .fixed(&out_buf);
         try vt_input.encodeKey(&writer, event, .{});
