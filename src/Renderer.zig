@@ -1392,6 +1392,29 @@ fn blitGlyph(
     }
 }
 
+/// The glyph-space pixel ranges that land inside the buffer, computed
+/// once so the blit loops run branch-free over valid pixels.
+const GlyphClip = struct {
+    gx_start: usize,
+    gx_end: usize,
+    gy_start: usize,
+    gy_end: usize,
+};
+
+fn clipGlyph(g: *const Font.Glyph, x0: i32, y0: i32, buf_width: u31, buf_height: u31) ?GlyphClip {
+    const gx_start: i64 = @max(0, -@as(i64, x0));
+    const gy_start: i64 = @max(0, -@as(i64, y0));
+    const gx_end: i64 = @min(@as(i64, g.width), @as(i64, buf_width) - x0);
+    const gy_end: i64 = @min(@as(i64, g.height), @as(i64, buf_height) - y0);
+    if (gx_end <= gx_start or gy_end <= gy_start) return null;
+    return .{
+        .gx_start = @intCast(gx_start),
+        .gx_end = @intCast(gx_end),
+        .gy_start = @intCast(gy_start),
+        .gy_end = @intCast(gy_end),
+    };
+}
+
 fn blitAlphaGlyph(
     pixels: []u32,
     buf_width: u31,
@@ -1401,16 +1424,15 @@ fn blitAlphaGlyph(
     y0: i32,
     color: u32,
 ) void {
-    for (0..g.height) |gy| {
-        const py = y0 + @as(i32, @intCast(gy));
-        if (py < 0 or py >= buf_height) continue;
-        for (0..g.width) |gx| {
-            const px = x0 + @as(i32, @intCast(gx));
-            if (px < 0 or px >= buf_width) continue;
-            const coverage = g.bitmap[gy * g.width + gx];
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+    for (clip.gy_start..clip.gy_end) |gy| {
+        const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+        const src = g.bitmap[gy * g.width + clip.gx_start .. gy * g.width + clip.gx_end];
+        const dst = pixels[py * buf_width + px_start ..][0..src.len];
+        for (src, dst) |coverage, *pixel| {
             if (coverage == 0) continue;
-            const idx = @as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px));
-            pixels[idx] = blend(color, pixels[idx], coverage);
+            pixel.* = blend(color, pixel.*, coverage);
         }
     }
 }
@@ -1423,17 +1445,16 @@ fn blitBgraGlyph(
     x0: i32,
     y0: i32,
 ) void {
-    for (0..g.height) |gy| {
-        const py = y0 + @as(i32, @intCast(gy));
-        if (py < 0 or py >= buf_height) continue;
-        for (0..g.width) |gx| {
-            const px = x0 + @as(i32, @intCast(gx));
-            if (px < 0 or px >= buf_width) continue;
-            const src = g.bitmap[(gy * g.width + gx) * 4 ..][0..4];
-            const alpha = src[3];
-            if (alpha == 0) continue;
-            const idx = @as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px));
-            pixels[idx] = blendPremultipliedBgra(src, pixels[idx]);
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+    for (clip.gy_start..clip.gy_end) |gy| {
+        const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
+        const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+        const dst = pixels[py * buf_width + px_start ..][0 .. clip.gx_end - clip.gx_start];
+        for (dst, 0..) |*pixel, i| {
+            const cell = src[i * 4 ..][0..4];
+            if (cell[3] == 0) continue;
+            pixel.* = blendPremultipliedBgra(cell, pixel.*);
         }
     }
 }
@@ -1447,16 +1468,16 @@ fn blitBgraGlyphAsAlpha(
     y0: i32,
     color: u32,
 ) void {
-    for (0..g.height) |gy| {
-        const py = y0 + @as(i32, @intCast(gy));
-        if (py < 0 or py >= buf_height) continue;
-        for (0..g.width) |gx| {
-            const px = x0 + @as(i32, @intCast(gx));
-            if (px < 0 or px >= buf_width) continue;
-            const alpha = g.bitmap[(gy * g.width + gx) * 4 + 3];
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+    for (clip.gy_start..clip.gy_end) |gy| {
+        const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
+        const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+        const dst = pixels[py * buf_width + px_start ..][0 .. clip.gx_end - clip.gx_start];
+        for (dst, 0..) |*pixel, i| {
+            const alpha = src[i * 4 + 3];
             if (alpha == 0) continue;
-            const idx = @as(usize, @intCast(py)) * buf_width + @as(usize, @intCast(px));
-            pixels[idx] = blend(color, pixels[idx], alpha);
+            pixel.* = blend(color, pixel.*, alpha);
         }
     }
 }
