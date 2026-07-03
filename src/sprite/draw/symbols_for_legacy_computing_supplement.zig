@@ -254,12 +254,7 @@ pub fn draw1CC30_1CC3F(
     }
 }
 
-/// TODO: These two characters should be easy, but it's not clear how they're
-///       meant to align with adjacent cells, what characters they're meant to
-///       be used with:
-///       - 1CC1F 𜰟 BOX DRAWINGS DOUBLE DIAGONAL UPPER RIGHT TO LOWER LEFT
-///       - 1CC20 𜰠 BOX DRAWINGS DOUBLE DIAGONAL UPPER LEFT TO LOWER RIGHT
-pub fn draw1CC1B_1CC1E(
+pub fn draw1CC1B_1CC20(
     cp: u32,
     canvas: *sprite.Canvas,
     width: u32,
@@ -290,7 +285,50 @@ pub fn draw1CC1B_1CC1E(
             canvas.box(0, h - t, w, h, .on);
             canvas.box(0, @divFloor(h, 2), t, h, .on);
         },
+        // 𜰟 BOX DRAWINGS DOUBLE DIAGONAL UPPER RIGHT TO LOWER LEFT
+        0x1CC1F => doubleDiagonal(canvas, metrics, .upper_right_to_lower_left),
+        // 𜰠 BOX DRAWINGS DOUBLE DIAGONAL UPPER LEFT TO LOWER RIGHT
+        0x1CC20 => doubleDiagonal(canvas, metrics, .upper_left_to_lower_right),
         else => unreachable,
+    }
+}
+
+const DiagonalDirection = enum {
+    upper_left_to_lower_right,
+    upper_right_to_lower_left,
+};
+
+fn doubleDiagonal(
+    canvas: *sprite.Canvas,
+    metrics: font.Metrics,
+    comptime direction: DiagonalDirection,
+) void {
+    const thick_px = Thickness.light.height(metrics.box_thickness);
+    const float_width: f64 = @floatFromInt(metrics.cell_width);
+    const float_height: f64 = @floatFromInt(metrics.cell_height);
+    const float_thick: f64 = @floatFromInt(thick_px);
+
+    // Match the single diagonal slope and slight corner overshoot used by
+    // U+2571/U+2572, then draw two light strokes with the same one-stroke gap
+    // convention used by double horizontal/vertical box drawing lines.
+    const slope_x: f64 = @min(1.0, float_width / float_height);
+    const slope_y: f64 = @min(1.0, float_height / float_width);
+
+    const offsets = [_]f64{
+        -@as(f64, @floatFromInt(thick_px)),
+        @floatFromInt(thick_px),
+    };
+    inline for (offsets) |offset| {
+        switch (direction) {
+            .upper_left_to_lower_right => canvas.line(.{
+                .p0 = .{ .x = -0.5 * slope_x + offset, .y = -0.5 * slope_y },
+                .p1 = .{ .x = float_width + 0.5 * slope_x + offset, .y = float_height + 0.5 * slope_y },
+            }, float_thick, .on) catch {},
+            .upper_right_to_lower_left => canvas.line(.{
+                .p0 = .{ .x = float_width + 0.5 * slope_x + offset, .y = -0.5 * slope_y },
+                .p1 = .{ .x = -0.5 * slope_x + offset, .y = float_height + 0.5 * slope_y },
+            }, float_thick, .on) catch {},
+        }
     }
 }
 

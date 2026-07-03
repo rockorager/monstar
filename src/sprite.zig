@@ -224,6 +224,8 @@ test "sprite coverage" {
     try std.testing.expect(covers(0x2800)); // ⠀ braille
     try std.testing.expect(covers(0xE0B0)); // powerline
     try std.testing.expect(covers(0x1FB00)); // legacy computing
+    try std.testing.expect(covers(0x1CC1F)); // supplement double diagonal
+    try std.testing.expect(covers(0x1CC20)); // supplement double diagonal
     try std.testing.expect(!covers('A'));
     try std.testing.expect(!covers(0x3042)); // あ
 }
@@ -267,6 +269,21 @@ test "render box drawing sprites" {
     // Rounded corner: uses the z2d path rasterizer.
     {
         const g = try render(alloc, 0x256D, test_metrics, 15, 1); // ╭
+        defer alloc.free(g.bitmap);
+        var sum: usize = 0;
+        for (g.bitmap) |px| sum += px;
+        try std.testing.expect(sum > 0);
+    }
+
+    // Diagonal fills and supplement double diagonals render at awkward
+    // non-even cell metrics, which exercises the hatch alignment path.
+    const odd_metrics: Metrics = .{
+        .cell_width = 11,
+        .cell_height = 23,
+        .box_thickness = 1,
+    };
+    inline for (&.{ 0x1FB98, 0x1FB99, 0x1CC1F, 0x1CC20 }) |cp| {
+        const g = try render(alloc, cp, odd_metrics, 17, 1);
         defer alloc.free(g.bitmap);
         var sum: usize = 0;
         for (g.bitmap) |px| sum += px;

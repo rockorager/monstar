@@ -733,31 +733,7 @@ pub fn draw1FB98(
     _ = width;
     _ = height;
 
-    // Set the clip so we don't include anything outside of the cell.
-    canvas.clip_left = canvas.padding_x;
-    canvas.clip_right = canvas.padding_x;
-    canvas.clip_top = canvas.padding_y;
-    canvas.clip_bottom = canvas.padding_y;
-
-    // TODO: This doesn't align properly for most cell sizes, fix that.
-
-    const thick_px = Thickness.light.height(metrics.box_thickness);
-    const line_count = metrics.cell_width / (2 * thick_px);
-
-    const float_width: f64 = @floatFromInt(metrics.cell_width);
-    const float_height: f64 = @floatFromInt(metrics.cell_height);
-    const float_thick: f64 = @floatFromInt(thick_px);
-    const stride = @round(float_width / @as(f64, @floatFromInt(line_count)));
-
-    for (0..line_count * 2 + 1) |_i| {
-        const i = @as(i32, @intCast(_i)) - @as(i32, @intCast(line_count));
-        const top_x = @as(f64, @floatFromInt(i)) * stride;
-        const bottom_x = float_width + top_x;
-        canvas.line(.{
-            .p0 = .{ .x = top_x, .y = 0 },
-            .p1 = .{ .x = bottom_x, .y = float_height },
-        }, float_thick, .on) catch {};
-    }
+    diagonalFill(canvas, metrics, .upper_left_to_lower_right);
 }
 
 /// Upper Right to Lower Left Fill
@@ -773,30 +749,49 @@ pub fn draw1FB99(
     _ = width;
     _ = height;
 
+    diagonalFill(canvas, metrics, .upper_right_to_lower_left);
+}
+
+const DiagonalDirection = enum {
+    upper_left_to_lower_right,
+    upper_right_to_lower_left,
+};
+
+fn diagonalFill(
+    canvas: *sprite.Canvas,
+    metrics: font.Metrics,
+    comptime direction: DiagonalDirection,
+) void {
     // Set the clip so we don't include anything outside of the cell.
     canvas.clip_left = canvas.padding_x;
     canvas.clip_right = canvas.padding_x;
     canvas.clip_top = canvas.padding_y;
     canvas.clip_bottom = canvas.padding_y;
 
-    // TODO: This doesn't align properly for most cell sizes, fix that.
-
     const thick_px = Thickness.light.height(metrics.box_thickness);
-    const line_count = metrics.cell_width / (2 * thick_px);
+    const line_count = @max(1, metrics.cell_width / (2 * thick_px));
 
     const float_width: f64 = @floatFromInt(metrics.cell_width);
     const float_height: f64 = @floatFromInt(metrics.cell_height);
     const float_thick: f64 = @floatFromInt(thick_px);
-    const stride = @round(float_width / @as(f64, @floatFromInt(line_count)));
+    // Keep the repeat period an exact divisor of the cell width. Rounding
+    // this causes the hatch to restart out of phase in adjacent cells for
+    // common odd cell widths.
+    const stride = float_width / @as(f64, @floatFromInt(line_count));
 
     for (0..line_count * 2 + 1) |_i| {
         const i = @as(i32, @intCast(_i)) - @as(i32, @intCast(line_count));
-        const bottom_x = @as(f64, @floatFromInt(i)) * stride;
-        const top_x = float_width + bottom_x;
-        canvas.line(.{
-            .p0 = .{ .x = top_x, .y = 0 },
-            .p1 = .{ .x = bottom_x, .y = float_height },
-        }, float_thick, .on) catch {};
+        const x = @as(f64, @floatFromInt(i)) * stride;
+        switch (direction) {
+            .upper_left_to_lower_right => canvas.line(.{
+                .p0 = .{ .x = x, .y = 0 },
+                .p1 = .{ .x = float_width + x, .y = float_height },
+            }, float_thick, .on) catch {},
+            .upper_right_to_lower_left => canvas.line(.{
+                .p0 = .{ .x = float_width + x, .y = 0 },
+                .p1 = .{ .x = x, .y = float_height },
+            }, float_thick, .on) catch {},
+        }
     }
 }
 
