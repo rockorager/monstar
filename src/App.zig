@@ -174,6 +174,8 @@ clip_offer: ?*ClipboardOffer,
 clip_pending_offer: ?*ClipboardOffer,
 primary_offer: ?*PrimaryOffer,
 primary_pending_offer: ?*PrimaryOffer,
+/// Active drag-and-drop offer, valid between wl_data_device.enter/leave.
+dnd_offer: ?*ClipboardOffer,
 /// Our own outgoing selection sources, so exit can reclaim them if the
 /// compositor never cancels them (nobody else took the selection).
 clip_source: ?*SourceCtx,
@@ -181,14 +183,40 @@ primary_source: ?*SourceCtx,
 /// An in-flight paste: pipe read end (-1 when idle) and received bytes.
 paste_fd: posix.fd_t,
 paste_buf: std.ArrayList(u8),
+paste_action: PasteAction,
 
 const paste_mime = "text/plain;charset=utf-8";
+const uri_list_mime = "text/uri-list";
 const paste_mime_preference = [_][:0]const u8{
     paste_mime,
     "text/plain",
     "UTF8_STRING",
     "TEXT",
     "STRING",
+};
+const dnd_mime_preference = [_][:0]const u8{
+    uri_list_mime,
+    paste_mime,
+    "text/plain",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+};
+const PasteAction = union(enum) {
+    terminal,
+    osc52_read: u8,
+    dnd: *ClipboardOffer,
+};
+const TransferOffer = union(enum) {
+    clipboard: *ClipboardOffer,
+    primary: *PrimaryOffer,
+
+    fn receive(self: TransferOffer, mime: [*:0]const u8, fd: posix.fd_t) void {
+        switch (self) {
+            .clipboard => |offer| offer.offer.receive(mime, fd),
+            .primary => |offer| offer.offer.receive(mime, fd),
+        }
+    }
 };
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
@@ -466,10 +494,12 @@ pub fn init(
         .clip_pending_offer = null,
         .primary_offer = null,
         .primary_pending_offer = null,
+        .dnd_offer = null,
         .clip_source = null,
         .primary_source = null,
         .paste_fd = -1,
         .paste_buf = .empty,
+        .paste_action = .terminal,
     };
     self.stream = .initAlloc(alloc, .{
         .app = self,
@@ -1027,6 +1057,7 @@ pub fn deinit(self: *App) void {
     if (self.clip_pending_offer) |offer| offer.destroy();
     if (self.primary_offer) |offer| offer.destroy();
     if (self.primary_pending_offer) |offer| offer.destroy();
+    if (self.dnd_offer) |offer| offer.destroy();
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
@@ -1320,6 +1351,44 @@ fn osc7Path(arena: std.mem.Allocator, url: []const u8) std.mem.Allocator.Error!?
     return try arena.dupeZ(u8, path);
 }
 
+fn formatUriListDrop(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+
+    var first = true;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = if (std.mem.endsWith(u8, raw_line, "\r"))
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        if (line.len == 0 or line[0] == '#') continue;
+        const path = (try osc7Path(arena, line)) orelse continue;
+
+        if (!first) try writer.writer.writeByte(' ');
+        first = false;
+        try writeShellQuoted(&writer.writer, path);
+    }
+
+    return writer.toOwnedSlice();
+}
+
+fn writeShellQuoted(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('\'');
+    for (text) |byte| {
+        if (byte == '\'') {
+            try writer.writeAll("'\\''");
+        } else {
+            try writer.writeByte(byte);
+        }
+    }
+    try writer.writeByte('\'');
+}
+
 test "osc7Path decodes local file URIs" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1343,6 +1412,16 @@ test "osc7Path decodes local file URIs" {
     try std.testing.expectEqual(null, try osc7Path(arena, "https://example.com/x"));
     try std.testing.expectEqual(null, try osc7Path(arena, "not a uri"));
     try std.testing.expectEqual(null, try osc7Path(arena, "file://"));
+}
+
+test "formatUriListDrop shell quotes local file paths" {
+    const text = try formatUriListDrop(
+        std.testing.allocator,
+        "# comment\r\nfile:///tmp/a%20b\r\nhttps://example.com/nope\nfile:///tmp/it%27s\n",
+    );
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings("'/tmp/a b' '/tmp/it'\\''s'", text);
 }
 
 fn applyConfig(self: *App, new_config: Config) !void {
@@ -1547,7 +1626,7 @@ fn writeKittyColorValue(writer: *std.Io.Writer, color: vt.color.RGB) !void {
 
 fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
     if (data.len == 1 and data[0] == '?') {
-        log.debug("ignoring unsupported OSC 52 clipboard read", .{});
+        self.beginOsc52Read(kind);
         return;
     }
 
@@ -1563,6 +1642,48 @@ fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
         .clipboard => self.claimClipboardText(text),
         .primary => self.claimPrimaryText(text),
     }
+}
+
+fn beginOsc52Read(self: *App, kind: u8) void {
+    if (self.paste_fd >= 0) return;
+
+    switch (osc52Target(kind)) {
+        .clipboard => {
+            const offer = self.clip_offer orelse return self.writeOsc52ClipboardReport(kind, "");
+            self.beginClipboardTransfer(offer.bestMime() orelse return self.writeOsc52ClipboardReport(kind, ""), .{ .clipboard = offer }, .{ .osc52_read = kind }) catch {
+                self.writeOsc52ClipboardReport(kind, "");
+            };
+        },
+        .primary => {
+            const offer = self.primary_offer orelse return self.writeOsc52ClipboardReport(kind, "");
+            self.beginClipboardTransfer(offer.bestMime() orelse return self.writeOsc52ClipboardReport(kind, ""), .{ .primary = offer }, .{ .osc52_read = kind }) catch {
+                self.writeOsc52ClipboardReport(kind, "");
+            };
+        },
+    }
+}
+
+fn writeOsc52ClipboardReport(self: *App, kind: u8, data: []const u8) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    formatOsc52ClipboardReport(&writer.writer, kind, data) catch return;
+    const response = writer.toOwnedSlice() catch return;
+    defer self.alloc.free(response);
+    self.writePty(response);
+}
+
+fn formatOsc52ClipboardReport(writer: *std.Io.Writer, kind: u8, data: []const u8) !void {
+    const enc = std.base64.standard.Encoder;
+    var encoded_buf: [4096]u8 = undefined;
+    if (enc.calcSize(data.len) <= encoded_buf.len) {
+        const payload = enc.encode(&encoded_buf, data);
+        try writer.print("\x1b]52;{c};{s}\x07", .{ kind, payload });
+        return;
+    }
+
+    try writer.print("\x1b]52;{c};", .{kind});
+    try enc.encodeWriter(writer, data);
+    try writer.writeByte(0x07);
 }
 
 const Osc52Target = enum { clipboard, primary };
@@ -1856,6 +1977,13 @@ test "OSC 52 set decodes clipboard payload" {
     try std.testing.expectEqual(.primary, osc52Target('s'));
     try std.testing.expectEqual(.primary, osc52Target('p'));
     try std.testing.expectEqual(.clipboard, osc52Target('7'));
+}
+
+test "OSC 52 read reports base64 clipboard payload" {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try formatOsc52ClipboardReport(&writer, 'c', "hello");
+    try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", writer.buffered());
 }
 
 test "kitty PNG direct transmit installs decoded RGBA image" {
@@ -2368,8 +2496,25 @@ fn mimeBit(mime_type: [*:0]const u8) ?MimeMask {
     return null;
 }
 
+fn dndMimeBit(mime_type: [*:0]const u8) ?MimeMask {
+    const offered = std.mem.span(mime_type);
+    inline for (dnd_mime_preference, 0..) |candidate, i| {
+        if (std.mem.eql(u8, offered, candidate[0..candidate.len])) {
+            return @as(MimeMask, 1) << @intCast(i);
+        }
+    }
+    return null;
+}
+
 fn bestPasteMime(mask: MimeMask) ?[*:0]const u8 {
     inline for (paste_mime_preference, 0..) |candidate, i| {
+        if (mask & (@as(MimeMask, 1) << @intCast(i)) != 0) return candidate.ptr;
+    }
+    return null;
+}
+
+fn bestDndMimeForMask(mask: MimeMask) ?[*:0]const u8 {
+    inline for (dnd_mime_preference, 0..) |candidate, i| {
         if (mask & (@as(MimeMask, 1) << @intCast(i)) != 0) return candidate.ptr;
     }
     return null;
@@ -2379,19 +2524,27 @@ const ClipboardOffer = struct {
     app: *App,
     offer: *wl.DataOffer,
     mimes: MimeMask = 0,
+    dnd_mimes: MimeMask = 0,
+    dnd_action: wl.DataDeviceManager.DndAction = .{},
 
     fn noteMime(self: *ClipboardOffer, mime_type: [*:0]const u8) void {
         if (mimeBit(mime_type)) |bit| self.mimes |= bit;
+        if (dndMimeBit(mime_type)) |bit| self.dnd_mimes |= bit;
     }
 
     fn bestMime(self: *const ClipboardOffer) ?[*:0]const u8 {
         return bestPasteMime(self.mimes);
     }
 
+    fn bestDndMime(self: *const ClipboardOffer) ?[*:0]const u8 {
+        return bestDndMimeForMask(self.dnd_mimes);
+    }
+
     fn destroy(self: *ClipboardOffer) void {
         const app = self.app;
         if (app.clip_offer == self) app.clip_offer = null;
         if (app.clip_pending_offer == self) app.clip_pending_offer = null;
+        if (app.dnd_offer == self) app.dnd_offer = null;
         self.offer.destroy();
         app.alloc.destroy(self);
     }
@@ -2488,6 +2641,7 @@ fn primarySourceListener(
 fn dataOfferListener(_: *wl.DataOffer, event: wl.DataOffer.Event, offer: *ClipboardOffer) void {
     switch (event) {
         .offer => |ev| offer.noteMime(ev.mime_type),
+        .action => |ev| offer.dnd_action = ev.dnd_action,
         else => {},
     }
 }
@@ -2557,15 +2711,41 @@ fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *App)
         },
         .enter => |enter| {
             const id = enter.id orelse return;
-            if (self.takeClipboardOffer(id)) |offer| {
-                offer.destroy();
-            } else {
+            const offer = self.takeClipboardOffer(id) orelse {
                 id.destroy();
+                return;
+            };
+            if (offer.bestDndMime()) |mime| {
+                offer.offer.accept(enter.serial, mime);
+                offer.offer.setActions(.{ .copy = true }, .{ .copy = true });
+                if (self.dnd_offer) |old| old.destroy();
+                self.dnd_offer = offer;
+            } else {
+                offer.offer.accept(enter.serial, null);
+                offer.destroy();
             }
         },
-        // Drag and drop is unsupported; those offers are ignored.
-        else => {},
+        .leave => {
+            if (self.dnd_offer) |offer| offer.destroy();
+        },
+        .drop => self.beginDropPaste(),
+        .motion => {},
     }
+}
+
+fn beginDropPaste(self: *App) void {
+    if (self.paste_fd >= 0) {
+        if (self.dnd_offer) |offer| offer.destroy();
+        return;
+    }
+    const offer = self.dnd_offer orelse return;
+    const mime = offer.bestDndMime() orelse {
+        offer.destroy();
+        return;
+    };
+    self.beginClipboardTransfer(mime, .{ .clipboard = offer }, .{ .dnd = offer }) catch {
+        offer.destroy();
+    };
 }
 
 fn primaryDeviceListener(
@@ -2677,41 +2857,45 @@ fn claimClipboardText(self: *App, text: [:0]const u8) void {
 fn beginPaste(self: *App, comptime which: enum { clipboard, primary }) void {
     if (self.paste_fd >= 0) return; // one paste at a time
 
-    var fds: [2]posix.fd_t = undefined;
-    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
-
     switch (which) {
         .clipboard => {
             const offer = self.clip_offer orelse {
-                _ = std.os.linux.close(fds[0]);
-                _ = std.os.linux.close(fds[1]);
                 return;
             };
             const mime = offer.bestMime() orelse {
-                _ = std.os.linux.close(fds[0]);
-                _ = std.os.linux.close(fds[1]);
                 return;
             };
-            offer.offer.receive(mime, fds[1]);
+            self.beginClipboardTransfer(mime, .{ .clipboard = offer }, .terminal) catch return;
         },
         .primary => {
             const offer = self.primary_offer orelse {
-                _ = std.os.linux.close(fds[0]);
-                _ = std.os.linux.close(fds[1]);
                 return;
             };
             const mime = offer.bestMime() orelse {
-                _ = std.os.linux.close(fds[0]);
-                _ = std.os.linux.close(fds[1]);
                 return;
             };
-            offer.offer.receive(mime, fds[1]);
+            self.beginClipboardTransfer(mime, .{ .primary = offer }, .terminal) catch return;
         },
     }
+}
+
+fn beginClipboardTransfer(
+    self: *App,
+    mime: [*:0]const u8,
+    offer: TransferOffer,
+    action: PasteAction,
+) !void {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    errdefer _ = std.os.linux.close(fds[0]);
+    errdefer _ = std.os.linux.close(fds[1]);
+
+    offer.receive(mime, fds[1]);
     _ = std.os.linux.close(fds[1]);
     setNonblocking(fds[0]);
     self.paste_fd = fds[0];
     self.paste_buf.clearRetainingCapacity();
+    self.paste_action = action;
 }
 
 /// Drain the paste pipe; on EOF encode and write the paste to the PTY.
@@ -2731,16 +2915,40 @@ fn readPaste(self: *App) void {
 fn finishPaste(self: *App) void {
     _ = std.os.linux.close(self.paste_fd);
     self.paste_fd = -1;
-    if (self.paste_buf.items.len == 0) return;
+    defer {
+        self.paste_buf.clearRetainingCapacity();
+        self.paste_action = .terminal;
+    }
+
+    switch (self.paste_action) {
+        .terminal => self.writeTerminalPaste(self.paste_buf.items),
+        .osc52_read => |kind| self.writeOsc52ClipboardReport(kind, self.paste_buf.items),
+        .dnd => |offer| {
+            defer offer.destroy();
+            defer if (offer.dnd_action.copy or offer.dnd_action.move) offer.offer.finish();
+            const text = self.formatDropPaste(offer, self.paste_buf.items) catch return;
+            defer self.alloc.free(text);
+            self.writeTerminalPaste(text);
+        },
+    }
+}
+
+fn writeTerminalPaste(self: *App, data: []u8) void {
+    if (data.len == 0) return;
 
     // Mutable input lets the encoder sanitize control bytes in place,
     // so this cannot fail.
     const parts = vt.input.encodePaste(
-        @as([]u8, self.paste_buf.items),
+        data,
         .fromTerminal(&self.term),
     );
     for (parts) |part| self.writePty(part);
-    self.paste_buf.clearRetainingCapacity();
+}
+
+fn formatDropPaste(self: *App, offer: *const ClipboardOffer, data: []const u8) ![]u8 {
+    const mime = std.mem.span(offer.bestDndMime() orelse return self.alloc.dupe(u8, data));
+    if (!std.mem.eql(u8, mime, uri_list_mime)) return self.alloc.dupe(u8, data);
+    return try formatUriListDrop(self.alloc, data);
 }
 
 /// Convert accumulated wheel movement into scrolled lines: wheel clicks
