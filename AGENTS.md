@@ -1,5 +1,17 @@
 # AGENTS.md
 
+## Amp Orb Environment
+
+If `hostname` is `e2b.local` or `/proc/1/mountinfo` contains `/e2b/`, you are
+running in an Amp orb. Treat it as a disposable Linux sandbox, not the user's
+local machine.
+
+For new orbs, `.agents/setup` provisions Zig and the headless Wayland debugging
+stack. After setup, use `monstar-sway-headless` to start a Sway/wlroots
+headless compositor. Useful client-side tools include `grim` for screenshots,
+`wf-recorder` for recordings, `wtype` for virtual keyboard input, and
+`wl-vptr-click` for virtual pointer clicks.
+
 ## Zig Development
 
 Use `zigdoc` to discover current APIs for the Zig standard library and any third-party dependencies before coding.
