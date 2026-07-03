@@ -89,10 +89,19 @@ term: vt.Terminal,
 stream: AppStream,
 render_state: vt.RenderState,
 /// Complete ARGB8888 backing frame. Dirty-row rendering updates this
-/// buffer, then the window copies it into the Wayland shm buffer it acquired.
+/// buffer; each frame copies the rows a (possibly stale) shm buffer
+/// missed, guided by the damage history below.
 render_pixels: std.ArrayList(u32),
 render_width: u31,
 render_height: u31,
+/// Ring of per-frame damage records: what changed in each of the last
+/// N frames. A reused shm buffer of age N needs the union of the last
+/// N entries copied in; older buffers get a full copy.
+frame_damage: [frame_damage_len]FrameDamage,
+/// Ring index of the current frame's entry.
+frame_damage_index: usize,
+/// Scratch for the damage spans reported to the window each frame.
+damage_spans: std.ArrayList(Window.RowSpan),
 pty: Pty,
 child_pid: posix.pid_t,
 font: Font,
@@ -237,6 +246,26 @@ const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
 const precision_scroll_multiplier = 10.0;
+
+/// Damage history length; shm buffers older than this get a full copy.
+const frame_damage_len = 8;
+
+/// What one frame changed in `render_pixels`, recorded so stale shm
+/// buffers can be brought current without copying the whole frame.
+const FrameDamage = struct {
+    /// Everything changed (or rendering failed partway); ignore `rows`.
+    full: bool,
+    /// Changed cell rows, expanded by one row on each side to cover
+    /// glyph overhang, matching Renderer.renderDirty.
+    rows: std.DynamicBitSetUnmanaged,
+    /// The bottom link-hint strip was drawn this frame. It straddles
+    /// cell rows (it hugs the window's bottom edge), so it is tracked
+    /// separately from `rows`.
+    bottom_strip: bool,
+    /// Pixel geometry this entry was recorded at.
+    width: u31,
+    height: u31,
+};
 
 const TerminalHandler = vt.TerminalStream.Handler;
 const AppStream = vt.Stream(AppStreamHandler);
@@ -441,6 +470,15 @@ pub fn init(
         .render_pixels = .empty,
         .render_width = 0,
         .render_height = 0,
+        .frame_damage = @splat(.{
+            .full = true,
+            .rows = .{},
+            .bottom_strip = false,
+            .width = 0,
+            .height = 0,
+        }),
+        .frame_damage_index = 0,
+        .damage_spans = .empty,
         .pty = pty,
         .child_pid = child_pid,
         .font = font,
@@ -1109,6 +1147,8 @@ pub fn deinit(self: *App) void {
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
     self.render_pixels.deinit(self.alloc);
+    for (&self.frame_damage) |*damage| damage.rows.deinit(self.alloc);
+    self.damage_spans.deinit(self.alloc);
     self.clearImeText();
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
@@ -3402,16 +3442,23 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 }
 
 /// Window render delegate: refresh the render state and draw the grid.
-fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void {
+/// `age` is how many frames ago `pixels` was last drawn (0 = unknown).
+fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) anyerror!Window.Damage {
     const self: *App = @ptrCast(@alignCast(ctx));
+    // Claim the frame's damage entry up front, marked full: if rendering
+    // fails partway, later frames then fall back to a full copy.
+    const damage = self.beginFrameDamage(width, height);
     self.renderer.focused = self.focused;
     self.renderer.hyperlink_hints = self.keyboard.currentMods().ctrl;
     const resized = try self.ensureRenderPixels(width, height);
     const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
     if (self.term.modes.get(.synchronized_output)) {
-        if (resized) try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
-        @memcpy(pixels, self.render_pixels.items);
-        return;
+        if (resized) {
+            try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
+        } else {
+            try self.recordFrameDamage(damage, false);
+        }
+        return self.flushFrame(pixels, width, height, age);
     }
     const old_cursor = self.render_state.cursor;
     try self.render_state.update(self.alloc, &self.term);
@@ -3431,15 +3478,144 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void
     if (self.ime_preedit) |preedit| {
         try self.renderer.renderPreedit(&self.render_state, self.render_pixels.items, width, height, preedit);
     }
+    var hint_drawn = false;
     if (self.keyboard.currentMods().ctrl) {
         if (self.hyperlinkAtPointer()) |uri| {
             try self.renderer.renderLinkHint(&self.render_state, self.render_pixels.items, width, height, uri);
+            hint_drawn = true;
         }
     }
     self.syncTextInputCursorRect();
     if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
+    // Record what changed before the dirty flags are cleared.
+    try self.recordFrameDamage(damage, hint_drawn);
     self.clearRenderDirty();
-    @memcpy(pixels, self.render_pixels.items);
+    return self.flushFrame(pixels, width, height, age);
+}
+
+/// Advance the damage ring and reset the new current entry to full.
+fn beginFrameDamage(self: *App, width: u31, height: u31) *FrameDamage {
+    self.frame_damage_index = (self.frame_damage_index + 1) % frame_damage_len;
+    const damage = &self.frame_damage[self.frame_damage_index];
+    damage.full = true;
+    damage.bottom_strip = false;
+    damage.width = width;
+    damage.height = height;
+    return damage;
+}
+
+/// Fill the current damage entry from the render state's dirty rows,
+/// expanded by one row on each side to match Renderer.renderDirty.
+fn recordFrameDamage(self: *App, damage: *FrameDamage, hint_drawn: bool) !void {
+    damage.bottom_strip = hint_drawn;
+    if (self.render_state.dirty == .full) return; // entry already full
+    const rows: usize = self.render_state.rows;
+    try damage.rows.resize(self.alloc, rows, false);
+    damage.rows.unsetAll();
+    damage.full = false;
+    if (self.render_state.dirty == .false) return;
+    const all_dirty = self.render_state.row_data.items(.dirty);
+    for (all_dirty[0..rows], 0..) |dirty, y| {
+        if (!dirty) continue;
+        const start = if (y == 0) y else y - 1;
+        const end = @min(rows, y + 2);
+        damage.rows.setRangeValue(.{ .start = start, .end = end }, true);
+    }
+}
+
+/// The damage entry recorded `back` frames ago (0 = current frame).
+fn frameDamageBack(self: *const App, back: usize) *const FrameDamage {
+    std.debug.assert(back < frame_damage_len);
+    return &self.frame_damage[(self.frame_damage_index + frame_damage_len - back) % frame_damage_len];
+}
+
+fn rowDamagedSince(self: *const App, row: usize, age: usize) bool {
+    for (0..age) |back| {
+        if (self.frameDamageBack(back).rows.isSet(row)) return true;
+    }
+    return false;
+}
+
+fn bottomStripSince(self: *const App, age: usize) bool {
+    for (0..age) |back| {
+        if (self.frameDamageBack(back).bottom_strip) return true;
+    }
+    return false;
+}
+
+/// Copy this frame into the shm buffer and report surface damage. The
+/// buffer needs every row that changed in the `age` frames it missed;
+/// the reported damage is only what changed since the previous frame.
+fn flushFrame(self: *App, pixels: []u32, width: u31, height: u31, age: usize) !Window.Damage {
+    std.debug.assert(pixels.len == self.render_pixels.items.len);
+    const cell_height: usize = self.font.cell_height;
+    const grid_rows: usize = self.render_state.rows;
+
+    const copy_all = copy_all: {
+        if (age == 0 or age > frame_damage_len) break :copy_all true;
+        for (0..age) |back| {
+            const entry = self.frameDamageBack(back);
+            if (entry.full) break :copy_all true;
+            if (entry.width != width or entry.height != height) break :copy_all true;
+            if (entry.rows.bit_length != grid_rows) break :copy_all true;
+        }
+        break :copy_all false;
+    };
+
+    if (copy_all) {
+        @memcpy(pixels, self.render_pixels.items);
+    } else {
+        var y: usize = 0;
+        while (y < grid_rows) {
+            if (!self.rowDamagedSince(y, age)) {
+                y += 1;
+                continue;
+            }
+            const start = y;
+            while (y < grid_rows and self.rowDamagedSince(y, age)) y += 1;
+            const px_start = @min(start * cell_height, height);
+            const px_end = @min(y * cell_height, height);
+            const offset = px_start * width;
+            const len = (px_end - px_start) * width;
+            @memcpy(pixels[offset..][0..len], self.render_pixels.items[offset..][0..len]);
+        }
+        if (height >= cell_height and self.bottomStripSince(age)) {
+            const offset = (height - cell_height) * width;
+            @memcpy(pixels[offset..], self.render_pixels.items[offset..]);
+        }
+    }
+
+    return self.currentFrameDamage(height);
+}
+
+/// Surface damage of the current frame only, as pixel-row spans.
+fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
+    const entry = self.frameDamageBack(0);
+    if (entry.full) return .full;
+    const cell_height: usize = self.font.cell_height;
+    self.damage_spans.clearRetainingCapacity();
+    var y: usize = 0;
+    while (y < entry.rows.bit_length) {
+        if (!entry.rows.isSet(y)) {
+            y += 1;
+            continue;
+        }
+        const start = y;
+        while (y < entry.rows.bit_length and entry.rows.isSet(y)) y += 1;
+        const px_start = @min(start * cell_height, height);
+        const px_end = @min(y * cell_height, height);
+        if (px_end > px_start) try self.damage_spans.append(self.alloc, .{
+            .y = @intCast(px_start),
+            .height = @intCast(px_end - px_start),
+        });
+    }
+    if (entry.bottom_strip and height >= cell_height) {
+        try self.damage_spans.append(self.alloc, .{
+            .y = @intCast(height - cell_height),
+            .height = @intCast(cell_height),
+        });
+    }
+    return .{ .spans = self.damage_spans.items };
 }
 
 fn syncTextInputCursorRect(self: *App) void {

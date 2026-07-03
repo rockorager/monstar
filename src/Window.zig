@@ -68,6 +68,10 @@ fatal_error: ?anyerror,
 /// compositor. `redraw()` queues instead.
 frame_pending: bool,
 redraw_queued: bool,
+/// Monotonic count of frames drawn, for buffer-age tracking. Each
+/// buffer remembers the frame it last held; the difference tells the
+/// render delegate how stale a reused buffer is.
+frame_counter: u64,
 suspended: bool,
 render_ctx: ?*anyopaque,
 render_fn: ?RenderFn,
@@ -77,9 +81,23 @@ pointer_fn: ?PointerFn,
 text_input_fn: ?TextInputFn,
 scale_fn: ?ScaleFn,
 
+/// A full-width horizontal band of pixels, in buffer coordinates.
+pub const RowSpan = struct { y: u31, height: u31 };
+
+/// The buffer region a render changed relative to the previous frame.
+pub const Damage = union(enum) {
+    full,
+    /// Changed full-width bands; an empty slice means nothing changed.
+    /// The slice must remain valid until the next render callback.
+    spans: []const RowSpan,
+};
+
 /// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
-/// Dimensions are physical pixels.
-pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void;
+/// Dimensions are physical pixels. `age` is how many frames ago this
+/// buffer was last drawn: 0 means its content is unknown and the whole
+/// buffer must be written; N means it holds the frame drawn N frames
+/// ago. Returns the damage of this frame relative to the previous one.
+pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) anyerror!Damage;
 
 /// Called when the window size changed, before the next draw.
 /// Dimensions are physical pixels.
@@ -236,6 +254,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
         .fatal_error = null,
         .frame_pending = false,
         .redraw_queued = false,
+        .frame_counter = 0,
         .suspended = false,
         .render_ctx = null,
         .render_fn = null,
@@ -405,11 +424,18 @@ fn draw(self: *Window) !void {
     const phys_width = self.physical(self.width);
     const phys_height = self.physical(self.height);
     const buffer = try self.acquireBuffer(phys_width, phys_height);
-    if (self.render_fn) |render_fn| {
-        try render_fn(self.render_ctx.?, buffer.pixels(), phys_width, phys_height);
-    } else {
+    self.frame_counter += 1;
+    const damage: Damage = if (self.render_fn) |render_fn| damage: {
+        const age: usize = if (buffer.frame == 0)
+            0
+        else
+            @intCast(self.frame_counter - buffer.frame);
+        break :damage try render_fn(self.render_ctx.?, buffer.pixels(), phys_width, phys_height, age);
+    } else damage: {
         @memset(buffer.pixels(), bg_color);
-    }
+        break :damage .full;
+    };
+    buffer.frame = self.frame_counter;
     if (self.viewport) |viewport| viewport.setDestination(self.width, self.height);
 
     // Throttle future redraws to the compositor's pace. Configure-driven
@@ -421,7 +447,12 @@ fn draw(self: *Window) !void {
     }
 
     self.surface.attach(buffer.wl_buffer, 0, 0);
-    self.surface.damageBuffer(0, 0, phys_width, phys_height);
+    switch (damage) {
+        .full => self.surface.damageBuffer(0, 0, phys_width, phys_height),
+        .spans => |spans| for (spans) |span| {
+            self.surface.damageBuffer(0, span.y, phys_width, span.height);
+        },
+    }
     self.surface.commit();
     buffer.busy = true;
 }
@@ -699,6 +730,9 @@ const Buffer = struct {
     width: u31,
     height: u31,
     busy: bool,
+    /// Window.frame_counter value when this buffer was last drawn;
+    /// 0 means never (content undefined).
+    frame: u64,
 
     fn create(alloc: std.mem.Allocator, shm: *wl.Shm, width: u31, height: u31) !*Buffer {
         std.debug.assert(width > 0 and height > 0);
@@ -731,6 +765,7 @@ const Buffer = struct {
             .width = width,
             .height = height,
             .busy = false,
+            .frame = 0,
         };
         wl_buffer.setListener(*Buffer, bufferListener, self);
         return self;
