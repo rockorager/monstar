@@ -2793,11 +2793,15 @@ fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *App)
 }
 
 fn beginDropPaste(self: *App) void {
+    const offer = self.dnd_offer orelse return;
+    // The compositor sends leave right after drop; hand ownership to
+    // the in-flight paste action now so that leave cannot destroy the
+    // offer under it (finishPaste destroys it when the transfer ends).
+    self.dnd_offer = null;
     if (self.paste_fd >= 0) {
-        if (self.dnd_offer) |offer| offer.destroy();
+        offer.destroy();
         return;
     }
-    const offer = self.dnd_offer orelse return;
     const mime = offer.bestDndMime() orelse {
         offer.destroy();
         return;
