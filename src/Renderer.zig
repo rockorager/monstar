@@ -122,8 +122,10 @@ pub fn render(
 ) !void {
     std.debug.assert(pixels.len == @as(usize, width) * height);
 
-    @memset(pixels, argb(state.colors.background));
-    if (state.rows == 0 or state.cols == 0) return;
+    if (state.rows == 0 or state.cols == 0) {
+        @memset(pixels, argb(state.colors.background));
+        return;
+    }
 
     const rows = state.row_data.slice();
     const all_cells = rows.items(.cells);
@@ -138,6 +140,13 @@ pub fn render(
             width,
             height,
         );
+    }
+
+    // Rows cover their own background; only the strip below the last
+    // grid row remains.
+    const grid_bottom = @as(usize, state.rows) * self.font.cell_height;
+    if (grid_bottom < height) {
+        @memset(pixels[grid_bottom * width ..], argb(state.colors.background));
     }
 }
 
@@ -168,7 +177,7 @@ pub fn renderWithKittyGraphics(
             pixels,
             width,
             height,
-            true,
+            .styled,
         );
     }
 
@@ -183,7 +192,7 @@ pub fn renderWithKittyGraphics(
             pixels,
             width,
             height,
-            false,
+            .none,
         );
         try self.renderRowForeground(
             state,
@@ -222,7 +231,6 @@ pub fn renderDirty(
         const end = @min(@as(usize, state.rows), y + 2);
         var row = @max(start, rendered_until);
         while (row < end) : (row += 1) {
-            self.clearRow(state, @intCast(row), pixels, width, height);
             try self.renderRow(
                 state,
                 all_cells[row].slice(),
@@ -900,26 +908,6 @@ fn blendPixel(dst: u32, src: *const [4]u8) u32 {
     return 0xff000000 | (r << 16) | (g << 8) | b;
 }
 
-fn clearRow(
-    self: *Renderer,
-    state: *const vt.RenderState,
-    y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
-) void {
-    fillRect(
-        pixels,
-        width,
-        height,
-        0,
-        y * self.font.cell_height,
-        width,
-        self.font.cell_height,
-        argb(state.colors.background),
-    );
-}
-
 fn renderRow(
     self: *Renderer,
     state: *const vt.RenderState,
@@ -930,9 +918,16 @@ fn renderRow(
     width: u31,
     height: u31,
 ) !void {
-    try self.prepareRow(state, cells, selection, y, pixels, width, height, true);
+    try self.prepareRow(state, cells, selection, y, pixels, width, height, .all);
     try self.renderRowForeground(state, cells, y, pixels, width, height);
 }
+
+/// Which cell backgrounds prepareRow paints. `.all` covers the entire
+/// row rect (unstyled cells and the right margin get the default
+/// background), so callers need no separate clear pass. `.styled`
+/// leaves unstyled pixels untouched, letting below-text kitty images
+/// show through.
+const Backgrounds = enum { none, styled, all };
 
 fn prepareRow(
     self: *Renderer,
@@ -943,7 +938,7 @@ fn prepareRow(
     pixels: []u32,
     width: u31,
     height: u31,
-    draw_backgrounds: bool,
+    backgrounds: Backgrounds,
 ) !void {
     const font = self.font;
     const colors = &state.colors;
@@ -1008,8 +1003,12 @@ fn prepareRow(
         }
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
-        if (draw_backgrounds) {
-            if (bg) |bg_color| {
+        if (backgrounds != .none) {
+            const cell_bg: ?vt.color.RGB = bg orelse switch (backgrounds) {
+                .all => colors.background,
+                else => null,
+            };
+            if (cell_bg) |bg_color| {
                 const color = argb(bg_color);
                 const px_start = @as(u31, @intCast(x)) * font.cell_width;
                 const px_end = px_start + font.cell_width * cellSpan(raws[x]);
@@ -1023,6 +1022,20 @@ fn prepareRow(
                 }
             } else {
                 bg_run.flush(pixels, width, height, y_px, font.cell_height);
+            }
+        }
+    }
+    // In .all mode the row rect must be fully covered: extend to the
+    // buffer's right edge past the last column.
+    if (backgrounds == .all) {
+        const margin_start: u31 = cols * font.cell_width;
+        if (margin_start < width) {
+            const color = argb(colors.background);
+            if (bg_run.active and color == bg_run.color) {
+                bg_run.end_px = width;
+            } else {
+                bg_run.flush(pixels, width, height, y_px, font.cell_height);
+                bg_run = .{ .active = true, .color = color, .start_px = margin_start, .end_px = width };
             }
         }
     }
