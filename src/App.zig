@@ -145,6 +145,8 @@ repeat_delay: i32,
 sync_output_fd: posix.fd_t,
 /// Timer for ghostty-vt selection autoscroll while dragging past an edge.
 selection_autoscroll_fd: posix.fd_t,
+/// One-shot timer that clears stale OSC 9;4 taskbar progress.
+taskbar_progress_fd: posix.fd_t,
 /// Pointer position in logical surface coordinates.
 pointer_x: f64,
 pointer_y: f64,
@@ -201,7 +203,9 @@ const initial_cols = 80;
 const initial_rows = 24;
 const app_id = "dev.rockorager.monstar";
 const app_name = "Monstar";
+const app_desktop_uri = "application://" ++ app_id ++ ".desktop";
 const sync_output_reset_ms = 1000;
+const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
 const precision_scroll_multiplier = 10.0;
@@ -230,6 +234,7 @@ const AppStreamHandler = struct {
             .kitty_color_report => self.app.answerKittyColorQueries(value),
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
+            .progress_report => self.app.reportTaskbarProgress(value),
             .dcs_hook => self.dcsHook(value),
             .dcs_put => self.dcsPut(value),
             .dcs_unhook => self.dcsUnhook(),
@@ -389,6 +394,11 @@ pub fn init(
     const selection_autoscroll_fd: posix.fd_t = @intCast(selection_autoscroll_rc);
     errdefer _ = std.os.linux.close(selection_autoscroll_fd);
 
+    const taskbar_progress_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (std.os.linux.errno(taskbar_progress_rc) != .SUCCESS) return error.TimerFdFailed;
+    const taskbar_progress_fd: posix.fd_t = @intCast(taskbar_progress_rc);
+    errdefer _ = std.os.linux.close(taskbar_progress_fd);
+
     // Self-reference into listeners/streams requires a stable address.
     const self = try alloc.create(App);
     errdefer alloc.destroy(self);
@@ -437,6 +447,7 @@ pub fn init(
         .repeat_delay = 600,
         .sync_output_fd = sync_output_fd,
         .selection_autoscroll_fd = selection_autoscroll_fd,
+        .taskbar_progress_fd = taskbar_progress_fd,
         .pointer_x = 0,
         .pointer_y = 0,
         .scroll_pixels = 0,
@@ -623,6 +634,21 @@ fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void
     };
 }
 
+fn reportTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) void {
+    self.sendTaskbarProgress(report) catch |err| {
+        if (err != error.DBusUnavailable) {
+            log.warn("failed to send taskbar progress: {}", .{err});
+        }
+        return;
+    };
+
+    if (report.state == .remove) {
+        self.stopTaskbarProgressTimer();
+    } else {
+        self.armTaskbarProgressTimer();
+    }
+}
+
 /// Finish setting up the session bus connection made in init (filter,
 /// matches, poll fd); the connection itself is created before the child
 /// fork so that cgroup scope creation can use it.
@@ -652,6 +678,7 @@ fn initDbus(self: *App) void {
 }
 
 fn deinitDbus(self: *App) void {
+    self.sendTaskbarProgress(.{ .state = .remove }) catch {};
     self.notification_ids.deinit(self.alloc);
 
     var it = self.notification_tokens.valueIterator();
@@ -760,6 +787,45 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
     try self.notification_ids.put(self.alloc, notification_id, {});
 }
 
+fn sendTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) !void {
+    const connection = self.dbus orelse return error.DBusUnavailable;
+
+    const message = c.dbus_message_new_signal(
+        "/com/canonical/Unity/LauncherEntry",
+        "com.canonical.Unity.LauncherEntry",
+        "Update",
+    ) orelse return error.OutOfMemory;
+    defer c.dbus_message_unref(message);
+
+    var iter: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_init_append(message, &iter);
+    var desktop_uri: [*:0]const u8 = app_desktop_uri;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &desktop_uri);
+
+    var properties: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &properties) == 0) return error.OutOfMemory;
+
+    const value = taskbarProgressValue(report);
+    const visible = report.state != .remove;
+    try dbusAppendBoolVariant(&properties, "progress-visible", visible);
+    try dbusAppendDoubleVariant(&properties, "progress", value);
+
+    if (c.dbus_message_iter_close_container(&iter, &properties) == 0) return error.OutOfMemory;
+
+    if (c.dbus_connection_send(connection, message, null) == 0) return error.OutOfMemory;
+    c.dbus_connection_flush(connection);
+}
+
+fn taskbarProgressValue(report: vt.osc.Command.ProgressReport) f64 {
+    return switch (report.state) {
+        .remove, .indeterminate => 0.0,
+        .set, .@"error", .pause => if (report.progress) |progress|
+            @as(f64, @floatFromInt(progress)) / 100.0
+        else
+            0.0,
+    };
+}
+
 fn openUriPortal(self: *App, uri: []const u8) !void {
     const connection = self.dbus orelse return error.DBusUnavailable;
 
@@ -804,6 +870,36 @@ fn dbusAppendStringHint(iter: *c.DBusMessageIter, key: [:0]const u8, value: [:0]
     if (c.dbus_message_iter_open_container(&entry, c.DBUS_TYPE_VARIANT, "s", &variant) == 0) return error.OutOfMemory;
     var value_ptr: [*:0]const u8 = value;
     try dbusAppendBasic(&variant, c.DBUS_TYPE_STRING, &value_ptr);
+    if (c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
+
+    if (c.dbus_message_iter_close_container(iter, &entry) == 0) return error.OutOfMemory;
+}
+
+fn dbusAppendBoolVariant(iter: *c.DBusMessageIter, key: [:0]const u8, value: bool) !void {
+    var dbus_value: c.dbus_bool_t = if (value) 1 else 0;
+    try dbusAppendVariant(iter, key, "b", c.DBUS_TYPE_BOOLEAN, &dbus_value);
+}
+
+fn dbusAppendDoubleVariant(iter: *c.DBusMessageIter, key: [:0]const u8, value: f64) !void {
+    var dbus_value = value;
+    try dbusAppendVariant(iter, key, "d", c.DBUS_TYPE_DOUBLE, &dbus_value);
+}
+
+fn dbusAppendVariant(
+    iter: *c.DBusMessageIter,
+    key: [:0]const u8,
+    comptime signature: [:0]const u8,
+    type_: c_int,
+    value: anytype,
+) !void {
+    var entry: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(iter, c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
+    var key_ptr: [*:0]const u8 = key;
+    try dbusAppendBasic(&entry, c.DBUS_TYPE_STRING, &key_ptr);
+
+    var variant: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(&entry, c.DBUS_TYPE_VARIANT, signature, &variant) == 0) return error.OutOfMemory;
+    try dbusAppendBasic(&variant, type_, value);
     if (c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
 
     if (c.dbus_message_iter_close_container(iter, &entry) == 0) return error.OutOfMemory;
@@ -935,6 +1031,7 @@ pub fn deinit(self: *App) void {
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
     self.deinitDbus();
+    _ = std.os.linux.close(self.taskbar_progress_fd);
     _ = std.os.linux.close(self.selection_autoscroll_fd);
     _ = std.os.linux.close(self.sync_output_fd);
     _ = std.os.linux.close(self.repeat_fd);
@@ -964,6 +1061,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.signal_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.sync_output_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.selection_autoscroll_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.taskbar_progress_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
@@ -973,7 +1071,8 @@ pub fn run(self: *App) !void {
     const signal_fd = &fds[4];
     const sync_output_fd = &fds[5];
     const selection_autoscroll_fd = &fds[6];
-    const dbus_fd = &fds[7];
+    const taskbar_progress_fd = &fds[7];
+    const dbus_fd = &fds[8];
 
     while (self.window.running and !self.child_exited) {
         wl_fd.events = posix.POLL.IN;
@@ -1043,6 +1142,10 @@ pub fn run(self: *App) !void {
 
         if (selection_autoscroll_fd.revents & posix.POLL.IN != 0) {
             self.fireSelectionAutoscroll();
+        }
+
+        if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
+            self.fireTaskbarProgressTimeout();
         }
 
         if (dbus_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
@@ -1785,6 +1888,38 @@ fn fireSyncOutputReset(self: *App) void {
         self.term.modes.set(.synchronized_output, false);
     }
     self.syncSynchronizedOutput();
+}
+
+fn armTaskbarProgressTimer(self: *App) void {
+    self.setTaskbarProgressTimer(.{
+        .it_value = .{ .sec = taskbar_progress_timeout_seconds, .nsec = 0 },
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    });
+}
+
+fn stopTaskbarProgressTimer(self: *App) void {
+    self.setTaskbarProgressTimer(.{
+        .it_value = .{ .sec = 0, .nsec = 0 },
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    });
+}
+
+fn setTaskbarProgressTimer(self: *App, spec: std.os.linux.itimerspec) void {
+    const rc = std.os.linux.timerfd_settime(self.taskbar_progress_fd, .{}, &spec, null);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        log.err("taskbar progress timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
+    }
+}
+
+fn fireTaskbarProgressTimeout(self: *App) void {
+    var expirations: u64 = 0;
+    const n = posix.read(self.taskbar_progress_fd, std.mem.asBytes(&expirations)) catch return;
+    if (n != @sizeOf(u64) or expirations == 0) return;
+    self.sendTaskbarProgress(.{ .state = .remove }) catch |err| {
+        if (err != error.DBusUnavailable) {
+            log.warn("failed to clear stale taskbar progress: {}", .{err});
+        }
+    };
 }
 
 /// Window pointer delegate: track position and accumulate wheel scroll,
