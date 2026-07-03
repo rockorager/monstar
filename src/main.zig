@@ -26,6 +26,9 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 1 and std.mem.eql(u8, args[1], "--dump")) {
         return dump(init, args[2..]);
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--bench")) {
+        return @import("bench.zig").run(init);
+    }
     return gui(init, args[1..]);
 }
 
