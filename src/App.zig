@@ -2588,7 +2588,9 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void
         @memcpy(pixels, self.render_pixels.items);
         return;
     }
+    const old_cursor = self.render_state.cursor;
     try self.render_state.update(self.alloc, &self.term);
+    self.dirtyCursorRows(old_cursor);
     const kitty_graphics_dirty = self.term.screens.active.kitty_images.dirty;
     if (resized or kitty_graphics_dirty or has_kitty_graphics) self.render_state.dirty = .full;
     switch (self.render_state.dirty) {
@@ -2603,6 +2605,27 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void
     if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
     self.clearRenderDirty();
     @memcpy(pixels, self.render_pixels.items);
+}
+
+fn dirtyCursorRows(self: *App, old_cursor: vt.RenderState.Cursor) void {
+    const new_cursor = self.render_state.cursor;
+    if (old_cursor.visible == new_cursor.visible and
+        old_cursor.visual_style == new_cursor.visual_style and
+        std.meta.eql(old_cursor.viewport, new_cursor.viewport))
+    {
+        return;
+    }
+
+    self.dirtyCursorRow(old_cursor.viewport);
+    self.dirtyCursorRow(new_cursor.viewport);
+}
+
+fn dirtyCursorRow(self: *App, viewport: ?vt.RenderState.Cursor.Viewport) void {
+    const row = viewport orelse return;
+    if (row.y >= self.render_state.row_data.len) return;
+
+    self.render_state.row_data.items(.dirty)[row.y] = true;
+    if (self.render_state.dirty == .false) self.render_state.dirty = .partial;
 }
 
 fn ensureRenderPixels(self: *App, width: u31, height: u31) !bool {
