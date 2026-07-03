@@ -81,7 +81,9 @@ fn tcapString(comptime v: []const u8) []const u8 {
 }
 
 alloc: std.mem.Allocator,
-config: *const Config,
+config_arena: std.heap.ArenaAllocator,
+config: Config,
+environ: std.process.Environ,
 term: vt.Terminal,
 stream: AppStream,
 render_state: vt.RenderState,
@@ -128,8 +130,8 @@ dbus_fd: posix.fd_t,
 notification_ids: std.AutoHashMapUnmanaged(u32, void),
 notification_tokens: std.AutoHashMapUnmanaged(u32, []u8),
 color_scheme: vt.device_status.ColorScheme,
-/// signalfd for SIGCHLD, polled in the event loop.
-sigchld_fd: posix.fd_t,
+/// signalfd for process-local signals, polled in the event loop.
+signal_fd: posix.fd_t,
 /// Key repeat: timerfd armed while a repeating key is held.
 repeat_fd: posix.fd_t,
 repeat_keycode: ?u32,
@@ -284,11 +286,13 @@ const AppStreamHandler = struct {
 };
 
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
-/// copies them via execve); `config` must outlive the App.
+/// copies them via execve). `config` strings must remain valid until the
+/// first successful reload or App teardown.
 pub fn init(
     io: std.Io,
     alloc: std.mem.Allocator,
-    config: *const Config,
+    config: Config,
+    environ: std.process.Environ,
     path: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
@@ -308,18 +312,20 @@ pub fn init(
     term.width_px = initial_cols * font.cell_width;
     term.height_px = initial_rows * font.cell_height;
 
-    // Child-exit detection is driven by SIGCHLD, not pty EOF: block the
-    // signal and receive it through a signalfd in the poll loop. This
-    // must happen before the fork so an early exit cannot be missed.
+    // Child-exit detection is driven by SIGCHLD, not pty EOF; config
+    // reloads are driven by SIGUSR1. Block both and receive them through
+    // signalfd in the poll loop. This must happen before the fork so an
+    // early child exit cannot be missed.
     var sigmask = posix.sigemptyset();
     posix.sigaddset(&sigmask, .CHLD);
+    posix.sigaddset(&sigmask, .USR1);
     posix.sigprocmask(std.os.linux.SIG.BLOCK, &sigmask, null);
-    const sigchld_fd = posix.signalfd(
+    const signal_fd = posix.signalfd(
         -1,
         &sigmask,
         std.os.linux.SFD.CLOEXEC | std.os.linux.SFD.NONBLOCK,
     ) catch return error.SignalFdFailed;
-    errdefer _ = std.os.linux.close(sigchld_fd);
+    errdefer _ = std.os.linux.close(signal_fd);
 
     var pty: Pty = try .open(.{
         .row = initial_rows,
@@ -362,7 +368,9 @@ pub fn init(
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
+        .config_arena = .init(alloc),
         .config = config,
+        .environ = environ,
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
@@ -395,7 +403,7 @@ pub fn init(
         .notification_ids = .empty,
         .notification_tokens = .empty,
         .color_scheme = .dark,
-        .sigchld_fd = sigchld_fd,
+        .signal_fd = signal_fd,
         .repeat_fd = repeat_fd,
         .repeat_keycode = null,
         .repeat_rate = 25,
@@ -873,7 +881,7 @@ pub fn deinit(self: *App) void {
     _ = std.os.linux.close(self.selection_autoscroll_fd);
     _ = std.os.linux.close(self.sync_output_fd);
     _ = std.os.linux.close(self.repeat_fd);
-    _ = std.os.linux.close(self.sigchld_fd);
+    _ = std.os.linux.close(self.signal_fd);
     self.keyboard.deinit();
     self.window.destroy();
     self.renderer.deinit();
@@ -881,6 +889,7 @@ pub fn deinit(self: *App) void {
     self.stream.deinit();
     self.term.deinit(self.alloc);
     self.font.deinit(self.alloc);
+    self.config_arena.deinit();
     self.alloc.destroy(self);
 }
 
@@ -895,7 +904,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
         // In-flight paste pipe; negative (ignored) while idle.
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = self.sigchld_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.signal_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.sync_output_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.selection_autoscroll_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -904,7 +913,7 @@ pub fn run(self: *App) !void {
     const pty_fd = &fds[1];
     const repeat_fd = &fds[2];
     const paste_fd = &fds[3];
-    const sigchld_fd = &fds[4];
+    const signal_fd = &fds[4];
     const sync_output_fd = &fds[5];
     const selection_autoscroll_fd = &fds[6];
     const dbus_fd = &fds[7];
@@ -954,8 +963,8 @@ pub fn run(self: *App) !void {
         }
         if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
 
-        if (sigchld_fd.revents & posix.POLL.IN != 0) {
-            self.drainSigchld();
+        if (signal_fd.revents & posix.POLL.IN != 0) {
+            self.drainSignals();
         }
 
         if (pty_fd.revents & posix.POLL.OUT != 0) {
@@ -1017,18 +1026,78 @@ fn hangupChild(self: *App) void {
     _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
 }
 
-/// SIGCHLD arrived: reap the child if it actually exited. This is the
-/// only place the terminal decides the session is over.
-fn drainSigchld(self: *App) void {
+/// Signal events arrived. SIGCHLD is the only place the terminal decides
+/// the session is over; SIGUSR1 reloads process-local configuration.
+fn drainSignals(self: *App) void {
     var info: std.os.linux.signalfd_siginfo = undefined;
+    var saw_sigchld = false;
+    var saw_sigusr1 = false;
     while (true) {
-        const n = posix.read(self.sigchld_fd, std.mem.asBytes(&info)) catch break;
+        const n = posix.read(self.signal_fd, std.mem.asBytes(&info)) catch break;
         if (n == 0) break;
+        switch (info.signo) {
+            @intFromEnum(std.os.linux.SIG.CHLD) => saw_sigchld = true,
+            @intFromEnum(std.os.linux.SIG.USR1) => saw_sigusr1 = true,
+            else => {},
+        }
     }
-    if (Pty.tryWait(self.child_pid)) |status| {
-        log.debug("child exited with status {d}", .{status});
-        self.child_exited = true;
+    if (saw_sigusr1) self.reloadConfig();
+    if (saw_sigchld) {
+        if (Pty.tryWait(self.child_pid)) |status| {
+            log.debug("child exited with status {d}", .{status});
+            self.child_exited = true;
+        }
     }
+}
+
+fn reloadConfig(self: *App) void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    var committed = false;
+    defer if (!committed) arena_state.deinit();
+
+    const new_config = Config.load(arena_state.allocator(), self.environ);
+    self.applyConfig(new_config) catch |err| {
+        log.warn("config reload failed: {}", .{err});
+        return;
+    };
+
+    self.config_arena.deinit();
+    self.config_arena = arena_state;
+    self.config = new_config;
+    committed = true;
+    log.info("config reloaded", .{});
+}
+
+fn applyConfig(self: *App, new_config: Config) !void {
+    const desired_font_size: u31 = @intCast((@as(u64, new_config.font_size) * self.window.scale120 + 60) / 120);
+    const new_font: Font = try .init(self.alloc, new_config.font_family, desired_font_size);
+
+    const colors = new_config.terminalColors();
+    self.term.colors.background.default = colors.background.default;
+    self.term.colors.foreground.default = colors.foreground.default;
+    self.term.colors.cursor.default = colors.cursor.default;
+    self.term.colors.palette.changeDefault(colors.palette.original);
+
+    self.renderer.selection_bg = new_config.selection_background orelse .{ .r = 0x33, .g = 0x46, .b = 0x7c };
+    self.renderer.selection_fg = new_config.selection_foreground;
+
+    // Always rebuild the Font on config reload so a reload also picks up
+    // fontconfig/file changes for the same family name. The resize path is
+    // responsible for deciding whether the new cell metrics changed enough
+    // to notify the pty and DEC 2048 in-band size-report listeners.
+    self.font.deinit(self.alloc);
+    self.font = new_font;
+    self.font_size_px = desired_font_size;
+    resize(
+        self,
+        physicalDimension(self.window.width, self.window.scale120),
+        physicalDimension(self.window.height, self.window.scale120),
+    ) catch |err| {
+        log.warn("config reload resize failed: {}", .{err});
+    };
+
+    self.render_state.dirty = .full;
+    self.needs_redraw = true;
 }
 
 /// Drain available PTY output into the terminal. Bounded so a

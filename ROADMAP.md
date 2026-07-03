@@ -8,11 +8,6 @@ high-resolution wheel scrolling, and text-input-v3 IME support.
 
 ## Open issues to revisit
 
-- Nerd Font rendering when an icon is not followed by a space: the
-  current Ghostty-style widening/scaling path does not always shrink
-  single-cell icons enough in that case. Tracked in GitHub.
-- Config reload: support the signal used by Omarchy (likely `SIGUSR1`)
-  to reload config without restarting. Tracked in GitHub.
 - Runtime font size changes: add keybindings to increase/decrease/reset
   font size. Tracked in GitHub.
 

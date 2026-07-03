@@ -84,7 +84,7 @@ fn gui(init: std.process.Init, args: []const [:0]const u8) !void {
     const argv_z = try argv.toOwnedSliceSentinel(arena, null);
     const envp = try buildEnvp(arena, init.minimal.environ);
 
-    const app = try App.init(init.io, init.gpa, &config, argv_z[0].?, argv_z.ptr, envp);
+    const app = try App.init(init.io, init.gpa, config, init.minimal.environ, argv_z[0].?, argv_z.ptr, envp);
     defer app.deinit();
     try app.run();
 }
