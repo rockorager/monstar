@@ -27,6 +27,8 @@ selection_fg: ?vt.color.RGB,
 /// Keyboard focus: unfocused windows draw the cursor as a hollow
 /// rectangle regardless of the requested style. Set by the caller.
 focused: bool = true,
+/// When true, OSC 8 hyperlink cells get an underline affordance.
+hyperlink_hints: bool = false,
 /// Per-cell resolved foreground colors for the row being rendered.
 fg_scratch: std.ArrayList(vt.color.RGB),
 /// Per-cell font face indices for the row being rendered.
@@ -238,6 +240,87 @@ pub fn renderPreedit(
         }
         try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), pixels, width, height);
         x += span;
+    }
+}
+
+pub fn renderLinkHint(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    uri: []const u8,
+) !void {
+    if (uri.len == 0 or width == 0 or height < self.font.cell_height) return;
+
+    const cols: u31 = @max(1, width / self.font.cell_width);
+    const text_start: u31 = @intFromBool(cols > 1);
+    const text_limit: u31 = if (cols > 2) cols - 1 else cols;
+    const y: u31 = height - self.font.cell_height;
+    const baseline_y: i32 = @as(i32, @intCast(y)) + self.font.baseline;
+    const bg = self.selection_bg;
+    const fg = self.selection_fg orelse state.colors.foreground;
+    var x: u31 = text_start;
+
+    fillRect(
+        pixels,
+        width,
+        height,
+        0,
+        y,
+        text_start * self.font.cell_width,
+        self.font.cell_height,
+        argb(bg),
+    );
+
+    var it = (try std.unicode.Utf8View.init(uri)).iterator();
+    while (it.nextCodepoint()) |cp| {
+        const span = codepointCellWidth(cp);
+        if (span == 0) continue;
+        if (x >= text_limit) break;
+        const clipped_span: u31 = @min(span, text_limit - x);
+
+        fillRect(
+            pixels,
+            width,
+            height,
+            x * self.font.cell_width,
+            y,
+            clipped_span * self.font.cell_width,
+            self.font.cell_height,
+            argb(bg),
+        );
+
+        const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+        const face = self.font.face(face_idx);
+        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+        if (glyph_idx != 0) {
+            const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), isSymbol(cp));
+            blitGlyph(
+                pixels,
+                width,
+                height,
+                g,
+                @as(i32, x) * self.font.cell_width + g.bearing_x,
+                baseline_y - g.bearing_y,
+                argb(fg),
+                false,
+            );
+        }
+        x += span;
+    }
+
+    if (x < cols) {
+        fillRect(
+            pixels,
+            width,
+            height,
+            x * self.font.cell_width,
+            y,
+            self.font.cell_width,
+            self.font.cell_height,
+            argb(bg),
+        );
     }
 }
 
@@ -782,19 +865,24 @@ fn renderRowForeground(
     }
     try self.drawRun(raws, graphemes, run_start, cols, y, pixels, width, height);
 
-    // Decoration pass: underlines, strikethrough, and overline overlay
-    // the glyphs, in the style's underline color (or the resolved fg).
+    // Decoration pass: underlines, strikethrough, overline, and hyperlink
+    // hints overlay the glyphs, in the style's underline color (or the
+    // resolved fg).
     for (0..cols) |dx| {
-        if (raws[dx].style_id == 0) continue;
-        const style = styles[dx];
+        const show_hyperlink = self.hyperlink_hints and raws[dx].hyperlink;
+        if (raws[dx].style_id == 0 and !show_hyperlink) continue;
+        const style: vt.Style = if (raws[dx].style_id == 0) .{} else styles[dx];
         const underline: ?vt.sgr.Attribute.Underline = switch (style.flags.underline) {
             .none => null,
             else => |u| u,
         };
-        if (underline == null and !style.flags.strikethrough and !style.flags.overline)
+        if (underline == null and !style.flags.strikethrough and !style.flags.overline and !show_hyperlink)
             continue;
 
         const cell_x: u31 = @intCast(dx);
+        if (show_hyperlink) {
+            try self.blitDecoration(.underline, cell_x, y, argb(self.fg_scratch.items[dx]), pixels, width, height);
+        }
         if (underline) |u| {
             const kind: @import("sprite.zig").Decoration = switch (u) {
                 .single => .underline,

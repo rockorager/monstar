@@ -732,6 +732,35 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
     try self.notification_ids.put(self.alloc, notification_id, {});
 }
 
+fn openUriPortal(self: *App, uri: []const u8) !void {
+    const connection = self.dbus orelse return error.DBusUnavailable;
+
+    const uri_z = try self.alloc.dupeZ(u8, uri);
+    defer self.alloc.free(uri_z);
+
+    const message = c.dbus_message_new_method_call(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.OpenURI",
+        "OpenURI",
+    ) orelse return error.OutOfMemory;
+    defer c.dbus_message_unref(message);
+
+    var iter: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_init_append(message, &iter);
+    var parent_window: [*:0]const u8 = "";
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &parent_window);
+    var uri_ptr: [*:0]const u8 = uri_z;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &uri_ptr);
+
+    var options: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &options) == 0) return error.OutOfMemory;
+    if (c.dbus_message_iter_close_container(&iter, &options) == 0) return error.OutOfMemory;
+
+    const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return error.DBusUnavailable;
+    c.dbus_message_unref(reply);
+}
+
 fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void {
     const opaque_value: *const anyopaque = @ptrCast(value);
     if (c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
@@ -1437,7 +1466,8 @@ fn syncCursorShape(self: *App) void {
     self.window.setCursorShape(self.currentCursorShape());
 }
 
-fn currentCursorShape(self: *const App) Window.CursorShape {
+fn currentCursorShape(self: *App) Window.CursorShape {
+    if (self.keyboard.currentMods().ctrl and self.hyperlinkAtPointer() != null) return .pointer;
     if (self.mouse_shape_explicit) return cursorShapeFromMouseShape(self.term.mouse_shape);
     return if (self.term.flags.mouse_event != .none) .default else .text;
 }
@@ -1694,10 +1724,20 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .enter => |enter| {
             self.pointer_x = enter.surface_x.toDouble();
             self.pointer_y = enter.surface_y.toDouble();
+            self.syncCursorShape();
+            if (self.keyboard.currentMods().ctrl) {
+                self.render_state.dirty = .full;
+                self.needs_redraw = true;
+            }
         },
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
+            self.syncCursorShape();
+            if (self.keyboard.currentMods().ctrl) {
+                self.render_state.dirty = .full;
+                self.needs_redraw = true;
+            }
             if (self.selecting) {
                 self.extendSelection();
             } else if (self.mouse_button != null or self.reportingMouse()) {
@@ -1736,6 +1776,10 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             const mouse_button = mouseButtonFromEvdev(button.button);
 
             if (button.button == 272) { // BTN_LEFT
+                if (self.keyboard.currentMods().ctrl and self.hyperlinkAtPointer() != null) {
+                    if (button.state == .released) self.openHyperlinkAtPointer();
+                    return;
+                }
                 switch (button.state) {
                     .pressed => if (reporting) {
                         self.forwardMouseButton(button, mouse_button.?);
@@ -1792,6 +1836,22 @@ fn pinAtPointer(self: *App) ?vt.Pin {
     return self.term.screens.active.pages.pin(.{
         .viewport = .{ .x = cell.x, .y = cell.y },
     });
+}
+
+fn hyperlinkAtPointer(self: *App) ?[]const u8 {
+    const pin = self.pinAtPointer() orelse return null;
+    const rac = pin.rowAndCell();
+    if (!rac.cell.hyperlink) return null;
+    const link_id = pin.node.data.lookupHyperlink(rac.cell) orelse return null;
+    const entry = pin.node.data.hyperlink_set.get(pin.node.data.memory, link_id);
+    return entry.uri.slice(pin.node.data.memory);
+}
+
+fn openHyperlinkAtPointer(self: *App) void {
+    const uri = self.hyperlinkAtPointer() orelse return;
+    self.openUriPortal(uri) catch |err| {
+        log.warn("failed to open hyperlink through portal: {}", .{err});
+    };
 }
 
 fn pointerPhysical(self: *App) struct { x: f64, y: f64 } {
@@ -2467,12 +2527,20 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
                 log.err("keymap load failed: {}", .{err});
             };
         },
-        .modifiers => |mods| self.keyboard.updateMods(
-            mods.mods_depressed,
-            mods.mods_latched,
-            mods.mods_locked,
-            mods.group,
-        ),
+        .modifiers => |mods| {
+            const ctrl_was_down = self.keyboard.currentMods().ctrl;
+            self.keyboard.updateMods(
+                mods.mods_depressed,
+                mods.mods_latched,
+                mods.mods_locked,
+                mods.group,
+            );
+            if (ctrl_was_down != self.keyboard.currentMods().ctrl) {
+                self.syncCursorShape();
+                self.render_state.dirty = .full;
+                self.needs_redraw = true;
+            }
+        },
         .key => |key| {
             self.last_serial = key.serial;
             const action: vt.input.KeyAction = switch (key.state) {
@@ -2733,6 +2801,7 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
     self.renderer.focused = self.focused;
+    self.renderer.hyperlink_hints = self.keyboard.currentMods().ctrl;
     const resized = try self.ensureRenderPixels(width, height);
     const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
     if (self.term.modes.get(.synchronized_output)) {
@@ -2757,6 +2826,11 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31) anyerror!void
     }
     if (self.ime_preedit) |preedit| {
         try self.renderer.renderPreedit(&self.render_state, self.render_pixels.items, width, height, preedit);
+    }
+    if (self.keyboard.currentMods().ctrl) {
+        if (self.hyperlinkAtPointer()) |uri| {
+            try self.renderer.renderLinkHint(&self.render_state, self.render_pixels.items, width, height, uri);
+        }
     }
     self.syncTextInputCursorRect();
     if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
