@@ -12,6 +12,20 @@ headless compositor. Useful client-side tools include `grim` for screenshots,
 `wf-recorder` for recordings, `wtype` for virtual keyboard input, and
 `wl-vptr-click` for virtual pointer clicks.
 
+When recording UI demos in an orb, run the compositor in the shared `dev` tmux
+session and point clients at its runtime, usually:
+
+```bash
+XDG_RUNTIME_DIR=/tmp/monstar-wayland-run WAYLAND_DISPLAY=wayland-1
+```
+
+Save user-reviewable recordings under `.amp/in/artifacts/`. Prefer recording
+MP4 with `wf-recorder -f .amp/in/artifacts/name.mp4`; if the video should render
+inline on GitHub, also make a small GIF with `ffmpeg` and embed that with
+Markdown image syntax. GitHub's public CLI/API does not expose the web UI's
+`user-attachments` upload endpoint; a practical CLI-only workaround is to upload
+demo media as release assets and link/embed those URLs in the PR body.
+
 ## Zig Development
 
 Use `zigdoc` to discover current APIs for the Zig standard library and any third-party dependencies before coding.
