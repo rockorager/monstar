@@ -108,8 +108,10 @@ pub fn translate(
 
     const utf8_len_c = c.xkb_state_key_get_utf8(state, keycode, utf8_buf.ptr, utf8_buf.len);
     const utf8_len: usize = if (utf8_len_c > 0) @intCast(utf8_len_c) else 0;
-    // Don't send control characters as text; the encoder derives them.
-    const utf8: []const u8 = if (utf8_len == 1 and utf8_buf[0] < 0x20)
+    // Don't send most control characters as text; the encoder derives
+    // them from the physical key. Plain Tab is the exception: ghostty-vt's
+    // legacy encoder expects the tab byte in utf8 when no modifiers are held.
+    const utf8: []const u8 = if (utf8_len == 1 and utf8_buf[0] < 0x20 and utf8_buf[0] != '\t')
         ""
     else
         utf8_buf[0..utf8_len];
@@ -353,6 +355,31 @@ test "translate and encode: plain, shifted, control" {
         var writer: std.Io.Writer = .fixed(&out_buf);
         try vt_input.encodeKey(&writer, event, .{});
         try std.testing.expectEqualStrings("\r", writer.buffered());
+    }
+
+    // Tab (evdev 15) must keep its C0 utf8 byte; ghostty-vt's
+    // legacy encoder uses it for unmodified Tab.
+    {
+        const event = kb.translate(&utf8_buf, 15, .press).?;
+        try std.testing.expectEqualStrings("\t", event.utf8);
+        try std.testing.expectEqual(vt_input.Key.tab, event.key);
+
+        var writer: std.Io.Writer = .fixed(&out_buf);
+        try vt_input.encodeKey(&writer, event, .{});
+        try std.testing.expectEqualStrings("\t", writer.buffered());
+    }
+
+    // Shift+Tab -> CSI Z.
+    {
+        _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_DOWN);
+        defer _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_UP);
+
+        const event = kb.translate(&utf8_buf, 15, .press).?;
+        try std.testing.expect(event.mods.shift);
+
+        var writer: std.Io.Writer = .fixed(&out_buf);
+        try vt_input.encodeKey(&writer, event, .{});
+        try std.testing.expectEqualStrings("\x1b[Z", writer.buffered());
     }
 
     // Arrow up (evdev 103) -> CSI A.
