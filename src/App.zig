@@ -1228,6 +1228,123 @@ fn reloadConfig(self: *App) void {
     log.info("config reloaded", .{});
 }
 
+/// Ctrl+Shift+N: spawn an independent monstar window in the shell's
+/// current directory. The directory comes from OSC 7 if the shell
+/// reports it; otherwise the child inherits our cwd, which is where
+/// this window's shell started.
+fn spawnNewWindow(self: *App) void {
+    const linux = std.os.linux;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pwd: ?[:0]const u8 = pwd: {
+        const url = self.term.getPwd() orelse break :pwd null;
+        break :pwd osc7Path(arena, url) catch null;
+    };
+
+    const argv = [_:null]?[*:0]const u8{"monstar"};
+    const envp = self.spawnEnvp(arena, pwd) catch |err| {
+        log.err("spawn env setup failed: {}", .{err});
+        return;
+    };
+
+    // Double fork: the intermediate child exits immediately so init
+    // adopts the new window and it never lingers as our zombie.
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        log.err("spawn fork failed: {}", .{linux.errno(fork_rc)});
+        return;
+    }
+    const pid: posix.pid_t = @intCast(fork_rc);
+
+    if (pid == 0) {
+        // Intermediate child. Only async-signal-safe calls from here on.
+        // We block SIGCHLD/SIGUSR1 for our signalfd; the new window must
+        // start with a clean mask and its own session.
+        const empty_mask = posix.sigemptyset();
+        posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
+        _ = linux.setsid();
+        if (linux.fork() != 0) linux.exit(0); // second-fork parent, or fork failure
+
+        if (pwd) |p| _ = linux.chdir(p.ptr);
+        _ = linux.execve("/proc/self/exe", &argv, envp);
+        linux.exit(127); // exec failed
+    }
+
+    // Reap the intermediate child; it exits right after the second fork.
+    var status: u32 = undefined;
+    _ = linux.wait4(pid, &status, 0, null);
+}
+
+/// Environment for a spawned window: our own environment with PWD
+/// rewritten to match the child's starting directory.
+fn spawnEnvp(
+    self: *App,
+    arena: std.mem.Allocator,
+    pwd: ?[:0]const u8,
+) ![*:null]const ?[*:0]const u8 {
+    var list: std.ArrayList(?[*:0]const u8) = .empty;
+    for (self.environ.block.slice) |entry| {
+        const e = entry orelse continue;
+        if (pwd != null and std.mem.startsWith(u8, std.mem.span(e), "PWD=")) continue;
+        try list.append(arena, e);
+    }
+    if (pwd) |p| {
+        const entry = try std.mem.joinZ(arena, "", &.{ "PWD=", p });
+        try list.append(arena, entry.ptr);
+    }
+    const slice = try list.toOwnedSliceSentinel(arena, null);
+    return slice.ptr;
+}
+
+/// Decode an OSC 7 payload (`file://host/path`) into a local filesystem
+/// path. Returns null for anything that is not an absolute path on this
+/// machine: foreign schemes, remote hosts, malformed URIs.
+fn osc7Path(arena: std.mem.Allocator, url: []const u8) std.mem.Allocator.Error!?[:0]const u8 {
+    const uri = std.Uri.parse(url) catch return null;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "file")) return null;
+
+    if (uri.host) |host| {
+        const h = try host.toRawMaybeAlloc(arena);
+        if (h.len > 0 and !std.mem.eql(u8, h, "localhost")) {
+            var name_buf: [posix.HOST_NAME_MAX]u8 = undefined;
+            const hostname = posix.gethostname(&name_buf) catch return null;
+            if (!std.mem.eql(u8, h, hostname)) return null;
+        }
+    }
+
+    const path = try uri.path.toRawMaybeAlloc(arena);
+    if (path.len == 0 or path[0] != '/') return null;
+    return try arena.dupeZ(u8, path);
+}
+
+test "osc7Path decodes local file URIs" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings(
+        "/home/tim",
+        (try osc7Path(arena, "file:///home/tim")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "/home/tim",
+        (try osc7Path(arena, "file://localhost/home/tim")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "/home/tim/my dir",
+        (try osc7Path(arena, "file:///home/tim/my%20dir")).?,
+    );
+
+    // Remote hosts, foreign schemes, and junk must not produce a path.
+    try std.testing.expectEqual(null, try osc7Path(arena, "file://otherhost.example/home/tim"));
+    try std.testing.expectEqual(null, try osc7Path(arena, "https://example.com/x"));
+    try std.testing.expectEqual(null, try osc7Path(arena, "not a uri"));
+    try std.testing.expectEqual(null, try osc7Path(arena, "file://"));
+}
+
 fn applyConfig(self: *App, new_config: Config) !void {
     const desired_font_size = scaledFontSize(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
     const new_font: Font = try .init(self.alloc, new_config.font_family, desired_font_size);
@@ -2925,6 +3042,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     if (action == .press and event.mods.ctrl and event.mods.shift) {
         switch (event.key) {
             .key_c => return self.copyToClipboard(),
+            .key_n => return self.spawnNewWindow(),
             .key_v => return self.beginPaste(.clipboard),
             .comma => return self.reloadConfig(),
             else => {},

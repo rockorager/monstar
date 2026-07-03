@@ -26,6 +26,7 @@ pkill -USR1 monstar
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Shift+C` | Copy selection to clipboard |
+| `Ctrl+Shift+N` | New window in current directory |
 | `Ctrl+Shift+V` | Paste from clipboard |
 | `Ctrl+Shift+,` | Reload config |
 | `Ctrl++` / `Ctrl+=` | Increase font size for this window |
