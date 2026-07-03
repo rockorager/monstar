@@ -147,7 +147,7 @@ const Globals = struct {
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
-pub fn create(alloc: std.mem.Allocator) !*Window {
+pub fn create(alloc: std.mem.Allocator, app_id: [:0]const u8) !*Window {
     const display = try wl.Display.connect(null);
     errdefer display.disconnect();
 
@@ -163,7 +163,7 @@ pub fn create(alloc: std.mem.Allocator) !*Window {
     const surface = try compositor.createSurface();
     const xdg_surface = try wm_base.getXdgSurface(surface);
     const toplevel = try xdg_surface.getToplevel();
-    toplevel.setAppId("dev.rockorager.monstar");
+    toplevel.setAppId(app_id);
     toplevel.setTitle("monstar");
 
     const toplevel_decoration = decoration: {

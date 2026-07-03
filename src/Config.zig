@@ -15,6 +15,10 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
     if (!builtin.is_test) log.warn(fmt, args);
 }
 
+pub const default_app_id = "dev.rockorager.monstar";
+
+/// Wayland app-id and desktop-entry hint for desktop integration.
+app_id: [:0]const u8 = default_app_id,
 font_family: [:0]const u8 = "monospace",
 /// Font size in logical pixels (scaled by the output's fractional scale).
 font_size: u31 = 16,
@@ -86,7 +90,9 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Config {
 const SetError = error{ InvalidValue, UnknownKey, OutOfMemory };
 
 fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8) SetError!void {
-    if (std.mem.eql(u8, key, "font-family")) {
+    if (std.mem.eql(u8, key, "app-id")) {
+        self.app_id = try arena.dupeZ(u8, value);
+    } else if (std.mem.eql(u8, key, "font-family")) {
         self.font_family = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "font-size")) {
         const size = std.fmt.parseInt(u31, value, 10) catch return error.InvalidValue;
@@ -171,6 +177,7 @@ fn readFile(arena: std.mem.Allocator, path: [:0]const u8) ?[]const u8 {
 
 test "defaults" {
     const config: Config = .{};
+    try std.testing.expectEqualStrings(default_app_id, config.app_id);
     try std.testing.expectEqualStrings("monospace", config.font_family);
     try std.testing.expectEqual(@as(u31, 16), config.font_size);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.shell);
@@ -184,6 +191,7 @@ test "parse config" {
 
     const config = parse(arena,
         \\# a comment
+        \\app-id = com.example.scratchpad
         \\font-family = Fira Code
         \\font-size = 14
         \\shell = /usr/bin/fish
@@ -198,6 +206,7 @@ test "parse config" {
         \\font-size = not-a-number
     );
 
+    try std.testing.expectEqualStrings("com.example.scratchpad", config.app_id);
     try std.testing.expectEqualStrings("Fira Code", config.font_family);
     // invalid re-assignment keeps the previous valid value
     try std.testing.expectEqual(@as(u31, 14), config.font_size);

@@ -27,6 +27,13 @@ Send `SIGUSR1` to reload the config for a running process:
 pkill -USR1 monstar
 ```
 
+Set `app-id` to customize the Wayland app-id and desktop-entry hint used by
+compositor/window-manager rules:
+
+```conf
+app-id = com.example.scratchpad
+```
+
 To pipe the last OSC 133-delimited command output with `Ctrl+Shift+G`, set a
 shell command that receives the output on stdin:
 

@@ -248,9 +248,7 @@ const selection_word_boundaries = [_]u21{
 /// Terminal lines per wheel click.
 const initial_cols = 80;
 const initial_rows = 24;
-const app_id = "dev.rockorager.monstar";
 const app_name = "Monstar";
-const app_desktop_uri = "application://" ++ app_id ++ ".desktop";
 const sync_output_reset_ms = 1000;
 const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
@@ -445,7 +443,7 @@ pub fn init(
     // space) while we respond to queries embedded in that output.
     setNonblocking(pty.master);
 
-    const window = try Window.create(alloc);
+    const window = try Window.create(alloc, config.app_id);
     errdefer window.destroy();
 
     // Timerfds must be nonblocking: disarming a timerfd clears its
@@ -873,7 +871,7 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
 
     var hints: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &hints) == 0) return error.OutOfMemory;
-    try dbusAppendStringHint(&hints, "desktop-entry", app_id);
+    try dbusAppendStringHint(&hints, "desktop-entry", self.config.app_id);
     if (c.dbus_message_iter_close_container(&iter, &hints) == 0) return error.OutOfMemory;
 
     var expire_timeout: i32 = -1;
@@ -898,7 +896,9 @@ fn sendTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) !void 
 
     var iter: c.DBusMessageIter = undefined;
     c.dbus_message_iter_init_append(message, &iter);
-    var desktop_uri: [*:0]const u8 = app_desktop_uri;
+    const desktop_uri_z = try std.fmt.allocPrintSentinel(self.alloc, "application://{s}.desktop", .{self.config.app_id}, 0);
+    defer self.alloc.free(desktop_uri_z);
+    var desktop_uri: [*:0]const u8 = desktop_uri_z;
     try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &desktop_uri);
 
     var properties: c.DBusMessageIter = undefined;
@@ -1711,6 +1711,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
     self.renderer.selection_bg = new_config.selection_background orelse .{ .r = 0x33, .g = 0x46, .b = 0x7c };
     self.renderer.selection_fg = new_config.selection_foreground;
+    self.window.toplevel.setAppId(new_config.app_id);
 
     // Always rebuild the Font on config reload so a reload also picks up
     // fontconfig/file changes for the same family name. The resize path is
