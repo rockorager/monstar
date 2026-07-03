@@ -82,6 +82,7 @@ fn tcapString(comptime v: []const u8) []const u8 {
 }
 
 alloc: std.mem.Allocator,
+io: std.Io,
 config_arena: std.heap.ArenaAllocator,
 config: Config,
 environ: std.process.Environ,
@@ -102,6 +103,19 @@ frame_damage: [frame_damage_len]FrameDamage,
 frame_damage_index: usize,
 /// Scratch for the damage spans reported to the window each frame.
 damage_spans: std.ArrayList(Window.RowSpan),
+/// Monotonic nanoseconds taken at render() entry when the frame
+/// timer is enabled; consumed by flushFrame.
+frame_start: i96,
+/// Timestamp after render-state update, splitting the frame log's
+/// `update` (state snapshot) from `draw` (pixel work). Stays at
+/// frame_start on paths that skip the update.
+frame_update_done: i96,
+/// The previous frame's total CPU cost. The overlay shows this
+/// rather than the current frame's so the shm copy is included.
+last_frame_ns: u64,
+/// Rows repainted this frame, for the frame log ("all" when the
+/// whole grid was redrawn or blitted).
+frame_rows: union(enum) { all, count: usize },
 pty: Pty,
 child_pid: posix.pid_t,
 font: Font,
@@ -463,6 +477,7 @@ pub fn init(
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
+        .io = io,
         .config_arena = .init(alloc),
         .config = config,
         .environ = environ,
@@ -481,6 +496,10 @@ pub fn init(
         }),
         .frame_damage_index = 0,
         .damage_spans = .empty,
+        .frame_start = 0,
+        .frame_update_done = 0,
+        .last_frame_ns = 0,
+        .frame_rows = .{ .count = 0 },
         .pty = pty,
         .child_pid = child_pid,
         .font = font,
@@ -3603,6 +3622,10 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 /// `age` is how many frames ago `pixels` was last drawn (0 = unknown).
 fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) anyerror!Window.Damage {
     const self: *App = @ptrCast(@alignCast(ctx));
+    if (self.config.frame_timer != .off) {
+        self.frame_start = self.nowNs();
+        self.frame_update_done = self.frame_start;
+    }
     // Claim the frame's damage entry up front, marked full: if rendering
     // fails partway, later frames then fall back to a full copy.
     const damage = self.beginFrameDamage(width, height);
@@ -3613,8 +3636,10 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
     if (self.term.modes.get(.synchronized_output)) {
         if (resized) {
             try self.renderer.render(&self.render_state, self.render_pixels.items, width, height);
+            self.frame_rows = .all;
         } else {
             try self.recordFrameDamage(damage, false);
+            self.frame_rows = .{ .count = 0 };
         }
         return self.flushFrame(pixels, width, height, age);
     }
@@ -3635,6 +3660,7 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
     // A detected scroll implies the viewport pin changed, which update
     // always answers with a full redraw.
     std.debug.assert(scroll == null or self.render_state.dirty == .full);
+    if (self.config.frame_timer != .off) self.frame_update_done = self.nowNs();
     var scrolled = false;
     switch (self.render_state.dirty) {
         .false => {},
@@ -3652,6 +3678,11 @@ fn render(ctx: *anyopaque, pixels: []u32, width: u31, height: u31, age: usize) a
         },
         .partial => try self.renderer.renderDirty(&self.render_state, self.render_pixels.items, width, height),
     }
+    self.frame_rows = switch (self.render_state.dirty) {
+        .false => .{ .count = 0 },
+        .full => .all,
+        .partial => .{ .count = self.renderer.repainted.count() },
+    };
     if (self.ime_preedit) |preedit| {
         try self.renderer.renderPreedit(&self.render_state, self.render_pixels.items, width, height, preedit);
     }
@@ -3727,6 +3758,22 @@ fn flushFrame(self: *App, pixels: []u32, width: u31, height: u31, age: usize) !W
     const cell_height: usize = self.font.cell_height;
     const grid_rows: usize = self.render_state.rows;
 
+    const frame_timer = self.config.frame_timer;
+    const render_done: i96 = if (frame_timer != .off) self.nowNs() else 0;
+    if (frame_timer == .overlay or frame_timer == .both) {
+        try self.renderer.renderFrameTimer(
+            &self.render_state,
+            self.render_pixels.items,
+            width,
+            height,
+            self.last_frame_ns,
+        );
+        // The overlay occupies the top cell row; make partial copies
+        // and reported surface damage carry it every frame.
+        const entry = &self.frame_damage[self.frame_damage_index];
+        if (!entry.full and entry.rows.bit_length > 0) entry.rows.set(0);
+    }
+
     const copy_all = copy_all: {
         if (age == 0 or age > frame_damage_len) break :copy_all true;
         for (0..age) |back| {
@@ -3761,7 +3808,31 @@ fn flushFrame(self: *App, pixels: []u32, width: u31, height: u31, age: usize) !W
         }
     }
 
+    if (frame_timer != .off) {
+        const now = self.nowNs();
+        self.last_frame_ns = @intCast(now - self.frame_start);
+        if (frame_timer == .log or frame_timer == .both) {
+            const frame_log = std.log.scoped(.frame);
+            var rows_buf: [24]u8 = undefined;
+            const rows_str = switch (self.frame_rows) {
+                .all => "all",
+                .count => |n| std.fmt.bufPrint(&rows_buf, "{d}", .{n}) catch "?",
+            };
+            frame_log.info("frame {d:.3} ms (update {d:.3} ms, draw {d:.3} ms, flush {d:.3} ms) rows {s}", .{
+                @as(f64, @floatFromInt(now - self.frame_start)) / std.time.ns_per_ms,
+                @as(f64, @floatFromInt(self.frame_update_done - self.frame_start)) / std.time.ns_per_ms,
+                @as(f64, @floatFromInt(render_done - self.frame_update_done)) / std.time.ns_per_ms,
+                @as(f64, @floatFromInt(now - render_done)) / std.time.ns_per_ms,
+                rows_str,
+            });
+        }
+    }
+
     return self.currentFrameDamage(height);
+}
+
+fn nowNs(self: *App) i96 {
+    return std.Io.Clock.awake.now(self.io).nanoseconds;
 }
 
 /// Surface damage of the current frame only, as pixel-row spans.

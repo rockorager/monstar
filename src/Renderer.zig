@@ -575,6 +575,51 @@ pub fn renderLinkHint(
     }
 }
 
+/// Draw a frame-time readout in the top-right corner, one cell high.
+/// The text is a fixed width so each frame's background fill fully
+/// erases the previous readout.
+pub fn renderFrameTimer(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    frame_ns: u64,
+) !void {
+    if (width == 0 or height < self.font.cell_height) return;
+
+    var buf: [24]u8 = undefined;
+    const ms = @as(f64, @floatFromInt(frame_ns)) / std.time.ns_per_ms;
+    const text = std.fmt.bufPrint(&buf, "{d:>7.2} ms", .{ms}) catch return;
+
+    const bg = argb(self.selection_bg);
+    const fg = argb(self.selection_fg orelse state.colors.foreground);
+    const cell_width = self.font.cell_width;
+    const x0 = width -| @as(u31, @intCast(text.len * cell_width));
+    fillRect(pixels, width, height, x0, 0, width - x0, self.font.cell_height, bg);
+
+    var x: i32 = x0;
+    for (text) |ch| {
+        const face_idx = self.font.faceForCodepoint(self.alloc, ch);
+        const face = self.font.face(face_idx);
+        const glyph_idx = c.FT_Get_Char_Index(face.ft_face, ch);
+        if (glyph_idx != 0) {
+            const g = try face.glyph(self.alloc, glyph_idx, 1, false);
+            blitGlyph(
+                pixels,
+                width,
+                height,
+                g,
+                x + g.bearing_x,
+                self.font.baseline - g.bearing_y,
+                fg,
+                false,
+            );
+        }
+        x += cell_width;
+    }
+}
+
 fn renderKittyGraphics(
     self: *Renderer,
     terminal: *const vt.Terminal,

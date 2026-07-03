@@ -24,6 +24,10 @@ shell: ?[:0]const u8 = null,
 pipe_command_output: ?[:0]const u8 = null,
 scrollback: usize = 10_000,
 wheel_scroll_lines: u31 = 3,
+/// Frame timing readout: `overlay` draws the previous frame's CPU
+/// cost in the top-right corner, `log` writes per-frame timings to
+/// stderr, `both` does both.
+frame_timer: FrameTimer = .off,
 
 background: ?vt.color.RGB = null,
 foreground: ?vt.color.RGB = null,
@@ -31,6 +35,8 @@ cursor_color: ?vt.color.RGB = null,
 selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
 palette: [16]?vt.color.RGB = @splat(null),
+
+pub const FrameTimer = enum { off, overlay, log, both };
 
 /// Load the config file, if any. Strings are allocated in `arena` and
 /// live as long as it does.
@@ -96,6 +102,8 @@ fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []const 
         const lines = std.fmt.parseInt(u31, value, 10) catch return error.InvalidValue;
         if (lines == 0) return error.InvalidValue;
         self.wheel_scroll_lines = lines;
+    } else if (std.mem.eql(u8, key, "frame-timer")) {
+        self.frame_timer = std.meta.stringToEnum(FrameTimer, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background")) {
         self.background = try parseColor(value);
     } else if (std.mem.eql(u8, key, "foreground")) {
