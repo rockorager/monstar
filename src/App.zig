@@ -859,6 +859,14 @@ fn taskbarProgressValue(report: vt.osc.Command.ProgressReport) f64 {
 fn openUriPortal(self: *App, uri: []const u8) !void {
     const connection = self.dbus orelse return error.DBusUnavailable;
 
+    // The portal's OpenURI method rejects file:// URIs by design; local
+    // paths go through the fd-passing OpenFile/OpenDirectory methods.
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    if (try osc7Path(arena_state.allocator(), uri)) |path| {
+        return openFilePortal(connection, path);
+    }
+
     const uri_z = try self.alloc.dupeZ(u8, uri);
     defer self.alloc.free(uri_z);
 
@@ -876,6 +884,57 @@ fn openUriPortal(self: *App, uri: []const u8) !void {
     try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &parent_window);
     var uri_ptr: [*:0]const u8 = uri_z;
     try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &uri_ptr);
+
+    var options: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &options) == 0) return error.OutOfMemory;
+    if (c.dbus_message_iter_close_container(&iter, &options) == 0) return error.OutOfMemory;
+
+    const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return error.DBusUnavailable;
+    c.dbus_message_unref(reply);
+}
+
+/// Open a local file or directory through the portal by passing an fd:
+/// files open with the default handler, directories in the file manager.
+fn openFilePortal(connection: *c.DBusConnection, path: [:0]const u8) !void {
+    const linux = std.os.linux;
+
+    // Directory-ness decides the portal method; O_DIRECTORY fails with
+    // ENOTDIR on regular files. NONBLOCK guards against FIFOs blocking
+    // the event loop (a no-op for regular files).
+    var is_dir = true;
+    var rc = linux.openat(linux.AT.FDCWD, path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .DIRECTORY = true,
+        .NONBLOCK = true,
+    }, 0);
+    if (linux.errno(rc) == .NOTDIR) {
+        is_dir = false;
+        rc = linux.openat(linux.AT.FDCWD, path, .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        }, 0);
+    }
+    if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
+    const fd: posix.fd_t = @intCast(rc);
+    // libdbus dups the fd when it is appended, so ours closes here.
+    defer _ = linux.close(fd);
+
+    const message = c.dbus_message_new_method_call(
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.OpenURI",
+        if (is_dir) "OpenDirectory" else "OpenFile",
+    ) orelse return error.OutOfMemory;
+    defer c.dbus_message_unref(message);
+
+    var iter: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_init_append(message, &iter);
+    var parent_window: [*:0]const u8 = "";
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_STRING, &parent_window);
+    var fd_value: c_int = fd;
+    try dbusAppendBasic(&iter, c.DBUS_TYPE_UNIX_FD, &fd_value);
 
     var options: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &options) == 0) return error.OutOfMemory;
