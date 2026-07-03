@@ -85,6 +85,8 @@ alloc: std.mem.Allocator,
 io: std.Io,
 config_arena: std.heap.ArenaAllocator,
 config: Config,
+config_path: ?[:0]const u8,
+config_overrides: []const []const u8,
 environ: std.process.Environ,
 term: vt.Terminal,
 stream: AppStream,
@@ -248,7 +250,7 @@ const selection_word_boundaries = [_]u21{
 /// Terminal lines per wheel click.
 const initial_cols = 80;
 const initial_rows = 24;
-const app_name = "Monstar";
+const app_name = "monstar";
 const sync_output_reset_ms = 1000;
 const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
@@ -258,6 +260,52 @@ const precision_scroll_multiplier = 10.0;
 
 /// Damage history length; shm buffers older than this get a full copy.
 const frame_damage_len = 8;
+
+pub const InitialSize = union(enum) {
+    default,
+    chars: struct { cols: u16, rows: u16 },
+    pixels: struct { width: u31, height: u31 },
+};
+
+pub const InitOptions = struct {
+    config_path: ?[:0]const u8 = null,
+    config_overrides: []const []const u8 = &.{},
+    working_directory: ?[:0]const u8 = null,
+    title: [:0]const u8 = "monstar",
+    initial_size: InitialSize = .default,
+};
+
+const StartupSize = struct {
+    cols: u16,
+    rows: u16,
+    window: Window.InitialSize,
+};
+
+fn initialTerminalSize(size: InitialSize, font: *const Font) StartupSize {
+    return switch (size) {
+        .default => .{
+            .cols = initial_cols,
+            .rows = initial_rows,
+            .window = .{},
+        },
+        .chars => |chars| .{
+            .cols = chars.cols,
+            .rows = chars.rows,
+            .window = .{
+                .width = chars.cols * font.cell_width,
+                .height = chars.rows * font.cell_height,
+            },
+        },
+        .pixels => |pixels| .{
+            .cols = @intCast(@min(std.math.maxInt(u16), @max(1, pixels.width / font.cell_width))),
+            .rows = @intCast(@min(std.math.maxInt(u16), @max(1, pixels.height / font.cell_height))),
+            .window = .{
+                .width = pixels.width,
+                .height = pixels.height,
+            },
+        },
+    };
+}
 
 /// What one frame changed, recorded so stale shm buffers can be brought
 /// current from the newest rendered shm buffer without copying everything.
@@ -370,21 +418,24 @@ pub fn init(
     path: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
+    options: InitOptions,
 ) !*App {
     var font: Font = try .init(alloc, config.font_family, config.font_size);
     errdefer font.deinit(alloc);
 
     vt.sys.decode_png = decodePng;
 
+    const startup_size = initialTerminalSize(options.initial_size, &font);
+
     var term: vt.Terminal = try .init(io, alloc, .{
-        .cols = initial_cols,
-        .rows = initial_rows,
+        .cols = startup_size.cols,
+        .rows = startup_size.rows,
         .max_scrollback = config.scrollback,
         .colors = config.terminalColors(),
     });
     errdefer term.deinit(alloc);
-    term.width_px = initial_cols * font.cell_width;
-    term.height_px = initial_rows * font.cell_height;
+    term.width_px = startup_size.cols * font.cell_width;
+    term.height_px = startup_size.rows * font.cell_height;
 
     // Child-exit detection is driven by SIGCHLD, not pty EOF; config
     // reloads are driven by SIGUSR1. Block both and receive them through
@@ -412,10 +463,10 @@ pub fn init(
     };
 
     var pty: Pty = try .open(.{
-        .row = initial_rows,
-        .col = initial_cols,
-        .xpixel = @intCast(initial_cols * font.cell_width),
-        .ypixel = @intCast(initial_rows * font.cell_height),
+        .row = startup_size.rows,
+        .col = startup_size.cols,
+        .xpixel = @intCast(startup_size.cols * font.cell_width),
+        .ypixel = @intCast(startup_size.rows * font.cell_height),
     });
     errdefer pty.deinit();
 
@@ -427,7 +478,10 @@ pub fn init(
     // systemd's reply and the pid migration land while we set up the
     // window, and the gate is released once both are confirmed below.
     const use_cgroup_scope = dbus_connection != null and cgroup.systemdBooted();
-    const child_pid = try pty.spawn(path, argv, envp, .{ .gate_child = use_cgroup_scope });
+    const child_pid = try pty.spawn(path, argv, envp, .{
+        .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
+        .gate_child = use_cgroup_scope,
+    });
     var pending_scope: ?cgroup.Pending = null;
     if (use_cgroup_scope) {
         pending_scope = cgroup.startMoveIntoScope(dbus_connection.?, @intCast(child_pid)) catch blk: {
@@ -444,7 +498,7 @@ pub fn init(
     // space) while we respond to queries embedded in that output.
     setNonblocking(pty.master);
 
-    const window = try Window.create(alloc, config.app_id);
+    const window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
     errdefer window.destroy();
 
     // Timerfds must be nonblocking: disarming a timerfd clears its
@@ -490,6 +544,8 @@ pub fn init(
         .io = io,
         .config_arena = .init(alloc),
         .config = config,
+        .config_path = options.config_path,
+        .config_overrides = options.config_overrides,
         .environ = environ,
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
@@ -647,7 +703,7 @@ const Handler = TerminalHandler;
 const Effects = Handler.Effects;
 
 /// Effects callbacks only receive the terminal handler; walk back up through
-/// Monstar's wrapper handler.
+/// monstar's wrapper handler.
 fn appFromHandler(handler: *Handler) *App {
     const app_handler: *AppStreamHandler = @fieldParentPtr("terminal_handler", handler);
     return app_handler.app;
@@ -1376,7 +1432,17 @@ fn reloadConfig(self: *App) void {
     var committed = false;
     defer if (!committed) arena_state.deinit();
 
-    const new_config = Config.load(arena_state.allocator(), self.environ);
+    const arena = arena_state.allocator();
+    var new_config = if (self.config_path) |path|
+        Config.loadPath(arena, path)
+    else
+        Config.load(arena, self.environ);
+    for (self.config_overrides) |override| {
+        new_config.applyOverride(arena, override) catch |err| {
+            log.warn("config override failed: {s}: {}", .{ override, err });
+            return;
+        };
+    }
     self.applyConfig(new_config) catch |err| {
         log.warn("config reload failed: {}", .{err});
         return;

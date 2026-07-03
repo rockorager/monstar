@@ -1,6 +1,6 @@
-# Monstar
+# monstar
 
-Monstar is a small Wayland terminal emulator written in Zig, built on Ghostty's terminal core.
+monstar is a small Wayland terminal emulator written in Zig, built on Ghostty's terminal core.
 
 ## Building
 
@@ -19,6 +19,34 @@ zig build -Doptimize=ReleaseFast install --prefix $HOME/.local
 ```sh
 zig build run
 ```
+
+Run a command directly in a new terminal window:
+
+```sh
+monstar -e ls -la
+```
+
+Use `--` to run a command through `/bin/sh -c`:
+
+```sh
+monstar -- 'echo "$SHELL"'
+```
+
+Set the child's working directory:
+
+```sh
+monstar --working-directory /tmp -e env A=B
+```
+
+Useful launcher/scripting options include:
+
+```sh
+monstar --title scratch --app-id com.example.scratchpad \
+  --window-size-chars 100x32 --font "Iosevka" \
+  -o scrollback=20000 -e fish
+```
+
+Run `monstar --help` for the full option list.
 
 Configuration is read from `$XDG_CONFIG_HOME/monstar/config` or `~/.config/monstar/config`.
 Send `SIGUSR1` to reload the config for a running process:

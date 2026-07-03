@@ -1,8 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=Monstar
+Name=monstar
 Comment=Wayland terminal emulator
 Exec=monstar
 Terminal=false
 StartupNotify=true
 Categories=System;TerminalEmulator;
+X-TerminalArgExec=-e
+X-TerminalArgAppId=--app-id=
+X-TerminalArgTitle=--title=
+X-TerminalArgDir=--working-directory=

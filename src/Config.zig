@@ -42,8 +42,8 @@ palette: [16]?vt.color.RGB = @splat(null),
 
 pub const FrameTimer = enum { off, overlay, log, both };
 
-/// Load the config file, if any. Strings are allocated in `arena` and
-/// live as long as it does.
+/// Load the default config file, if any. Strings are allocated in `arena`
+/// and live as long as it does.
 pub fn load(arena: std.mem.Allocator, environ: std.process.Environ) Config {
     const path = path: {
         if (environ.getPosix("XDG_CONFIG_HOME")) |base| {
@@ -55,6 +55,11 @@ pub fn load(arena: std.mem.Allocator, environ: std.process.Environ) Config {
         return .{};
     };
 
+    return loadPath(arena, path);
+}
+
+/// Load a specific config file. Missing or unreadable file means defaults.
+pub fn loadPath(arena: std.mem.Allocator, path: [:0]const u8) Config {
     const text = readFile(arena, path) orelse return .{};
     log.info("loaded {s}", .{path});
     return parse(arena, text);
@@ -87,9 +92,17 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Config {
     return config;
 }
 
-const SetError = error{ InvalidValue, UnknownKey, OutOfMemory };
+pub const SetError = error{ InvalidValue, UnknownKey, OutOfMemory };
 
-fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8) SetError!void {
+pub fn applyOverride(self: *Config, arena: std.mem.Allocator, text: []const u8) SetError!void {
+    const eq = std.mem.indexOfScalar(u8, text, '=') orelse return error.InvalidValue;
+    const key = std.mem.trim(u8, text[0..eq], " \t");
+    const value = std.mem.trim(u8, text[eq + 1 ..], " \t");
+    if (key.len == 0 or value.len == 0) return error.InvalidValue;
+    try self.set(arena, key, value);
+}
+
+pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8) SetError!void {
     if (std.mem.eql(u8, key, "app-id")) {
         self.app_id = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "font-family")) {

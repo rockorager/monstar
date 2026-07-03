@@ -18,6 +18,8 @@ gate: posix.fd_t,
 pub const Error = error{PtyFailed};
 
 pub const SpawnOptions = struct {
+    /// Child working directory. Null inherits the parent's cwd.
+    cwd: ?[*:0]const u8 = null,
     /// Hold the child just before exec until `releaseChild` is called
     /// (or the Pty is deinitialized). Lets the parent move the child
     /// into a cgroup before it can spawn grandchildren.
@@ -114,6 +116,9 @@ pub fn spawn(
         _ = linux.dup2(self.slave, 2);
         _ = linux.close(self.master);
         if (self.slave > 2) _ = linux.close(self.slave);
+        if (options.cwd) |cwd| {
+            if (linux.errno(linux.chdir(cwd)) != .SUCCESS) linux.exit(126);
+        }
         if (options.gate_child) {
             // Close our copy of the write end so the parent closing
             // its end is observable as EOF. A byte or EOF both mean go;

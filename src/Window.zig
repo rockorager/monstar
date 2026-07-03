@@ -126,6 +126,11 @@ pub const TextInputRect = struct {
     height: i32,
 };
 
+pub const InitialSize = struct {
+    width: u31 = default_width,
+    height: u31 = default_height,
+};
+
 /// Called when the output scale changed, before the resize/draw that
 /// follows. `scale120` is the scale in 1/120ths (120 == 1.0).
 pub const ScaleFn = *const fn (ctx: *anyopaque, scale120: u32) anyerror!void;
@@ -147,7 +152,12 @@ const Globals = struct {
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
-pub fn create(alloc: std.mem.Allocator, app_id: [:0]const u8) !*Window {
+pub fn create(
+    alloc: std.mem.Allocator,
+    app_id: [:0]const u8,
+    title: [:0]const u8,
+    initial_size: InitialSize,
+) !*Window {
     const display = try wl.Display.connect(null);
     errdefer display.disconnect();
 
@@ -164,7 +174,7 @@ pub fn create(alloc: std.mem.Allocator, app_id: [:0]const u8) !*Window {
     const xdg_surface = try wm_base.getXdgSurface(surface);
     const toplevel = try xdg_surface.getToplevel();
     toplevel.setAppId(app_id);
-    toplevel.setTitle("monstar");
+    toplevel.setTitle(title);
 
     const toplevel_decoration = decoration: {
         const manager = globals.decoration_manager orelse break :decoration null;
@@ -252,8 +262,8 @@ pub fn create(alloc: std.mem.Allocator, app_id: [:0]const u8) !*Window {
         // fires before the first draw.
         .width = 0,
         .height = 0,
-        .pending_width = default_width,
-        .pending_height = default_height,
+        .pending_width = initial_size.width,
+        .pending_height = initial_size.height,
         .scale120 = 120,
         .running = true,
         .fatal_error = null,
