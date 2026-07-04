@@ -65,6 +65,11 @@ pending_height: u31,
 /// Output scale in 1/120ths (wp_fractional_scale unit); 120 == 1.0.
 /// Buffers are sized in physical pixels: logical * scale120 / 120.
 scale120: u32,
+/// Wayland callbacks update pending state; expensive/app-visible work is
+/// flushed once after the current dispatch batch.
+pending_scale_changed: bool,
+pending_geometry_changed: bool,
+pending_draw: bool,
 running: bool,
 fatal_error: ?anyerror,
 /// A frame callback is outstanding; drawing now would outpace the
@@ -265,6 +270,9 @@ pub fn create(
         .pending_width = initial_size.width,
         .pending_height = initial_size.height,
         .scale120 = 120,
+        .pending_scale_changed = false,
+        .pending_geometry_changed = false,
+        .pending_draw = false,
         .running = true,
         .fatal_error = null,
         .frame_pending = false,
@@ -327,7 +335,33 @@ pub fn destroy(self: *Window) void {
 /// the window has been closed.
 pub fn dispatch(self: *Window) !bool {
     if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+    self.flushPending();
     return self.running;
+}
+
+/// Apply coalesced state from the most recent Wayland dispatch batch. Scale,
+/// configure, and redraw events can arrive as a related group; doing the
+/// expensive side effects here avoids resizing/drawing intermediate states.
+pub fn flushPending(self: *Window) void {
+    if (!self.running) return;
+
+    if (self.pending_scale_changed) {
+        self.pending_scale_changed = false;
+        if (self.scale_fn) |scale_fn| {
+            scale_fn(self.render_ctx.?, self.scale120) catch |err| {
+                log.err("scale handler failed: {}", .{err});
+                self.fatal_error = err;
+                self.running = false;
+                return;
+            };
+        }
+    }
+
+    if (!self.pending_draw) return;
+    const resized = self.pending_geometry_changed;
+    self.pending_draw = false;
+    self.pending_geometry_changed = false;
+    self.geometryChanged(resized);
 }
 
 /// Set the delegates for drawing, resizing, input, and scale.
@@ -669,7 +703,8 @@ fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, self:
                 self.height != self.pending_height;
             self.width = self.pending_width;
             self.height = self.pending_height;
-            self.geometryChanged(resized);
+            self.pending_geometry_changed = self.pending_geometry_changed or resized;
+            self.pending_draw = true;
         },
     }
 }
@@ -711,16 +746,11 @@ fn fractionalScaleListener(
             if (preferred.scale == self.scale120) return;
             log.debug("scale changed to {d}/120", .{preferred.scale});
             self.scale120 = preferred.scale;
-            if (self.scale_fn) |scale_fn| {
-                scale_fn(self.render_ctx.?, self.scale120) catch |err| {
-                    log.err("scale handler failed: {}", .{err});
-                    self.fatal_error = err;
-                    self.running = false;
-                    return;
-                };
+            self.pending_scale_changed = true;
+            if (self.width > 0) {
+                self.pending_geometry_changed = true;
+                self.pending_draw = true;
             }
-            // Before the first configure there is nothing to redraw yet.
-            if (self.width > 0) self.geometryChanged(true);
         },
     }
 }

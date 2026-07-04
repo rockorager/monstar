@@ -1303,6 +1303,7 @@ pub fn run(self: *App) !void {
         // requests, then sleep until one of the fds is ready.
         while (!display.prepareRead()) {
             if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
+            self.window.flushPending();
         }
         switch (display.flush()) {
             .SUCCESS => {},
@@ -1339,6 +1340,7 @@ pub fn run(self: *App) !void {
             display.cancelRead();
         }
         if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
+        self.window.flushPending();
 
         if (signal_fd.revents & posix.POLL.IN != 0) {
             self.drainSignals();
