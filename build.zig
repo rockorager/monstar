@@ -73,8 +73,8 @@ pub fn build(b: *std.Build) void {
         .name = "monstar",
         .root_module = root_module,
     });
-    root_module.addCSourceFile(.{ .file = b.path("src/vendor/stb_image_resize.c") });
-    root_module.addCSourceFile(.{ .file = b.path("src/vendor/stb_image.c") });
+    root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image_resize.c") });
+    root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image.c") });
 
     b.installArtifact(exe);
     b.installFile("dist/dev.rockorager.monstar.desktop", "share/applications/dev.rockorager.monstar.desktop");

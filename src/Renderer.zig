@@ -61,6 +61,8 @@ repainted: std.DynamicBitSetUnmanaged,
 shape_cache: std.StringHashMapUnmanaged([]ShapedGlyph),
 /// Scratch for the current run's cache key.
 shape_key: std.ArrayList(u32),
+/// Scratch codepoints for cluster-width measurement of overlay text.
+codepoint_scratch: std.ArrayList(u21),
 /// Shape cache counters for benchmarks/profiling. Production rendering does
 /// not read these, so they stay deliberately cheap and approximate.
 shape_stats: ShapeStats = .{},
@@ -109,6 +111,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .repainted = .{},
         .shape_cache = .empty,
         .shape_key = .empty,
+        .codepoint_scratch = .empty,
         .shape_stats = .{},
     };
 }
@@ -125,6 +128,7 @@ pub fn deinit(self: *Renderer) void {
     self.clearShapeCache();
     self.shape_cache.deinit(self.alloc);
     self.shape_key.deinit(self.alloc);
+    self.codepoint_scratch.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -474,12 +478,19 @@ pub fn renderPreedit(
     var x: u31 = @intCast(cursor.x -| @intFromBool(cursor.wide_tail));
     const y: u31 = @intCast(cursor.y);
     const baseline_y: i32 = @as(i32, y) * self.font.cell_height + self.font.baseline;
-    var it = (try std.unicode.Utf8View.init(text)).iterator();
-    while (it.nextCodepoint()) |cp| {
-        const span = codepointCellWidth(cp);
+    const cps = try self.overlayCodepoints(text);
+
+    var i: usize = 0;
+    while (i < cps.len) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        i += cluster.len;
+
+        const span: u31 = cluster.width;
         if (span == 0) continue;
         if (x >= state.cols) break;
         const clipped_span: u31 = @min(span, state.cols - x);
+        const cp = cps[i - cluster.len];
 
         fillRect(
             pixels,
@@ -543,12 +554,19 @@ pub fn renderLinkHint(
         argb(bg),
     );
 
-    var it = (try std.unicode.Utf8View.init(uri)).iterator();
-    while (it.nextCodepoint()) |cp| {
-        const span = codepointCellWidth(cp);
+    const cps = try self.overlayCodepoints(uri);
+
+    var i: usize = 0;
+    while (i < cps.len) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        i += cluster.len;
+
+        const span: u31 = cluster.width;
         if (span == 0) continue;
         if (x >= text_limit) break;
         const clipped_span: u31 = @min(span, text_limit - x);
+        const cp = cps[i - cluster.len];
 
         fillRect(
             pixels,
@@ -1464,33 +1482,11 @@ fn cellSpan(cell: vt.Cell) u31 {
     return if (cell.wide == .wide) 2 else 1;
 }
 
-fn codepointCellWidth(cp: u21) u31 {
-    if (cp < 0x20) return 0;
-    if (isCombiningCodepoint(cp)) return 0;
-    return if (isWideCodepoint(cp)) 2 else 1;
-}
-
-fn isCombiningCodepoint(cp: u21) bool {
-    return (cp >= 0x0300 and cp <= 0x036f) or
-        (cp >= 0x1ab0 and cp <= 0x1aff) or
-        (cp >= 0x1dc0 and cp <= 0x1dff) or
-        (cp >= 0x20d0 and cp <= 0x20ff) or
-        (cp >= 0xfe20 and cp <= 0xfe2f);
-}
-
-fn isWideCodepoint(cp: u21) bool {
-    return (cp >= 0x1100 and cp <= 0x115f) or
-        cp == 0x2329 or cp == 0x232a or
-        (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
-        (cp >= 0xac00 and cp <= 0xd7a3) or
-        (cp >= 0xf900 and cp <= 0xfaff) or
-        (cp >= 0xfe10 and cp <= 0xfe19) or
-        (cp >= 0xfe30 and cp <= 0xfe6f) or
-        (cp >= 0xff00 and cp <= 0xff60) or
-        (cp >= 0xffe0 and cp <= 0xffe6) or
-        (cp >= 0x1f300 and cp <= 0x1f64f) or
-        (cp >= 0x1f900 and cp <= 0x1f9ff) or
-        (cp >= 0x20000 and cp <= 0x3fffd);
+fn overlayCodepoints(self: *Renderer, text: []const u8) ![]const u21 {
+    self.codepoint_scratch.clearRetainingCapacity();
+    var it = (try std.unicode.Utf8View.init(text)).iterator();
+    while (it.nextCodepoint()) |cp| try self.codepoint_scratch.append(self.alloc, cp);
+    return self.codepoint_scratch.items;
 }
 
 /// Renderer-only glyph constraint width, matching Ghostty's symbol heuristic:
