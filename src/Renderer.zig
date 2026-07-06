@@ -1412,12 +1412,25 @@ fn drawRun(
         }
         const cluster_x: usize = @intCast(cluster);
         const constraint_width = constraintWidth(raws, cluster_x, raws.len);
-        const g = try face.glyph(
+        const cp = cellCodepoint(raws[cluster_x]);
+        const g = face.glyph(
             self.alloc,
             sg.glyph,
             constraint_width,
-            isSymbol(cellCodepoint(raws[cluster_x])),
-        );
+            isSymbol(cp),
+        ) catch |err| switch (err) {
+            error.FontLoadFailed, error.GlyphResizeFailed => {
+                log.warn("skipping glyph render face={d} glyph={d} codepoint=U+{X}: {}", .{
+                    face_index,
+                    sg.glyph,
+                    cp,
+                    err,
+                });
+                pen_x += sg.x_advance;
+                continue;
+            },
+            else => |e| return e,
+        };
         self.noteOverhang(@as(i32, font.baseline) - sg.y_offset - g.bearing_y, g.height);
         blitGlyph(
             pixels,
