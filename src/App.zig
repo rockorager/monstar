@@ -1463,12 +1463,10 @@ fn reloadConfig(self: *App) void {
 }
 
 /// Ctrl+Shift+N: spawn an independent monstar window in the shell's
-/// current directory. The directory comes from OSC 7 if the shell
-/// reports it; otherwise the child inherits our cwd, which is where
-/// this window's shell started.
+/// current directory. Prefer the user service manager so the new window
+/// is not adopted by this monstar's launcher; fall back through known
+/// compositor launchers and finally a direct detached fork.
 fn spawnNewWindow(self: *App) void {
-    const linux = std.os.linux;
-
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1478,11 +1476,164 @@ fn spawnNewWindow(self: *App) void {
         break :pwd osc7Path(arena, url) catch null;
     };
 
-    const argv = [_:null]?[*:0]const u8{"monstar"};
     const envp = self.spawnEnvp(arena, pwd) catch |err| {
         log.err("spawn env setup failed: {}", .{err});
         return;
     };
+    const exe_path = currentExePath(arena) catch |err| exe_path: {
+        log.warn("current executable lookup failed: {}", .{err});
+        break :exe_path "monstar";
+    };
+
+    if (self.spawnSystemdRun(arena, envp, exe_path, pwd)) return;
+    if (self.spawnSwayExec(arena, envp, exe_path, pwd)) return;
+    if (self.spawnHyprlandExec(arena, envp, exe_path, pwd)) return;
+    spawnDetachedMonstar(envp, exe_path, pwd);
+}
+
+fn spawnSystemdRun(
+    self: *App,
+    arena: std.mem.Allocator,
+    envp: [*:null]const ?[*:0]const u8,
+    exe_path: [:0]const u8,
+    pwd: ?[:0]const u8,
+) bool {
+    const systemd_run = resolveCommandPath(arena, self.environ, "systemd-run") catch |err| {
+        log.warn("systemd-run lookup failed: {}", .{err});
+        return false;
+    };
+
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    argv.appendSlice(arena, &.{ "systemd-run", "--user", "--collect" }) catch |err| {
+        log.err("systemd-run argv setup failed: {}", .{err});
+        return false;
+    };
+    if (pwd) |p| {
+        const cwd_arg = std.fmt.allocPrintSentinel(arena, "--working-directory={s}", .{p}, 0) catch |err| {
+            log.err("systemd-run cwd setup failed: {}", .{err});
+            return false;
+        };
+        argv.append(arena, cwd_arg.ptr) catch |err| {
+            log.err("systemd-run argv setup failed: {}", .{err});
+            return false;
+        };
+    }
+    argv.append(arena, exe_path.ptr) catch |err| {
+        log.err("systemd-run argv setup failed: {}", .{err});
+        return false;
+    };
+    const argv_slice = argv.toOwnedSliceSentinel(arena, null) catch |err| {
+        log.err("systemd-run argv setup failed: {}", .{err});
+        return false;
+    };
+    return spawnLauncher(systemd_run, argv_slice.ptr, envp, "systemd-run");
+}
+
+fn spawnSwayExec(
+    self: *App,
+    arena: std.mem.Allocator,
+    envp: [*:null]const ?[*:0]const u8,
+    exe_path: [:0]const u8,
+    pwd: ?[:0]const u8,
+) bool {
+    if (self.environ.getPosix("SWAYSOCK") == null) return false;
+    const swaymsg = resolveCommandPath(arena, self.environ, "swaymsg") catch |err| {
+        log.warn("swaymsg lookup failed: {}", .{err});
+        return false;
+    };
+    const command = spawnNewWindowShellCommand(arena, exe_path, pwd) catch |err| {
+        log.err("sway exec command setup failed: {}", .{err});
+        return false;
+    };
+    const argv = [_:null]?[*:0]const u8{ "swaymsg", "exec", command.ptr };
+    return spawnLauncher(swaymsg, &argv, envp, "swaymsg exec");
+}
+
+fn spawnHyprlandExec(
+    self: *App,
+    arena: std.mem.Allocator,
+    envp: [*:null]const ?[*:0]const u8,
+    exe_path: [:0]const u8,
+    pwd: ?[:0]const u8,
+) bool {
+    if (self.environ.getPosix("HYPRLAND_INSTANCE_SIGNATURE") == null) return false;
+    const hyprctl = resolveCommandPath(arena, self.environ, "hyprctl") catch |err| {
+        log.warn("hyprctl lookup failed: {}", .{err});
+        return false;
+    };
+    const command = spawnNewWindowShellCommand(arena, exe_path, pwd) catch |err| {
+        log.err("hyprland exec command setup failed: {}", .{err});
+        return false;
+    };
+    const argv = [_:null]?[*:0]const u8{ "hyprctl", "dispatch", "exec", command.ptr };
+    return spawnLauncher(hyprctl, &argv, envp, "hyprctl exec");
+}
+
+fn spawnNewWindowShellCommand(
+    arena: std.mem.Allocator,
+    exe_path: [:0]const u8,
+    pwd: ?[:0]const u8,
+) ![:0]const u8 {
+    const exe = try shellQuote(arena, exe_path);
+    const dir = pwd orelse return try arena.dupeZ(u8, exe);
+    const quoted = try shellQuote(arena, dir);
+    return try std.fmt.allocPrintSentinel(arena, "{s} --working-directory {s}", .{ exe, quoted }, 0);
+}
+
+fn shellQuote(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.append(arena, '\'');
+    for (value) |byte| {
+        if (byte == '\'') {
+            try buf.appendSlice(arena, "'\\''");
+        } else {
+            try buf.append(arena, byte);
+        }
+    }
+    try buf.append(arena, '\'');
+    return buf.toOwnedSlice(arena);
+}
+
+test "shell quote for launcher commands" {
+    const actual = try shellQuote(std.testing.allocator, "/tmp/it isn't here");
+    defer std.testing.allocator.free(actual);
+    try std.testing.expectEqualStrings("'/tmp/it isn'\\''t here'", actual);
+}
+
+fn spawnLauncher(
+    path: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    label: []const u8,
+) bool {
+    const linux = std.os.linux;
+
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) {
+        log.err("{s} fork failed: {}", .{ label, linux.errno(fork_rc) });
+        return false;
+    }
+    const pid: posix.pid_t = @intCast(fork_rc);
+
+    if (pid == 0) {
+        const empty_mask = posix.sigemptyset();
+        posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
+        _ = linux.execve(path, argv, envp);
+        linux.exit(127);
+    }
+
+    var status: u32 = undefined;
+    _ = linux.wait4(pid, &status, 0, null);
+    return waitStatusExitedZero(status);
+}
+
+fn spawnDetachedMonstar(
+    envp: [*:null]const ?[*:0]const u8,
+    exe_path: [:0]const u8,
+    pwd: ?[:0]const u8,
+) void {
+    const linux = std.os.linux;
+    const argv = [_:null]?[*:0]const u8{"monstar"};
 
     // Double fork: the intermediate child exits immediately so init
     // adopts the new window and it never lingers as our zombie.
@@ -1503,13 +1654,44 @@ fn spawnNewWindow(self: *App) void {
         if (linux.fork() != 0) linux.exit(0); // second-fork parent, or fork failure
 
         if (pwd) |p| _ = linux.chdir(p.ptr);
-        _ = linux.execve("/proc/self/exe", &argv, envp);
+        _ = linux.execve(exe_path.ptr, &argv, envp);
         linux.exit(127); // exec failed
     }
 
     // Reap the intermediate child; it exits right after the second fork.
     var status: u32 = undefined;
     _ = linux.wait4(pid, &status, 0, null);
+}
+
+fn waitStatusExitedZero(status: u32) bool {
+    return (status & 0x7f) == 0 and (status >> 8) == 0;
+}
+
+fn currentExePath(arena: std.mem.Allocator) ![:0]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rc = std.os.linux.readlink("/proc/self/exe", &buf, buf.len);
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.CurrentExeUnavailable;
+    if (rc == buf.len) return error.NameTooLong;
+    return try arena.dupeZ(u8, buf[0..rc]);
+}
+
+fn resolveCommandPath(
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    command: [:0]const u8,
+) ![*:0]const u8 {
+    if (std.mem.indexOfScalar(u8, command, '/') != null) return command.ptr;
+
+    const path_env = environ.getPosix("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
+    var dirs = std.mem.splitScalar(u8, path_env, ':');
+    while (dirs.next()) |dir| {
+        const base = if (dir.len == 0) "." else dir;
+        const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, command }, 0);
+        if (std.os.linux.errno(std.os.linux.access(candidate, std.os.linux.X_OK)) == .SUCCESS) {
+            return candidate.ptr;
+        }
+    }
+    return command.ptr;
 }
 
 /// Ctrl+Shift+Z/X: move the scrollback viewport between OSC 133 prompt marks.
