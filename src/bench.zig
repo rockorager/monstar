@@ -33,7 +33,7 @@ pub fn run(init: std.process.Init) !void {
         .cols = cols,
         .rows = rows,
         .max_scrollback = config.scrollback,
-        .colors = config.terminalColors(),
+        .colors = config.terminalColors(.dark),
     });
     defer term.deinit(alloc);
     term.width_px = width;
@@ -234,7 +234,7 @@ fn benchFullGrid(
         .cols = bench_cols,
         .rows = bench_rows,
         .max_scrollback = config.scrollback,
-        .colors = config.terminalColors(),
+        .colors = config.terminalColors(.dark),
     });
     defer term.deinit(alloc);
     term.width_px = width;
@@ -339,7 +339,7 @@ fn benchShapePrefixChurn(
         .cols = bench_cols,
         .rows = bench_rows,
         .max_scrollback = config.scrollback,
-        .colors = config.terminalColors(),
+        .colors = config.terminalColors(.dark),
     });
     defer term.deinit(alloc);
     term.width_px = width;

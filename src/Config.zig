@@ -16,9 +16,9 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub const default_app_id = "dev.rockorager.monstar";
-pub const default_theme: Theme = .dark;
+pub const default_theme: Theme = .system;
 
-pub const Theme = enum { light, dark };
+pub const Theme = enum { system, light, dark };
 
 pub const ThemeColors = struct {
     background: vt.color.RGB,
@@ -230,24 +230,35 @@ fn parseColor(value: []const u8) error{InvalidValue}!vt.color.RGB {
 
 pub fn themeColors(theme: Theme) ThemeColors {
     return switch (theme) {
+        .system => dark_theme,
         .light => light_theme,
         .dark => dark_theme,
     };
 }
 
-pub fn effectiveSelectionBackground(self: *const Config) vt.color.RGB {
-    return self.selection_background orelse themeColors(self.theme).selection_background;
+pub fn effectiveTheme(self: *const Config, color_scheme: vt.device_status.ColorScheme) Theme {
+    return switch (self.theme) {
+        .system => switch (color_scheme) {
+            .light => .light,
+            .dark => .dark,
+        },
+        .light, .dark => self.theme,
+    };
 }
 
-pub fn effectiveSelectionForeground(self: *const Config) vt.color.RGB {
-    return self.selection_foreground orelse themeColors(self.theme).selection_foreground;
+pub fn effectiveSelectionBackground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
+    return self.selection_background orelse themeColors(self.effectiveTheme(color_scheme)).selection_background;
+}
+
+pub fn effectiveSelectionForeground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
+    return self.selection_foreground orelse themeColors(self.effectiveTheme(color_scheme)).selection_foreground;
 }
 
 /// The terminal color options this config describes: config colors form
 /// the *default* layer, so OSC 10/11/12/4 can still override and reset.
-pub fn terminalColors(self: *const Config) vt.Terminal.Colors {
+pub fn terminalColors(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.Terminal.Colors {
     var palette = vt.color.default;
-    const themed = themeColors(self.theme);
+    const themed = themeColors(self.effectiveTheme(color_scheme));
     for (themed.palette, 0..) |rgb, i| {
         palette[i] = rgb;
     }
@@ -291,8 +302,8 @@ test "defaults" {
     try std.testing.expectEqual(default_theme, config.theme);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
-    try std.testing.expectEqual(default_selection_background, config.effectiveSelectionBackground());
-    try std.testing.expectEqual(default_selection_foreground, config.effectiveSelectionForeground());
+    try std.testing.expectEqual(default_selection_background, config.effectiveSelectionBackground(.dark));
+    try std.testing.expectEqual(default_selection_foreground, config.effectiveSelectionForeground(.dark));
 }
 
 test "parse config" {
@@ -334,12 +345,25 @@ test "parse config" {
 test "terminal colors from config" {
     var config: Config = .{};
     config.background = .{ .r = 1, .g = 2, .b = 3 };
-    const colors = config.terminalColors();
+    const colors = config.terminalColors(.dark);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
     try std.testing.expectEqual(default_foreground, colors.foreground.get().?);
     try std.testing.expectEqual(default_cursor_color, colors.cursor.get().?);
     try std.testing.expectEqual(default_palette[0], colors.palette.current[0]);
     try std.testing.expectEqual(default_palette[15], colors.palette.current[15]);
+}
+
+test "system theme follows color scheme" {
+    const config: Config = .{};
+    try std.testing.expectEqual(Theme.system, config.theme);
+    try std.testing.expectEqual(Theme.dark, config.effectiveTheme(.dark));
+    try std.testing.expectEqual(Theme.light, config.effectiveTheme(.light));
+
+    const light_colors = config.terminalColors(.light);
+    try std.testing.expectEqual(light_theme.background, light_colors.background.get().?);
+    try std.testing.expectEqual(light_theme.foreground, light_colors.foreground.get().?);
+    try std.testing.expectEqual(light_theme.selection_background, config.effectiveSelectionBackground(.light));
+    try std.testing.expectEqual(light_theme.selection_foreground, config.effectiveSelectionForeground(.light));
 }
 
 test "dark theme" {
@@ -351,14 +375,14 @@ test "dark theme" {
         \\theme = dark
     );
 
-    const colors = config.terminalColors();
+    const colors = config.terminalColors(.light);
     try std.testing.expectEqual(Theme.dark, config.theme);
     try std.testing.expectEqual(dark_theme.background, colors.background.get().?);
     try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
     try std.testing.expectEqual(dark_theme.cursor_color, colors.cursor.get().?);
     try std.testing.expectEqual(dark_theme.palette[1], colors.palette.current[1]);
-    try std.testing.expectEqual(dark_theme.selection_background, config.effectiveSelectionBackground());
-    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground());
+    try std.testing.expectEqual(dark_theme.selection_background, config.effectiveSelectionBackground(.light));
+    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.light));
 }
 
 test "theme does not replace explicit color overrides" {
@@ -373,10 +397,10 @@ test "theme does not replace explicit color overrides" {
         \\theme = dark
     );
 
-    const colors = config.terminalColors();
+    const colors = config.terminalColors(.light);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
     try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, colors.palette.current[1]);
-    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveSelectionBackground());
-    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground());
+    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveSelectionBackground(.light));
+    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.light));
 }

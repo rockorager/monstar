@@ -68,7 +68,8 @@ compositor/window-manager rules:
 app-id = com.example.scratchpad
 ```
 
-Set `theme` to choose the built-in light or dark color theme. The default is `dark`:
+Set `theme` to choose the built-in light or dark color theme, or `system` to
+follow the desktop portal color scheme. The default is `system`:
 
 ```conf
 theme = light

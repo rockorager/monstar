@@ -433,7 +433,7 @@ pub fn init(
         .cols = startup_size.cols,
         .rows = startup_size.rows,
         .max_scrollback = config.scrollback,
-        .colors = config.terminalColors(),
+        .colors = config.terminalColors(.dark),
         .default_modes = .{ .grapheme_cluster = true },
     });
     errdefer term.deinit(alloc);
@@ -572,8 +572,8 @@ pub fn init(
         .font_size_px = config.font_size,
         .runtime_font_size = null,
         .renderer = try .init(alloc, &self.font, .{
-            .selection_background = config.effectiveSelectionBackground(),
-            .selection_foreground = config.effectiveSelectionForeground(),
+            .selection_background = config.effectiveSelectionBackground(.dark),
+            .selection_foreground = config.effectiveSelectionForeground(.dark),
         }),
         .window = window,
         .keyboard = try .init(),
@@ -882,7 +882,7 @@ fn readPortalColorScheme(self: *App) void {
     var reply_iter: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_init(reply, &reply_iter) == 0) return;
     const value = dbusVariantUint32(&reply_iter) orelse return;
-    self.color_scheme = portalColorScheme(value);
+    self.setColorScheme(portalColorScheme(value), false);
 }
 
 fn portalColorScheme(value: u32) vt.device_status.ColorScheme {
@@ -1180,8 +1180,13 @@ fn handlePortalSettingChanged(self: *App, message: *c.DBusMessage) void {
     const value = dbusVariantUint32(&iter) orelse return;
     const color_scheme = portalColorScheme(value);
     if (self.color_scheme == color_scheme) return;
+    self.setColorScheme(color_scheme, true);
+}
+
+fn setColorScheme(self: *App, color_scheme: vt.device_status.ColorScheme, report: bool) void {
     self.color_scheme = color_scheme;
-    if (self.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport();
+    self.applyColorDefaults();
+    if (report and self.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport();
 }
 
 fn handleNotificationActivationToken(self: *App, message: *c.DBusMessage) void {
@@ -1958,14 +1963,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     const desired_font_size = scaledFontSize(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
     const new_font: Font = try .init(self.alloc, new_config.font_family, desired_font_size);
 
-    const colors = new_config.terminalColors();
-    self.term.colors.background.default = colors.background.default;
-    self.term.colors.foreground.default = colors.foreground.default;
-    self.term.colors.cursor.default = colors.cursor.default;
-    self.term.colors.palette.changeDefault(colors.palette.original);
-
-    self.renderer.selection_bg = new_config.effectiveSelectionBackground();
-    self.renderer.selection_fg = new_config.effectiveSelectionForeground();
+    self.applyColorDefaultsForConfig(new_config);
     self.window.toplevel.setAppId(new_config.app_id);
 
     // Always rebuild the Font on config reload so a reload also picks up
@@ -1986,6 +1984,23 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
     self.render_state.dirty = .full;
     self.needs_redraw = true;
+}
+
+fn applyColorDefaults(self: *App) void {
+    self.applyColorDefaultsForConfig(self.config);
+    self.render_state.dirty = .full;
+    self.needs_redraw = true;
+}
+
+fn applyColorDefaultsForConfig(self: *App, config: Config) void {
+    const colors = config.terminalColors(self.color_scheme);
+    self.term.colors.background.default = colors.background.default;
+    self.term.colors.foreground.default = colors.foreground.default;
+    self.term.colors.cursor.default = colors.cursor.default;
+    self.term.colors.palette.changeDefault(colors.palette.original);
+
+    self.renderer.selection_bg = config.effectiveSelectionBackground(self.color_scheme);
+    self.renderer.selection_fg = config.effectiveSelectionForeground(self.color_scheme);
 }
 
 fn effectiveFontSize(self: *const App) u31 {
@@ -2097,8 +2112,8 @@ fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
 fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
     switch (target) {
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.renderer.selection_bg = self.config.effectiveSelectionBackground(),
-            .highlight_foreground => self.renderer.selection_fg = self.config.effectiveSelectionForeground(),
+            .highlight_background => self.renderer.selection_bg = self.config.effectiveSelectionBackground(self.color_scheme),
+            .highlight_foreground => self.renderer.selection_fg = self.config.effectiveSelectionForeground(self.color_scheme),
             else => return,
         },
         else => return,
