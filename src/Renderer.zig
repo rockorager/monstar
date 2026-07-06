@@ -1085,6 +1085,7 @@ fn prepareRow(
     try self.face_scratch.resize(self.alloc, cols);
     try self.reverse_scratch.resize(self.alloc, cols);
     const y_px: u31 = y * font.cell_height;
+    const graphemes = cells.items(.grapheme);
     var bg_run: BgRun = .{};
     for (0..cols) |x| {
         const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
@@ -1093,7 +1094,10 @@ fn prepareRow(
                 .codepoint, .codepoint_grapheme => {},
                 else => break :face 0,
             }
-            const cp = raws[x].content.codepoint.data;
+            const cp = faceCodepoint(
+                raws[x],
+                if (raws[x].content_tag == .codepoint_grapheme) graphemes[x] else &.{},
+            );
             if (cp == 0 or cp == ' ' or cp == kitty_placeholder) break :face 0;
             break :face self.font.faceForCodepointStyle(
                 self.alloc,
@@ -1382,12 +1386,7 @@ fn drawRun(
         const cp = raw.content.codepoint.data;
         if (cp != ' ' or raw.content_tag == .codepoint_grapheme) non_space = true;
         const rel: u32 = @intCast(x - start);
-        try self.shape_key.appendSlice(self.alloc, &.{ rel, cp });
-        if (raw.content_tag == .codepoint_grapheme) {
-            for (graphemes[x]) |extra| {
-                try self.shape_key.appendSlice(self.alloc, &.{ rel, extra });
-            }
-        }
+        try self.appendShapeKeyCodepoints(rel, cp, if (raw.content_tag == .codepoint_grapheme) graphemes[x] else &.{});
     }
     if (!non_space) return;
 
@@ -1477,6 +1476,13 @@ fn shapeRun(self: *Renderer, face: *Font.Face) ![]ShapedGlyph {
     return shaped;
 }
 
+fn appendShapeKeyCodepoints(self: *Renderer, rel: u32, cp: u21, grapheme: []const u21) !void {
+    try self.shape_key.appendSlice(self.alloc, &.{ rel, cp });
+    for (grapheme) |extra| {
+        try self.shape_key.appendSlice(self.alloc, &.{ rel, extra });
+    }
+}
+
 /// How many cells a cell's background covers (wide chars span two).
 fn cellSpan(cell: vt.Cell) u31 {
     return if (cell.wide == .wide) 2 else 1;
@@ -1514,6 +1520,54 @@ fn cellCodepoint(cell: vt.Cell) u21 {
     return switch (cell.content_tag) {
         .codepoint, .codepoint_grapheme => cell.content.codepoint.data,
         else => 0,
+    };
+}
+
+const emoji_presentation_face_codepoint: u21 = 0x1F600; // GRINNING FACE
+const emoji_keycap_face_codepoint: u21 = 0x1F51F; // KEYCAP: 10
+
+fn faceCodepoint(cell: vt.Cell, grapheme: []const u21) u21 {
+    const cp = cellCodepoint(cell);
+    if (cell.content_tag != .codepoint_grapheme) return cp;
+
+    if (isKeycapBase(cp) and std.mem.findScalar(u21, grapheme, 0x20E3) != null) {
+        return emoji_keycap_face_codepoint;
+    }
+    if (needsEmojiPresentationFace(cp, grapheme)) return emoji_presentation_face_codepoint;
+    return cp;
+}
+
+fn isKeycapBase(cp: u21) bool {
+    return switch (cp) {
+        '0'...'9', '#', '*' => true,
+        else => false,
+    };
+}
+
+fn needsEmojiPresentationFace(cp: u21, grapheme: []const u21) bool {
+    if (std.mem.findScalar(u21, grapheme, 0xFE0F) != null) return true;
+
+    if (std.mem.findScalar(u21, grapheme, 0x200D) != null) {
+        if (isEmojiCodepoint(cp)) return true;
+        for (grapheme) |extra| {
+            if (isEmojiCodepoint(extra)) return true;
+        }
+    }
+
+    return false;
+}
+
+fn isEmojiCodepoint(cp: u21) bool {
+    return switch (cp) {
+        0x00A9,
+        0x00AE,
+        0x2122,
+        0x3030,
+        0x303D,
+        0x2600...0x27BF,
+        0x1F000...0x1FAFF,
+        => true,
+        else => false,
     };
 }
 
@@ -1867,6 +1921,140 @@ test "blendAlphaSpan matches scalar blend" {
             try std.testing.expectEqualSlices(u32, want[0..len], got[0..len]);
         }
     }
+}
+
+test "emoji keycap grapheme selects emoji fallback face" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{
+        .cols = 4,
+        .rows = 1,
+        .default_modes = .{ .grapheme_cluster = true },
+    });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+
+    stream.nextSlice("1\xEF\xB8\x8F\xE2\x83\xA3");
+    try state.update(alloc, &term);
+
+    const cells = state.row_data.get(0).cells.slice();
+    const raws = cells.items(.raw);
+    const graphemes = cells.items(.grapheme);
+    try testing.expectEqual(.codepoint_grapheme, raws[0].content_tag);
+    try testing.expectEqual(@as(u21, '1'), raws[0].content.codepoint.data);
+    try testing.expectEqualSlices(u21, &.{ 0xFE0F, 0x20E3 }, graphemes[0]);
+    try testing.expectEqual(emoji_keycap_face_codepoint, faceCodepoint(raws[0], graphemes[0]));
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    const keycap_face = font.faceForCodepoint(alloc, emoji_keycap_face_codepoint);
+    if (keycap_face == 0) return error.SkipZigTest;
+
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 4;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+    try testing.expectEqual(keycap_face, renderer.face_scratch.items[0]);
+
+    renderer.shape_key.clearRetainingCapacity();
+    try renderer.shape_key.append(alloc, keycap_face);
+    try renderer.appendShapeKeyCodepoints(0, raws[0].content.codepoint.data, graphemes[0]);
+    try testing.expectEqualSlices(u32, &.{ keycap_face, 0, '1', 0, 0xFE0F, 0, 0x20E3 }, renderer.shape_key.items);
+    try testing.expect(try renderer.shapeKeyHasColorGlyph(font.face(keycap_face)));
+
+    try renderer.render(&state, pixels, width, height);
+    try testing.expect(chromaticPixelCount(pixels) > 0);
+}
+
+test "emoji presentation graphemes select emoji fallback face" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    const emoji_face = font.faceForCodepoint(alloc, emoji_presentation_face_codepoint);
+    if (emoji_face == 0) return error.SkipZigTest;
+    const emoji_glyph_idx = c.FT_Get_Char_Index(font.face(emoji_face).ft_face, emoji_presentation_face_codepoint);
+    if (emoji_glyph_idx == 0) return error.SkipZigTest;
+    const emoji_glyph = try font.face(emoji_face).glyph(alloc, emoji_glyph_idx, 2, false);
+    if (emoji_glyph.format != .bgra) return error.SkipZigTest;
+
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+
+    const width: u31 = font.cell_width * 8;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    const cases = [_][]const u8{
+        "\xE2\x9D\xA4\xEF\xB8\x8F", // heart emoji
+        "\xC2\xA9\xEF\xB8\x8F", // copyright emoji
+        "\xE2\x84\xA2\xEF\xB8\x8F", // trademark emoji
+        "\xE2\x98\x80\xEF\xB8\x8F", // sun emoji
+        "\xE2\x9D\xA4\xEF\xB8\x8F\xE2\x80\x8D\xF0\x9F\x94\xA5", // heart on fire
+    };
+
+    for (cases) |text| {
+        term.fullReset();
+        stream.nextSlice(text);
+        try state.update(alloc, &term);
+
+        const cells = state.row_data.get(0).cells.slice();
+        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+        try testing.expectEqual(emoji_face, renderer.face_scratch.items[0]);
+
+        const raws = cells.items(.raw);
+        const graphemes = cells.items(.grapheme);
+        renderer.shape_key.clearRetainingCapacity();
+        try renderer.shape_key.append(alloc, emoji_face);
+        try renderer.appendShapeKeyCodepoints(
+            0,
+            raws[0].content.codepoint.data,
+            if (raws[0].content_tag == .codepoint_grapheme) graphemes[0] else &.{},
+        );
+        try testing.expect(try renderer.shapeKeyHasColorGlyph(font.face(emoji_face)));
+
+        try renderer.render(&state, pixels, width, height);
+        try testing.expect(chromaticPixelCount(pixels) > 0);
+    }
+}
+
+fn shapeKeyHasColorGlyph(self: *Renderer, face: *Font.Face) !bool {
+    const shaped = try self.shapeRun(face);
+    for (shaped) |sg| {
+        const glyph = face.glyph(self.alloc, sg.glyph, 2, false) catch continue;
+        if (glyph.format == .bgra) return true;
+    }
+    return false;
+}
+
+fn chromaticPixelCount(pixels: []const u32) usize {
+    var count: usize = 0;
+    for (pixels) |px| {
+        const r: u8 = @truncate(px >> 16);
+        const g: u8 = @truncate(px >> 8);
+        const b: u8 = @truncate(px);
+        if (r != g or g != b) count += 1;
+    }
+    return count;
 }
 
 test "symbol glyph constraint widths match Ghostty" {

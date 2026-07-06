@@ -435,6 +435,7 @@ pub fn init(
         .rows = startup_size.rows,
         .max_scrollback = config.scrollback,
         .colors = config.terminalColors(),
+        .default_modes = .{ .grapheme_cluster = true },
     });
     errdefer term.deinit(alloc);
     term.width_px = startup_size.cols * font.cell_width;
