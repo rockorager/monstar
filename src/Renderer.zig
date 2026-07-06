@@ -11,6 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c");
 const vt = @import("ghostty-vt");
+const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 
 const log = std.log.scoped(.renderer);
@@ -100,7 +101,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .alloc = alloc,
         .font = font,
         .hb_buf = hb_buf,
-        .selection_bg = opts.selection_background orelse .{ .r = 0x33, .g = 0x46, .b = 0x7c },
+        .selection_bg = opts.selection_background orelse Config.default_selection_background,
         .selection_fg = opts.selection_foreground,
         .fg_scratch = .empty,
         .face_scratch = .empty,

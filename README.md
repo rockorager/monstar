@@ -68,6 +68,12 @@ compositor/window-manager rules:
 app-id = com.example.scratchpad
 ```
 
+Set `theme` to choose the built-in light or dark color theme. The default is `dark`:
+
+```conf
+theme = light
+```
+
 To pipe the last OSC 133-delimited command output with `Ctrl+Shift+G`, set a
 shell command that receives the output on stdin:
 

@@ -16,6 +16,77 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub const default_app_id = "dev.rockorager.monstar";
+pub const default_theme: Theme = .dark;
+
+pub const Theme = enum { light, dark };
+
+pub const ThemeColors = struct {
+    background: vt.color.RGB,
+    foreground: vt.color.RGB,
+    cursor_color: vt.color.RGB,
+    selection_background: vt.color.RGB,
+    selection_foreground: vt.color.RGB,
+    palette: [16]vt.color.RGB,
+};
+
+pub const light_theme: ThemeColors = .{
+    .background = .{ .r = 0xf5, .g = 0xf6, .b = 0xfa },
+    .foreground = .{ .r = 0x0c, .g = 0x0e, .b = 0x12 },
+    .cursor_color = .{ .r = 0x0c, .g = 0x0e, .b = 0x12 },
+    .selection_background = .{ .r = 0xc9, .g = 0xe3, .b = 0xff },
+    .selection_foreground = .{ .r = 0x0c, .g = 0x0e, .b = 0x12 },
+    .palette = .{
+        .{ .r = 0x0c, .g = 0x0e, .b = 0x12 },
+        .{ .r = 0xad, .g = 0x41, .b = 0x43 },
+        .{ .r = 0x1c, .g = 0x80, .b = 0x5b },
+        .{ .r = 0x96, .g = 0x72, .b = 0x22 },
+        .{ .r = 0x26, .g = 0x5e, .b = 0xb2 },
+        .{ .r = 0x76, .g = 0x53, .b = 0x9c },
+        .{ .r = 0x12, .g = 0x7f, .b = 0x76 },
+        .{ .r = 0x9a, .g = 0x9b, .b = 0xa0 },
+        .{ .r = 0x75, .g = 0x77, .b = 0x7b },
+        .{ .r = 0x82, .g = 0x2d, .b = 0x2f },
+        .{ .r = 0x0e, .g = 0x5e, .b = 0x42 },
+        .{ .r = 0x6e, .g = 0x53, .b = 0x13 },
+        .{ .r = 0x19, .g = 0x45, .b = 0x87 },
+        .{ .r = 0x58, .g = 0x3c, .b = 0x75 },
+        .{ .r = 0x04, .g = 0x5e, .b = 0x57 },
+        .{ .r = 0xf5, .g = 0xf6, .b = 0xfa },
+    },
+};
+
+pub const dark_theme: ThemeColors = .{
+    .background = .{ .r = 0x0c, .g = 0x0e, .b = 0x12 },
+    .foreground = .{ .r = 0xf5, .g = 0xf6, .b = 0xfa },
+    .cursor_color = .{ .r = 0xf5, .g = 0xf6, .b = 0xfa },
+    .selection_background = .{ .r = 0x19, .g = 0x45, .b = 0x87 },
+    .selection_foreground = .{ .r = 0xf5, .g = 0xf6, .b = 0xfa },
+    .palette = .{
+        .{ .r = 0x0c, .g = 0x0e, .b = 0x12 },
+        .{ .r = 0xff, .g = 0x8e, .b = 0x8c },
+        .{ .r = 0x71, .g = 0xd2, .b = 0xa7 },
+        .{ .r = 0xee, .g = 0xc5, .b = 0x74 },
+        .{ .r = 0x6c, .g = 0xac, .b = 0xff },
+        .{ .r = 0xc5, .g = 0x9e, .b = 0xf3 },
+        .{ .r = 0x6e, .g = 0xd2, .b = 0xc7 },
+        .{ .r = 0xbb, .g = 0xbc, .b = 0xc0 },
+        .{ .r = 0x75, .g = 0x77, .b = 0x7b },
+        .{ .r = 0xff, .g = 0xa6, .b = 0xa2 },
+        .{ .r = 0x90, .g = 0xde, .b = 0xb9 },
+        .{ .r = 0xf3, .g = 0xd1, .b = 0x8f },
+        .{ .r = 0x8a, .g = 0xc0, .b = 0xff },
+        .{ .r = 0xd3, .g = 0xb3, .b = 0xfb },
+        .{ .r = 0x8d, .g = 0xdd, .b = 0xd3 },
+        .{ .r = 0xf5, .g = 0xf6, .b = 0xfa },
+    },
+};
+
+pub const default_background: vt.color.RGB = dark_theme.background;
+pub const default_foreground: vt.color.RGB = dark_theme.foreground;
+pub const default_cursor_color: vt.color.RGB = dark_theme.cursor_color;
+pub const default_selection_background: vt.color.RGB = dark_theme.selection_background;
+pub const default_selection_foreground: vt.color.RGB = dark_theme.selection_foreground;
+pub const default_palette: [16]vt.color.RGB = dark_theme.palette;
 
 /// Wayland app-id and desktop-entry hint for desktop integration.
 app_id: [:0]const u8 = default_app_id,
@@ -33,6 +104,7 @@ wheel_scroll_lines: u31 = 3,
 /// stderr, `both` does both.
 frame_timer: FrameTimer = .off,
 
+theme: Theme = default_theme,
 background: ?vt.color.RGB = null,
 foreground: ?vt.color.RGB = null,
 cursor_color: ?vt.color.RGB = null,
@@ -123,6 +195,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.wheel_scroll_lines = lines;
     } else if (std.mem.eql(u8, key, "frame-timer")) {
         self.frame_timer = std.meta.stringToEnum(FrameTimer, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "theme")) {
+        self.theme = std.meta.stringToEnum(Theme, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background")) {
         self.background = try parseColor(value);
     } else if (std.mem.eql(u8, key, "foreground")) {
@@ -154,17 +228,36 @@ fn parseColor(value: []const u8) error{InvalidValue}!vt.color.RGB {
     };
 }
 
+pub fn themeColors(theme: Theme) ThemeColors {
+    return switch (theme) {
+        .light => light_theme,
+        .dark => dark_theme,
+    };
+}
+
+pub fn effectiveSelectionBackground(self: *const Config) vt.color.RGB {
+    return self.selection_background orelse themeColors(self.theme).selection_background;
+}
+
+pub fn effectiveSelectionForeground(self: *const Config) vt.color.RGB {
+    return self.selection_foreground orelse themeColors(self.theme).selection_foreground;
+}
+
 /// The terminal color options this config describes: config colors form
 /// the *default* layer, so OSC 10/11/12/4 can still override and reset.
 pub fn terminalColors(self: *const Config) vt.Terminal.Colors {
     var palette = vt.color.default;
+    const themed = themeColors(self.theme);
+    for (themed.palette, 0..) |rgb, i| {
+        palette[i] = rgb;
+    }
     for (self.palette, 0..) |entry, i| {
         if (entry) |rgb| palette[i] = rgb;
     }
     return .{
-        .background = if (self.background) |rgb| .init(rgb) else .unset,
-        .foreground = if (self.foreground) |rgb| .init(rgb) else .unset,
-        .cursor = if (self.cursor_color) |rgb| .init(rgb) else .unset,
+        .background = .init(self.background orelse themed.background),
+        .foreground = .init(self.foreground orelse themed.foreground),
+        .cursor = .init(self.cursor_color orelse themed.cursor_color),
         .palette = .init(palette),
     };
 }
@@ -195,6 +288,11 @@ test "defaults" {
     try std.testing.expectEqual(@as(u31, 16), config.font_size);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.shell);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.pipe_command_output);
+    try std.testing.expectEqual(default_theme, config.theme);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
+    try std.testing.expectEqual(default_selection_background, config.effectiveSelectionBackground());
+    try std.testing.expectEqual(default_selection_foreground, config.effectiveSelectionForeground());
 }
 
 test "parse config" {
@@ -238,5 +336,47 @@ test "terminal colors from config" {
     config.background = .{ .r = 1, .g = 2, .b = 3 };
     const colors = config.terminalColors();
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
-    try std.testing.expectEqual(@as(?vt.color.RGB, null), colors.foreground.get());
+    try std.testing.expectEqual(default_foreground, colors.foreground.get().?);
+    try std.testing.expectEqual(default_cursor_color, colors.cursor.get().?);
+    try std.testing.expectEqual(default_palette[0], colors.palette.current[0]);
+    try std.testing.expectEqual(default_palette[15], colors.palette.current[15]);
+}
+
+test "dark theme" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const config = parse(arena,
+        \\theme = dark
+    );
+
+    const colors = config.terminalColors();
+    try std.testing.expectEqual(Theme.dark, config.theme);
+    try std.testing.expectEqual(dark_theme.background, colors.background.get().?);
+    try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
+    try std.testing.expectEqual(dark_theme.cursor_color, colors.cursor.get().?);
+    try std.testing.expectEqual(dark_theme.palette[1], colors.palette.current[1]);
+    try std.testing.expectEqual(dark_theme.selection_background, config.effectiveSelectionBackground());
+    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground());
+}
+
+test "theme does not replace explicit color overrides" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const config = parse(arena,
+        \\background = #010203
+        \\palette1 = #040506
+        \\selection-background = #070809
+        \\theme = dark
+    );
+
+    const colors = config.terminalColors();
+    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
+    try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, colors.palette.current[1]);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveSelectionBackground());
+    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground());
 }

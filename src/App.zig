@@ -257,7 +257,6 @@ const sync_output_reset_ms = 1000;
 const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
-const default_selection_bg: vt.color.RGB = .{ .r = 0x33, .g = 0x46, .b = 0x7c };
 const precision_scroll_multiplier = 10.0;
 
 /// Damage history length; shm buffers older than this get a full copy.
@@ -573,8 +572,8 @@ pub fn init(
         .font_size_px = config.font_size,
         .runtime_font_size = null,
         .renderer = try .init(alloc, &self.font, .{
-            .selection_background = config.selection_background,
-            .selection_foreground = config.selection_foreground,
+            .selection_background = config.effectiveSelectionBackground(),
+            .selection_foreground = config.effectiveSelectionForeground(),
         }),
         .window = window,
         .keyboard = try .init(),
@@ -1965,8 +1964,8 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.term.colors.cursor.default = colors.cursor.default;
     self.term.colors.palette.changeDefault(colors.palette.original);
 
-    self.renderer.selection_bg = new_config.selection_background orelse default_selection_bg;
-    self.renderer.selection_fg = new_config.selection_foreground;
+    self.renderer.selection_bg = new_config.effectiveSelectionBackground();
+    self.renderer.selection_fg = new_config.effectiveSelectionForeground();
     self.window.toplevel.setAppId(new_config.app_id);
 
     // Always rebuild the Font on config reload so a reload also picks up
@@ -2098,8 +2097,8 @@ fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
 fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
     switch (target) {
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.renderer.selection_bg = self.config.selection_background orelse default_selection_bg,
-            .highlight_foreground => self.renderer.selection_fg = self.config.selection_foreground,
+            .highlight_background => self.renderer.selection_bg = self.config.effectiveSelectionBackground(),
+            .highlight_foreground => self.renderer.selection_fg = self.config.effectiveSelectionForeground(),
             else => return,
         },
         else => return,
