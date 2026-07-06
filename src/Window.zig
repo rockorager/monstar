@@ -19,7 +19,7 @@ const default_width = 800;
 const default_height = 600;
 
 /// Opaque dark background, ARGB8888.
-const bg_color: u32 = 0xff1a1b26;
+const bg_color: u32 = 0xff18191b;
 
 alloc: std.mem.Allocator,
 display: *wl.Display,
