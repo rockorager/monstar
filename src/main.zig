@@ -367,6 +367,7 @@ test {
     _ = @import("cgroup.zig");
     _ = @import("Keyboard.zig");
     _ = Pty;
+    _ = @import("ReadPipeline.zig");
     _ = Renderer;
     _ = @import("sprite.zig");
     _ = @import("sprite/canvas.zig");

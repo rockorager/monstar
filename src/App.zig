@@ -1,7 +1,8 @@
 //! The live terminal application: owns the terminal state, PTY, renderer,
 //! and window, and runs the event loop that ties them together.
 //!
-//! The loop polls two fds: the Wayland display and the PTY master. PTY
+//! The loop polls the Wayland display and the read pipeline's ready
+//! eventfd (a gather thread drains the PTY master concurrently). PTY
 //! output feeds the terminal and schedules a redraw; redraws are throttled
 //! by the window's frame callbacks.
 
@@ -18,6 +19,7 @@ const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
 const Pty = @import("Pty.zig");
+const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
 const cgroup = @import("cgroup.zig");
 const Window = @import("Window.zig");
@@ -113,6 +115,9 @@ last_frame_ns: u64,
 /// whole grid was redrawn or blitted).
 frame_rows: union(enum) { all, count: usize },
 pty: Pty,
+/// Gather-thread pipeline draining the pty master; the main loop
+/// consumes parsed batches via its ready_fd in the poll set.
+pipeline: ReadPipeline,
 child_pid: posix.pid_t,
 font: Font,
 /// The physical pixel size the font is currently loaded at.
@@ -143,11 +148,6 @@ write_queue: std.ArrayList(u8),
 child_exited: bool,
 /// Keep the window open after the child exits.
 hold: bool,
-/// The pty master returned EIO/EOF while the child is still alive
-/// (e.g. the child transiently closed every slave fd, as some shells
-/// do at startup). Reads are retried on a timer until the child
-/// reopens the tty or exits; EIO alone never shuts the terminal down.
-pty_suspended: bool,
 /// Session bus connection, used for notifications and future desktop settings.
 dbus: ?*c.DBusConnection,
 dbus_fd: posix.fd_t,
@@ -571,6 +571,7 @@ pub fn init(
         .last_frame_ns = 0,
         .frame_rows = .{ .count = 0 },
         .pty = pty,
+        .pipeline = try .init(pty.master),
         .child_pid = child_pid,
         .font = font,
         .font_size_px = config.font_size,
@@ -592,7 +593,6 @@ pub fn init(
         .write_queue = .empty,
         .child_exited = false,
         .hold = options.hold,
-        .pty_suspended = false,
         .dbus = dbus_connection,
         .dbus_fd = -1,
         .notification_ids = .empty,
@@ -1244,6 +1244,7 @@ fn setNonblocking(fd: posix.fd_t) void {
 
 pub fn deinit(self: *App) void {
     self.hangupChild();
+    self.pipeline.deinit();
     self.pty.deinit();
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
@@ -1281,10 +1282,15 @@ pub fn deinit(self: *App) void {
 pub fn run(self: *App) !void {
     errdefer self.hangupChild();
 
+    try self.pipeline.start();
+
     const display = self.window.display;
     var fds = [_]posix.pollfd{
         .{ .fd = display.getFd(), .events = posix.POLL.IN, .revents = 0 },
-        .{ .fd = self.pty.master, .events = posix.POLL.IN, .revents = 0 },
+        // Parsed pty batches arrive via the pipeline's ready eventfd;
+        // the master itself is only polled for writability (below).
+        .{ .fd = self.pipeline.ready_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 },
         .{ .fd = self.repeat_fd, .events = posix.POLL.IN, .revents = 0 },
         // In-flight paste pipe; negative (ignored) while idle.
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
@@ -1295,14 +1301,15 @@ pub fn run(self: *App) !void {
         .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
-    const pty_fd = &fds[1];
-    const repeat_fd = &fds[2];
-    const paste_fd = &fds[3];
-    const signal_fd = &fds[4];
-    const sync_output_fd = &fds[5];
-    const selection_autoscroll_fd = &fds[6];
-    const taskbar_progress_fd = &fds[7];
-    const dbus_fd = &fds[8];
+    const pipeline_fd = &fds[1];
+    const pty_write_fd = &fds[2];
+    const repeat_fd = &fds[3];
+    const paste_fd = &fds[4];
+    const signal_fd = &fds[5];
+    const sync_output_fd = &fds[6];
+    const selection_autoscroll_fd = &fds[7];
+    const taskbar_progress_fd = &fds[8];
+    const dbus_fd = &fds[9];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
@@ -1325,19 +1332,12 @@ pub fn run(self: *App) !void {
             },
         }
 
-        // Only ask for writability while a backlog exists, otherwise
+        // Only poll the master while a write backlog exists, otherwise
         // POLLOUT would make every poll return immediately.
-        pty_fd.events = posix.POLL.IN;
-        if (self.write_queue.items.len > 0) pty_fd.events |= posix.POLL.OUT;
+        pty_write_fd.fd = if (self.write_queue.items.len > 0) self.pty.master else -1;
         paste_fd.fd = self.paste_fd;
 
-        // A suspended pty would report POLLHUP continuously; drop it
-        // from the set and probe on a timer instead until the child
-        // reopens the tty (or exits, via SIGCHLD).
-        pty_fd.fd = if (self.pty_suspended) -1 else self.pty.master;
-        const timeout: i32 = if (self.pty_suspended and !self.child_exited) 100 else -1;
-
-        const ready = posix.poll(&fds, timeout) catch {
+        const ready = posix.poll(&fds, -1) catch {
             display.cancelRead();
             return error.PollFailed;
         };
@@ -1355,13 +1355,11 @@ pub fn run(self: *App) !void {
             self.drainSignals();
         }
 
-        if (pty_fd.revents & posix.POLL.OUT != 0) {
+        if (pty_write_fd.revents & posix.POLL.OUT != 0) {
             self.flushWriteQueue();
         }
-        if (self.pty_suspended or
-            pty_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0)
-        {
-            self.readPty();
+        if (pipeline_fd.revents & posix.POLL.IN != 0) {
+            self.drainPipeline();
         }
 
         if (repeat_fd.revents & posix.POLL.IN != 0) {
@@ -1411,6 +1409,9 @@ pub fn run(self: *App) !void {
 }
 
 fn hangupChild(self: *App) void {
+    // The gather thread must be joined before the master can be closed;
+    // stop() is idempotent and deinit covers the child-exited path.
+    self.pipeline.stop();
     if (self.child_exited) {
         return;
     }
@@ -2054,34 +2055,21 @@ fn resetRuntimeFontSize(self: *App) void {
     self.setRuntimeFontSize(null);
 }
 
-/// Drain available PTY output into the terminal. Bounded so a
-/// flooding child cannot starve the Wayland side of the loop.
+/// Feed pipeline batches of PTY output into the terminal. Bounded to
+/// one ring's worth so a flooding child cannot starve the Wayland side
+/// of the loop; rearm() keeps the eventfd hot while batches remain.
 ///
-/// EIO/EOF on the master only means no process currently holds a
-/// slave fd, which can be transient (some shells reopen their tty at
-/// startup): reads suspend until the master is usable again, and only
-/// SIGCHLD ends the session.
-fn readPty(self: *App) void {
-    var buf: [16 * 1024]u8 = undefined;
-    for (0..16) |_| {
-        const n = posix.read(self.pty.master, &buf) catch |err| switch (err) {
-            error.WouldBlock => {
-                self.resumePty();
-                break;
-            },
-            else => {
-                self.suspendPty(err);
-                break;
-            },
-        };
-        if (n == 0) {
-            self.suspendPty(error.EndOfStream);
-            break;
-        }
-        self.resumePty();
-        self.stream.nextSlice(buf[0..n]);
+/// The master can never return EIO/EOF because Pty.spawn retains a
+/// slave fd in this process; only SIGCHLD ends the session.
+fn drainPipeline(self: *App) void {
+    self.pipeline.clearReady();
+    for (0..ReadPipeline.buffer_count) |_| {
+        const batch = self.pipeline.take() orelse break;
+        self.stream.nextSlice(batch);
+        self.pipeline.release();
         self.needs_redraw = true;
     }
+    self.pipeline.rearm();
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
     self.syncActiveScreen();
@@ -2641,30 +2629,6 @@ test "XTGETTCAP string values decode tcap escapes unless parameterized" {
     var buf: [512]u8 = undefined;
     const len = try formatXtgettcapResponse(&buf, hexEncodeComptime("Se"), comptime tcapString("\\E[0 q"));
     try std.testing.expectEqualStrings("\x1bP1+r5365=1B5B302071\x1b\\", buf[0..len]);
-}
-
-fn suspendPty(self: *App, err: anyerror) void {
-    if (self.pty_suspended) return;
-    if (self.child_exited) {
-        self.pty_suspended = true;
-        return;
-    }
-    // Most of the time this is a real child exit; the SIGCHLD arriving
-    // right after ends the session. Reap eagerly to avoid one poll
-    // round trip.
-    if (Pty.tryWait(self.child_pid)) |status| {
-        log.debug("child exited with status {d}", .{status});
-        self.child_exited = true;
-        return;
-    }
-    log.debug("pty read failed ({}) with child alive; suspending reads", .{err});
-    self.pty_suspended = true;
-}
-
-fn resumePty(self: *App) void {
-    if (!self.pty_suspended) return;
-    log.debug("pty readable again; resuming reads", .{});
-    self.pty_suspended = false;
 }
 
 /// DEC mode 2048 (in-band size reports): the terminal must send a size
