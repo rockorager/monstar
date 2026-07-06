@@ -73,8 +73,13 @@ pub fn closeMaster(self: *Pty) void {
 }
 
 /// Fork and exec `path` with the slave side as the child's controlling
-/// terminal and stdio. Returns the child pid; the slave fd is closed in
-/// the parent so that EOF is observable on the master when the child exits.
+/// terminal and stdio. Returns the child pid.
+///
+/// The parent keeps its slave fd open for the pty's lifetime: with a
+/// slave always open, the master can never return EIO/EOF/HUP, so a
+/// child that transiently closes every slave fd (some shells reopen
+/// their tty at startup) is a non-event instead of a failure mode.
+/// Child exit is detected via SIGCHLD, never via the master.
 ///
 /// `argv` and `envp` must outlive the call in the parent (the child copies
 /// them into its own image via execve).
@@ -135,9 +140,8 @@ pub fn spawn(
         linux.exit(127); // exec failed
     }
 
-    // Parent: the slave belongs to the child now.
-    _ = linux.close(self.slave);
-    self.slave = -1;
+    // Parent: keep our slave fd (see doc comment); it is CLOEXEC so it
+    // cannot leak into exec'd children.
     if (options.gate_child) {
         _ = linux.close(gate_fds[0]);
         self.gate = gate_fds[1];
