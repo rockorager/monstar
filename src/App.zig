@@ -1484,10 +1484,7 @@ fn spawnNewWindow(self: *App) void {
         log.err("spawn env setup failed: {}", .{err});
         return;
     };
-    const exe_path = currentExePath(arena) catch |err| exe_path: {
-        log.warn("current executable lookup failed: {}", .{err});
-        break :exe_path "monstar";
-    };
+    const exe_path = resolveCommandPathZ(arena, self.environ, "monstar") catch "monstar";
 
     if (self.spawnSystemdRun(arena, envp, exe_path, pwd)) return;
     if (self.spawnSwayExec(arena, envp, exe_path, pwd)) return;
@@ -1671,20 +1668,20 @@ fn waitStatusExitedZero(status: u32) bool {
     return (status & 0x7f) == 0 and (status >> 8) == 0;
 }
 
-fn currentExePath(arena: std.mem.Allocator) ![:0]const u8 {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const rc = std.os.linux.readlink("/proc/self/exe", &buf, buf.len);
-    if (std.os.linux.errno(rc) != .SUCCESS) return error.CurrentExeUnavailable;
-    if (rc == buf.len) return error.NameTooLong;
-    return try arena.dupeZ(u8, buf[0..rc]);
-}
-
 fn resolveCommandPath(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
     command: [:0]const u8,
 ) ![*:0]const u8 {
-    if (std.mem.indexOfScalar(u8, command, '/') != null) return command.ptr;
+    return (try resolveCommandPathZ(arena, environ, command)).ptr;
+}
+
+fn resolveCommandPathZ(
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    command: [:0]const u8,
+) ![:0]const u8 {
+    if (std.mem.indexOfScalar(u8, command, '/') != null) return command;
 
     const path_env = environ.getPosix("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
     var dirs = std.mem.splitScalar(u8, path_env, ':');
@@ -1692,10 +1689,10 @@ fn resolveCommandPath(
         const base = if (dir.len == 0) "." else dir;
         const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, command }, 0);
         if (std.os.linux.errno(std.os.linux.access(candidate, std.os.linux.X_OK)) == .SUCCESS) {
-            return candidate.ptr;
+            return candidate;
         }
     }
-    return command.ptr;
+    return command;
 }
 
 /// Ctrl+Shift+Z/X: move the scrollback viewport between OSC 133 prompt marks.
