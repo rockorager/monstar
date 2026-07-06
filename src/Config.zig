@@ -98,6 +98,10 @@ shell: ?[:0]const u8 = null,
 /// Shell command that receives the last semantic command output on stdin.
 pipe_command_output: ?[:0]const u8 = null,
 scrollback: usize = 10_000,
+/// Total storage limit in bytes for kitty graphics images per screen;
+/// 0 disables the protocol. A single image larger than this limit is
+/// rejected, so it must comfortably fit a fullscreen RGBA frame.
+image_storage_limit: usize = 320 * 1000 * 1000,
 wheel_scroll_lines: u31 = 3,
 /// Frame timing readout: `overlay` draws the previous frame's CPU
 /// cost in the top-right corner, `log` writes per-frame timings to
@@ -189,6 +193,11 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.pipe_command_output = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "scrollback")) {
         self.scrollback = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "image-storage-limit")) {
+        const limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
+        // Same cap as Ghostty's image-storage-limit (4GiB).
+        if (limit > std.math.maxInt(u32)) return error.InvalidValue;
+        self.image_storage_limit = limit;
     } else if (std.mem.eql(u8, key, "wheel-scroll-lines")) {
         const lines = std.fmt.parseInt(u31, value, 10) catch return error.InvalidValue;
         if (lines == 0) return error.InvalidValue;
@@ -319,6 +328,7 @@ test "parse config" {
         \\shell = /usr/bin/fish
         \\pipe-command-output = cat > /tmp/monstar-output
         \\scrollback = 5000
+        \\image-storage-limit = 50000000
         \\wheel-scroll-lines = 5
         \\background = #1a1b26
         \\foreground = c0caf5
@@ -335,6 +345,7 @@ test "parse config" {
     try std.testing.expectEqualStrings("/usr/bin/fish", config.shell.?);
     try std.testing.expectEqualStrings("cat > /tmp/monstar-output", config.pipe_command_output.?);
     try std.testing.expectEqual(@as(usize, 5000), config.scrollback);
+    try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(u31, 5), config.wheel_scroll_lines);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);

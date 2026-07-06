@@ -435,6 +435,10 @@ pub fn init(
         .max_scrollback = config.scrollback,
         .colors = config.terminalColors(.dark),
         .default_modes = .{ .grapheme_cluster = true },
+        // libghostty-vt defaults to a conservative 10MB, which rejects a
+        // single fullscreen image on large displays (a 4K RGBA frame is
+        // ~32MB). Default matches the Ghostty app (320MB).
+        .kitty_image_storage_limit = config.image_storage_limit,
     });
     errdefer term.deinit(alloc);
     term.width_px = startup_size.cols * font.cell_width;
@@ -1962,6 +1966,12 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
     self.applyColorDefaultsForConfig(new_config);
     self.window.toplevel.setAppId(new_config.app_id);
+
+    if (new_config.image_storage_limit != self.config.image_storage_limit) {
+        self.term.setKittyGraphicsSizeLimit(self.alloc, new_config.image_storage_limit) catch |err| {
+            log.warn("kitty image storage limit change failed: {}", .{err});
+        };
+    }
 
     // Always rebuild the Font on config reload so a reload also picks up
     // fontconfig/file changes for the same family name. The resize path is
