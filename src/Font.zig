@@ -179,7 +179,12 @@ pub const Face = struct {
 
         const slot = self.ft_face.*.glyph;
         const bitmap = slot.*.bitmap;
-        const rendered = switch (bitmap.pixel_mode) {
+        const rendered = if (bitmap.width == 0 or bitmap.rows == 0) RenderedBitmap{
+            .bitmap = try alloc.alloc(u8, 0),
+            .format = .alpha,
+            .width = 0,
+            .height = 0,
+        } else switch (bitmap.pixel_mode) {
             c.FT_PIXEL_MODE_GRAY => try self.copyGrayBitmap(alloc, bitmap, constraint_width, constrain_alpha),
             c.FT_PIXEL_MODE_BGRA => try self.copyBgraBitmap(alloc, bitmap, constraint_width),
             else => return error.FontLoadFailed,
