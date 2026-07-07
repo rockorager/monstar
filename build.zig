@@ -66,12 +66,21 @@ pub fn build(b: *std.Build) void {
     }
 
     if (ghostty_dep) |dep| {
-        root_module.addImport("ghostty-vt", dep.module("ghostty-vt"));
+        const ghostty_vt = dep.module("ghostty-vt");
+        root_module.addImport("ghostty-vt", ghostty_vt);
+        root_module.addImport(
+            "uucode",
+            ghostty_vt.import_table.get("uucode") orelse
+                @panic("ghostty-vt does not provide uucode"),
+        );
     }
 
     const exe = b.addExecutable(.{
         .name = "monstar",
         .root_module = root_module,
+        // uucode's generated tables crash the x86_64 self-hosted backend on
+        // Zig 0.16. Ghostty uses LLVM for the same reason.
+        .use_llvm = true,
     });
     root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image_resize.c") });
     root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image.c") });
@@ -91,6 +100,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const exe_tests = b.addTest(.{
         .root_module = root_module,
+        .use_llvm = true,
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 

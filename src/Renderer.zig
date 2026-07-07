@@ -1562,27 +1562,13 @@ fn needsEmojiPresentationFace(cp: u21, grapheme: []const u21) bool {
     if (std.mem.findScalar(u21, grapheme, 0xFE0F) != null) return true;
 
     if (std.mem.findScalar(u21, grapheme, 0x200D) != null) {
-        if (isEmojiCodepoint(cp)) return true;
+        if (Font.hasDefaultEmojiPresentation(cp)) return true;
         for (grapheme) |extra| {
-            if (isEmojiCodepoint(extra)) return true;
+            if (Font.hasDefaultEmojiPresentation(extra)) return true;
         }
     }
 
     return false;
-}
-
-fn isEmojiCodepoint(cp: u21) bool {
-    return switch (cp) {
-        0x00A9,
-        0x00AE,
-        0x2122,
-        0x3030,
-        0x303D,
-        0x2600...0x27BF,
-        0x1F000...0x1FAFF,
-        => true,
-        else => false,
-    };
 }
 
 fn isSymbol(cp: u21) bool {
@@ -2048,6 +2034,69 @@ test "emoji presentation graphemes select emoji fallback face" {
 
         try renderer.render(&state, pixels, width, height);
         try testing.expect(chromaticPixelCount(pixels) > 0);
+    }
+}
+
+test "default emoji presentation squares select emoji fallback face" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    const emoji_face = font.faceForCodepoint(alloc, emoji_presentation_face_codepoint);
+    if (emoji_face == 0) return error.SkipZigTest;
+    const emoji_glyph_idx = c.FT_Get_Char_Index(font.face(emoji_face).ft_face, emoji_presentation_face_codepoint);
+    if (emoji_glyph_idx == 0) return error.SkipZigTest;
+    const emoji_glyph = try font.face(emoji_face).glyph(alloc, emoji_glyph_idx, 2, false);
+    if (emoji_glyph.format != .bgra) return error.SkipZigTest;
+
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 12, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+
+    const width: u31 = font.cell_width * 12;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    const cases = [_][]const u8{
+        "\xE2\xAC\x9B", // black large square
+        "\xE2\xAC\x9C", // white large square
+        "\xE2\xAD\x90", // star
+        "\xE2\x9A\xAB", // black circle
+        "\xE2\x9A\xAA", // white circle
+        "\xF0\x9F\x9F\xAB", // brown square
+        "\xF0\x9F\x9F\xA5", // red square
+    };
+
+    for (cases) |text| {
+        term.fullReset();
+        stream.nextSlice(text);
+        try state.update(alloc, &term);
+
+        const cells = state.row_data.get(0).cells.slice();
+        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+        try testing.expectEqual(emoji_face, renderer.face_scratch.items[0]);
+
+        const raws = cells.items(.raw);
+        const graphemes = cells.items(.grapheme);
+        renderer.shape_key.clearRetainingCapacity();
+        try renderer.shape_key.append(alloc, emoji_face);
+        try renderer.appendShapeKeyCodepoints(
+            0,
+            raws[0].content.codepoint.data,
+            if (raws[0].content_tag == .codepoint_grapheme) graphemes[0] else &.{},
+        );
+        try testing.expect(try renderer.shapeKeyHasColorGlyph(font.face(emoji_face)));
+
+        try renderer.render(&state, pixels, width, height);
     }
 }
 

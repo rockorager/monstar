@@ -10,6 +10,7 @@ const Font = @This();
 
 const std = @import("std");
 const c = @import("c");
+const uucode = @import("uucode");
 const sprite = @import("sprite.zig");
 
 const log = std.log.scoped(.font);
@@ -839,7 +840,7 @@ pub fn faceForCodepointStyle(
 /// Walk the fontconfig sort order for the first usable face whose
 /// charset covers `cp`.
 fn searchFallback(self: *Font, alloc: std.mem.Allocator, cp: u21, style: FaceStyle) ?u16 {
-    if (isEmojiCodepoint(cp)) {
+    if (hasDefaultEmojiPresentation(cp)) {
         if (self.searchFallbackPass(alloc, cp, style, true)) |face_idx| return face_idx;
     }
     return self.searchFallbackPass(alloc, cp, style, false);
@@ -906,10 +907,15 @@ fn patternHasColor(pattern: ?*c.FcPattern) bool {
     return c.FcPatternGetBool(pattern, c.FC_COLOR, 0, &color) == c.FcResultMatch and color == c.FcTrue;
 }
 
-fn isEmojiCodepoint(cp: u21) bool {
-    return (cp >= 0x1F000 and cp <= 0x1FAFF) or
-        (cp >= 0x2600 and cp <= 0x27BF) or
-        cp == 0x00A9 or cp == 0x00AE or cp == 0x2122 or cp == 0x3030 or cp == 0x303D;
+pub fn hasDefaultEmojiPresentation(cp: u21) bool {
+    return uucode.get(.is_emoji_presentation, cp);
+}
+
+test "default emoji presentation uses Unicode data" {
+    try std.testing.expect(hasDefaultEmojiPresentation(0x1F600)); // 😀
+    try std.testing.expect(hasDefaultEmojiPresentation(0x2B1B)); // ⬛
+    try std.testing.expect(!hasDefaultEmojiPresentation(0x2600)); // ☀ defaults to text
+    try std.testing.expect(!hasDefaultEmojiPresentation('A'));
 }
 
 fn loadFromPattern(
