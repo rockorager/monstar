@@ -209,6 +209,7 @@ pub const Face = struct {
         gop.value_ptr.* = .{
             .bitmap = rendered.bitmap,
             .format = rendered.format,
+            .fully_opaque = rendered.format == .alpha and alphaBitmapOpaque(rendered.bitmap),
             .width = rendered.width,
             .height = rendered.height,
             .bearing_x = bearing_x,
@@ -379,11 +380,28 @@ const RenderedBitmap = struct {
 pub const Glyph = struct {
     bitmap: []u8,
     format: GlyphFormat = .alpha,
+    /// Every A8 sample is fully covered, so the renderer can replace
+    /// per-pixel alpha blending with a clipped rectangle fill.
+    fully_opaque: bool = false,
     width: u31,
     height: u31,
     bearing_x: i32,
     bearing_y: i32,
 };
+
+fn alphaBitmapOpaque(bitmap: []const u8) bool {
+    if (bitmap.len == 0) return false;
+    for (bitmap) |coverage| {
+        if (coverage != 0xff) return false;
+    }
+    return true;
+}
+
+test "classify fully opaque alpha bitmap" {
+    try std.testing.expect(!alphaBitmapOpaque(&.{}));
+    try std.testing.expect(alphaBitmapOpaque(&.{ 0xff, 0xff, 0xff }));
+    try std.testing.expect(!alphaBitmapOpaque(&.{ 0xff, 0xfe, 0xff }));
+}
 
 fn selectNearestStrike(ft_face: c.FT_Face, size_px: u31) bool {
     if (!c.FT_HAS_FIXED_SIZES(ft_face) or ft_face.*.num_fixed_sizes <= 0) return false;
@@ -762,6 +780,7 @@ pub fn spriteGlyph(
     const g = try sprite.render(alloc, cp, self.sprite_metrics, self.baseline, cell_span);
     gop.value_ptr.* = .{
         .bitmap = g.bitmap,
+        .fully_opaque = alphaBitmapOpaque(g.bitmap),
         .width = g.width,
         .height = g.height,
         .bearing_x = g.bearing_x,
@@ -783,6 +802,7 @@ pub fn decorationGlyph(
     const g = try sprite.renderDecoration(alloc, kind, self.sprite_metrics, self.baseline);
     gop.value_ptr.* = .{
         .bitmap = g.bitmap,
+        .fully_opaque = alphaBitmapOpaque(g.bitmap),
         .width = g.width,
         .height = g.height,
         .bearing_x = g.bearing_x,

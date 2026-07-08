@@ -1732,7 +1732,10 @@ fn blitGlyph(
     reverse_color_glyph: bool,
 ) void {
     switch (g.format) {
-        .alpha => blitAlphaGlyph(pixels, buf_width, buf_height, g, x0, y0, color),
+        .alpha => if (g.fully_opaque)
+            blitOpaqueGlyph(pixels, buf_width, buf_height, g, x0, y0, color)
+        else
+            blitAlphaGlyph(pixels, buf_width, buf_height, g, x0, y0, color),
         .bgra => if (reverse_color_glyph)
             blitBgraGlyphAsAlpha(pixels, buf_width, buf_height, g, x0, y0, color)
         else
@@ -1761,6 +1764,24 @@ fn clipGlyph(g: *const Font.Glyph, x0: i32, y0: i32, buf_width: u31, buf_height:
         .gy_start = @intCast(gy_start),
         .gy_end = @intCast(gy_end),
     };
+}
+
+fn blitOpaqueGlyph(
+    pixels: []u32,
+    buf_width: u31,
+    buf_height: u31,
+    g: *const Font.Glyph,
+    x0: i32,
+    y0: i32,
+    color: u32,
+) void {
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+    const span_len = clip.gx_end - clip.gx_start;
+    for (clip.gy_start..clip.gy_end) |gy| {
+        const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+        fillSpan(pixels[py * buf_width + px_start ..][0..span_len], color);
+    }
 }
 
 fn blitAlphaGlyph(
@@ -1831,11 +1852,55 @@ fn blitBgraGlyph(
         const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
         const dst = pixels[py * buf_width + px_start ..][0 .. clip.gx_end - clip.gx_start];
+        blendPremultipliedBgraSpan(dst, src[0 .. dst.len * 4]);
+    }
+}
+
+/// Blend premultiplied BGRA color-glyph pixels four at a time. Color
+/// emoji are large relative to text glyphs, so doing this per channel
+/// instead of per pixel keeps full-screen emoji output from dominating
+/// frame rendering.
+fn blendPremultipliedBgraSpan(noalias dst: []u32, noalias src: []const u8) void {
+    std.debug.assert(src.len == dst.len * 4);
+    // ARGB8888 u32 pixels have BGRA byte order only on little-endian
+    // machines. Keep the scalar channel-explicit path elsewhere.
+    if (comptime builtin.target.cpu.arch.endian() != .little) {
         for (dst, 0..) |*pixel, i| {
             const cell = src[i * 4 ..][0..4];
             if (cell[3] == 0) continue;
             pixel.* = blendPremultipliedBgra(cell, pixel.*);
         }
+        return;
+    }
+
+    const ByteVector = @Vector(16, u8);
+    const WideVector = @Vector(16, u16);
+    const PixelVector = @Vector(4, u32);
+    const alpha_lanes: [4]i32 = .{ 3, 7, 11, 15 };
+    const expand_alpha: [16]i32 = .{ 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3 };
+
+    var i: usize = 0;
+    while (i + 4 <= dst.len) : (i += 4) {
+        const source: ByteVector = src[i * 4 ..][0..16].*;
+        const alpha: @Vector(4, u8) = @shuffle(u8, source, undefined, alpha_lanes);
+        if (@reduce(.Or, alpha) == 0) continue;
+        if (@reduce(.And, alpha == @as(@Vector(4, u8), @splat(0xff)))) {
+            dst[i..][0..4].* = @bitCast(source);
+            continue;
+        }
+
+        const a: WideVector = @shuffle(u8, alpha, undefined, expand_alpha);
+        const inverse = @as(WideVector, @splat(255)) - a;
+        const background: WideVector = @as(ByteVector, @bitCast(dst[i..][0..4].*));
+        const foreground: WideVector = source;
+        const mixed = foreground + (background * inverse) / @as(WideVector, @splat(255));
+        const result: PixelVector = @bitCast(@as(ByteVector, @intCast(mixed)));
+        dst[i..][0..4].* = result | @as(PixelVector, @splat(0xff000000));
+    }
+    for (dst[i..], 0..) |*pixel, tail_i| {
+        const cell = src[(i + tail_i) * 4 ..][0..4];
+        if (cell[3] == 0) continue;
+        pixel.* = blendPremultipliedBgra(cell, pixel.*);
     }
 }
 
@@ -1918,6 +1983,88 @@ test "blendAlphaSpan matches scalar blend" {
                 w.* = if (cov.* == 0) bg else blend(color, bg, cov.*);
             }
             blendAlphaSpan(got[0..len], coverage[0..len], color);
+            try std.testing.expectEqualSlices(u32, want[0..len], got[0..len]);
+        }
+    }
+}
+
+test "opaque glyph fast path matches alpha blending with clipping" {
+    const bitmap: [12]u8 = @splat(0xff);
+    const alpha_glyph: Font.Glyph = .{
+        .bitmap = @constCast(&bitmap),
+        .width = 4,
+        .height = 3,
+        .bearing_x = 0,
+        .bearing_y = 0,
+    };
+    var opaque_glyph = alpha_glyph;
+    opaque_glyph.fully_opaque = true;
+
+    var alpha_pixels: [5 * 4]u32 = @splat(0xff123456);
+    var opaque_pixels = alpha_pixels;
+    blitGlyph(&alpha_pixels, 5, 4, &alpha_glyph, -1, 2, 0xffabcdef, false);
+    blitGlyph(&opaque_pixels, 5, 4, &opaque_glyph, -1, 2, 0xffabcdef, false);
+    try std.testing.expectEqualSlices(u32, &alpha_pixels, &opaque_pixels);
+}
+
+test "blendPremultipliedBgraSpan matches scalar blend" {
+    const transparent_source: [4 * 4]u8 = @splat(0);
+    var transparent_got = [_]u32{ 0xff010203, 0xff112233, 0xffabcdef, 0xff987654 };
+    const transparent_want = transparent_got;
+    blendPremultipliedBgraSpan(&transparent_got, &transparent_source);
+    try std.testing.expectEqualSlices(u32, &transparent_want, &transparent_got);
+
+    const opaque_source = [_]u8{
+        1,  2,  3,  255,
+        4,  5,  6,  255,
+        7,  8,  9,  255,
+        10, 11, 12, 255,
+    };
+    var opaque_got: [4]u32 = @splat(0xff112233);
+    blendPremultipliedBgraSpan(&opaque_got, &opaque_source);
+    try std.testing.expectEqualSlices(u32, &.{ 0xff030201, 0xff060504, 0xff090807, 0xff0c0b0a }, &opaque_got);
+
+    const mixed_source = [_]u8{
+        0,  0,  0,   0,
+        20, 40, 80,  255,
+        10, 20, 30,  128,
+        1,  2,  3,   64,
+        9,  18, 27,  255,
+        0,  0,  0,   0,
+        20, 30, 100, 200,
+    };
+    var mixed_got: [7]u32 = @splat(0xff204060);
+    var mixed_want = mixed_got;
+    for (&mixed_want, 0..) |*pixel, i| {
+        const cell = mixed_source[i * 4 ..][0..4];
+        if (cell[3] != 0) pixel.* = blendPremultipliedBgra(cell, pixel.*);
+    }
+    blendPremultipliedBgraSpan(&mixed_got, &mixed_source);
+    try std.testing.expectEqualSlices(u32, &mixed_want, &mixed_got);
+
+    var prng: std.Random.DefaultPrng = .init(0xb6a4);
+    const random = prng.random();
+    for ([_]usize{ 1, 3, 4, 7, 16, 21 }) |len| {
+        var source: [21 * 4]u8 = undefined;
+        var got: [21]u32 = undefined;
+        var want: [21]u32 = undefined;
+        for (0..10) |_| {
+            for (got[0..len], want[0..len], 0..) |*g, *w, i| {
+                const alpha = switch (random.int(u2)) {
+                    0 => 0,
+                    1 => 0xff,
+                    else => random.int(u8),
+                };
+                const cell = source[i * 4 ..][0..4];
+                cell[0] = random.intRangeAtMost(u8, 0, alpha);
+                cell[1] = random.intRangeAtMost(u8, 0, alpha);
+                cell[2] = random.intRangeAtMost(u8, 0, alpha);
+                cell[3] = alpha;
+                const bg = random.int(u32) | 0xff000000;
+                g.* = bg;
+                w.* = if (alpha == 0) bg else blendPremultipliedBgra(cell, bg);
+            }
+            blendPremultipliedBgraSpan(got[0..len], source[0 .. len * 4]);
             try std.testing.expectEqualSlices(u32, want[0..len], got[0..len]);
         }
     }
