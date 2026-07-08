@@ -44,6 +44,8 @@ master: posix.fd_t,
 ready_fd: posix.fd_t,
 /// Wakes the gather thread when the main thread frees a ring slot.
 slot_free_fd: posix.fd_t,
+/// Wakes the gather thread from a bridge poll when the parser goes idle.
+idle_fds: [2]posix.fd_t,
 /// Wakes and stops the gather thread; read end is index 0.
 quit_fds: [2]posix.fd_t,
 thread: ?std.Thread,
@@ -60,6 +62,11 @@ lens: [buffer_count]usize,
 head: usize,
 /// Next slot the main thread consumes. Consumer-owned.
 tail: usize,
+
+/// Set while the gather thread is sleeping in a bridge poll. The main
+/// thread only writes the idle pipe when this is set, so interactive
+/// output never pays the extra syscall.
+bridging: std.atomic.Value(bool),
 
 bufs: [buffer_count][buffer_capacity]u8,
 
@@ -78,6 +85,15 @@ pub fn init(master: posix.fd_t) Error!ReadPipeline {
     const slot_free_fd: posix.fd_t = @intCast(slot_rc);
     errdefer _ = linux.close(slot_free_fd);
 
+    var idle_fds: [2]posix.fd_t = .{ -1, -1 };
+    if (linux.errno(linux.pipe2(&idle_fds, .{ .CLOEXEC = true, .NONBLOCK = true })) != .SUCCESS) {
+        log.warn("failed to create read pipeline idle pipe; bridge polls are timeout-bound", .{});
+    }
+    errdefer if (idle_fds[0] >= 0) {
+        _ = linux.close(idle_fds[0]);
+        _ = linux.close(idle_fds[1]);
+    };
+
     var quit_fds: [2]posix.fd_t = undefined;
     if (linux.errno(linux.pipe2(&quit_fds, .{ .CLOEXEC = true })) != .SUCCESS) {
         return error.PipelineFailed;
@@ -87,12 +103,14 @@ pub fn init(master: posix.fd_t) Error!ReadPipeline {
         .master = master,
         .ready_fd = ready_fd,
         .slot_free_fd = slot_free_fd,
+        .idle_fds = idle_fds,
         .quit_fds = quit_fds,
         .thread = null,
         .count = .init(0),
         .lens = @splat(0),
         .head = 0,
         .tail = 0,
+        .bridging = .init(false),
         .bufs = undefined,
     };
 }
@@ -119,6 +137,10 @@ pub fn deinit(self: *ReadPipeline) void {
     self.stop();
     _ = linux.close(self.ready_fd);
     _ = linux.close(self.slot_free_fd);
+    if (self.idle_fds[0] >= 0) {
+        _ = linux.close(self.idle_fds[0]);
+        _ = linux.close(self.idle_fds[1]);
+    }
     _ = linux.close(self.quit_fds[0]);
     _ = linux.close(self.quit_fds[1]);
     self.* = undefined;
@@ -142,7 +164,13 @@ pub fn take(self: *const ReadPipeline) ?[]const u8 {
 pub fn release(self: *ReadPipeline) void {
     std.debug.assert(self.count.load(.monotonic) > 0);
     self.tail = (self.tail + 1) % buffer_count;
-    _ = self.count.fetchSub(1, .release);
+    // This and waitBridge's arm/check pair form a missed-wakeup handshake
+    // across two atomics, so they need one global order rather than merely
+    // ordering each atomic independently.
+    const previous_count = self.count.fetchSub(1, .seq_cst);
+    if (previous_count == 1 and self.bridging.load(.seq_cst) and self.idle_fds[1] >= 0) {
+        _ = linux.write(self.idle_fds[1], "i", 1);
+    }
     bump(self.slot_free_fd);
 }
 
@@ -164,6 +192,7 @@ fn nowNs() i128 {
 }
 
 const Wait = enum { readable, timeout, quit, hangup };
+const BridgeWait = enum { readable, timeout, quit, idle, hangup };
 
 /// Wait for the master to become readable, the quit pipe to fire, or
 /// the timeout (ms, -1 blocks) to expire.
@@ -178,6 +207,51 @@ fn waitReadable(self: *ReadPipeline, timeout_ms: i32) Wait {
     if (fds[0].revents & posix.POLL.IN != 0) return .readable;
     // POLLHUP/POLLERR alone: let read() observe and classify the error.
     return .hangup;
+}
+
+/// Wait for a producer refill while bridging a saturated burst. If the
+/// parser consumes the last published batch first, deliver immediately:
+/// any extra wait is visible latency, and a frame-synced producer may be
+/// blocked on a reply to data already in this unpublished batch.
+fn waitBridge(self: *ReadPipeline, timeout_ms: i32) BridgeWait {
+    if (self.idle_fds[0] >= 0) self.drainIdlePipe();
+
+    self.bridging.store(true, .seq_cst);
+    if (self.count.load(.seq_cst) == 0) {
+        self.bridging.store(false, .seq_cst);
+        if (self.idle_fds[0] >= 0) self.drainIdlePipe();
+        return .idle;
+    }
+
+    var fds = [_]posix.pollfd{
+        .{ .fd = self.master, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.quit_fds[0], .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.idle_fds[0], .events = posix.POLL.IN, .revents = 0 },
+    };
+    const n = posix.poll(&fds, timeout_ms) catch {
+        self.bridging.store(false, .seq_cst);
+        return .quit;
+    };
+    self.bridging.store(false, .seq_cst);
+
+    const idle_fd_ready = self.idle_fds[0] >= 0 and fds[2].revents & posix.POLL.IN != 0;
+    const parser_idle = self.count.load(.seq_cst) == 0;
+    if (self.idle_fds[0] >= 0 and (idle_fd_ready or parser_idle)) self.drainIdlePipe();
+
+    if (n == 0) return .timeout;
+    if (fds[1].revents != 0) return .quit;
+    if (idle_fd_ready or parser_idle) return .idle;
+    if (fds[0].revents & posix.POLL.IN != 0) return .readable;
+    return .hangup;
+}
+
+fn drainIdlePipe(self: *ReadPipeline) void {
+    std.debug.assert(self.idle_fds[0] >= 0);
+    var trash: [16]u8 = undefined;
+    while (true) {
+        const rc = linux.read(self.idle_fds[0], &trash, trash.len);
+        if (linux.errno(rc) != .SUCCESS or rc < trash.len) break;
+    }
 }
 
 /// Wait for a free ring slot (or quit). Returns false on quit.
@@ -241,9 +315,9 @@ fn gatherMain(self: *ReadPipeline) void {
                     if (bridge_start) |started| {
                         if (now - started >= gather_budget_ns) break :gather;
                     } else bridge_start = now;
-                    switch (self.waitReadable(bridge_poll_timeout_ms)) {
+                    switch (self.waitBridge(bridge_poll_timeout_ms)) {
                         .readable => continue :gather,
-                        .timeout, .hangup => break :gather,
+                        .timeout, .idle, .hangup => break :gather,
                         .quit => {
                             quit = true;
                             break :gather;
@@ -327,4 +401,37 @@ test "pipeline delivers batches and stops cleanly after EOF" {
     _ = linux.close(pipe_fds[1]);
     const ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
     _ = linux.nanosleep(&ts, null);
+}
+
+fn releaseAfterBridgeArmed(pipeline: *ReadPipeline) void {
+    const deadline = nowNs() + 500 * std.time.ns_per_ms;
+    while (!pipeline.bridging.load(.acquire)) {
+        if (nowNs() >= deadline) return;
+        std.Thread.yield() catch {};
+    }
+    pipeline.release();
+}
+
+test "bridge wait wakes when consumer releases last batch" {
+    var pipe_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })));
+    defer _ = linux.close(pipe_fds[0]);
+    defer _ = linux.close(pipe_fds[1]);
+    setNonblocking(pipe_fds[0]);
+
+    var pipeline: ReadPipeline = try .init(pipe_fds[0]);
+    defer pipeline.deinit();
+    try std.testing.expect(pipeline.idle_fds[0] >= 0);
+
+    pipeline.lens[0] = 1;
+    pipeline.count.store(1, .release);
+
+    const started = nowNs();
+    const releaser = try std.Thread.spawn(.{}, releaseAfterBridgeArmed, .{&pipeline});
+    const result = pipeline.waitBridge(1000);
+    releaser.join();
+
+    try std.testing.expectEqual(.idle, result);
+    try std.testing.expect(nowNs() - started < 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.count.load(.acquire));
 }
