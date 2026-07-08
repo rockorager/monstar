@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ghostty = .{
-            .url = "git+https://github.com/rockorager/ghostty.git#4916e009f125430252213c544d40aa7c8e2c4ef6",
-            .hash = "ghostty-1.3.2-dev-5UdBC4OfHAXGiNlwxcSIZ9bG39moxgQ3_aiBrn7bwJJ0",
+            .url = "git+https://github.com/rockorager/ghostty.git#637f47256a068818664068584bf05f050da853e5",
+            .hash = "ghostty-1.3.2-dev-5UdBCykjHQUp9jJhZms7t2VcdTTStlUie91yMdjufJM4",
         },
         .wayland = .{
             .url = "git+https://codeberg.org/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",

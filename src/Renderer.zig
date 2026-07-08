@@ -1231,11 +1231,11 @@ fn renderRowForeground(
             raws[x].style_id != raws[run_start].style_id or
             faces[x] != faces[run_start];
         if (breaks_run) {
-            try self.drawRun(raws, graphemes, run_start, x, y, pixels, width, height);
+            try self.drawRun(raws, graphemes, run_start, x, cols, y, pixels, width, height);
             run_start = if (has_text) x else x + 1;
         }
     }
-    try self.drawRun(raws, graphemes, run_start, cols, y, pixels, width, height);
+    try self.drawRun(raws, graphemes, run_start, cols, cols, y, pixels, width, height);
 
     // Decoration pass: underlines, strikethrough, overline, and hyperlink
     // hints overlay the glyphs, in the style's underline color (or the
@@ -1337,6 +1337,7 @@ fn drawRun(
     graphemes: []const []const u21,
     start: u31,
     end: u31,
+    cols: u31,
     y: u31,
     pixels: []u32,
     width: u31,
@@ -1411,7 +1412,7 @@ fn drawRun(
             pen_x = @as(i32, @intCast(cluster)) * font.cell_width;
         }
         const cluster_x: usize = @intCast(cluster);
-        const constraint_width = constraintWidth(raws, cluster_x, raws.len);
+        const constraint_width = constraintWidth(raws, cluster_x, cols);
         const cp = cellCodepoint(raws[cluster_x]);
         const g = face.glyph(
             self.alloc,
@@ -2267,6 +2268,118 @@ fn chromaticPixelCount(pixels: []const u32) usize {
     return count;
 }
 
+test "termtest emoji graphemes occupy two grid cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_][]const u8{
+        "⬛",
+        "⚫",
+        "◼️",
+        "🟫",
+        "🤎",
+        "◾",
+        "🟥",
+        "🔴",
+        "❤️",
+        "🟧",
+        "🟠",
+        "🔶",
+        "🟨",
+        "🟡",
+        "⭐",
+        "⬜",
+        "⚪",
+        "💫",
+        "▫️",
+        "▪️",
+        "🧱",
+        "🪵",
+        "🌑",
+        "💥",
+        "🌋",
+        "❤️‍🔥",
+        "🔥",
+        "♨️",
+        "✨",
+        "🌟",
+        "⚡",
+        "🙂",
+        "😐",
+        "😃",
+        "😅",
+        "🙃",
+        "🥵",
+        "😵‍💫",
+        "🤯",
+        "🧑‍🚒",
+        "👩‍🚒",
+        "👨‍🚒",
+        "🧑‍🏭",
+        "👩‍🏭",
+        "👨‍🏭",
+        "👨‍👩‍👧‍👦",
+        "👩‍👩‍👧‍👦",
+        "👨‍👨‍👧‍👦",
+    };
+
+    for (cases) |text| {
+        var term: vt.Terminal = try .init(std.testing.io, alloc, .{
+            .cols = 4,
+            .rows = 1,
+            .default_modes = .{ .grapheme_cluster = true },
+        });
+        defer term.deinit(alloc);
+        var stream = term.vtStream();
+        defer stream.deinit();
+
+        stream.nextSlice(text);
+
+        var state: vt.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &term);
+
+        const raws = state.row_data.get(0).cells.items(.raw);
+        try testing.expectEqual(.wide, raws[0].wide);
+        try testing.expectEqual(.spacer_tail, raws[1].wide);
+    }
+}
+
+test "termtest emoji graphemes keep width across stream splits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cases = [_][]const u8{
+        "❤️‍🔥",
+        "😵‍💫",
+        "🧑‍🚒",
+        "🧑‍🏭",
+        "👨‍👩‍👧‍👦",
+    };
+
+    for (cases) |text| {
+        var term: vt.Terminal = try .init(std.testing.io, alloc, .{
+            .cols = 12,
+            .rows = 1,
+            .default_modes = .{ .grapheme_cluster = true },
+        });
+        defer term.deinit(alloc);
+        var stream = term.vtStream();
+        defer stream.deinit();
+
+        for (text) |byte| stream.nextSlice((&byte)[0..1]);
+
+        var state: vt.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &term);
+
+        const raws = state.row_data.get(0).cells.items(.raw);
+        try testing.expectEqual(.wide, raws[0].wide);
+        try testing.expectEqual(.spacer_tail, raws[1].wide);
+        try testing.expectEqual(@as(u21, 0), cellCodepoint(raws[2]));
+    }
+}
+
 test "symbol glyph constraint widths match Ghostty" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2309,6 +2422,15 @@ test "symbol glyph constraint widths match Ghostty" {
         try state.update(alloc, &term);
         const raws = state.row_data.get(0).cells.items(.raw);
         try testing.expectEqual(@as(u2, 1), constraintWidth(raws, 3, state.cols));
+    }
+
+    {
+        term.fullReset();
+        stream.nextSlice("   ");
+        try state.update(alloc, &term);
+        const raws = state.row_data.get(0).cells.items(.raw);
+        try testing.expectEqual(@as(u2, 1), constraintWidth(raws, 2, 3));
+        try testing.expectEqual(@as(u2, 2), constraintWidth(raws, 2, state.cols));
     }
 
     {

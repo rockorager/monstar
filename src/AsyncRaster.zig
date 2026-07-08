@@ -1,4 +1,4 @@
-//! Full-frame asynchronous CPU raster worker.
+//! Asynchronous CPU raster worker.
 
 const AsyncRaster = @This();
 
@@ -11,15 +11,20 @@ const Renderer = @import("Renderer.zig");
 
 pub const Job = struct {
     pixels: []u32,
+    source_pixels: ?[]const u32,
     width: u31,
     height: u31,
+    age: usize,
     generation: u64,
     focused: bool,
 };
 
+pub const Damage = enum { full, partial, none };
+
 pub const Result = struct {
     job: Job,
     err: ?anyerror,
+    damage: Damage,
 };
 
 alloc: std.mem.Allocator,
@@ -159,6 +164,16 @@ pub fn takeResult(self: *AsyncRaster) ?Result {
     return result;
 }
 
+pub fn copyRepaintedRows(self: *AsyncRaster, alloc: std.mem.Allocator, dest: *std.DynamicBitSetUnmanaged) !void {
+    self.lock();
+    defer self.mutex.unlock();
+    std.debug.assert(!self.has_job and !self.working and self.result == null);
+    try dest.resize(alloc, self.renderer.repainted.bit_length, false);
+    dest.unsetAll();
+    var it = self.renderer.repainted.iterator(.{});
+    while (it.next()) |row| dest.set(row);
+}
+
 fn lock(self: *AsyncRaster) void {
     while (!self.mutex.tryLock()) std.Thread.yield() catch {};
 }
@@ -211,12 +226,74 @@ fn workerMain(self: *AsyncRaster) void {
         self.mutex.unlock();
 
         self.renderer.focused = job.focused;
-        const maybe_err: ?anyerror = if (self.renderer.render(self.state, job.pixels, job.width, job.height)) |_| null else |e| e;
+        var damage: Damage = .full;
+        const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
 
         self.lock();
         self.working = false;
-        self.result = .{ .job = job, .err = maybe_err };
+        self.result = .{ .job = job, .err = maybe_err, .damage = damage };
         self.mutex.unlock();
         writeEventfd(self.complete_fd) catch |err| std.debug.panic("failed to notify async raster completion: {}", .{err});
     }
+}
+
+fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
+    switch (self.state.dirty) {
+        .full => {
+            try self.renderer.render(self.state, job.pixels, job.width, job.height);
+            damage.* = .full;
+        },
+        .partial => {
+            if (!repairToPreviousFrame(job)) {
+                try self.renderer.render(self.state, job.pixels, job.width, job.height);
+                damage.* = .full;
+                return;
+            }
+            try self.renderer.renderDirty(self.state, job.pixels, job.width, job.height);
+            damage.* = .partial;
+        },
+        .false => {
+            if (!repairToPreviousFrame(job)) {
+                try self.renderer.render(self.state, job.pixels, job.width, job.height);
+                damage.* = .full;
+                return;
+            }
+            damage.* = .none;
+        },
+    }
+}
+
+fn repairToPreviousFrame(job: Job) bool {
+    if (job.age == 1) return true;
+    const source = job.source_pixels orelse return false;
+    std.debug.assert(source.len == job.pixels.len);
+    if (source.ptr != job.pixels.ptr) Renderer.copyPixels(job.pixels, source);
+    return true;
+}
+
+test "repair previous frame" {
+    var target = [_]u32{ 1, 2, 3, 4 };
+    const source = [_]u32{ 5, 6, 7, 8 };
+    const base: Job = .{
+        .pixels = &target,
+        .source_pixels = &source,
+        .width = 2,
+        .height = 2,
+        .age = 0,
+        .generation = 1,
+        .focused = true,
+    };
+
+    try std.testing.expect(repairToPreviousFrame(base));
+    try std.testing.expectEqualSlices(u32, &source, &target);
+
+    target = .{ 1, 2, 3, 4 };
+    var current = base;
+    current.source_pixels = null;
+    current.age = 1;
+    try std.testing.expect(repairToPreviousFrame(current));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, &target);
+
+    current.age = 0;
+    try std.testing.expect(!repairToPreviousFrame(current));
 }

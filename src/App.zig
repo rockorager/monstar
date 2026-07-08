@@ -97,6 +97,9 @@ render_state: vt.RenderState,
 async_render_state: vt.RenderState,
 async_raster: ?AsyncRaster,
 async_generation: u64,
+/// The next async snapshot must be rebuilt completely because renderer-only
+/// state changed or a prior snapshot was rendered but not committed.
+async_force_full: bool,
 /// Ring of per-frame damage records: what changed in each of the last
 /// N frames. Stale shm buffers use this to copy missed rows from the
 /// newest rendered shm buffer before this frame's dirty rows are drawn.
@@ -351,7 +354,7 @@ const AppStreamHandler = struct {
         self.terminal_handler.vt(action, value);
         switch (action) {
             .color_operation => self.app.handleOscColorOperation(&value.requests, value.terminator),
-            .kitty_color_report => self.app.answerKittyColorQueries(value),
+            .kitty_color_report => self.app.answerKittySelectionColorQueries(value),
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
             .progress_report => self.app.reportTaskbarProgress(value),
@@ -564,6 +567,7 @@ pub fn init(
         .async_render_state = .empty,
         .async_raster = null,
         .async_generation = 1,
+        .async_force_full = true,
         .frame_damage = @splat(.{
             .full = true,
             .rows = .{},
@@ -727,7 +731,7 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     self.font = new_font;
     self.renderer.clearShapeCache();
     self.font_size_px = size_px;
-    self.async_generation +%= 1;
+    self.invalidateAsyncFrame();
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
@@ -2019,7 +2023,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.font = new_font;
     self.renderer.clearShapeCache();
     self.font_size_px = desired_font_size;
-    self.async_generation +%= 1;
+    self.invalidateAsyncFrame();
     resize(
         self,
         physicalDimension(self.window.width, self.window.scale120),
@@ -2034,7 +2038,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
 fn applyColorDefaults(self: *App) void {
     self.applyColorDefaultsForConfig(self.config);
-    self.async_generation +%= 1;
+    self.invalidateAsyncFrame();
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
@@ -2071,7 +2075,7 @@ fn setRuntimeFontSize(self: *App, logical_size: ?u31) void {
     self.font = new_font;
     self.renderer.clearShapeCache();
     self.font_size_px = size_px;
-    self.async_generation +%= 1;
+    self.invalidateAsyncFrame();
     resize(
         self,
         physicalDimension(self.window.width, self.window.scale120),
@@ -2124,7 +2128,7 @@ fn handleOscColorOperation(
     while (it.next()) |req| {
         switch (req.*) {
             .set => |set| self.setOscColor(set),
-            .query => |target| self.answerOscColorQuery(target, terminator),
+            .query => |target| self.answerOscSelectionColorQuery(target, terminator),
             .reset => |target| self.resetOscColor(target),
             else => {},
         }
@@ -2140,7 +2144,7 @@ fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
         },
         else => return,
     }
-    self.async_generation +%= 1;
+    self.invalidateAsyncFrame();
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
@@ -2154,16 +2158,16 @@ fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
         },
         else => return,
     }
-    self.async_generation +%= 1;
+    self.invalidateAsyncFrame();
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
 
-fn answerKittyColorQueries(self: *App, request: vt.kitty.color.OSC) void {
+fn answerKittySelectionColorQueries(self: *App, request: vt.kitty.color.OSC) void {
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
 
-    const wrote_response = self.formatKittyColorResponse(&writer.writer, request) catch return;
+    const wrote_response = self.formatKittySelectionColorResponse(&writer.writer, request) catch return;
     if (!wrote_response) return;
 
     const response = writer.toOwnedSlice() catch return;
@@ -2171,7 +2175,7 @@ fn answerKittyColorQueries(self: *App, request: vt.kitty.color.OSC) void {
     self.writePty(response);
 }
 
-fn formatKittyColorResponse(
+fn formatKittySelectionColorResponse(
     self: *const App,
     writer: *std.Io.Writer,
     request: vt.kitty.color.OSC,
@@ -2180,11 +2184,12 @@ fn formatKittyColorResponse(
     for (request.list.items) |item| {
         switch (item) {
             .query => |key| {
+                const value = self.kittySelectionColorValue(key) orelse continue;
                 if (!wrote_response) {
                     try writer.writeAll("\x1b]21");
                     wrote_response = true;
                 }
-                try writeKittyColorReport(writer, key, self.kittyColorValue(key));
+                try writeKittyColorReport(writer, key, value);
             },
             else => {},
         }
@@ -2198,25 +2203,22 @@ const KittyColorValue = union(enum) {
     unset,
 };
 
-fn kittyColorValue(self: *const App, key: vt.kitty.color.Kind) KittyColorValue {
+fn kittySelectionColorValue(self: *const App, key: vt.kitty.color.Kind) ?KittyColorValue {
     return switch (key) {
-        .palette => |idx| .{ .color = self.term.colors.palette.current[idx] },
+        .palette => null,
         .special => |special| switch (special) {
-            .foreground => .{ .color = self.effectiveForeground() },
-            .background => .{ .color = self.effectiveBackground() },
             .selection_background => .{ .color = self.renderer.selection_bg },
             .selection_foreground => if (self.renderer.selection_fg) |color|
                 .{ .color = color }
             else
                 .unset,
-            .cursor => if (self.term.colors.cursor.get()) |color|
-                .{ .color = color }
-            else
-                .unset,
+            .foreground,
+            .background,
+            .cursor,
             .cursor_text,
             .visual_bell,
             .second_transparent_background,
-            => .unset,
+            => null,
         },
     };
 }
@@ -2399,28 +2401,29 @@ fn formatDecrqssResponse(
     return writer.end;
 }
 
-fn answerOscColorQuery(
+fn answerOscSelectionColorQuery(
     self: *App,
     target: vt.osc.color.Target,
     terminator: vt.osc.Terminator,
 ) void {
     switch (target) {
-        .palette => |idx| self.writeOscPaletteReport(idx, terminator),
+        .palette => {},
         .dynamic => |dynamic| switch (dynamic) {
-            .foreground => self.writeOscDynamicReport(10, self.effectiveForeground(), terminator),
-            .background => self.writeOscDynamicReport(11, self.effectiveBackground(), terminator),
-            .cursor => self.writeOscDynamicReport(
-                12,
-                self.term.colors.cursor.get() orelse self.effectiveForeground(),
-                terminator,
-            ),
             .highlight_background => self.writeOscDynamicReport(17, self.renderer.selection_bg, terminator),
             .highlight_foreground => self.writeOscDynamicReport(
                 19,
                 self.renderer.selection_fg orelse self.effectiveForeground(),
                 terminator,
             ),
-            else => {},
+            .foreground,
+            .background,
+            .cursor,
+            .pointer_foreground,
+            .pointer_background,
+            .tektronix_foreground,
+            .tektronix_background,
+            .tektronix_cursor,
+            => {},
         },
         .special => {},
     }
@@ -3708,7 +3711,7 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
 fn setFocus(self: *App, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
-    self.async_generation +%= 1;
+    self.invalidateAsyncFrame();
     if (focused) {
         self.window.setUrgent(false) catch |err| {
             log.warn("failed to clear window attention: {}", .{err});
@@ -3963,10 +3966,7 @@ fn render(
     // This synchronous snapshot consumes terminal dirty flags that the
     // independent async snapshot would otherwise miss on a later frame.
     // Force that snapshot to rebuild before it returns to the worker path.
-    if (self.async_raster != null) {
-        self.async_render_state.rows = 0;
-        self.async_render_state.dirty = .full;
-    }
+    if (self.async_raster != null) self.async_force_full = true;
     if (self.config.frame_timer != .off) {
         self.frame_start = self.nowNs();
         self.frame_update_done = self.frame_start;
@@ -4104,9 +4104,16 @@ fn startAsyncRender(self: *App) !bool {
     const target = self.window.acquireRenderTarget() catch return false;
     errdefer self.window.cancelRender(target.buffer);
 
-    self.async_render_state.dirty = .full;
+    if (self.async_force_full) {
+        self.async_render_state.rows = 0;
+        self.async_render_state.dirty = .full;
+    }
+    const old_cursor = self.async_render_state.cursor;
     try self.async_render_state.update(self.alloc, &self.term);
-    self.async_render_state.dirty = .full;
+    dirtyCursorRowsForState(&self.async_render_state, old_cursor);
+    if (self.async_render_state.dirty == .partial and allStateRowsDirty(&self.async_render_state)) {
+        self.async_render_state.dirty = .full;
+    }
     // The async snapshot consumed the terminal dirty flags. Make the next
     // synchronous fallback rebuild its independent snapshot completely.
     self.render_state.rows = 0;
@@ -4114,8 +4121,10 @@ fn startAsyncRender(self: *App) !bool {
     self.async_generation +%= 1;
     async_raster.submit(.{
         .pixels = target.pixels,
+        .source_pixels = target.source_pixels,
         .width = target.width,
         .height = target.height,
+        .age = target.age,
         .generation = self.async_generation,
         .focused = self.focused,
     }) catch |err| {
@@ -4125,6 +4134,7 @@ fn startAsyncRender(self: *App) !bool {
         self.async_raster = null;
         return false;
     };
+    self.async_force_full = false;
     return true;
 }
 
@@ -4161,12 +4171,28 @@ fn finishAsyncRender(self: *App) void {
         result.job.height != physicalDimension(self.window.height, self.window.scale120))
     {
         self.window.cancelRender(buffer);
+        self.async_force_full = true;
         self.needs_redraw = true;
         return;
     }
-    _ = self.beginFrameDamage(result.job.width, result.job.height);
+    const damage = self.beginFrameDamage(result.job.width, result.job.height);
+    self.recordAsyncFrameDamage(damage, async_raster, result.damage) catch |err| {
+        log.err("async damage bookkeeping failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+        return;
+    };
+    clearStateDirty(&self.async_render_state);
     self.syncTextInputCursorRect(&self.async_render_state);
-    self.window.commitRender(buffer, .full) catch |err| {
+    const surface_damage = self.currentFrameDamage(result.job.height) catch |err| {
+        log.err("async surface damage failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+        return;
+    };
+    self.window.commitRender(buffer, surface_damage) catch |err| {
         log.err("async commit failed: {}", .{err});
         self.window.cancelRender(buffer);
         self.window.fatal_error = err;
@@ -4195,6 +4221,20 @@ fn beginFrameDamage(self: *App, width: u31, height: u31) *FrameDamage {
     damage.width = width;
     damage.height = height;
     return damage;
+}
+
+fn recordAsyncFrameDamage(self: *App, damage: *FrameDamage, async_raster: *AsyncRaster, rendered: AsyncRaster.Damage) !void {
+    if (rendered == .full) return;
+    damage.full = false;
+    switch (rendered) {
+        .full => unreachable,
+        .partial => try async_raster.copyRepaintedRows(self.alloc, &damage.rows),
+        .none => {
+            try damage.rows.resize(self.alloc, self.async_render_state.rows, false);
+            damage.rows.unsetAll();
+        },
+    }
+    std.debug.assert(damage.rows.bit_length == self.async_render_state.rows);
 }
 
 /// Fill the current damage entry from the render state's dirty rows,
@@ -4237,9 +4277,13 @@ fn bottomStripBetween(self: *const App, first_back: usize, end_back: usize) bool
 }
 
 fn allRenderRowsDirty(self: *const App) bool {
-    const rows: usize = self.render_state.rows;
+    return allStateRowsDirty(&self.render_state);
+}
+
+fn allStateRowsDirty(state: *const vt.RenderState) bool {
+    const rows: usize = state.rows;
     if (rows == 0) return false;
-    for (self.render_state.row_data.items(.dirty)[0..rows]) |dirty| {
+    for (state.row_data.items(.dirty)[0..rows]) |dirty| {
         if (!dirty) return false;
     }
     return true;
@@ -4420,7 +4464,11 @@ fn scaledPhysicalToLogical(scale120: u32, value: i32) i32 {
 }
 
 fn dirtyCursorRows(self: *App, old_cursor: vt.RenderState.Cursor) void {
-    const new_cursor = self.render_state.cursor;
+    dirtyCursorRowsForState(&self.render_state, old_cursor);
+}
+
+fn dirtyCursorRowsForState(state: *vt.RenderState, old_cursor: vt.RenderState.Cursor) void {
+    const new_cursor = state.cursor;
     if (old_cursor.visible == new_cursor.visible and
         old_cursor.visual_style == new_cursor.visual_style and
         std.meta.eql(old_cursor.viewport, new_cursor.viewport))
@@ -4428,22 +4476,31 @@ fn dirtyCursorRows(self: *App, old_cursor: vt.RenderState.Cursor) void {
         return;
     }
 
-    self.dirtyCursorRow(old_cursor.viewport);
-    self.dirtyCursorRow(new_cursor.viewport);
+    dirtyCursorRowInState(state, old_cursor.viewport);
+    dirtyCursorRowInState(state, new_cursor.viewport);
 }
 
-fn dirtyCursorRow(self: *App, viewport: ?vt.RenderState.Cursor.Viewport) void {
+fn dirtyCursorRowInState(state: *vt.RenderState, viewport: ?vt.RenderState.Cursor.Viewport) void {
     const row = viewport orelse return;
-    if (row.y >= self.render_state.row_data.len) return;
+    if (row.y >= state.row_data.len) return;
 
-    self.render_state.row_data.items(.dirty)[row.y] = true;
-    if (self.render_state.dirty == .false) self.render_state.dirty = .partial;
+    state.row_data.items(.dirty)[row.y] = true;
+    if (state.dirty == .false) state.dirty = .partial;
 }
 
 fn clearRenderDirty(self: *App) void {
-    const rows = self.render_state.row_data.slice();
+    clearStateDirty(&self.render_state);
+}
+
+fn clearStateDirty(state: *vt.RenderState) void {
+    const rows = state.row_data.slice();
     for (rows.items(.dirty)) |*dirty| dirty.* = false;
-    self.render_state.dirty = .false;
+    state.dirty = .false;
+}
+
+fn invalidateAsyncFrame(self: *App) void {
+    self.async_generation +%= 1;
+    self.async_force_full = true;
 }
 
 /// Window resize delegate: fit the grid to the new size, resize the
