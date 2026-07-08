@@ -75,6 +75,7 @@ fatal_error: ?anyerror,
 /// A frame callback is outstanding; drawing now would outpace the
 /// compositor. `redraw()` queues instead.
 frame_pending: bool,
+rendering_pending: bool,
 redraw_queued: bool,
 /// Monotonic count of frames drawn, for buffer-age tracking. Each
 /// buffer remembers the frame it last held; the difference tells the
@@ -88,6 +89,7 @@ keyboard_fn: ?KeyboardFn,
 pointer_fn: ?PointerFn,
 text_input_fn: ?TextInputFn,
 scale_fn: ?ScaleFn,
+redraw_ready_fn: ?RedrawReadyFn,
 
 /// A full-width horizontal band of pixels, in buffer coordinates.
 pub const RowSpan = struct { y: u31, height: u31 };
@@ -139,6 +141,11 @@ pub const InitialSize = struct {
 /// Called when the output scale changed, before the resize/draw that
 /// follows. `scale120` is the scale in 1/120ths (120 == 1.0).
 pub const ScaleFn = *const fn (ctx: *anyopaque, scale120: u32) anyerror!void;
+
+/// Called when compositor throttling ends or configure work requires a
+/// frame. The application decides whether to raster synchronously or on a
+/// worker; Window never bypasses that decision from a Wayland callback.
+pub const RedrawReadyFn = *const fn (ctx: *anyopaque) void;
 
 /// Globals collected during the initial registry roundtrip.
 const Globals = struct {
@@ -276,6 +283,7 @@ pub fn create(
         .running = true,
         .fatal_error = null,
         .frame_pending = false,
+        .rendering_pending = false,
         .redraw_queued = false,
         .frame_counter = 0,
         .suspended = false,
@@ -286,6 +294,7 @@ pub fn create(
         .pointer_fn = null,
         .text_input_fn = null,
         .scale_fn = null,
+        .redraw_ready_fn = null,
     };
 
     if (toplevel_decoration) |decoration| decoration.setListener(*Window, decorationListener, self);
@@ -374,6 +383,7 @@ pub fn setCallbacks(
     pointer_fn: ?PointerFn,
     text_input_fn: ?TextInputFn,
     scale_fn: ?ScaleFn,
+    redraw_ready_fn: ?RedrawReadyFn,
 ) void {
     self.render_ctx = ctx;
     self.render_fn = render_fn;
@@ -382,6 +392,7 @@ pub fn setCallbacks(
     self.pointer_fn = pointer_fn;
     self.text_input_fn = text_input_fn;
     self.scale_fn = scale_fn;
+    self.redraw_ready_fn = redraw_ready_fn;
 }
 
 pub fn setCursorShape(self: *Window, shape: CursorShape) void {
@@ -460,7 +471,7 @@ pub fn redraw(self: *Window) !void {
         self.redraw_queued = true;
         return;
     }
-    if (self.frame_pending) {
+    if (self.frame_pending or self.rendering_pending) {
         self.redraw_queued = true;
         return;
     }
@@ -472,27 +483,64 @@ pub fn redraw(self: *Window) !void {
 fn draw(self: *Window) !void {
     const phys_width = self.physical(self.width);
     const phys_height = self.physical(self.height);
-    const buffer = try self.acquireBuffer(phys_width, phys_height);
-    self.frame_counter += 1;
+    const target = try self.beginRender(phys_width, phys_height);
+    const buffer = target.buffer;
+    errdefer self.cancelRender(buffer);
     const damage: Damage = if (self.render_fn) |render_fn| damage: {
-        const age: usize = if (buffer.frame == 0)
-            0
-        else
-            @intCast(self.frame_counter - buffer.frame);
-        const source_pixels: ?[]const u32 = if (self.newest_buffer) |newest|
-            if (newest.frame != 0 and newest.width == phys_width and newest.height == phys_height)
-                newest.pixels()
-            else
-                null
-        else
-            null;
-        break :damage try render_fn(self.render_ctx.?, buffer.pixels(), source_pixels, phys_width, phys_height, age);
+        break :damage try render_fn(self.render_ctx.?, buffer.pixels(), target.source_pixels, phys_width, phys_height, target.age);
     } else damage: {
         @memset(buffer.pixels(), bg_color);
         break :damage .full;
     };
+    self.commitRender(buffer, damage) catch |err| {
+        return err;
+    };
+}
+
+pub const RenderTarget = struct {
+    buffer: *Buffer,
+    pixels: []u32,
+    source_pixels: ?[]const u32,
+    width: u31,
+    height: u31,
+    age: usize,
+};
+
+pub fn acquireRenderTarget(self: *Window) !RenderTarget {
+    if (self.width == 0 or self.suspended or self.frame_pending or self.rendering_pending) return error.NotReady;
+    return self.beginRender(self.physical(self.width), self.physical(self.height));
+}
+
+fn beginRender(self: *Window, phys_width: u31, phys_height: u31) !RenderTarget {
+    const buffer = try self.acquireBuffer(phys_width, phys_height);
+    buffer.rendering = true;
+    self.rendering_pending = true;
+    const age: usize = if (buffer.frame == 0) 0 else @intCast(self.frame_counter + 1 - buffer.frame);
+    const source_pixels: ?[]const u32 = if (self.newest_buffer) |newest|
+        if (newest.frame != 0 and newest.width == phys_width and newest.height == phys_height)
+            newest.pixels()
+        else
+            null
+    else
+        null;
+    return .{ .buffer = buffer, .pixels = buffer.pixels(), .source_pixels = source_pixels, .width = phys_width, .height = phys_height, .age = age };
+}
+
+pub fn cancelRender(self: *Window, buffer: *Buffer) void {
+    buffer.rendering = false;
+    self.rendering_pending = false;
+    self.redraw_queued = true;
+}
+
+pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
+    std.debug.assert(buffer.rendering);
+    buffer.rendering = false;
+    self.rendering_pending = false;
+    self.frame_counter += 1;
     buffer.frame = self.frame_counter;
     self.newest_buffer = buffer;
+    const phys_width = buffer.width;
+    const phys_height = buffer.height;
     if (self.viewport) |viewport| viewport.setDestination(self.width, self.height);
 
     // Throttle future redraws to the compositor's pace. Configure-driven
@@ -522,11 +570,7 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
             if (self.redraw_queued) {
                 if (self.suspended) return;
                 self.redraw_queued = false;
-                self.draw() catch |err| {
-                    log.err("draw failed: {}", .{err});
-                    self.fatal_error = err;
-                    self.running = false;
-                };
+                self.scheduleDraw();
             }
         },
     }
@@ -538,7 +582,7 @@ fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
     var i: usize = 0;
     while (i < self.buffers.items.len) {
         const buffer = self.buffers.items[i];
-        if (buffer.busy) {
+        if (buffer.busy or buffer.rendering) {
             i += 1;
             continue;
         }
@@ -729,6 +773,18 @@ fn geometryChanged(self: *Window, resized: bool) void {
         self.redraw_queued = true;
         return;
     }
+    if (self.frame_pending or self.rendering_pending) {
+        self.redraw_queued = true;
+        return;
+    }
+    self.scheduleDraw();
+}
+
+fn scheduleDraw(self: *Window) void {
+    if (self.redraw_ready_fn) |redraw_ready_fn| {
+        redraw_ready_fn(self.render_ctx.?);
+        return;
+    }
     self.draw() catch |err| {
         log.err("draw failed: {}", .{err});
         self.fatal_error = err;
@@ -778,12 +834,13 @@ fn toplevelState(states: anytype, needle: xdg.Toplevel.State) bool {
 
 /// A wl_shm backed pixel buffer. `busy` is true while the compositor
 /// holds the buffer; the release event clears it.
-const Buffer = struct {
+pub const Buffer = struct {
     wl_buffer: *wl.Buffer,
     data: []align(std.heap.page_size_min) u8,
     width: u31,
     height: u31,
     busy: bool,
+    rendering: bool,
     /// Window.frame_counter value when this buffer was last drawn;
     /// 0 means never (content undefined).
     frame: u64,
@@ -819,6 +876,7 @@ const Buffer = struct {
             .width = width,
             .height = height,
             .busy = false,
+            .rendering = false,
             .frame = 0,
         };
         wl_buffer.setListener(*Buffer, bufferListener, self);
@@ -831,7 +889,7 @@ const Buffer = struct {
         alloc.destroy(self);
     }
 
-    fn pixels(self: *Buffer) []u32 {
+    pub fn pixels(self: *Buffer) []u32 {
         return @alignCast(std.mem.bytesAsSlice(u32, self.data));
     }
 

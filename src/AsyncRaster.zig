@@ -1,0 +1,222 @@
+//! Full-frame asynchronous CPU raster worker.
+
+const AsyncRaster = @This();
+
+const std = @import("std");
+const linux = std.os.linux;
+const posix = std.posix;
+const vt = @import("ghostty-vt");
+const Font = @import("Font.zig");
+const Renderer = @import("Renderer.zig");
+
+pub const Job = struct {
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    generation: u64,
+    focused: bool,
+};
+
+pub const Result = struct {
+    job: Job,
+    err: ?anyerror,
+};
+
+alloc: std.mem.Allocator,
+font_family: [:0]u8,
+font_size_px: u31,
+font: Font,
+renderer: Renderer,
+thread: ?std.Thread,
+mutex: std.atomic.Mutex = .unlocked,
+job_fd: posix.fd_t,
+complete_fd: posix.fd_t,
+stop: bool = false,
+has_job: bool = false,
+working: bool = false,
+job: Job = undefined,
+result: ?Result = null,
+state: *vt.RenderState,
+
+pub fn init(
+    font_family: [:0]const u8,
+    font_size_px: u31,
+    selection_background: vt.color.RGB,
+    selection_foreground: vt.color.RGB,
+    state: *vt.RenderState,
+) !AsyncRaster {
+    const alloc = std.heap.smp_allocator;
+    const family = try alloc.dupeZ(u8, font_family);
+    errdefer alloc.free(family);
+    var font: Font = try .init(alloc, family, font_size_px);
+    errdefer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{
+        .selection_background = selection_background,
+        .selection_foreground = selection_foreground,
+    });
+    errdefer renderer.deinit();
+    const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+    if (linux.errno(rc) != .SUCCESS) return error.EventFdFailed;
+    errdefer _ = linux.close(@as(posix.fd_t, @intCast(rc)));
+    const job_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(job_rc) != .SUCCESS) return error.EventFdFailed;
+    errdefer _ = linux.close(@as(posix.fd_t, @intCast(job_rc)));
+    const self: AsyncRaster = .{
+        .alloc = alloc,
+        .font_family = family,
+        .font_size_px = font_size_px,
+        .font = font,
+        .renderer = renderer,
+        .thread = null,
+        .job_fd = @intCast(job_rc),
+        .complete_fd = @intCast(rc),
+        .state = state,
+    };
+    return self;
+}
+
+pub fn start(self: *AsyncRaster) !void {
+    std.debug.assert(self.thread == null);
+    // init returns this structure by value, so repair the renderer's pointer
+    // after it reaches its stable address and before the worker can use it.
+    self.renderer.font = &self.font;
+    self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
+}
+
+pub fn deinit(self: *AsyncRaster) void {
+    self.lock();
+    self.stop = true;
+    self.mutex.unlock();
+    self.notifyJob() catch |err| std.debug.panic("failed to wake async raster worker during shutdown: {}", .{err});
+    if (self.thread) |thread| thread.join();
+    _ = linux.close(self.job_fd);
+    _ = linux.close(self.complete_fd);
+    self.renderer.deinit();
+    self.font.deinit(self.alloc);
+    self.alloc.free(self.font_family);
+    self.* = undefined;
+}
+
+pub fn reconfigure(self: *AsyncRaster, font_family: [:0]const u8, font_size_px: u31, selection_background: vt.color.RGB, selection_foreground: ?vt.color.RGB) !void {
+    self.lock();
+    defer self.mutex.unlock();
+    if (self.has_job or self.working or self.result != null) return error.Busy;
+    const family = try self.alloc.dupeZ(u8, font_family);
+    errdefer self.alloc.free(family);
+    var font: Font = try .init(self.alloc, family, font_size_px);
+    errdefer font.deinit(self.alloc);
+    var renderer: Renderer = try .init(self.alloc, &font, .{ .selection_background = selection_background, .selection_foreground = selection_foreground });
+    errdefer renderer.deinit();
+    self.renderer.deinit();
+    self.font.deinit(self.alloc);
+    self.alloc.free(self.font_family);
+    self.font_family = family;
+    self.font_size_px = font_size_px;
+    self.font = font;
+    self.renderer = renderer;
+    self.renderer.font = &self.font;
+}
+
+pub fn busy(self: *AsyncRaster) bool {
+    self.lock();
+    defer self.mutex.unlock();
+    return self.has_job or self.working or self.result != null;
+}
+
+pub fn configuredFor(
+    self: *AsyncRaster,
+    font_family: []const u8,
+    font_size_px: u31,
+    selection_background: vt.color.RGB,
+    selection_foreground: ?vt.color.RGB,
+) bool {
+    self.lock();
+    defer self.mutex.unlock();
+    return std.mem.eql(u8, self.font_family, font_family) and
+        self.font_size_px == font_size_px and
+        self.renderer.selection_bg.eql(selection_background) and
+        optionalRgbEql(self.renderer.selection_fg, selection_foreground);
+}
+
+pub fn submit(self: *AsyncRaster, job: Job) !void {
+    self.lock();
+    defer self.mutex.unlock();
+    if (self.has_job or self.working or self.result != null) return error.Busy;
+    self.job = job;
+    self.has_job = true;
+    self.notifyJob() catch |err| {
+        self.has_job = false;
+        return err;
+    };
+}
+
+pub fn takeResult(self: *AsyncRaster) ?Result {
+    self.drainEventfd();
+    self.lock();
+    defer self.mutex.unlock();
+    const result = self.result orelse return null;
+    self.result = null;
+    return result;
+}
+
+fn lock(self: *AsyncRaster) void {
+    while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+}
+
+fn optionalRgbEql(a: ?vt.color.RGB, b: ?vt.color.RGB) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
+}
+
+fn drainEventfd(self: *AsyncRaster) void {
+    var value: u64 = 0;
+    while (posix.read(self.complete_fd, std.mem.asBytes(&value))) |_| {} else |_| {}
+}
+
+fn notifyJob(self: *AsyncRaster) !void {
+    try writeEventfd(self.job_fd);
+}
+
+fn writeEventfd(fd: posix.fd_t) !void {
+    const one: u64 = 1;
+    while (true) {
+        const rc = linux.write(fd, @ptrCast(&one), @sizeOf(u64));
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc != @sizeOf(u64)) return error.ShortEventFdWrite;
+                return;
+            },
+            .INTR => continue,
+            else => return error.EventFdWriteFailed,
+        }
+    }
+}
+
+fn waitJob(self: *AsyncRaster) void {
+    var value: u64 = 0;
+    while (posix.read(self.job_fd, std.mem.asBytes(&value))) |_| return else |_| {}
+}
+
+fn workerMain(self: *AsyncRaster) void {
+    while (true) {
+        self.waitJob();
+        self.lock();
+        if (self.stop) {
+            self.mutex.unlock();
+            return;
+        }
+        const job = self.job;
+        self.has_job = false;
+        self.working = true;
+        self.mutex.unlock();
+
+        self.renderer.focused = job.focused;
+        const maybe_err: ?anyerror = if (self.renderer.render(self.state, job.pixels, job.width, job.height)) |_| null else |e| e;
+
+        self.lock();
+        self.working = false;
+        self.result = .{ .job = job, .err = maybe_err };
+        self.mutex.unlock();
+        writeEventfd(self.complete_fd) catch |err| std.debug.panic("failed to notify async raster completion: {}", .{err});
+    }
+}

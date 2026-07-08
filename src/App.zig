@@ -21,6 +21,7 @@ const Keyboard = @import("Keyboard.zig");
 const Pty = @import("Pty.zig");
 const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
+const AsyncRaster = @import("AsyncRaster.zig");
 const cgroup = @import("cgroup.zig");
 const Window = @import("Window.zig");
 
@@ -93,6 +94,9 @@ environ: std.process.Environ,
 term: vt.Terminal,
 stream: AppStream,
 render_state: vt.RenderState,
+async_render_state: vt.RenderState,
+async_raster: ?AsyncRaster,
+async_generation: u64,
 /// Ring of per-frame damage records: what changed in each of the last
 /// N frames. Stale shm buffers use this to copy missed rows from the
 /// newest rendered shm buffer before this frame's dirty rows are drawn.
@@ -557,6 +561,9 @@ pub fn init(
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
+        .async_render_state = .empty,
+        .async_raster = null,
+        .async_generation = 1,
         .frame_damage = @splat(.{
             .full = true,
             .rows = .{},
@@ -657,7 +664,24 @@ pub fn init(
     self.stream.handler.terminal_handler.effects = effects;
 
     self.initDbus();
-    window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged);
+    self.async_raster = AsyncRaster.init(
+        config.font_family,
+        self.font_size_px,
+        config.effectiveSelectionBackground(.dark),
+        config.effectiveSelectionForeground(.dark),
+        &self.async_render_state,
+    ) catch |err| blk: {
+        log.warn("async raster unavailable; using sync renderer: {}", .{err});
+        break :blk null;
+    };
+    if (self.async_raster) |*async_raster| {
+        async_raster.start() catch |err| {
+            log.warn("async raster unavailable; using sync renderer: {}", .{err});
+            async_raster.deinit();
+            self.async_raster = null;
+        };
+    }
+    window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged, redrawReady);
     return self;
 }
 
@@ -703,6 +727,7 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     self.font = new_font;
     self.renderer.clearShapeCache();
     self.font_size_px = size_px;
+    self.async_generation +%= 1;
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
@@ -1249,6 +1274,7 @@ pub fn deinit(self: *App) void {
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
     for (&self.frame_damage) |*damage| damage.rows.deinit(self.alloc);
+    if (self.async_raster) |*async_raster| async_raster.deinit();
     self.damage_spans.deinit(self.alloc);
     self.clearImeText();
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
@@ -1270,6 +1296,7 @@ pub fn deinit(self: *App) void {
     self.keyboard.deinit();
     self.window.destroy();
     self.renderer.deinit();
+    self.async_render_state.deinit(self.alloc);
     self.render_state.deinit(self.alloc);
     self.stream.deinit();
     self.term.deinit(self.alloc);
@@ -1299,6 +1326,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.selection_autoscroll_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.taskbar_progress_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1310,16 +1338,26 @@ pub fn run(self: *App) !void {
     const selection_autoscroll_fd = &fds[7];
     const taskbar_progress_fd = &fds[8];
     const dbus_fd = &fds[9];
+    const async_fd = &fds[10];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
+        async_fd.fd = if (self.async_raster) |*async_raster| async_raster.complete_fd else -1;
 
         // Standard libwayland read dance: drain the local queue, flush
         // requests, then sleep until one of the fds is ready.
         while (!display.prepareRead()) {
             if (display.dispatchPending() != .SUCCESS) return error.DispatchFailed;
             self.window.flushPending();
+        }
+        // Pending Wayland callbacks can request a redraw while prepareRead
+        // drains the local queue. Do that work before entering an infinite
+        // poll, or it may remain stranded until an unrelated fd wakes us.
+        if (self.hasReadyRedraw()) {
+            display.cancelRead();
+            try self.redrawIfNeeded();
+            continue;
         }
         switch (display.flush()) {
             .SUCCESS => {},
@@ -1382,16 +1420,15 @@ pub fn run(self: *App) !void {
             self.dispatchDbus();
         }
 
+        if (async_fd.revents & posix.POLL.IN != 0) {
+            self.finishAsyncRender();
+        }
+
         if (self.paste_fd >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
             self.readPaste();
         }
 
-        if (self.needs_redraw) {
-            if (!self.term.modes.get(.synchronized_output)) {
-                self.needs_redraw = false;
-                try self.window.redraw();
-            }
-        }
+        try self.redrawIfNeeded();
     }
 
     if (self.window.fatal_error != null) {
@@ -1982,6 +2019,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.font = new_font;
     self.renderer.clearShapeCache();
     self.font_size_px = desired_font_size;
+    self.async_generation +%= 1;
     resize(
         self,
         physicalDimension(self.window.width, self.window.scale120),
@@ -1996,6 +2034,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
 fn applyColorDefaults(self: *App) void {
     self.applyColorDefaultsForConfig(self.config);
+    self.async_generation +%= 1;
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
@@ -2032,6 +2071,7 @@ fn setRuntimeFontSize(self: *App, logical_size: ?u31) void {
     self.font = new_font;
     self.renderer.clearShapeCache();
     self.font_size_px = size_px;
+    self.async_generation +%= 1;
     resize(
         self,
         physicalDimension(self.window.width, self.window.scale120),
@@ -2100,6 +2140,7 @@ fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
         },
         else => return,
     }
+    self.async_generation +%= 1;
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
@@ -2113,6 +2154,7 @@ fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
         },
         else => return,
     }
+    self.async_generation +%= 1;
     self.render_state.dirty = .full;
     self.needs_redraw = true;
 }
@@ -3666,6 +3708,7 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
 fn setFocus(self: *App, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
+    self.async_generation +%= 1;
     if (focused) {
         self.window.setUrgent(false) catch |err| {
             log.warn("failed to clear window attention: {}", .{err});
@@ -3688,7 +3731,7 @@ fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
     switch (event) {
         .enter => {
             self.ime_focused = true;
-            self.window.enableTextInput(self.textInputCursorRect());
+            self.window.enableTextInput(self.textInputCursorRect(self.currentCursorState()));
         },
         .leave => {
             self.ime_focused = false;
@@ -3721,7 +3764,7 @@ fn applyPendingIme(self: *App) void {
     }
     self.setImePreedit(self.ime_pending_preedit);
     self.resetPendingIme();
-    self.syncTextInputCursorRect();
+    self.syncTextInputCursorRect(&self.render_state);
 }
 
 fn setImePreedit(self: *App, text: ?[]const u8) void {
@@ -3917,6 +3960,13 @@ fn render(
 ) anyerror!Window.Damage {
     const self: *App = @ptrCast(@alignCast(ctx));
     std.debug.assert(pixels.len == @as(usize, width) * height);
+    // This synchronous snapshot consumes terminal dirty flags that the
+    // independent async snapshot would otherwise miss on a later frame.
+    // Force that snapshot to rebuild before it returns to the worker path.
+    if (self.async_raster != null) {
+        self.async_render_state.rows = 0;
+        self.async_render_state.dirty = .full;
+    }
     if (self.config.frame_timer != .off) {
         self.frame_start = self.nowNs();
         self.frame_update_done = self.frame_start;
@@ -4014,13 +4064,126 @@ fn render(
             hint_drawn = true;
         }
     }
-    self.syncTextInputCursorRect();
+    self.syncTextInputCursorRect(&self.render_state);
     if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
     // Record what changed before the dirty flags are cleared. A scroll
     // moved every pixel, so its entry keeps the claimed full damage.
     if (!force_full_render and !scrolled) try self.recordFrameDamage(damage, hint_drawn);
     self.clearRenderDirty();
     return self.finishFrame(pixels, width, height);
+}
+
+fn asyncEligible(self: *App) bool {
+    if (self.async_raster == null) return false;
+    if (self.config.frame_timer != .off) return false;
+    if (self.term.modes.get(.synchronized_output)) return false;
+    if (self.term.screens.active.kitty_images.placements.count() > 0) return false;
+    if (self.term.screens.active.kitty_images.dirty) return false;
+    if (self.ime_preedit != null) return false;
+    if (self.keyboard.currentMods().ctrl) return false;
+    return true;
+}
+
+fn startAsyncRender(self: *App) !bool {
+    if (!self.asyncEligible()) return false;
+    var async_raster = &(self.async_raster orelse return false);
+    if (async_raster.busy()) return false;
+    if (!async_raster.configuredFor(
+        self.config.font_family,
+        self.font_size_px,
+        self.renderer.selection_bg,
+        self.renderer.selection_fg,
+    )) {
+        async_raster.reconfigure(
+            self.config.font_family,
+            self.font_size_px,
+            self.renderer.selection_bg,
+            self.renderer.selection_fg,
+        ) catch return false;
+    }
+    const target = self.window.acquireRenderTarget() catch return false;
+    errdefer self.window.cancelRender(target.buffer);
+
+    self.async_render_state.dirty = .full;
+    try self.async_render_state.update(self.alloc, &self.term);
+    self.async_render_state.dirty = .full;
+    // The async snapshot consumed the terminal dirty flags. Make the next
+    // synchronous fallback rebuild its independent snapshot completely.
+    self.render_state.rows = 0;
+    self.render_state.dirty = .full;
+    self.async_generation +%= 1;
+    async_raster.submit(.{
+        .pixels = target.pixels,
+        .width = target.width,
+        .height = target.height,
+        .generation = self.async_generation,
+        .focused = self.focused,
+    }) catch |err| {
+        log.warn("async render submission failed; falling back to sync: {}", .{err});
+        self.window.cancelRender(target.buffer);
+        async_raster.deinit();
+        self.async_raster = null;
+        return false;
+    };
+    return true;
+}
+
+fn hasReadyRedraw(self: *const App) bool {
+    return self.needs_redraw and !self.term.modes.get(.synchronized_output);
+}
+
+fn redrawIfNeeded(self: *App) !void {
+    if (!self.hasReadyRedraw()) return;
+    self.needs_redraw = false;
+    if (!try self.startAsyncRender()) try self.window.redraw();
+}
+
+fn finishAsyncRender(self: *App) void {
+    var async_raster = &(self.async_raster orelse return);
+    const result = async_raster.takeResult() orelse return;
+    const buffer = self.findRenderingBuffer(result.job.pixels) orelse {
+        self.needs_redraw = true;
+        return;
+    };
+    if (result.err) |err| {
+        log.warn("async render failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        // A deterministic raster error would otherwise retry the same async
+        // path forever. Retire the experiment and use the sync renderer.
+        async_raster.deinit();
+        self.async_raster = null;
+        self.needs_redraw = true;
+        return;
+    }
+    if (result.job.generation != self.async_generation or
+        self.window.suspended or
+        result.job.width != physicalDimension(self.window.width, self.window.scale120) or
+        result.job.height != physicalDimension(self.window.height, self.window.scale120))
+    {
+        self.window.cancelRender(buffer);
+        self.needs_redraw = true;
+        return;
+    }
+    _ = self.beginFrameDamage(result.job.width, result.job.height);
+    self.syncTextInputCursorRect(&self.async_render_state);
+    self.window.commitRender(buffer, .full) catch |err| {
+        log.err("async commit failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+    };
+}
+
+fn redrawReady(ctx: *anyopaque) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.needs_redraw = true;
+}
+
+fn findRenderingBuffer(self: *App, pixels: []u32) ?*Window.Buffer {
+    for (self.window.buffers.items) |buffer| {
+        if (buffer.rendering and buffer.pixels().ptr == pixels.ptr) return buffer;
+    }
+    return null;
 }
 
 /// Advance the damage ring and reset the new current entry to full.
@@ -4222,13 +4385,13 @@ fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
     return .{ .spans = self.damage_spans.items };
 }
 
-fn syncTextInputCursorRect(self: *App) void {
+fn syncTextInputCursorRect(self: *App, state: *const vt.RenderState) void {
     if (!self.ime_focused) return;
-    self.window.setTextInputCursorRect(self.textInputCursorRect());
+    self.window.setTextInputCursorRect(self.textInputCursorRect(state));
 }
 
-fn textInputCursorRect(self: *App) Window.TextInputRect {
-    const cursor = self.render_state.cursor.viewport;
+fn textInputCursorRect(self: *App, state: *const vt.RenderState) Window.TextInputRect {
+    const cursor = state.cursor.viewport;
     const x_cells: u32 = if (cursor) |cpos| @intCast(cpos.x -| @intFromBool(cpos.wide_tail)) else 0;
     const y_cells: u32 = if (cursor) |cpos| @intCast(cpos.y) else 0;
     return physicalRectToLogical(self.window.scale120, .{
@@ -4237,6 +4400,10 @@ fn textInputCursorRect(self: *App) Window.TextInputRect {
         .width = @intCast(self.font.cell_width),
         .height = @intCast(self.font.cell_height),
     });
+}
+
+fn currentCursorState(self: *const App) *const vt.RenderState {
+    return if (self.render_state.rows == 0) &self.async_render_state else &self.render_state;
 }
 
 fn physicalRectToLogical(scale120: u32, rect: Window.TextInputRect) Window.TextInputRect {
