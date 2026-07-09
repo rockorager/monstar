@@ -96,6 +96,10 @@ stream: AppStream,
 render_state: vt.RenderState,
 async_render_state: vt.RenderState,
 async_raster: ?AsyncRaster,
+async_raster_loader: ?AsyncRaster.Loader,
+/// A deterministic loader, worker, or submission failure retires async
+/// rasterization for this App instead of retrying on every frame.
+async_raster_disabled: bool,
 async_generation: u64,
 /// The next async snapshot must be rebuilt completely because renderer-only
 /// state changed or a prior snapshot was rendered but not committed.
@@ -567,6 +571,8 @@ pub fn init(
         .render_state = .empty,
         .async_render_state = .empty,
         .async_raster = null,
+        .async_raster_loader = null,
+        .async_raster_disabled = false,
         .async_generation = 1,
         .async_force_full = true,
         .frame_damage = @splat(.{
@@ -669,23 +675,6 @@ pub fn init(
     self.stream.handler.terminal_handler.effects = effects;
 
     self.initDbus();
-    self.async_raster = AsyncRaster.init(
-        config.font_family,
-        self.font_size_px,
-        config.effectiveSelectionBackground(.dark),
-        config.effectiveSelectionForeground(.dark),
-        &self.async_render_state,
-    ) catch |err| blk: {
-        log.warn("async raster unavailable; using sync renderer: {}", .{err});
-        break :blk null;
-    };
-    if (self.async_raster) |*async_raster| {
-        async_raster.start() catch |err| {
-            log.warn("async raster unavailable; using sync renderer: {}", .{err});
-            async_raster.deinit();
-            self.async_raster = null;
-        };
-    }
     window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged, redrawReady);
     return self;
 }
@@ -1279,6 +1268,7 @@ pub fn deinit(self: *App) void {
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
     for (&self.frame_damage) |*damage| damage.rows.deinit(self.alloc);
+    if (self.async_raster_loader) |*loader| loader.deinit();
     if (self.async_raster) |*async_raster| async_raster.deinit();
     self.damage_spans.deinit(self.alloc);
     self.clearImeText();
@@ -1348,7 +1338,12 @@ pub fn run(self: *App) !void {
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
-        async_fd.fd = if (self.async_raster) |*async_raster| async_raster.complete_fd else -1;
+        async_fd.fd = if (self.async_raster_loader) |*loader|
+            loader.complete_fd
+        else if (self.async_raster) |*async_raster|
+            async_raster.complete_fd
+        else
+            -1;
 
         // Standard libwayland read dance: drain the local queue, flush
         // requests, then sleep until one of the fds is ready.
@@ -1426,7 +1421,10 @@ pub fn run(self: *App) !void {
         }
 
         if (async_fd.revents & posix.POLL.IN != 0) {
-            self.finishAsyncRender();
+            if (self.async_raster_loader != null)
+                self.finishAsyncRasterLoad()
+            else
+                self.finishAsyncRender();
         }
 
         if (self.paste_fd >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
@@ -4090,14 +4088,12 @@ fn startAsyncRender(self: *App) !bool {
     var async_raster = &(self.async_raster orelse return false);
     if (async_raster.busy()) return false;
     if (!async_raster.configuredFor(
-        self.config.font_family,
-        self.font_size_px,
+        self.font.discovery(),
         self.renderer.selection_bg,
         self.renderer.selection_fg,
     )) {
         async_raster.reconfigure(
-            self.config.font_family,
-            self.font_size_px,
+            self.font.discovery(),
             self.renderer.selection_bg,
             self.renderer.selection_fg,
         ) catch return false;
@@ -4133,6 +4129,7 @@ fn startAsyncRender(self: *App) !bool {
         self.window.cancelRender(target.buffer);
         async_raster.deinit();
         self.async_raster = null;
+        self.async_raster_disabled = true;
         return false;
     };
     self.async_force_full = false;
@@ -4146,7 +4143,74 @@ fn hasReadyRedraw(self: *const App) bool {
 fn redrawIfNeeded(self: *App) !void {
     if (!self.hasReadyRedraw()) return;
     self.needs_redraw = false;
-    if (!try self.startAsyncRender()) try self.window.redraw();
+    if (!try self.startAsyncRender()) {
+        try self.window.redraw();
+        self.startAsyncRasterLoad();
+    }
+}
+
+fn startAsyncRasterLoad(self: *App) void {
+    // Window.redraw can be a no-op before configure or while throttled. Do
+    // not let that path move font work back ahead of the first real commit.
+    if (self.window.frame_counter == 0) return;
+    if (self.child_exited and !self.hold) return;
+    if (self.async_raster != null or self.async_raster_loader != null or self.async_raster_disabled) return;
+    if (self.config.frame_timer != .off) return;
+
+    self.async_raster_loader = AsyncRaster.Loader.init(
+        self.font.discovery(),
+        self.renderer.selection_bg,
+        self.renderer.selection_fg,
+        &self.async_render_state,
+    ) catch |err| {
+        log.warn("async raster unavailable; using sync renderer: {}", .{err});
+        self.async_raster_disabled = true;
+        return;
+    };
+    if (self.async_raster_loader) |*loader| {
+        loader.start() catch |err| {
+            log.warn("async raster unavailable; using sync renderer: {}", .{err});
+            loader.deinit();
+            self.async_raster_loader = null;
+            self.async_raster_disabled = true;
+        };
+    }
+}
+
+fn finishAsyncRasterLoad(self: *App) void {
+    var loader = &(self.async_raster_loader orelse return);
+    const result = loader.takeResult() orelse return;
+    loader.deinit();
+    self.async_raster_loader = null;
+
+    switch (result) {
+        .failed => |err| {
+            log.warn("async raster unavailable; using sync renderer: {}", .{err});
+            self.async_raster_disabled = true;
+        },
+        .ready => |ready| {
+            var raster = ready;
+            if (self.config.frame_timer != .off or !raster.configuredFor(
+                self.font.discovery(),
+                self.renderer.selection_bg,
+                self.renderer.selection_fg,
+            )) {
+                raster.deinit();
+                if (self.config.frame_timer == .off) self.needs_redraw = true;
+                return;
+            }
+
+            self.async_raster = raster;
+            if (self.async_raster) |*async_raster| {
+                async_raster.start() catch |err| {
+                    log.warn("async raster unavailable; using sync renderer: {}", .{err});
+                    async_raster.deinit();
+                    self.async_raster = null;
+                    self.async_raster_disabled = true;
+                };
+            }
+        },
+    }
 }
 
 fn finishAsyncRender(self: *App) void {
@@ -4163,6 +4227,7 @@ fn finishAsyncRender(self: *App) void {
         // path forever. Retire the experiment and use the sync renderer.
         async_raster.deinit();
         self.async_raster = null;
+        self.async_raster_disabled = true;
         self.needs_redraw = true;
         return;
     }

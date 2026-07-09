@@ -305,6 +305,13 @@ pub fn create(
     xdg_surface.setListener(*Window, xdgSurfaceListener, self);
     toplevel.setListener(*Window, toplevelListener, self);
     surface.commit();
+    // Send the initial commit now so the compositor can prepare configure
+    // while the App finishes initialization. A full socket is harmless: the
+    // main poll loop will flush it when writable.
+    switch (display.flush()) {
+        .SUCCESS, .AGAIN => {},
+        else => |err| log.warn("initial Wayland flush failed: {}", .{err}),
+    }
 
     return self;
 }

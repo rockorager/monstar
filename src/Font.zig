@@ -30,8 +30,8 @@ const failed_face = std.math.maxInt(u16);
 ft_lib: c.FT_Library,
 /// Loaded faces; faces[0] is the primary and defines cell metrics.
 faces: std.ArrayList(Face),
-/// Fontconfig's sorted candidate lists for fallback lookups, one per style.
-sort_sets: [style_count]*c.FcFontSet,
+/// Immutable Fontconfig matches shared with other rasterizers at this size.
+discovery_data: *Discovery,
 /// Primary face index for each style; 0 means fall back to regular.
 primary_faces: [style_count]u16,
 /// Whether the resolved primary face for each style covers printable ASCII.
@@ -88,6 +88,61 @@ pub const FaceStyle = enum(u2) {
 };
 
 const style_count = std.meta.fields(FaceStyle).len;
+
+/// Immutable Fontconfig results. Rasterizers need independent FreeType,
+/// HarfBuzz, and glyph-cache state, but can safely share these read-only
+/// candidate lists instead of repeating font discovery.
+pub const Discovery = struct {
+    refs: std.atomic.Value(usize),
+    family: [:0]u8,
+    size_px: u31,
+    sort_sets: [style_count]*c.FcFontSet,
+
+    fn init(family: [:0]const u8, size_px: u31) Error!*Discovery {
+        if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
+
+        var sort_sets_opt: [style_count]?*c.FcFontSet = @splat(null);
+        errdefer {
+            for (sort_sets_opt) |sort_set| {
+                if (sort_set) |set| c.FcFontSetDestroy(set);
+            }
+        }
+        inline for (std.meta.fields(FaceStyle)) |field| {
+            const style: FaceStyle = @enumFromInt(field.value);
+            sort_sets_opt[field.value] = try fontSort(family, size_px, style);
+        }
+        var sort_sets: [style_count]*c.FcFontSet = undefined;
+        for (sort_sets_opt, 0..) |sort_set, i| sort_sets[i] = sort_set.?;
+
+        const alloc = std.heap.smp_allocator;
+        const family_copy = try alloc.dupeZ(u8, family);
+        errdefer alloc.free(family_copy);
+        const self = try alloc.create(Discovery);
+        self.* = .{
+            .refs = .init(1),
+            .family = family_copy,
+            .size_px = size_px,
+            .sort_sets = sort_sets,
+        };
+        return self;
+    }
+
+    pub fn ref(self: *Discovery) void {
+        const previous = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    pub fn unref(self: *Discovery) void {
+        const previous = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+
+        for (self.sort_sets) |sort_set| c.FcFontSetDestroy(sort_set);
+        const alloc = std.heap.smp_allocator;
+        alloc.free(self.family);
+        alloc.destroy(self);
+    }
+};
 
 /// A single loaded font face with its glyph cache.
 pub const Face = struct {
@@ -574,26 +629,18 @@ fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
 pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!Font {
     std.debug.assert(size_px > 0);
 
-    if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
+    const discovery_data = try Discovery.init(family, size_px);
+    defer discovery_data.unref();
+    return initWithDiscovery(alloc, discovery_data);
+}
 
-    // Sorted candidates: entry 0 is the best match (the primary face),
-    // the rest are fallbacks in preference order. Keep one list per style
-    // so fallback scripts can choose bold/italic variants too.
-    var sort_sets_opt: [style_count]?*c.FcFontSet = @splat(null);
-    errdefer {
-        for (sort_sets_opt) |sort_set| {
-            if (sort_set) |set| c.FcFontSetDestroy(set);
-        }
-    }
-    inline for (std.meta.fields(FaceStyle)) |field| {
-        const style: FaceStyle = @enumFromInt(field.value);
-        sort_sets_opt[field.value] = try fontSort(family, size_px, style);
-    }
-    const sort_sets: [style_count]*c.FcFontSet = sort_sets: {
-        var sets: [style_count]*c.FcFontSet = undefined;
-        for (sort_sets_opt, 0..) |sort_set, i| sets[i] = sort_set.?;
-        break :sort_sets sets;
-    };
+/// Build independent raster state from an existing immutable discovery.
+/// The returned Font retains `discovery_data`.
+pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) Error!Font {
+    discovery_data.ref();
+    errdefer discovery_data.unref();
+    const sort_sets = discovery_data.sort_sets;
+    const size_px = discovery_data.size_px;
 
     var ft_lib: c.FT_Library = undefined;
     if (c.FT_Init_FreeType(&ft_lib) != 0) return error.FontLoadFailed;
@@ -664,7 +711,7 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
     }
 
     log.info("loaded primary face ({s}) cell {d}x{d} baseline {d}, {d} fallback candidates", .{
-        family,
+        discovery_data.family,
         cell_width,
         cell_height,
         baseline,
@@ -709,7 +756,7 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
     return .{
         .ft_lib = ft_lib,
         .faces = faces,
-        .sort_sets = sort_sets,
+        .discovery_data = discovery_data,
         .primary_faces = primary_faces,
         .primary_ascii = primary_ascii,
         .sort_faces = .empty,
@@ -747,9 +794,13 @@ pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
     var deco_it = self.decoration_glyphs.valueIterator();
     while (deco_it.next()) |g| alloc.free(g.bitmap);
     self.decoration_glyphs.deinit(alloc);
-    for (self.sort_sets) |sort_set| c.FcFontSetDestroy(sort_set);
     _ = c.FT_Done_FreeType(self.ft_lib);
+    self.discovery_data.unref();
     self.* = undefined;
+}
+
+pub fn discovery(self: *const Font) *Discovery {
+    return self.discovery_data;
 }
 
 pub fn face(self: *Font, index: u16) *Face {
@@ -873,7 +924,7 @@ fn searchFallbackPass(
     style: FaceStyle,
     color_only: bool,
 ) ?u16 {
-    const sort_set = self.sort_sets[@intFromEnum(style)];
+    const sort_set = self.discovery_data.sort_sets[@intFromEnum(style)];
     const nfont: usize = @intCast(sort_set.*.nfont);
     const start: usize = if (style == .regular) 1 else 0;
     for (start..nfont) |i| {
@@ -895,7 +946,7 @@ fn loadFallbackAt(
     sort_index: usize,
     cp: u21,
 ) ?u16 {
-    const pattern = self.sort_sets[@intFromEnum(style)].*.fonts[sort_index];
+    const pattern = self.discovery_data.sort_sets[@intFromEnum(style)].*.fonts[sort_index];
     const key: SortFaceKey = .{ .style = style, .sort_index = @intCast(sort_index) };
 
     if (self.sort_faces.get(key)) |loaded| {
@@ -967,6 +1018,25 @@ test "load monospace font and rasterize a glyph" {
     try std.testing.expect(g.width > 0 and g.height > 0);
     // Cached: same pointer on second lookup.
     try std.testing.expectEqual(g, try primary.glyph(alloc, idx, 1, false));
+}
+
+test "rasterizers share discovery but own face state" {
+    const alloc = std.testing.allocator;
+    var first: Font = try .init(alloc, "monospace", 16);
+    var first_live = true;
+    defer if (first_live) first.deinit(alloc);
+    var second: Font = try .initWithDiscovery(alloc, first.discovery());
+    defer second.deinit(alloc);
+
+    try std.testing.expectEqual(first.discovery(), second.discovery());
+    try std.testing.expect(first.ft_lib != second.ft_lib);
+    try std.testing.expect(first.face(0).ft_face != second.face(0).ft_face);
+
+    // The shared result remains valid after the font that discovered it goes
+    // away, as when a config reload races a deferred raster load.
+    first.deinit(alloc);
+    first_live = false;
+    try std.testing.expect(c.FT_Get_Char_Index(second.face(0).ft_face, 'A') != 0);
 }
 
 test "styled primary faces are selected when available" {

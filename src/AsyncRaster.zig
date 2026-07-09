@@ -27,9 +27,96 @@ pub const Result = struct {
     damage: Damage,
 };
 
+pub const LoadResult = union(enum) {
+    ready: AsyncRaster,
+    failed: anyerror,
+};
+
+/// Builds the worker's independent FreeType and renderer state after the
+/// first frame without repeating the main Font's immutable discovery.
+pub const Loader = struct {
+    discovery: *Font.Discovery,
+    selection_background: vt.color.RGB,
+    selection_foreground: ?vt.color.RGB,
+    state: *vt.RenderState,
+    thread: ?std.Thread = null,
+    mutex: std.atomic.Mutex = .unlocked,
+    result: ?LoadResult = null,
+    complete_fd: posix.fd_t,
+
+    pub fn init(
+        discovery: *Font.Discovery,
+        selection_background: vt.color.RGB,
+        selection_foreground: ?vt.color.RGB,
+        state: *vt.RenderState,
+    ) !Loader {
+        const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
+        if (linux.errno(rc) != .SUCCESS) return error.EventFdFailed;
+        discovery.ref();
+        return .{
+            .discovery = discovery,
+            .selection_background = selection_background,
+            .selection_foreground = selection_foreground,
+            .state = state,
+            .complete_fd = @intCast(rc),
+        };
+    }
+
+    pub fn start(self: *Loader) !void {
+        std.debug.assert(self.thread == null);
+        self.thread = try std.Thread.spawn(.{}, loadMain, .{self});
+    }
+
+    pub fn takeResult(self: *Loader) ?LoadResult {
+        drainEventFd(self.complete_fd);
+        self.lock();
+        const result = self.result orelse {
+            self.mutex.unlock();
+            return null;
+        };
+        self.result = null;
+        self.mutex.unlock();
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        return result;
+    }
+
+    pub fn deinit(self: *Loader) void {
+        if (self.thread) |thread| thread.join();
+        if (self.result) |*result| switch (result.*) {
+            .ready => |*raster| raster.deinit(),
+            .failed => {},
+        };
+        _ = linux.close(self.complete_fd);
+        self.discovery.unref();
+        self.* = undefined;
+    }
+
+    fn loadMain(self: *Loader) void {
+        const result: LoadResult = if (AsyncRaster.init(
+            self.discovery,
+            self.selection_background,
+            self.selection_foreground,
+            self.state,
+        )) |raster|
+            .{ .ready = raster }
+        else |err|
+            .{ .failed = err };
+
+        self.lock();
+        self.result = result;
+        self.mutex.unlock();
+        writeEventfd(self.complete_fd) catch |err| {
+            std.debug.panic("failed to notify async raster load completion: {}", .{err});
+        };
+    }
+
+    fn lock(self: *Loader) void {
+        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+    }
+};
+
 alloc: std.mem.Allocator,
-font_family: [:0]u8,
-font_size_px: u31,
 font: Font,
 renderer: Renderer,
 thread: ?std.Thread,
@@ -44,16 +131,13 @@ result: ?Result = null,
 state: *vt.RenderState,
 
 pub fn init(
-    font_family: [:0]const u8,
-    font_size_px: u31,
+    discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
-    selection_foreground: vt.color.RGB,
+    selection_foreground: ?vt.color.RGB,
     state: *vt.RenderState,
 ) !AsyncRaster {
     const alloc = std.heap.smp_allocator;
-    const family = try alloc.dupeZ(u8, font_family);
-    errdefer alloc.free(family);
-    var font: Font = try .init(alloc, family, font_size_px);
+    var font: Font = try .initWithDiscovery(alloc, discovery);
     errdefer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{
         .selection_background = selection_background,
@@ -68,8 +152,6 @@ pub fn init(
     errdefer _ = linux.close(@as(posix.fd_t, @intCast(job_rc)));
     const self: AsyncRaster = .{
         .alloc = alloc,
-        .font_family = family,
-        .font_size_px = font_size_px,
         .font = font,
         .renderer = renderer,
         .thread = null,
@@ -89,34 +171,30 @@ pub fn start(self: *AsyncRaster) !void {
 }
 
 pub fn deinit(self: *AsyncRaster) void {
-    self.lock();
-    self.stop = true;
-    self.mutex.unlock();
-    self.notifyJob() catch |err| std.debug.panic("failed to wake async raster worker during shutdown: {}", .{err});
-    if (self.thread) |thread| thread.join();
+    if (self.thread) |thread| {
+        self.lock();
+        self.stop = true;
+        self.mutex.unlock();
+        self.notifyJob() catch |err| std.debug.panic("failed to wake async raster worker during shutdown: {}", .{err});
+        thread.join();
+    }
     _ = linux.close(self.job_fd);
     _ = linux.close(self.complete_fd);
     self.renderer.deinit();
     self.font.deinit(self.alloc);
-    self.alloc.free(self.font_family);
     self.* = undefined;
 }
 
-pub fn reconfigure(self: *AsyncRaster, font_family: [:0]const u8, font_size_px: u31, selection_background: vt.color.RGB, selection_foreground: ?vt.color.RGB) !void {
+pub fn reconfigure(self: *AsyncRaster, discovery: *Font.Discovery, selection_background: vt.color.RGB, selection_foreground: ?vt.color.RGB) !void {
     self.lock();
     defer self.mutex.unlock();
     if (self.has_job or self.working or self.result != null) return error.Busy;
-    const family = try self.alloc.dupeZ(u8, font_family);
-    errdefer self.alloc.free(family);
-    var font: Font = try .init(self.alloc, family, font_size_px);
+    var font: Font = try .initWithDiscovery(self.alloc, discovery);
     errdefer font.deinit(self.alloc);
     var renderer: Renderer = try .init(self.alloc, &font, .{ .selection_background = selection_background, .selection_foreground = selection_foreground });
     errdefer renderer.deinit();
     self.renderer.deinit();
     self.font.deinit(self.alloc);
-    self.alloc.free(self.font_family);
-    self.font_family = family;
-    self.font_size_px = font_size_px;
     self.font = font;
     self.renderer = renderer;
     self.renderer.font = &self.font;
@@ -130,15 +208,13 @@ pub fn busy(self: *AsyncRaster) bool {
 
 pub fn configuredFor(
     self: *AsyncRaster,
-    font_family: []const u8,
-    font_size_px: u31,
+    discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
 ) bool {
     self.lock();
     defer self.mutex.unlock();
-    return std.mem.eql(u8, self.font_family, font_family) and
-        self.font_size_px == font_size_px and
+    return self.font.discovery() == discovery and
         self.renderer.selection_bg.eql(selection_background) and
         optionalRgbEql(self.renderer.selection_fg, selection_foreground);
 }
@@ -184,8 +260,12 @@ fn optionalRgbEql(a: ?vt.color.RGB, b: ?vt.color.RGB) bool {
 }
 
 fn drainEventfd(self: *AsyncRaster) void {
+    drainEventFd(self.complete_fd);
+}
+
+fn drainEventFd(fd: posix.fd_t) void {
     var value: u64 = 0;
-    while (posix.read(self.complete_fd, std.mem.asBytes(&value))) |_| {} else |_| {}
+    while (posix.read(fd, std.mem.asBytes(&value))) |_| {} else |_| {}
 }
 
 fn notifyJob(self: *AsyncRaster) !void {
