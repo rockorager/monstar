@@ -97,6 +97,9 @@ font_size: u31 = 16,
 shell: ?[:0]const u8 = null,
 /// Shell command that receives the last semantic command output on stdin.
 pipe_command_output: ?[:0]const u8 = null,
+/// Whether newly spawned children should be moved into their own transient
+/// systemd scope. This only affects startup; reloads do not move a live child.
+linux_cgroup: LinuxCgroup = .never,
 scrollback: usize = 10_000,
 /// Total storage limit in bytes for kitty graphics images per screen;
 /// 0 disables the protocol. A single image larger than this limit is
@@ -117,6 +120,7 @@ selection_foreground: ?vt.color.RGB = null,
 palette: [16]?vt.color.RGB = @splat(null),
 
 pub const FrameTimer = enum { off, overlay, log, both };
+pub const LinuxCgroup = enum { never, always };
 
 /// Load the default config file, if any. Strings are allocated in `arena`
 /// and live as long as it does.
@@ -191,6 +195,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.shell = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
         self.pipe_command_output = try arena.dupeZ(u8, value);
+    } else if (std.mem.eql(u8, key, "linux-cgroup")) {
+        self.linux_cgroup = std.meta.stringToEnum(LinuxCgroup, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "scrollback")) {
         self.scrollback = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "image-storage-limit")) {
@@ -308,6 +314,7 @@ test "defaults" {
     try std.testing.expectEqual(@as(u31, 16), config.font_size);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.shell);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.pipe_command_output);
+    try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
     try std.testing.expectEqual(default_theme, config.theme);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
@@ -327,6 +334,7 @@ test "parse config" {
         \\font-size = 14
         \\shell = /usr/bin/fish
         \\pipe-command-output = cat > /tmp/monstar-output
+        \\linux-cgroup = always
         \\scrollback = 5000
         \\image-storage-limit = 50000000
         \\wheel-scroll-lines = 5
@@ -344,6 +352,7 @@ test "parse config" {
     try std.testing.expectEqual(@as(u31, 14), config.font_size);
     try std.testing.expectEqualStrings("/usr/bin/fish", config.shell.?);
     try std.testing.expectEqualStrings("cat > /tmp/monstar-output", config.pipe_command_output.?);
+    try std.testing.expectEqual(LinuxCgroup.always, config.linux_cgroup);
     try std.testing.expectEqual(@as(usize, 5000), config.scrollback);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(u31, 5), config.wheel_scroll_lines);

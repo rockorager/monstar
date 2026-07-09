@@ -75,6 +75,19 @@ follow the desktop portal color scheme. The default is `system`:
 theme = light
 ```
 
+By default, child processes inherit Monstar's cgroup. To move each newly
+spawned child into a separate transient systemd scope, enable Linux cgroup
+isolation:
+
+```conf
+linux-cgroup = always
+```
+
+Valid values are `never` (the default) and `always`. The setting is applied
+when a child starts; reloading the config does not move an existing child.
+When enabled, Monstar falls back to the inherited cgroup if the session bus
+or systemd scope creation is unavailable.
+
 To pipe the last OSC 133-delimited command output with `Ctrl+Shift+G`, set a
 shell command that receives the output on stdin:
 

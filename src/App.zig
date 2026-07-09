@@ -484,14 +484,15 @@ pub fn init(
     });
     errdefer pty.deinit();
 
-    // Move the child into its own transient systemd scope before it can
-    // exec: OOM kills then apply to the shell's process tree instead of
-    // the whole terminal. The gate holds the child so grandchildren
-    // cannot be spawned into our cgroup; on failure, releasing the gate
-    // lets the child proceed un-isolated. Only the request is sent here:
-    // systemd's reply and the pid migration land while we set up the
-    // window, and the gate is released once both are confirmed below.
-    const use_cgroup_scope = dbus_connection != null and cgroup.systemdBooted();
+    // When enabled, move the child into its own transient systemd scope
+    // before it can exec. The gate holds the child so grandchildren cannot
+    // escape the scope; on failure, releasing the gate lets it proceed
+    // un-isolated. Only the request is sent here: systemd's reply and the
+    // pid migration land while we set up the window, and the gate is
+    // released once both are confirmed below.
+    const use_cgroup_scope = config.linux_cgroup == .always and
+        dbus_connection != null and
+        cgroup.systemdBooted();
     const child_pid = try pty.spawn(path, argv, envp, .{
         .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
         .gate_child = use_cgroup_scope,
