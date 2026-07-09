@@ -22,6 +22,7 @@ const Pty = @import("Pty.zig");
 const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
 const AsyncRaster = @import("AsyncRaster.zig");
+const KittyImageCache = @import("KittyImageCache.zig");
 const cgroup = @import("cgroup.zig");
 const Window = @import("Window.zig");
 
@@ -93,17 +94,35 @@ config_overrides: []const []const u8,
 environ: std.process.Environ,
 term: vt.Terminal,
 stream: AppStream,
+/// The single terminal snapshot both render paths draw from. Updated
+/// only on the main thread while no render target is checked out, so
+/// the async worker can read it without locks while a job is in flight.
 render_state: vt.RenderState,
-async_render_state: vt.RenderState,
 async_raster: ?AsyncRaster,
 async_raster_loader: ?AsyncRaster.Loader,
-/// A deterministic loader, worker, or submission failure retires async
-/// rasterization for this App instead of retrying on every frame.
-async_raster_disabled: bool,
 async_generation: u64,
 /// The next async snapshot must be rebuilt completely because renderer-only
 /// state changed or a prior snapshot was rendered but not committed.
 async_force_full: bool,
+/// A finished async frame whose buffer is checked out, waiting for the
+/// outstanding frame callback before it can be committed. While held,
+/// `window.rendering_pending` stays true so no new render can start.
+held_frame: ?*Window.Buffer,
+/// Owned copies of overlay strings for the in-flight async job. At most
+/// one job exists at a time; these are replaced on the next submission
+/// and freed on deinit.
+async_job_preedit: ?[]u8,
+async_job_link_hint: ?[]u8,
+/// Kitty render items for the in-flight async job, with image data
+/// repointed at cache-pinned copies. Same lifetime as the overlay
+/// copies above.
+async_job_kitty: []Renderer.KittyRenderItem,
+/// Pinned copies of kitty image data shared between consecutive async
+/// jobs, so the worker never reads terminal-owned image bytes.
+kitty_cache: KittyImageCache,
+/// The window geometry changed, so a repaint at the new size must
+/// happen even while synchronized output has content frames frozen.
+geometry_redraw: bool,
 /// Ring of per-frame damage records: what changed in each of the last
 /// N frames. Stale shm buffers use this to copy missed rows from the
 /// newest rendered shm buffer before this frame's dirty rows are drawn.
@@ -112,19 +131,6 @@ frame_damage: [frame_damage_len]FrameDamage,
 frame_damage_index: usize,
 /// Scratch for the damage spans reported to the window each frame.
 damage_spans: std.ArrayList(Window.RowSpan),
-/// Monotonic nanoseconds taken at render() entry when the frame
-/// timer is enabled; consumed by finishFrame.
-frame_start: i96,
-/// Timestamp after render-state update, splitting the frame log's
-/// `update` (state snapshot) from `draw` (pixel work). Stays at
-/// frame_start on paths that skip the update.
-frame_update_done: i96,
-/// The previous frame's total CPU cost. The overlay shows this
-/// rather than the current frame's so the final overlay work is included.
-last_frame_ns: u64,
-/// Rows repainted this frame, for the frame log ("all" when the
-/// whole grid was redrawn or blitted).
-frame_rows: union(enum) { all, count: usize },
 pty: Pty,
 /// Gather-thread pipeline draining the pty master; the main loop
 /// consumes parsed batches via its ready_fd in the poll set.
@@ -135,7 +141,10 @@ font: Font,
 font_size_px: u31,
 /// Runtime-only logical font-size override from keyboard shortcuts.
 runtime_font_size: ?u31,
-renderer: Renderer,
+/// Selection highlight colors, from config or OSC 17/19. Snapshotted
+/// into the raster worker's renderer on (re)configure.
+selection_bg: vt.color.RGB,
+selection_fg: ?vt.color.RGB,
 window: *Window,
 keyboard: Keyboard,
 /// Terminal contents changed since the last committed frame.
@@ -569,12 +578,16 @@ pub fn init(
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
-        .async_render_state = .empty,
         .async_raster = null,
         .async_raster_loader = null,
-        .async_raster_disabled = false,
         .async_generation = 1,
         .async_force_full = true,
+        .held_frame = null,
+        .async_job_preedit = null,
+        .async_job_link_hint = null,
+        .async_job_kitty = &.{},
+        .kitty_cache = .empty,
+        .geometry_redraw = false,
         .frame_damage = @splat(.{
             .full = true,
             .rows = .{},
@@ -584,20 +597,14 @@ pub fn init(
         }),
         .frame_damage_index = 0,
         .damage_spans = .empty,
-        .frame_start = 0,
-        .frame_update_done = 0,
-        .last_frame_ns = 0,
-        .frame_rows = .{ .count = 0 },
         .pty = pty,
         .pipeline = try .init(pty.master),
         .child_pid = child_pid,
         .font = font,
         .font_size_px = config.font_size,
         .runtime_font_size = null,
-        .renderer = try .init(alloc, &self.font, .{
-            .selection_background = config.effectiveSelectionBackground(.dark),
-            .selection_foreground = config.effectiveSelectionForeground(.dark),
-        }),
+        .selection_bg = config.effectiveSelectionBackground(.dark),
+        .selection_fg = config.effectiveSelectionForeground(.dark),
         .window = window,
         .keyboard = try .init(),
         .needs_redraw = true,
@@ -675,7 +682,7 @@ pub fn init(
     self.stream.handler.terminal_handler.effects = effects;
 
     self.initDbus();
-    window.setCallbacks(self, render, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged, redrawReady);
+    window.setCallbacks(self, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged, redrawReady);
     return self;
 }
 
@@ -719,7 +726,6 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const new_font: Font = try .init(self.alloc, self.config.font_family, size_px);
     self.font.deinit(self.alloc);
     self.font = new_font;
-    self.renderer.clearShapeCache();
     self.font_size_px = size_px;
     self.invalidateAsyncFrame();
     self.render_state.dirty = .full;
@@ -1270,6 +1276,10 @@ pub fn deinit(self: *App) void {
     for (&self.frame_damage) |*damage| damage.rows.deinit(self.alloc);
     if (self.async_raster_loader) |*loader| loader.deinit();
     if (self.async_raster) |*async_raster| async_raster.deinit();
+    if (self.async_job_preedit) |text| self.alloc.free(text);
+    if (self.async_job_link_hint) |uri| self.alloc.free(uri);
+    self.alloc.free(self.async_job_kitty);
+    self.kitty_cache.deinit(self.alloc);
     self.damage_spans.deinit(self.alloc);
     self.clearImeText();
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
@@ -1290,8 +1300,6 @@ pub fn deinit(self: *App) void {
     _ = std.os.linux.close(self.signal_fd);
     self.keyboard.deinit();
     self.window.destroy();
-    self.renderer.deinit();
-    self.async_render_state.deinit(self.alloc);
     self.render_state.deinit(self.alloc);
     self.stream.deinit();
     self.term.deinit(self.alloc);
@@ -1303,6 +1311,10 @@ pub fn deinit(self: *App) void {
 /// Run until the window is closed or, without hold mode, the child exits.
 pub fn run(self: *App) !void {
     errdefer self.hangupChild();
+
+    // The raster worker is the only renderer; start building it before
+    // the first configure so it is usually ready by the first frame.
+    self.startAsyncRasterLoad();
 
     try self.pipeline.start();
 
@@ -2020,7 +2032,6 @@ fn applyConfig(self: *App, new_config: Config) !void {
     // to notify the pty and DEC 2048 in-band size-report listeners.
     self.font.deinit(self.alloc);
     self.font = new_font;
-    self.renderer.clearShapeCache();
     self.font_size_px = desired_font_size;
     self.invalidateAsyncFrame();
     resize(
@@ -2049,8 +2060,8 @@ fn applyColorDefaultsForConfig(self: *App, config: Config) void {
     self.term.colors.cursor.default = colors.cursor.default;
     self.term.colors.palette.changeDefault(colors.palette.original);
 
-    self.renderer.selection_bg = config.effectiveSelectionBackground(self.color_scheme);
-    self.renderer.selection_fg = config.effectiveSelectionForeground(self.color_scheme);
+    self.selection_bg = config.effectiveSelectionBackground(self.color_scheme);
+    self.selection_fg = config.effectiveSelectionForeground(self.color_scheme);
 }
 
 fn effectiveFontSize(self: *const App) u31 {
@@ -2072,7 +2083,6 @@ fn setRuntimeFontSize(self: *App, logical_size: ?u31) void {
     self.runtime_font_size = logical_size;
     self.font.deinit(self.alloc);
     self.font = new_font;
-    self.renderer.clearShapeCache();
     self.font_size_px = size_px;
     self.invalidateAsyncFrame();
     resize(
@@ -2137,8 +2147,8 @@ fn handleOscColorOperation(
 fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
     switch (set.target) {
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.renderer.selection_bg = set.color,
-            .highlight_foreground => self.renderer.selection_fg = set.color,
+            .highlight_background => self.selection_bg = set.color,
+            .highlight_foreground => self.selection_fg = set.color,
             else => return,
         },
         else => return,
@@ -2151,8 +2161,8 @@ fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
 fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
     switch (target) {
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.renderer.selection_bg = self.config.effectiveSelectionBackground(self.color_scheme),
-            .highlight_foreground => self.renderer.selection_fg = self.config.effectiveSelectionForeground(self.color_scheme),
+            .highlight_background => self.selection_bg = self.config.effectiveSelectionBackground(self.color_scheme),
+            .highlight_foreground => self.selection_fg = self.config.effectiveSelectionForeground(self.color_scheme),
             else => return,
         },
         else => return,
@@ -2206,8 +2216,8 @@ fn kittySelectionColorValue(self: *const App, key: vt.kitty.color.Kind) ?KittyCo
     return switch (key) {
         .palette => null,
         .special => |special| switch (special) {
-            .selection_background => .{ .color = self.renderer.selection_bg },
-            .selection_foreground => if (self.renderer.selection_fg) |color|
+            .selection_background => .{ .color = self.selection_bg },
+            .selection_foreground => if (self.selection_fg) |color|
                 .{ .color = color }
             else
                 .unset,
@@ -2408,10 +2418,10 @@ fn answerOscSelectionColorQuery(
     switch (target) {
         .palette => {},
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.writeOscDynamicReport(17, self.renderer.selection_bg, terminator),
+            .highlight_background => self.writeOscDynamicReport(17, self.selection_bg, terminator),
             .highlight_foreground => self.writeOscDynamicReport(
                 19,
-                self.renderer.selection_fg orelse self.effectiveForeground(),
+                self.selection_fg orelse self.effectiveForeground(),
                 terminator,
             ),
             .foreground,
@@ -3950,171 +3960,68 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
     };
 }
 
-/// Window render delegate: refresh the render state and draw the grid.
-/// `age` is how many frames ago `pixels` was last drawn (0 = unknown).
-fn render(
-    ctx: *anyopaque,
-    pixels: []u32,
-    source_pixels: ?[]const u32,
-    width: u31,
-    height: u31,
-    age: usize,
-) anyerror!Window.Damage {
-    const self: *App = @ptrCast(@alignCast(ctx));
-    std.debug.assert(pixels.len == @as(usize, width) * height);
-    // This synchronous snapshot consumes terminal dirty flags that the
-    // independent async snapshot would otherwise miss on a later frame.
-    // Force that snapshot to rebuild before it returns to the worker path.
-    if (self.async_raster != null) self.async_force_full = true;
-    if (self.config.frame_timer != .off) {
-        self.frame_start = self.nowNs();
-        self.frame_update_done = self.frame_start;
-    }
-    // Claim the frame's damage entry up front, marked full: if rendering
-    // fails partway, later frames then fall back to a full copy.
-    const damage = self.beginFrameDamage(width, height);
-    self.renderer.focused = self.focused;
-    self.renderer.hyperlink_hints = self.keyboard.currentMods().ctrl;
-    const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
-    if (self.term.modes.get(.synchronized_output)) {
-        if (!try self.repairToPreviousFrame(pixels, source_pixels, width, height, age)) {
-            try self.renderer.render(&self.render_state, pixels, width, height);
-            self.frame_rows = .all;
-        } else {
-            try self.recordFrameDamage(damage, false);
-            self.frame_rows = .{ .count = 0 };
-        }
-        return self.finishFrame(pixels, width, height);
-    }
-    const old_cursor = self.render_state.cursor;
-    // A pure scroll can reuse most of last frame's pixels; overlays
-    // (kitty graphics, preedit, link hints) disqualify the frame since
-    // they draw outside the grid rows the shift accounts for.
-    var scroll: ?Renderer.Scroll = scroll: {
-        if (has_kitty_graphics or self.ime_preedit != null) break :scroll null;
-        if (self.keyboard.currentMods().ctrl) break :scroll null;
-        break :scroll try self.renderer.detectScroll(&self.render_state, &self.term);
-    };
-    try self.render_state.update(self.alloc, &self.term);
-    self.dirtyCursorRows(old_cursor);
-    const kitty_graphics_dirty = self.term.screens.active.kitty_images.dirty;
-    if (self.ime_preedit != null) self.render_state.dirty = .full;
-    if (kitty_graphics_dirty or has_kitty_graphics) self.render_state.dirty = .full;
-    if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) self.render_state.dirty = .full;
-    // A detected scroll implies the viewport pin changed, which update
-    // always answers with a full redraw.
-    std.debug.assert(scroll == null or self.render_state.dirty == .full);
-    if (self.config.frame_timer != .off) self.frame_update_done = self.nowNs();
-
-    const needs_previous_pixels = switch (self.render_state.dirty) {
-        .false, .partial => true,
-        .full => scroll != null,
-    };
-    var force_full_render = false;
-    if (needs_previous_pixels) {
-        if (!try self.repairToPreviousFrame(pixels, source_pixels, width, height, age)) {
-            force_full_render = true;
-            scroll = null;
-        }
-    }
-
-    var scrolled = false;
-    if (force_full_render) {
-        if (has_kitty_graphics) {
-            try self.renderer.renderWithKittyGraphics(&self.render_state, &self.term, pixels, width, height);
-        } else {
-            try self.renderer.render(&self.render_state, pixels, width, height);
-        }
-    } else {
-        switch (self.render_state.dirty) {
-            .false => {},
-            .full => if (has_kitty_graphics) {
-                try self.renderer.renderWithKittyGraphics(&self.render_state, &self.term, pixels, width, height);
-            } else if (scroll) |s| {
-                const old_cursor_row: ?usize = if (old_cursor.visible)
-                    if (old_cursor.viewport) |viewport| viewport.y else null
-                else
-                    null;
-                try self.renderer.renderScrolled(&self.render_state, pixels, width, height, s, old_cursor_row);
-                scrolled = true;
-            } else {
-                try self.renderer.render(&self.render_state, pixels, width, height);
-            },
-            .partial => try self.renderer.renderDirty(&self.render_state, pixels, width, height),
-        }
-    }
-
-    if (force_full_render) {
-        self.frame_rows = .all;
-    } else {
-        self.frame_rows = switch (self.render_state.dirty) {
-            .false => .{ .count = 0 },
-            .full => .all,
-            .partial => .{ .count = self.renderer.repainted.count() },
-        };
-    }
-    if (self.ime_preedit) |preedit| {
-        try self.renderer.renderPreedit(&self.render_state, pixels, width, height, preedit);
-    }
-    var hint_drawn = false;
-    if (self.keyboard.currentMods().ctrl) {
-        if (self.hyperlinkAtPointer()) |uri| {
-            try self.renderer.renderLinkHint(&self.render_state, pixels, width, height, uri);
-            hint_drawn = true;
-        }
-    }
-    self.syncTextInputCursorRect(&self.render_state);
-    if (kitty_graphics_dirty) self.term.screens.active.kitty_images.dirty = false;
-    // Record what changed before the dirty flags are cleared. A scroll
-    // moved every pixel, so its entry keeps the claimed full damage.
-    if (!force_full_render and !scrolled) try self.recordFrameDamage(damage, hint_drawn);
-    self.clearRenderDirty();
-    return self.finishFrame(pixels, width, height);
-}
-
-fn asyncEligible(self: *App) bool {
-    if (self.async_raster == null) return false;
-    if (self.config.frame_timer != .off) return false;
-    if (self.term.modes.get(.synchronized_output)) return false;
-    if (self.term.screens.active.kitty_images.placements.count() > 0) return false;
-    if (self.term.screens.active.kitty_images.dirty) return false;
-    if (self.ime_preedit != null) return false;
-    if (self.keyboard.currentMods().ctrl) return false;
-    return true;
-}
-
 fn startAsyncRender(self: *App) !bool {
-    if (!self.asyncEligible()) return false;
     var async_raster = &(self.async_raster orelse return false);
     if (async_raster.busy()) return false;
     if (!async_raster.configuredFor(
         self.font.discovery(),
-        self.renderer.selection_bg,
-        self.renderer.selection_fg,
+        self.selection_bg,
+        self.selection_fg,
     )) {
         async_raster.reconfigure(
             self.font.discovery(),
-            self.renderer.selection_bg,
-            self.renderer.selection_fg,
-        ) catch return false;
+            self.selection_bg,
+            self.selection_fg,
+        ) catch |err| {
+            self.rasterFatal(err);
+            return false;
+        };
     }
     const target = self.window.acquireRenderTarget() catch return false;
     errdefer self.window.cancelRender(target.buffer);
 
-    if (self.async_force_full) {
-        self.async_render_state.rows = 0;
-        self.async_render_state.dirty = .full;
+    // DEC 2026: the terminal is mid-update, so the previous snapshot
+    // (and its overlay/kitty copies) is re-rendered as-is — reachable
+    // only for geometry redraws. Any pending snapshot rebuild stays
+    // deferred until the freeze ends.
+    const frozen = self.term.modes.get(.synchronized_output);
+    var hyperlink_hints = self.keyboard.currentMods().ctrl;
+    if (!frozen) {
+        if (self.async_force_full) {
+            self.render_state.rows = 0;
+            self.render_state.dirty = .full;
+        }
+        const old_cursor = self.render_state.cursor;
+        try self.render_state.update(self.alloc, &self.term);
+        self.dirtyCursorRows(old_cursor);
+        if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) {
+            self.render_state.dirty = .full;
+        }
+        // Kitty placements are not tracked per row, so any frame with (or
+        // just after) graphics is a full render.
+        const kitty_dirty = self.term.screens.active.kitty_images.dirty;
+        const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
+        if (kitty_dirty or has_kitty_graphics) self.render_state.dirty = .full;
+        // Snapshot overlay inputs; the worker cannot safely read App state.
+        // The previous job's copies are dead: only one job exists at a time.
+        if (self.async_job_preedit) |old| self.alloc.free(old);
+        self.async_job_preedit = null;
+        if (self.async_job_link_hint) |old| self.alloc.free(old);
+        self.async_job_link_hint = null;
+        if (self.ime_preedit) |text| self.async_job_preedit = try self.alloc.dupe(u8, text);
+        if (hyperlink_hints) {
+            if (self.hyperlinkAtPointer()) |uri| {
+                self.async_job_link_hint = try self.alloc.dupe(u8, uri);
+            }
+        }
+        self.releaseKittyJob();
+        if (has_kitty_graphics) try self.snapshotKittyJob();
+        self.kitty_cache.sweep(self.alloc);
+        if (kitty_dirty) self.term.screens.active.kitty_images.dirty = false;
+    } else {
+        // Keep the hint flag consistent with the stale link-hint copy.
+        hyperlink_hints = self.async_job_link_hint != null;
     }
-    const old_cursor = self.async_render_state.cursor;
-    try self.async_render_state.update(self.alloc, &self.term);
-    dirtyCursorRowsForState(&self.async_render_state, old_cursor);
-    if (self.async_render_state.dirty == .partial and allStateRowsDirty(&self.async_render_state)) {
-        self.async_render_state.dirty = .full;
-    }
-    // The async snapshot consumed the terminal dirty flags. Make the next
-    // synchronous fallback rebuild its independent snapshot completely.
-    self.render_state.rows = 0;
-    self.render_state.dirty = .full;
     self.async_generation +%= 1;
     async_raster.submit(.{
         .pixels = target.pixels,
@@ -4124,55 +4031,136 @@ fn startAsyncRender(self: *App) !bool {
         .age = target.age,
         .generation = self.async_generation,
         .focused = self.focused,
+        .hyperlink_hints = hyperlink_hints,
+        .preedit = self.async_job_preedit,
+        .link_hint = self.async_job_link_hint,
+        .kitty_items = self.async_job_kitty,
     }) catch |err| {
-        log.warn("async render submission failed; falling back to sync: {}", .{err});
         self.window.cancelRender(target.buffer);
-        async_raster.deinit();
-        self.async_raster = null;
-        self.async_raster_disabled = true;
+        self.releaseKittyJob();
+        self.kitty_cache.sweep(self.alloc);
+        self.rasterFatal(err);
         return false;
     };
-    self.async_force_full = false;
+    if (!frozen) self.async_force_full = false;
     return true;
 }
 
-fn hasReadyRedraw(self: *const App) bool {
-    return self.needs_redraw and !self.term.modes.get(.synchronized_output);
+/// Snapshot the visible kitty placements for an async job, pinning
+/// copies of their image data in the cache.
+fn snapshotKittyJob(self: *App) !void {
+    std.debug.assert(self.async_job_kitty.len == 0);
+    const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
+    errdefer self.alloc.free(items);
+    var acquired: usize = 0;
+    errdefer for (items[0..acquired]) |item|
+        self.kitty_cache.release(item.image.id, item.image.generation);
+    for (items) |*item| {
+        item.image.data = try self.kitty_cache.acquire(self.alloc, item.image);
+        acquired += 1;
+    }
+    self.async_job_kitty = items;
+}
+
+/// Drop the last job's kitty pins. Only safe while no worker job
+/// references the items, i.e. the worker is idle or its result was
+/// already taken.
+fn releaseKittyJob(self: *App) void {
+    for (self.async_job_kitty) |item| {
+        self.kitty_cache.release(item.image.id, item.image.generation);
+    }
+    self.alloc.free(self.async_job_kitty);
+    self.async_job_kitty = &.{};
+}
+
+/// A finished frame is waiting and the compositor is ready for it.
+fn canCommitHeldFrame(self: *const App) bool {
+    if (self.held_frame == null) return false;
+    return !self.window.frame_pending and !self.window.suspended;
+}
+
+/// Dirty content can start a new frame right now. A frame may start
+/// while a frame callback is outstanding (raster overlaps the frame
+/// wait); it is refused only while the raster worker is still coming up
+/// or a render target is already checked out.
+fn hasContentRedraw(self: *App) bool {
+    if (!self.needs_redraw) return false;
+    // DEC 2026 freezes content frames, but geometry changes still
+    // repaint (the frozen snapshot at the new size).
+    if (self.term.modes.get(.synchronized_output) and !self.geometry_redraw) return false;
+    if (self.window.width == 0 or self.window.suspended) return false;
+    if (self.window.rendering_pending) return false;
+    if (self.async_raster == null) return false;
+    return true;
+}
+
+/// Must report true exactly when redrawIfNeeded will make progress:
+/// the pre-poll fast path in run() otherwise spins without ever reading
+/// the display socket.
+fn hasReadyRedraw(self: *App) bool {
+    return self.canCommitHeldFrame() or self.hasContentRedraw();
 }
 
 fn redrawIfNeeded(self: *App) !void {
-    if (!self.hasReadyRedraw()) return;
+    if (self.canCommitHeldFrame()) self.commitHeldFrame();
+    if (!self.hasContentRedraw()) return;
     self.needs_redraw = false;
-    if (!try self.startAsyncRender()) {
-        try self.window.redraw();
-        self.startAsyncRasterLoad();
-    }
+    self.geometry_redraw = false;
+    _ = try self.startAsyncRender();
 }
 
+/// Commit a finished frame that was held for the frame callback, unless
+/// the window geometry changed while it waited.
+fn commitHeldFrame(self: *App) void {
+    const buffer = self.held_frame orelse return;
+    self.held_frame = null;
+    if (buffer.width != physicalDimension(self.window.width, self.window.scale120) or
+        buffer.height != physicalDimension(self.window.height, self.window.scale120))
+    {
+        self.window.cancelRender(buffer);
+        self.async_force_full = true;
+        self.needs_redraw = true;
+        return;
+    }
+    self.commitFinishedFrame(buffer);
+}
+
+/// Commit an async-rendered buffer using the current frame's damage
+/// entry. Commit failures are fatal: the surface is unusable.
+fn commitFinishedFrame(self: *App, buffer: *Window.Buffer) void {
+    const surface_damage = self.currentFrameDamage(buffer.height) catch |err| {
+        log.err("async surface damage failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+        return;
+    };
+    self.window.commitRender(buffer, surface_damage) catch |err| {
+        log.err("async commit failed: {}", .{err});
+        self.window.cancelRender(buffer);
+        self.window.fatal_error = err;
+        self.window.running = false;
+    };
+}
+
+/// The raster worker is the only renderer; a load failure is fatal.
 fn startAsyncRasterLoad(self: *App) void {
-    // Window.redraw can be a no-op before configure or while throttled. Do
-    // not let that path move font work back ahead of the first real commit.
-    if (self.window.frame_counter == 0) return;
-    if (self.child_exited and !self.hold) return;
-    if (self.async_raster != null or self.async_raster_loader != null or self.async_raster_disabled) return;
-    if (self.config.frame_timer != .off) return;
+    std.debug.assert(self.async_raster == null and self.async_raster_loader == null);
 
     self.async_raster_loader = AsyncRaster.Loader.init(
         self.font.discovery(),
-        self.renderer.selection_bg,
-        self.renderer.selection_fg,
-        &self.async_render_state,
+        self.selection_bg,
+        self.selection_fg,
+        &self.render_state,
     ) catch |err| {
-        log.warn("async raster unavailable; using sync renderer: {}", .{err});
-        self.async_raster_disabled = true;
+        self.rasterFatal(err);
         return;
     };
     if (self.async_raster_loader) |*loader| {
         loader.start() catch |err| {
-            log.warn("async raster unavailable; using sync renderer: {}", .{err});
             loader.deinit();
             self.async_raster_loader = null;
-            self.async_raster_disabled = true;
+            self.rasterFatal(err);
         };
     }
 }
@@ -4184,33 +4172,40 @@ fn finishAsyncRasterLoad(self: *App) void {
     self.async_raster_loader = null;
 
     switch (result) {
-        .failed => |err| {
-            log.warn("async raster unavailable; using sync renderer: {}", .{err});
-            self.async_raster_disabled = true;
-        },
+        .failed => |err| self.rasterFatal(err),
         .ready => |ready| {
             var raster = ready;
-            if (self.config.frame_timer != .off or !raster.configuredFor(
+            if (!raster.configuredFor(
                 self.font.discovery(),
-                self.renderer.selection_bg,
-                self.renderer.selection_fg,
+                self.selection_bg,
+                self.selection_fg,
             )) {
+                // Config changed while loading; rebuild with the new one.
                 raster.deinit();
-                if (self.config.frame_timer == .off) self.needs_redraw = true;
+                self.startAsyncRasterLoad();
                 return;
             }
 
             self.async_raster = raster;
             if (self.async_raster) |*async_raster| {
                 async_raster.start() catch |err| {
-                    log.warn("async raster unavailable; using sync renderer: {}", .{err});
                     async_raster.deinit();
                     self.async_raster = null;
-                    self.async_raster_disabled = true;
+                    self.rasterFatal(err);
+                    return;
                 };
             }
+            // Content may have gone dirty while the worker was loading.
+            self.needs_redraw = true;
         },
     }
+}
+
+/// The app cannot render without the raster worker; stop with the error.
+fn rasterFatal(self: *App, err: anyerror) void {
+    log.err("raster worker unavailable: {}", .{err});
+    self.window.fatal_error = err;
+    self.window.running = false;
 }
 
 fn finishAsyncRender(self: *App) void {
@@ -4221,14 +4216,12 @@ fn finishAsyncRender(self: *App) void {
         return;
     };
     if (result.err) |err| {
-        log.warn("async render failed: {}", .{err});
         self.window.cancelRender(buffer);
-        // A deterministic raster error would otherwise retry the same async
-        // path forever. Retire the experiment and use the sync renderer.
-        async_raster.deinit();
-        self.async_raster = null;
-        self.async_raster_disabled = true;
-        self.needs_redraw = true;
+        self.releaseKittyJob();
+        self.kitty_cache.sweep(self.alloc);
+        // A deterministic raster error would retry forever; with no other
+        // renderer to fall back to, stop.
+        self.rasterFatal(err);
         return;
     }
     if (result.job.generation != self.async_generation or
@@ -4249,21 +4242,18 @@ fn finishAsyncRender(self: *App) void {
         self.window.running = false;
         return;
     };
-    clearStateDirty(&self.async_render_state);
-    self.syncTextInputCursorRect(&self.async_render_state);
-    const surface_damage = self.currentFrameDamage(result.job.height) catch |err| {
-        log.err("async surface damage failed: {}", .{err});
-        self.window.cancelRender(buffer);
-        self.window.fatal_error = err;
-        self.window.running = false;
+    self.clearRenderDirty();
+    self.syncTextInputCursorRect(&self.render_state);
+    if (self.window.frame_pending) {
+        // The compositor is not ready for another commit. Hold the
+        // finished buffer; redrawIfNeeded commits it when the frame
+        // callback fires, then starts the next render immediately so
+        // raster work overlaps the following frame wait.
+        std.debug.assert(self.held_frame == null);
+        self.held_frame = buffer;
         return;
-    };
-    self.window.commitRender(buffer, surface_damage) catch |err| {
-        log.err("async commit failed: {}", .{err});
-        self.window.cancelRender(buffer);
-        self.window.fatal_error = err;
-        self.window.running = false;
-    };
+    }
+    self.commitFinishedFrame(buffer);
 }
 
 fn redrawReady(ctx: *anyopaque) void {
@@ -4296,50 +4286,17 @@ fn recordAsyncFrameDamage(self: *App, damage: *FrameDamage, async_raster: *Async
         .full => unreachable,
         .partial => try async_raster.copyRepaintedRows(self.alloc, &damage.rows),
         .none => {
-            try damage.rows.resize(self.alloc, self.async_render_state.rows, false);
+            try damage.rows.resize(self.alloc, self.render_state.rows, false);
             damage.rows.unsetAll();
         },
     }
-    std.debug.assert(damage.rows.bit_length == self.async_render_state.rows);
-}
-
-/// Fill the current damage entry from the render state's dirty rows,
-/// expanded by one row on each side to match Renderer.renderDirty.
-fn recordFrameDamage(self: *App, damage: *FrameDamage, hint_drawn: bool) !void {
-    damage.bottom_strip = hint_drawn;
-    if (self.render_state.dirty == .full) return; // entry already full
-    const rows: usize = self.render_state.rows;
-    try damage.rows.resize(self.alloc, rows, false);
-    damage.rows.unsetAll();
-    damage.full = false;
-    if (self.render_state.dirty == .false or rows == 0) return;
-    // Mirror exactly the rows renderDirty repainted (dirty rows plus
-    // the neighbors its overhang tracking chose to include).
-    std.debug.assert(self.renderer.repainted.bit_length == rows);
-    var it = self.renderer.repainted.iterator(.{});
-    while (it.next()) |y| damage.rows.set(y);
+    std.debug.assert(damage.rows.bit_length == self.render_state.rows);
 }
 
 /// The damage entry recorded `back` frames ago (0 = current frame).
 fn frameDamageBack(self: *const App, back: usize) *const FrameDamage {
     std.debug.assert(back < frame_damage_len);
     return &self.frame_damage[(self.frame_damage_index + frame_damage_len - back) % frame_damage_len];
-}
-
-fn rowDamagedBetween(self: *const App, row: usize, first_back: usize, end_back: usize) bool {
-    var back = first_back;
-    while (back < end_back) : (back += 1) {
-        if (self.frameDamageBack(back).rows.isSet(row)) return true;
-    }
-    return false;
-}
-
-fn bottomStripBetween(self: *const App, first_back: usize, end_back: usize) bool {
-    var back = first_back;
-    while (back < end_back) : (back += 1) {
-        if (self.frameDamageBack(back).bottom_strip) return true;
-    }
-    return false;
 }
 
 fn allRenderRowsDirty(self: *const App) bool {
@@ -4353,116 +4310,6 @@ fn allStateRowsDirty(state: *const vt.RenderState) bool {
         if (!dirty) return false;
     }
     return true;
-}
-
-fn currentPartialFrameWillRepaintRow(self: *const App, row: usize) bool {
-    return self.render_state.dirty == .partial and self.render_state.row_data.items(.dirty)[row];
-}
-
-/// Bring `pixels` up to the previous committed frame before current dirty
-/// rows are drawn into it. Returns false when no safe repair source exists;
-/// the caller must then repaint the whole current frame.
-fn repairToPreviousFrame(
-    self: *App,
-    pixels: []u32,
-    source_pixels: ?[]const u32,
-    width: u31,
-    height: u31,
-    age: usize,
-) !bool {
-    std.debug.assert(pixels.len == @as(usize, width) * height);
-    if (age == 1) return true;
-
-    const source = source_pixels orelse return false;
-    std.debug.assert(source.len == pixels.len);
-    if (source.ptr == pixels.ptr) return true;
-
-    const cell_height: usize = self.font.cell_height;
-    const grid_rows: usize = self.render_state.rows;
-
-    const copy_all = copy_all: {
-        if (age == 0 or age > frame_damage_len) break :copy_all true;
-        var back: usize = 1;
-        while (back < age) : (back += 1) {
-            const entry = self.frameDamageBack(back);
-            if (entry.full) break :copy_all true;
-            if (entry.width != width or entry.height != height) break :copy_all true;
-            if (entry.rows.bit_length != grid_rows) break :copy_all true;
-        }
-        break :copy_all false;
-    };
-
-    if (copy_all) {
-        Renderer.copyPixels(pixels, source);
-        return true;
-    }
-
-    var y: usize = 0;
-    while (y < grid_rows) {
-        if (!self.rowDamagedBetween(y, 1, age) or self.currentPartialFrameWillRepaintRow(y)) {
-            y += 1;
-            continue;
-        }
-        const start = y;
-        while (y < grid_rows and self.rowDamagedBetween(y, 1, age) and !self.currentPartialFrameWillRepaintRow(y)) y += 1;
-        const px_start = @min(start * cell_height, height);
-        const px_end = @min(y * cell_height, height);
-        const offset = px_start * width;
-        const len = (px_end - px_start) * width;
-        Renderer.copyPixels(pixels[offset..][0..len], source[offset..][0..len]);
-    }
-    if (height >= cell_height and self.bottomStripBetween(1, age)) {
-        const offset = (height - cell_height) * width;
-        Renderer.copyPixels(pixels[offset..], source[offset..]);
-    }
-    return true;
-}
-
-/// Finish this frame after rendering directly into the target shm buffer.
-fn finishFrame(self: *App, pixels: []u32, width: u31, height: u31) !Window.Damage {
-    std.debug.assert(pixels.len == @as(usize, width) * height);
-
-    const frame_timer = self.config.frame_timer;
-    const render_done: i96 = if (frame_timer != .off) self.nowNs() else 0;
-    if (frame_timer == .overlay or frame_timer == .both) {
-        try self.renderer.renderFrameTimer(
-            &self.render_state,
-            pixels,
-            width,
-            height,
-            self.last_frame_ns,
-        );
-        // The overlay occupies the top cell row; make reported surface
-        // damage carry it every frame.
-        const entry = &self.frame_damage[self.frame_damage_index];
-        if (!entry.full and entry.rows.bit_length > 0) entry.rows.set(0);
-    }
-
-    if (frame_timer != .off) {
-        const now = self.nowNs();
-        self.last_frame_ns = @intCast(now - self.frame_start);
-        if (frame_timer == .log or frame_timer == .both) {
-            const frame_log = std.log.scoped(.frame);
-            var rows_buf: [24]u8 = undefined;
-            const rows_str = switch (self.frame_rows) {
-                .all => "all",
-                .count => |n| std.fmt.bufPrint(&rows_buf, "{d}", .{n}) catch "?",
-            };
-            frame_log.info("frame {d:.3} ms (update {d:.3} ms, draw {d:.3} ms, flush {d:.3} ms) rows {s}", .{
-                @as(f64, @floatFromInt(now - self.frame_start)) / std.time.ns_per_ms,
-                @as(f64, @floatFromInt(self.frame_update_done - self.frame_start)) / std.time.ns_per_ms,
-                @as(f64, @floatFromInt(render_done - self.frame_update_done)) / std.time.ns_per_ms,
-                @as(f64, @floatFromInt(now - render_done)) / std.time.ns_per_ms,
-                rows_str,
-            });
-        }
-    }
-
-    return self.currentFrameDamage(height);
-}
-
-fn nowNs(self: *App) i96 {
-    return std.Io.Clock.awake.now(self.io).nanoseconds;
 }
 
 /// Surface damage of the current frame only, as pixel-row spans.
@@ -4513,7 +4360,7 @@ fn textInputCursorRect(self: *App, state: *const vt.RenderState) Window.TextInpu
 }
 
 fn currentCursorState(self: *const App) *const vt.RenderState {
-    return if (self.render_state.rows == 0) &self.async_render_state else &self.render_state;
+    return &self.render_state;
 }
 
 fn physicalRectToLogical(scale120: u32, rect: Window.TextInputRect) Window.TextInputRect {
@@ -4567,6 +4414,13 @@ fn clearStateDirty(state: *vt.RenderState) void {
 fn invalidateAsyncFrame(self: *App) void {
     self.async_generation +%= 1;
     self.async_force_full = true;
+    // A held frame was rastered from the now-stale state; drop it rather
+    // than commit outdated pixels on the next frame callback.
+    if (self.held_frame) |buffer| {
+        self.held_frame = null;
+        self.window.cancelRender(buffer);
+        self.needs_redraw = true;
+    }
 }
 
 /// Window resize delegate: fit the grid to the new size, resize the
@@ -4594,6 +4448,7 @@ fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
         .ypixel = @intCast(height),
     });
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
+    self.geometry_redraw = true;
     self.needs_redraw = true;
 }
 

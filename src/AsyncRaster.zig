@@ -17,6 +17,21 @@ pub const Job = struct {
     age: usize,
     generation: u64,
     focused: bool,
+    /// Underline hovered hyperlinks in the base render.
+    hyperlink_hints: bool,
+    /// IME preedit overlay text. Owned by the submitter; must stay valid
+    /// until the job's result is taken.
+    preedit: ?[]const u8,
+    /// Hovered-hyperlink URI overlay. Same ownership as `preedit`.
+    link_hint: ?[]const u8,
+    /// Visible kitty placements, resolved on the main thread with image
+    /// data repointed at cache-pinned copies. Same ownership as
+    /// `preedit`; empty when no graphics are visible.
+    kitty_items: []const Renderer.KittyRenderItem,
+
+    fn hasOverlay(self: *const Job) bool {
+        return self.preedit != null or self.link_hint != null or self.kitty_items.len > 0;
+    }
 };
 
 pub const Damage = enum { full, partial, none };
@@ -306,6 +321,7 @@ fn workerMain(self: *AsyncRaster) void {
         self.mutex.unlock();
 
         self.renderer.focused = job.focused;
+        self.renderer.hyperlink_hints = job.hyperlink_hints;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
 
@@ -318,6 +334,23 @@ fn workerMain(self: *AsyncRaster) void {
 }
 
 fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
+    // Overlays draw outside the grid rows that dirty tracking accounts
+    // for, so an overlay frame is always a full render with full damage.
+    if (job.hasOverlay()) {
+        if (job.kitty_items.len > 0) {
+            try self.renderer.renderWithKittyItems(self.state, job.kitty_items, job.pixels, job.width, job.height);
+        } else {
+            try self.renderer.render(self.state, job.pixels, job.width, job.height);
+        }
+        if (job.preedit) |text| {
+            try self.renderer.renderPreedit(self.state, job.pixels, job.width, job.height, text);
+        }
+        if (job.link_hint) |uri| {
+            try self.renderer.renderLinkHint(self.state, job.pixels, job.width, job.height, uri);
+        }
+        damage.* = .full;
+        return;
+    }
     switch (self.state.dirty) {
         .full => {
             try self.renderer.render(self.state, job.pixels, job.width, job.height);
@@ -362,6 +395,10 @@ test "repair previous frame" {
         .age = 0,
         .generation = 1,
         .focused = true,
+        .hyperlink_hints = false,
+        .preedit = null,
+        .link_hint = null,
+        .kitty_items = &.{},
     };
 
     try std.testing.expect(repairToPreviousFrame(base));

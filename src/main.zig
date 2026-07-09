@@ -367,6 +367,7 @@ test {
     _ = Font;
     _ = @import("cgroup.zig");
     _ = @import("Keyboard.zig");
+    _ = @import("KittyImageCache.zig");
     _ = Pty;
     _ = @import("ReadPipeline.zig");
     _ = Renderer;

@@ -18,9 +18,6 @@ const log = std.log.scoped(.window);
 const default_width = 800;
 const default_height = 600;
 
-/// Opaque dark background, ARGB8888.
-const bg_color: u32 = 0xff18191b;
-
 alloc: std.mem.Allocator,
 display: *wl.Display,
 registry: *wl.Registry,
@@ -72,18 +69,18 @@ pending_geometry_changed: bool,
 pending_draw: bool,
 running: bool,
 fatal_error: ?anyerror,
-/// A frame callback is outstanding; drawing now would outpace the
-/// compositor. `redraw()` queues instead.
+/// A frame callback is outstanding; committing now would outpace the
+/// compositor. The application's scheduler decides what to do instead.
 frame_pending: bool,
+/// A render target is checked out (a raster job in flight, or a
+/// finished frame held for the next callback).
 rendering_pending: bool,
-redraw_queued: bool,
 /// Monotonic count of frames drawn, for buffer-age tracking. Each
 /// buffer remembers the frame it last held; the difference tells the
-/// render delegate how stale a reused buffer is.
+/// renderer how stale a reused buffer is.
 frame_counter: u64,
 suspended: bool,
 render_ctx: ?*anyopaque,
-render_fn: ?RenderFn,
 resize_fn: ?ResizeFn,
 keyboard_fn: ?KeyboardFn,
 pointer_fn: ?PointerFn,
@@ -101,14 +98,6 @@ pub const Damage = union(enum) {
     /// The slice must remain valid until the next render callback.
     spans: []const RowSpan,
 };
-
-/// Draw delegate: fills `pixels` (width*height ARGB8888, stride == width).
-/// Dimensions are physical pixels. `source_pixels` is the newest same-size
-/// committed buffer, if any; it may alias `pixels`. `age` is how many frames
-/// ago `pixels` was last drawn: 0 means its content is unknown, N means it
-/// holds the frame drawn N frames ago. Returns this frame's surface damage
-/// relative to the previous commit.
-pub const RenderFn = *const fn (ctx: *anyopaque, pixels: []u32, source_pixels: ?[]const u32, width: u31, height: u31, age: usize) anyerror!Damage;
 
 /// Called when the window size changed, before the next draw.
 /// Dimensions are physical pixels.
@@ -142,9 +131,9 @@ pub const InitialSize = struct {
 /// follows. `scale120` is the scale in 1/120ths (120 == 1.0).
 pub const ScaleFn = *const fn (ctx: *anyopaque, scale120: u32) anyerror!void;
 
-/// Called when compositor throttling ends or configure work requires a
-/// frame. The application decides whether to raster synchronously or on a
-/// worker; Window never bypasses that decision from a Wayland callback.
+/// Called when configure work requires a new frame (first configure,
+/// resize, scale change, resume). The application owns all render
+/// scheduling; Window never draws or commits on its own initiative.
 pub const RedrawReadyFn = *const fn (ctx: *anyopaque) void;
 
 /// Globals collected during the initial registry roundtrip.
@@ -284,11 +273,9 @@ pub fn create(
         .fatal_error = null,
         .frame_pending = false,
         .rendering_pending = false,
-        .redraw_queued = false,
         .frame_counter = 0,
         .suspended = false,
         .render_ctx = null,
-        .render_fn = null,
         .resize_fn = null,
         .keyboard_fn = null,
         .pointer_fn = null,
@@ -380,11 +367,10 @@ pub fn flushPending(self: *Window) void {
     self.geometryChanged(resized);
 }
 
-/// Set the delegates for drawing, resizing, input, and scale.
+/// Set the delegates for redraw scheduling, resizing, input, and scale.
 pub fn setCallbacks(
     self: *Window,
     ctx: *anyopaque,
-    render_fn: RenderFn,
     resize_fn: ?ResizeFn,
     keyboard_fn: ?KeyboardFn,
     pointer_fn: ?PointerFn,
@@ -393,7 +379,6 @@ pub fn setCallbacks(
     redraw_ready_fn: ?RedrawReadyFn,
 ) void {
     self.render_ctx = ctx;
-    self.render_fn = render_fn;
     self.resize_fn = resize_fn;
     self.keyboard_fn = keyboard_fn;
     self.pointer_fn = pointer_fn;
@@ -469,41 +454,6 @@ fn physical(self: *const Window, logical: u31) u31 {
     return @intCast((@as(u64, logical) * self.scale120 + 60) / 120);
 }
 
-/// Redraw as soon as the compositor is ready for a new frame: now if no
-/// frame callback is outstanding, otherwise when it fires.
-pub fn redraw(self: *Window) !void {
-    // Not configured yet; the first configure triggers the first draw.
-    if (self.width == 0) return;
-    if (self.suspended) {
-        self.redraw_queued = true;
-        return;
-    }
-    if (self.frame_pending or self.rendering_pending) {
-        self.redraw_queued = true;
-        return;
-    }
-    try self.draw();
-}
-
-/// Redraw the window contents and commit. The buffer is sized in
-/// physical pixels; the viewport (if any) maps it to the logical size.
-fn draw(self: *Window) !void {
-    const phys_width = self.physical(self.width);
-    const phys_height = self.physical(self.height);
-    const target = try self.beginRender(phys_width, phys_height);
-    const buffer = target.buffer;
-    errdefer self.cancelRender(buffer);
-    const damage: Damage = if (self.render_fn) |render_fn| damage: {
-        break :damage try render_fn(self.render_ctx.?, buffer.pixels(), target.source_pixels, phys_width, phys_height, target.age);
-    } else damage: {
-        @memset(buffer.pixels(), bg_color);
-        break :damage .full;
-    };
-    self.commitRender(buffer, damage) catch |err| {
-        return err;
-    };
-}
-
 pub const RenderTarget = struct {
     buffer: *Buffer,
     pixels: []u32,
@@ -513,8 +463,11 @@ pub const RenderTarget = struct {
     age: usize,
 };
 
+/// Check out a buffer for an asynchronous render. Allowed while a frame
+/// callback is outstanding so raster work can overlap the frame wait;
+/// refused only while another render target is already checked out.
 pub fn acquireRenderTarget(self: *Window) !RenderTarget {
-    if (self.width == 0 or self.suspended or self.frame_pending or self.rendering_pending) return error.NotReady;
+    if (self.width == 0 or self.suspended or self.rendering_pending) return error.NotReady;
     return self.beginRender(self.physical(self.width), self.physical(self.height));
 }
 
@@ -536,7 +489,6 @@ fn beginRender(self: *Window, phys_width: u31, phys_height: u31) !RenderTarget {
 pub fn cancelRender(self: *Window, buffer: *Buffer) void {
     buffer.rendering = false;
     self.rendering_pending = false;
-    self.redraw_queued = true;
 }
 
 pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
@@ -573,12 +525,10 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
     switch (event) {
         .done => {
             frame_cb.destroy();
+            // The application's main loop observes the cleared flag after
+            // dispatch and decides whether to commit a held frame or start
+            // a new render; Window never draws from this callback.
             self.frame_pending = false;
-            if (self.redraw_queued) {
-                if (self.suspended) return;
-                self.redraw_queued = false;
-                self.scheduleDraw();
-            }
         },
     }
 }
@@ -776,27 +726,12 @@ fn geometryChanged(self: *Window, resized: bool) void {
             };
         }
     }
-    if (self.suspended) {
-        self.redraw_queued = true;
-        return;
-    }
-    if (self.frame_pending or self.rendering_pending) {
-        self.redraw_queued = true;
-        return;
-    }
     self.scheduleDraw();
 }
 
 fn scheduleDraw(self: *Window) void {
-    if (self.redraw_ready_fn) |redraw_ready_fn| {
-        redraw_ready_fn(self.render_ctx.?);
-        return;
-    }
-    self.draw() catch |err| {
-        log.err("draw failed: {}", .{err});
-        self.fatal_error = err;
-        self.running = false;
-    };
+    const redraw_ready_fn = self.redraw_ready_fn orelse return;
+    redraw_ready_fn(self.render_ctx.?);
 }
 
 fn fractionalScaleListener(

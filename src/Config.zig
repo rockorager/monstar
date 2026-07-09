@@ -106,10 +106,6 @@ scrollback: usize = 10_000,
 /// rejected, so it must comfortably fit a fullscreen RGBA frame.
 image_storage_limit: usize = 320 * 1000 * 1000,
 wheel_scroll_lines: u31 = 3,
-/// Frame timing readout: `overlay` draws the previous frame's CPU
-/// cost in the top-right corner, `log` writes per-frame timings to
-/// stderr, `both` does both.
-frame_timer: FrameTimer = .off,
 
 theme: Theme = default_theme,
 background: ?vt.color.RGB = null,
@@ -119,7 +115,6 @@ selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
 palette: [16]?vt.color.RGB = @splat(null),
 
-pub const FrameTimer = enum { off, overlay, log, both };
 pub const LinuxCgroup = enum { never, always };
 
 /// Load the default config file, if any. Strings are allocated in `arena`
@@ -208,8 +203,6 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         const lines = std.fmt.parseInt(u31, value, 10) catch return error.InvalidValue;
         if (lines == 0) return error.InvalidValue;
         self.wheel_scroll_lines = lines;
-    } else if (std.mem.eql(u8, key, "frame-timer")) {
-        self.frame_timer = std.meta.stringToEnum(FrameTimer, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "theme")) {
         self.theme = std.meta.stringToEnum(Theme, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background")) {

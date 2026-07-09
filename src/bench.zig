@@ -84,59 +84,20 @@ pub fn run(init: std.process.Init) !void {
     }
 
     // End-to-end scroll frame: one new line fed, then the same path
-    // App.render takes (scroll detection, update, blit or full render).
+    // the raster worker takes (update, then a dirty render — a scroll
+    // marks every row dirty, so this is effectively a full repaint).
     // This is the hot path when a program streams output.
     {
         const scroll_line = comptime scrollLine();
         const iters = 100;
-        var blitted: usize = 0;
         const start = nowNs(init.io);
         for (0..iters) |_| {
             stream.nextSlice(scroll_line);
-            const scroll = try renderer.detectScroll(&render_state, &term);
-            const old_cursor = render_state.cursor;
             try render_state.update(alloc, &term);
-            if (scroll) |s| {
-                const old_cursor_row: ?usize = if (old_cursor.viewport) |viewport| viewport.y else null;
-                try renderer.renderScrolled(&render_state, pixels, width, height, s, old_cursor_row);
-                blitted += 1;
-            } else {
-                try renderer.render(&render_state, pixels, width, height);
-            }
+            try renderer.renderDirty(&render_state, pixels, width, height);
             clearDirty(&render_state);
         }
         try report(w, "scroll frame (feed+update+render)", nowNs(init.io) - start, iters, null);
-        if (blitted != iters) try w.print("  (!) only {d}/{d} frames took the blit path\n", .{ blitted, iters });
-
-        // Compare the blit path against a full render of the same
-        // state (using the shm buffer as scratch). Accent overhang
-        // re-blits blend over their own previous pixels at repaint
-        // boundaries, so anti-aliased edge pixels may drift slightly;
-        // anything beyond a small channel delta is a real bug.
-        stream.nextSlice(scroll_line);
-        const scroll = try renderer.detectScroll(&render_state, &term);
-        const old_cursor = render_state.cursor;
-        try render_state.update(alloc, &term);
-        if (scroll) |s| {
-            const old_cursor_row: ?usize = if (old_cursor.viewport) |viewport| viewport.y else null;
-            try renderer.renderScrolled(&render_state, pixels, width, height, s, old_cursor_row);
-            try renderer.render(&render_state, shm, width, height);
-            var diff_count: usize = 0;
-            var max_delta: u8 = 0;
-            for (pixels, shm) |a, b| {
-                if (a == b) continue;
-                diff_count += 1;
-                const ab: [4]u8 = @bitCast(a);
-                const bb: [4]u8 = @bitCast(b);
-                for (ab, bb) |ca, cb| {
-                    max_delta = @max(max_delta, if (ca > cb) ca - cb else cb - ca);
-                }
-            }
-            try w.print("scroll blit vs full render: {d} pixels differ, max channel delta {d}\n", .{ diff_count, max_delta });
-        } else {
-            try w.writeAll("scroll blit verification: no scroll detected\n");
-        }
-        clearDirty(&render_state);
     }
 
     // Steady-state frame: one row changes (cursor line, status bar).
