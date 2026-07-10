@@ -61,6 +61,9 @@ codepoint_scratch: std.ArrayList(u21),
 /// Shape cache counters for benchmarks/profiling. Production rendering does
 /// not read these, so they stay deliberately cheap and approximate.
 shape_stats: ShapeStats = .{},
+/// Physical framebuffer row stride. Zero means the visible width, which is
+/// convenient for standalone renderer tests and tightly packed buffers.
+buffer_stride: u31 = 0,
 
 /// Shape cache entry limit; at ~300 bytes per typical entry the cache
 /// tops out around a few megabytes before it resets.
@@ -106,6 +109,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .shape_key = .empty,
         .codepoint_scratch = .empty,
         .shape_stats = .{},
+        .buffer_stride = 0,
     };
 }
 
@@ -142,6 +146,17 @@ pub fn shapeStats(self: *const Renderer) ShapeStats {
     return self.shape_stats;
 }
 
+fn pixelStride(self: *const Renderer, width: u31) u31 {
+    const stride = if (self.buffer_stride == 0) width else self.buffer_stride;
+    std.debug.assert(stride >= width);
+    return stride;
+}
+
+fn pixelBufferFits(pixels: []const u32, stride: u31, width: u31, height: u31) bool {
+    if (width == 0 or height == 0) return true;
+    return pixels.len >= @as(usize, height - 1) * stride + width;
+}
+
 /// Draw the full render state into `pixels` (width*height, stride == width).
 pub fn render(
     self: *Renderer,
@@ -150,10 +165,10 @@ pub fn render(
     width: u31,
     height: u31,
 ) !void {
-    std.debug.assert(pixels.len == @as(usize, width) * height);
+    std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
 
     if (state.rows == 0 or state.cols == 0) {
-        @memset(pixels, argb(state.colors.background));
+        fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, argb(state.colors.background));
         return;
     }
     try self.row_overhang.resize(self.alloc, state.rows, false);
@@ -177,7 +192,17 @@ pub fn render(
     // grid row remains.
     const grid_bottom = @as(usize, state.rows) * self.font.cell_height;
     if (grid_bottom < height) {
-        @memset(pixels[grid_bottom * width ..], argb(state.colors.background));
+        fillRect(
+            pixels,
+            self.pixelStride(width),
+            width,
+            height,
+            0,
+            @intCast(grid_bottom),
+            width,
+            height - @as(u31, @intCast(grid_bottom)),
+            argb(state.colors.background),
+        );
     }
 }
 
@@ -205,9 +230,9 @@ pub fn renderWithKittyItems(
     width: u31,
     height: u31,
 ) !void {
-    std.debug.assert(pixels.len == @as(usize, width) * height);
+    std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
 
-    @memset(pixels, argb(state.colors.background));
+    fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, argb(state.colors.background));
     if (state.rows == 0 or state.cols == 0) return;
 
     try self.renderKittyItems(items, pixels, width, height, .below_bg);
@@ -267,7 +292,7 @@ pub fn renderDirty(
     width: u31,
     height: u31,
 ) !void {
-    std.debug.assert(pixels.len == @as(usize, width) * height);
+    std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
     if (state.rows == 0 or state.cols == 0) return;
     try self.row_overhang.resize(self.alloc, state.rows, false);
     try self.repainted.resize(self.alloc, state.rows, false);
@@ -332,6 +357,7 @@ pub fn renderPreedit(
 
         fillRect(
             pixels,
+            self.pixelStride(width),
             width,
             height,
             x * self.font.cell_width,
@@ -348,6 +374,7 @@ pub fn renderPreedit(
             const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), isSymbol(cp));
             blitGlyph(
                 pixels,
+                self.pixelStride(width),
                 width,
                 height,
                 g,
@@ -383,6 +410,7 @@ pub fn renderLinkHint(
 
     fillRect(
         pixels,
+        self.pixelStride(width),
         width,
         height,
         0,
@@ -408,6 +436,7 @@ pub fn renderLinkHint(
 
         fillRect(
             pixels,
+            self.pixelStride(width),
             width,
             height,
             x * self.font.cell_width,
@@ -424,6 +453,7 @@ pub fn renderLinkHint(
             const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), isSymbol(cp));
             blitGlyph(
                 pixels,
+                self.pixelStride(width),
                 width,
                 height,
                 g,
@@ -439,6 +469,7 @@ pub fn renderLinkHint(
     if (x < cols) {
         fillRect(
             pixels,
+            self.pixelStride(width),
             width,
             height,
             x * self.font.cell_width,
@@ -637,7 +668,7 @@ fn renderKittyPlacement(
     // without c=/r=, making dest dims equal source dims. Blit straight
     // from the image bytes: no staging buffers, no resampler.
     if (dest_width == source_width and dest_height == source_height) {
-        blitKittyUnscaled(pixels, width, height, image, viewport, dest_x, dest_y);
+        blitKittyUnscaled(pixels, self.pixelStride(width), width, height, image, viewport, dest_x, dest_y);
         return;
     }
 
@@ -649,7 +680,7 @@ fn renderKittyPlacement(
     defer self.alloc.free(scaled);
     try resizeRgba(source, source_width, source_height, scaled, dest_width, dest_height);
 
-    blendRgba(pixels, width, height, scaled, dest_width, dest_height, dest_x, dest_y);
+    blendRgba(pixels, self.pixelStride(width), width, height, scaled, dest_width, dest_height, dest_x, dest_y);
 }
 
 /// Draw an unscaled placement directly from the terminal-owned image
@@ -657,6 +688,7 @@ fn renderKittyPlacement(
 /// converting from the image's wire format as it writes.
 fn blitKittyUnscaled(
     pixels: []u32,
+    stride: u31,
     width: u31,
     height: u31,
     image: KittyImage,
@@ -693,12 +725,12 @@ fn blitKittyUnscaled(
     for (0..rows) |row| {
         const src_off = ((src_y + row) * image.width + src_x) * channels;
         const src = image.data[src_off..];
-        const dst = pixels[(dest_row + row) * width + dest_col ..][0..cols];
+        const dst = pixels[(dest_row + row) * stride + dest_col ..][0..cols];
         switch (image.format) {
             .rgb => for (dst, 0..) |*px, i| {
-                const s = src[i * 3 ..][0..3];
+                const source = src[i * 3 ..][0..3];
                 px.* = 0xff000000 |
-                    (@as(u32, s[0]) << 16) | (@as(u32, s[1]) << 8) | s[2];
+                    (@as(u32, source[0]) << 16) | (@as(u32, source[1]) << 8) | source[2];
             },
             .rgba => for (dst, 0..) |*px, i| {
                 const s = src[i * 4 ..][0..4];
@@ -763,6 +795,11 @@ fn kittyPlacementViewport(
 
     const source_x = @min(placement.source_x, image.width);
     const source_y = @min(placement.source_y, image.height);
+    const source_width = @min(if (placement.source_width > 0) placement.source_width else image.width, image.width - source_x);
+    const source_height = @min(if (placement.source_height > 0) placement.source_height else image.height, image.height - source_y);
+    // An out-of-range source origin resolves to an empty crop. Do not let
+    // that no-op placement participate in occlusion or full-frame skips.
+    if (source_width == 0 or source_height == 0) return null;
     return .{
         .viewport_col = viewport_col,
         .viewport_row = viewport_row,
@@ -773,8 +810,8 @@ fn kittyPlacementViewport(
         .pixel_height = pixel_size.height,
         .source_x = source_x,
         .source_y = source_y,
-        .source_width = @min(if (placement.source_width > 0) placement.source_width else image.width, image.width - source_x),
-        .source_height = @min(if (placement.source_height > 0) placement.source_height else image.height, image.height - source_y),
+        .source_width = source_width,
+        .source_height = source_height,
     };
 }
 
@@ -949,6 +986,7 @@ fn resizeRgba(
 
 fn blendRgba(
     pixels: []u32,
+    stride: u31,
     width: u31,
     height: u31,
     rgba: []const u8,
@@ -969,7 +1007,7 @@ fn blendRgba(
             const alpha = rgba[src_offset + 3];
             if (alpha == 0) continue;
 
-            const dst_idx = @as(usize, @intCast(y)) * width + @as(usize, @intCast(x));
+            const dst_idx = @as(usize, @intCast(y)) * stride + @as(usize, @intCast(x));
             if (alpha == 0xff) {
                 pixels[dst_idx] = 0xff000000 |
                     (@as(u32, rgba[src_offset + 0]) << 16) |
@@ -1108,11 +1146,11 @@ fn prepareRow(
                 if (bg_run.active and color == bg_run.color and px_start <= bg_run.end_px) {
                     bg_run.end_px = @max(bg_run.end_px, px_end);
                 } else {
-                    bg_run.flush(pixels, width, height, y_px, font.cell_height);
+                    bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
                     bg_run = .{ .active = true, .color = color, .start_px = px_start, .end_px = px_end };
                 }
             } else {
-                bg_run.flush(pixels, width, height, y_px, font.cell_height);
+                bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
             }
         }
     }
@@ -1125,12 +1163,12 @@ fn prepareRow(
             if (bg_run.active and color == bg_run.color) {
                 bg_run.end_px = width;
             } else {
-                bg_run.flush(pixels, width, height, y_px, font.cell_height);
+                bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
                 bg_run = .{ .active = true, .color = color, .start_px = margin_start, .end_px = width };
             }
         }
     }
-    bg_run.flush(pixels, width, height, y_px, font.cell_height);
+    bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
 }
 
 /// A pending run of adjacent equal-color cell backgrounds.
@@ -1140,9 +1178,9 @@ const BgRun = struct {
     start_px: u31 = 0,
     end_px: u31 = 0,
 
-    fn flush(run: *BgRun, pixels: []u32, buf_width: u31, buf_height: u31, y_px: u31, h: u31) void {
+    fn flush(run: *BgRun, pixels: []u32, stride: u31, buf_width: u31, buf_height: u31, y_px: u31, h: u31) void {
         if (!run.active) return;
-        fillRect(pixels, buf_width, buf_height, run.start_px, y_px, run.end_px - run.start_px, h, run.color);
+        fillRect(pixels, stride, buf_width, buf_height, run.start_px, y_px, run.end_px - run.start_px, h, run.color);
         run.active = false;
     }
 };
@@ -1279,6 +1317,7 @@ fn blitDecoration(
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
     blitGlyph(
         pixels,
+        self.pixelStride(width),
         width,
         height,
         g,
@@ -1320,6 +1359,7 @@ fn drawRun(
             self.noteOverhang(@as(i32, font.baseline) - g.bearing_y, g.height);
             blitGlyph(
                 pixels,
+                self.pixelStride(width),
                 width,
                 height,
                 g,
@@ -1395,6 +1435,7 @@ fn drawRun(
         self.noteOverhang(@as(i32, font.baseline) - sg.y_offset - g.bearing_y, g.height);
         blitGlyph(
             pixels,
+            self.pixelStride(width),
             width,
             height,
             g,
@@ -1654,6 +1695,7 @@ fn argb(rgb: vt.color.RGB) u32 {
 
 fn fillRect(
     pixels: []u32,
+    stride: u31,
     buf_width: u31,
     buf_height: u31,
     x: u31,
@@ -1666,7 +1708,7 @@ fn fillRect(
     const x_end = @min(x + w, buf_width);
     const y_end = @min(y + h, buf_height);
     for (y..y_end) |row| {
-        fillSpan(pixels[row * buf_width + x .. row * buf_width + x_end], color);
+        fillSpan(pixels[row * stride + x .. row * stride + x_end], color);
     }
 }
 
@@ -1681,9 +1723,23 @@ fn fillSpan(dst: []u32, color: u32) void {
     for (dst[i..]) |*px| px.* = color;
 }
 
+test "fillRect clips to a view while honoring framebuffer stride" {
+    const untouched: u32 = 0x12345678;
+    var pixels = [_]u32{untouched} ** 15;
+    fillRect(&pixels, 5, 2, 2, 0, 0, 2, 2, 0xffabcdef);
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[0]);
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[1]);
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[5]);
+    try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[6]);
+    for ([_]usize{ 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14 }) |i| {
+        try std.testing.expectEqual(untouched, pixels[i]);
+    }
+}
+
 /// Alpha-blend an 8-bit coverage bitmap in `color` over the buffer.
 fn blitGlyph(
     pixels: []u32,
+    stride: u31,
     buf_width: u31,
     buf_height: u31,
     g: *const Font.Glyph,
@@ -1694,13 +1750,13 @@ fn blitGlyph(
 ) void {
     switch (g.format) {
         .alpha => if (g.fully_opaque)
-            blitOpaqueGlyph(pixels, buf_width, buf_height, g, x0, y0, color)
+            blitOpaqueGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color)
         else
-            blitAlphaGlyph(pixels, buf_width, buf_height, g, x0, y0, color),
+            blitAlphaGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color),
         .bgra => if (reverse_color_glyph)
-            blitBgraGlyphAsAlpha(pixels, buf_width, buf_height, g, x0, y0, color)
+            blitBgraGlyphAsAlpha(pixels, stride, buf_width, buf_height, g, x0, y0, color)
         else
-            blitBgraGlyph(pixels, buf_width, buf_height, g, x0, y0),
+            blitBgraGlyph(pixels, stride, buf_width, buf_height, g, x0, y0),
     }
 }
 
@@ -1729,6 +1785,7 @@ fn clipGlyph(g: *const Font.Glyph, x0: i32, y0: i32, buf_width: u31, buf_height:
 
 fn blitOpaqueGlyph(
     pixels: []u32,
+    stride: u31,
     buf_width: u31,
     buf_height: u31,
     g: *const Font.Glyph,
@@ -1741,12 +1798,13 @@ fn blitOpaqueGlyph(
     const span_len = clip.gx_end - clip.gx_start;
     for (clip.gy_start..clip.gy_end) |gy| {
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
-        fillSpan(pixels[py * buf_width + px_start ..][0..span_len], color);
+        fillSpan(pixels[py * stride + px_start ..][0..span_len], color);
     }
 }
 
 fn blitAlphaGlyph(
     pixels: []u32,
+    stride: u31,
     buf_width: u31,
     buf_height: u31,
     g: *const Font.Glyph,
@@ -1759,7 +1817,7 @@ fn blitAlphaGlyph(
     for (clip.gy_start..clip.gy_end) |gy| {
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
         const src = g.bitmap[gy * g.width + clip.gx_start .. gy * g.width + clip.gx_end];
-        const dst = pixels[py * buf_width + px_start ..][0..src.len];
+        const dst = pixels[py * stride + px_start ..][0..src.len];
         blendAlphaSpan(dst, src, color);
     }
 }
@@ -1801,6 +1859,7 @@ fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) 
 
 fn blitBgraGlyph(
     pixels: []u32,
+    stride: u31,
     buf_width: u31,
     buf_height: u31,
     g: *const Font.Glyph,
@@ -1812,7 +1871,7 @@ fn blitBgraGlyph(
     for (clip.gy_start..clip.gy_end) |gy| {
         const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
-        const dst = pixels[py * buf_width + px_start ..][0 .. clip.gx_end - clip.gx_start];
+        const dst = pixels[py * stride + px_start ..][0 .. clip.gx_end - clip.gx_start];
         blendPremultipliedBgraSpan(dst, src[0 .. dst.len * 4]);
     }
 }
@@ -1872,6 +1931,7 @@ fn blendPremultipliedBgraSpan(noalias dst: []u32, noalias src: []const u8) void 
 
 fn blitBgraGlyphAsAlpha(
     pixels: []u32,
+    stride: u31,
     buf_width: u31,
     buf_height: u31,
     g: *const Font.Glyph,
@@ -1884,7 +1944,7 @@ fn blitBgraGlyphAsAlpha(
     for (clip.gy_start..clip.gy_end) |gy| {
         const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
-        const dst = pixels[py * buf_width + px_start ..][0 .. clip.gx_end - clip.gx_start];
+        const dst = pixels[py * stride + px_start ..][0 .. clip.gx_end - clip.gx_start];
         for (dst, 0..) |*pixel, i| {
             const alpha = src[i * 4 + 3];
             if (alpha == 0) continue;
@@ -1945,7 +2005,7 @@ test "kitty unscaled blit converts rgb and clips" {
     };
 
     // Left column clips off the framebuffer: only source column 1 lands.
-    blitKittyUnscaled(&pixels, 3, 3, image, viewport, -1, 1);
+    blitKittyUnscaled(&pixels, 3, 3, 3, image, viewport, -1, 1);
     try std.testing.expectEqual(@as(u32, 0xff28323c), pixels[3]); // src (1,0)
     try std.testing.expectEqual(@as(u32, 0xff646e78), pixels[6]); // src (1,1)
     for ([_]usize{ 0, 1, 2, 4, 5, 7, 8 }) |i| {
@@ -1954,7 +2014,7 @@ test "kitty unscaled blit converts rgb and clips" {
 
     // Fully off-screen placements draw nothing.
     var before = pixels;
-    blitKittyUnscaled(&pixels, 3, 3, image, viewport, 3, 0);
+    blitKittyUnscaled(&pixels, 3, 3, 3, image, viewport, 3, 0);
     try std.testing.expectEqualSlices(u32, &before, &pixels);
 }
 
@@ -1984,7 +2044,7 @@ test "kitty unscaled blit honors rgba alpha" {
         .source_height = 2,
     };
 
-    blitKittyUnscaled(&pixels, 2, 2, image, viewport, 0, 0);
+    blitKittyUnscaled(&pixels, 2, 2, 2, image, viewport, 0, 0);
     try std.testing.expectEqual(bg, pixels[0]); // alpha 0 skipped
     try std.testing.expectEqual(@as(u32, 0xffc8c8c8), pixels[1]); // opaque
     try std.testing.expectEqual(
@@ -2095,8 +2155,8 @@ test "opaque glyph fast path matches alpha blending with clipping" {
 
     var alpha_pixels: [5 * 4]u32 = @splat(0xff123456);
     var opaque_pixels = alpha_pixels;
-    blitGlyph(&alpha_pixels, 5, 4, &alpha_glyph, -1, 2, 0xffabcdef, false);
-    blitGlyph(&opaque_pixels, 5, 4, &opaque_glyph, -1, 2, 0xffabcdef, false);
+    blitGlyph(&alpha_pixels, 5, 5, 4, &alpha_glyph, -1, 2, 0xffabcdef, false);
+    blitGlyph(&opaque_pixels, 5, 5, 4, &opaque_glyph, -1, 2, 0xffabcdef, false);
     try std.testing.expectEqualSlices(u32, &alpha_pixels, &opaque_pixels);
 }
 

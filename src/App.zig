@@ -23,6 +23,7 @@ const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
 const AsyncRaster = @import("AsyncRaster.zig");
 const KittyImageCache = @import("KittyImageCache.zig");
+const TerminalLayout = @import("TerminalLayout.zig");
 const cgroup = @import("cgroup.zig");
 const Window = @import("Window.zig");
 
@@ -144,6 +145,8 @@ font: Font,
 font_size_px: u31,
 /// Runtime-only logical font-size override from keyboard shortcuts.
 runtime_font_size: ?u31,
+/// Current physical grid rectangle and effective padding.
+layout: TerminalLayout,
 /// Selection highlight colors, from config or OSC 17/19. Snapshotted
 /// into the raster worker's renderer on (re)configure.
 selection_bg: vt.color.RGB,
@@ -308,7 +311,8 @@ const StartupSize = struct {
     window: Window.InitialSize,
 };
 
-fn initialTerminalSize(size: InitialSize, font: *const Font) StartupSize {
+fn initialTerminalSize(size: InitialSize, font: *const Font, config: Config) StartupSize {
+    const padding = physicalPadding(config, 120);
     return switch (size) {
         .default => .{
             .cols = initial_cols,
@@ -319,19 +323,29 @@ fn initialTerminalSize(size: InitialSize, font: *const Font) StartupSize {
             .cols = chars.cols,
             .rows = chars.rows,
             .window = .{
-                .width = chars.cols * font.cell_width,
-                .height = chars.rows * font.cell_height,
+                .width = dimensionForCells(chars.cols, font.cell_width, padding.left, padding.right),
+                .height = dimensionForCells(chars.rows, font.cell_height, padding.top, padding.bottom),
             },
         },
-        .pixels => |pixels| .{
-            .cols = @intCast(@min(std.math.maxInt(u16), @max(1, pixels.width / font.cell_width))),
-            .rows = @intCast(@min(std.math.maxInt(u16), @max(1, pixels.height / font.cell_height))),
-            .window = .{
-                .width = pixels.width,
-                .height = pixels.height,
-            },
+        .pixels => |pixels| pixels: {
+            const layout = TerminalLayout.init(pixels.width, pixels.height, font.cell_width, font.cell_height, padding);
+            break :pixels .{
+                .cols = layout.columns,
+                .rows = layout.rows,
+                .window = .{
+                    .width = pixels.width,
+                    .height = pixels.height,
+                },
+            };
         },
     };
+}
+
+fn dimensionForCells(cells: u16, cell_size: u31, before: u31, after: u31) u31 {
+    return @intCast(@min(
+        std.math.maxInt(u31),
+        @as(u64, cells) * cell_size + before + after,
+    ));
 }
 
 /// What one frame changed, recorded so stale shm buffers can be brought
@@ -462,7 +476,15 @@ pub fn init(
 
     vt.sys.decode_png = decodePng;
 
-    const startup_size = initialTerminalSize(options.initial_size, &font);
+    const startup_size = initialTerminalSize(options.initial_size, &font, config);
+    const startup_padding = physicalPadding(config, 120);
+    const startup_layout = TerminalLayout.init(
+        dimensionForCells(startup_size.cols, font.cell_width, startup_padding.left, startup_padding.right),
+        dimensionForCells(startup_size.rows, font.cell_height, startup_padding.top, startup_padding.bottom),
+        font.cell_width,
+        font.cell_height,
+        startup_padding,
+    );
 
     var term: vt.Terminal = try .init(io, alloc, .{
         .cols = startup_size.cols,
@@ -626,6 +648,7 @@ pub fn init(
         .font = font,
         .font_size_px = config.font_size,
         .runtime_font_size = null,
+        .layout = startup_layout,
         .selection_bg = config.effectiveSelectionBackground(.dark),
         .selection_fg = config.effectiveSelectionForeground(.dark),
         .window = window,
@@ -2061,10 +2084,11 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.font = new_font;
     self.font_size_px = desired_font_size;
     self.invalidateAsyncFrame();
-    resize(
+    resizeForConfig(
         self,
         physicalDimension(self.window.width, self.window.scale120),
         physicalDimension(self.window.height, self.window.scale120),
+        new_config,
     ) catch |err| {
         log.warn("config reload resize failed: {}", .{err});
     };
@@ -2907,8 +2931,8 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
 /// The viewport cell under the pointer, clamped to the grid.
 fn cellAtPointer(self: *App) struct { x: u16, y: u16 } {
     const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
-    const px: f64 = @max(0, self.pointer_x * scale);
-    const py: f64 = @max(0, self.pointer_y * scale);
+    const px: f64 = @max(0, self.pointer_x * scale - @as(f64, @floatFromInt(self.layout.grid_x)));
+    const py: f64 = @max(0, self.pointer_y * scale - @as(f64, @floatFromInt(self.layout.grid_y)));
     const x: u16 = @intFromFloat(@min(
         px / @as(f64, @floatFromInt(self.font.cell_width)),
         @as(f64, @floatFromInt(self.term.cols -| 1)),
@@ -2975,7 +2999,9 @@ fn pointerPhysical(self: *App) struct { x: f64, y: f64 } {
     const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
     return .{
         .x = @max(0, self.pointer_x * scale),
-        .y = @max(0, self.pointer_y * scale),
+        // SelectionGesture supports horizontal padding explicitly; make Y
+        // grid-local so its top/bottom autoscroll thresholds do the same.
+        .y = @max(0, self.pointer_y * scale - @as(f64, @floatFromInt(self.layout.grid_y))),
     };
 }
 
@@ -2983,13 +3009,29 @@ fn selectionGeometry(self: *App) vt.SelectionGesture.Drag.Geometry {
     return .{
         .columns = self.term.cols,
         .cell_width = self.font.cell_width,
-        .padding_left = 0,
-        .screen_height = physicalDimension(self.window.height, self.window.scale120),
+        .padding_left = self.layout.grid_x,
+        .screen_height = self.layout.grid_height,
     };
 }
 
 fn physicalDimension(logical: u31, scale120: u32) u31 {
     return @intCast((@as(u64, logical) * scale120 + 60) / 120);
+}
+
+fn physicalPadding(config: Config, scale120: u32) TerminalLayout.Padding {
+    return .{
+        .left = scaledConfigDimension(config.window_padding_x.first, scale120),
+        .right = scaledConfigDimension(config.window_padding_x.second, scale120),
+        .top = scaledConfigDimension(config.window_padding_y.first, scale120),
+        .bottom = scaledConfigDimension(config.window_padding_y.second, scale120),
+    };
+}
+
+fn scaledConfigDimension(logical: u31, scale120: u32) u31 {
+    return @intCast(@min(
+        std.math.maxInt(u31),
+        (@as(u64, logical) * scale120 + 60) / 120,
+    ));
 }
 
 fn selectionTimestamp(ms: u32) std.Io.Timestamp {
@@ -3695,11 +3737,16 @@ fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
     var writer: std.Io.Writer = .fixed(&buf);
     var opts = vt.input.MouseEncodeOptions.fromTerminal(&self.term, .{
         .screen = .{
-            .width = @intCast(self.term.cols * self.font.cell_width),
-            .height = @intCast(self.term.rows * self.font.cell_height),
+            .width = self.layout.surface_width,
+            .height = self.layout.surface_height,
         },
         .cell = .{ .width = self.font.cell_width, .height = self.font.cell_height },
-        .padding = .{},
+        .padding = .{
+            .top = self.layout.padding.top,
+            .right = self.layout.padding.right,
+            .bottom = self.layout.padding.bottom,
+            .left = self.layout.padding.left,
+        },
     });
     opts.any_button_pressed = event.action == .press or self.mouse_button != null;
     vt.input.encodeMouse(&writer, event, opts) catch return;
@@ -4104,6 +4151,10 @@ fn startAsyncRender(self: *App) !bool {
         .source_pixels = target.source_pixels,
         .width = target.width,
         .height = target.height,
+        .grid_x = self.layout.grid_x,
+        .grid_y = self.layout.grid_y,
+        .grid_width = self.layout.grid_width,
+        .grid_height = self.layout.grid_height,
         .age = target.age,
         .generation = self.async_generation,
         .focused = self.focused,
@@ -4408,8 +4459,8 @@ fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
         }
         const start = y;
         while (y < entry.rows.bit_length and entry.rows.isSet(y)) y += 1;
-        const px_start = @min(start * cell_height, height);
-        const px_end = @min(y * cell_height, height);
+        const px_start = @min(@as(usize, self.layout.grid_y) + start * cell_height, height);
+        const px_end = @min(@as(usize, self.layout.grid_y) + y * cell_height, height);
         if (px_end > px_start) try self.damage_spans.append(self.alloc, .{
             .y = @intCast(px_start),
             .height = @intCast(px_end - px_start),
@@ -4417,7 +4468,10 @@ fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
     }
     if (entry.bottom_strip and height >= cell_height) {
         try self.damage_spans.append(self.alloc, .{
-            .y = @intCast(height - cell_height),
+            .y = @intCast(@min(
+                height - cell_height,
+                self.layout.grid_y + self.layout.grid_height -| @as(u31, @intCast(cell_height)),
+            )),
             .height = @intCast(cell_height),
         });
     }
@@ -4434,8 +4488,8 @@ fn textInputCursorRect(self: *App, state: *const vt.RenderState) Window.TextInpu
     const x_cells: u32 = if (cursor) |cpos| @intCast(cpos.x -| @intFromBool(cpos.wide_tail)) else 0;
     const y_cells: u32 = if (cursor) |cpos| @intCast(cpos.y) else 0;
     return physicalRectToLogical(self.window.scale120, .{
-        .x = @intCast(x_cells * self.font.cell_width),
-        .y = @intCast(y_cells * self.font.cell_height),
+        .x = @intCast(self.layout.grid_x + x_cells * self.font.cell_width),
+        .y = @intCast(self.layout.grid_y + y_cells * self.font.cell_height),
         .width = @intCast(self.font.cell_width),
         .height = @intCast(self.font.cell_height),
     });
@@ -4509,13 +4563,26 @@ fn invalidateAsyncFrame(self: *App) void {
 /// terminal (reflow) and tell the child.
 fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const cols: u16 = @intCast(@min(std.math.maxInt(u16), @max(1, width / self.font.cell_width)));
-    const rows: u16 = @intCast(@min(std.math.maxInt(u16), @max(1, height / self.font.cell_height)));
-    const grid_width_px = @as(u32, cols) * self.font.cell_width;
-    const grid_height_px = @as(u32, rows) * self.font.cell_height;
+    return self.resizeForConfig(width, height, self.config);
+}
+
+fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror!void {
+    const layout = TerminalLayout.init(
+        width,
+        height,
+        self.font.cell_width,
+        self.font.cell_height,
+        physicalPadding(config, self.window.scale120),
+    );
+    const layout_changed = !std.meta.eql(layout, self.layout);
+    self.layout = layout;
+    const cols = layout.columns;
+    const rows = layout.rows;
+    const grid_width_px = layout.grid_width;
+    const grid_height_px = layout.grid_height;
     const pixels_changed = grid_width_px != self.term.width_px or grid_height_px != self.term.height_px;
     const cells_changed = cols != self.term.cols or rows != self.term.rows;
-    if (!cells_changed and !pixels_changed) return;
+    if (!cells_changed and !pixels_changed and !layout_changed) return;
 
     self.term.width_px = grid_width_px;
     self.term.height_px = grid_height_px;
@@ -4526,8 +4593,8 @@ fn resize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
     try self.pty.setWinsize(.{
         .row = rows,
         .col = cols,
-        .xpixel = @intCast(width),
-        .ypixel = @intCast(height),
+        .xpixel = @intCast(grid_width_px),
+        .ypixel = @intCast(grid_height_px),
     });
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.geometry_redraw = true;

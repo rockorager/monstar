@@ -20,6 +20,11 @@ pub const default_theme: Theme = .system;
 
 pub const Theme = enum { system, light, dark };
 
+pub const WindowPadding = struct {
+    first: u31 = 0,
+    second: u31 = 0,
+};
+
 pub const ThemeColors = struct {
     background: vt.color.RGB,
     foreground: vt.color.RGB,
@@ -93,6 +98,10 @@ app_id: [:0]const u8 = default_app_id,
 font_family: [:0]const u8 = "monospace",
 /// Font size in logical pixels (scaled by the output's fractional scale).
 font_size: u31 = 16,
+/// Minimum window padding in logical pixels. One configured value applies to
+/// both sides; two values are left/right for X and top/bottom for Y.
+window_padding_x: WindowPadding = .{},
+window_padding_y: WindowPadding = .{},
 /// Shell to run; unset falls back to $SHELL, then /bin/sh.
 shell: ?[:0]const u8 = null,
 /// Shell command that receives the last semantic command output on stdin.
@@ -186,6 +195,10 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         const size = std.fmt.parseInt(u31, value, 10) catch return error.InvalidValue;
         if (size == 0 or size > 512) return error.InvalidValue;
         self.font_size = size;
+    } else if (std.mem.eql(u8, key, "window-padding-x")) {
+        self.window_padding_x = try parseWindowPadding(value);
+    } else if (std.mem.eql(u8, key, "window-padding-y")) {
+        self.window_padding_y = try parseWindowPadding(value);
     } else if (std.mem.eql(u8, key, "shell")) {
         self.shell = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
@@ -222,6 +235,21 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else {
         warn("unknown key '{s}', ignoring", .{key});
     }
+}
+
+fn parseWindowPadding(value: []const u8) error{InvalidValue}!WindowPadding {
+    var values = std.mem.splitScalar(u8, value, ',');
+    const first_text = std.mem.trim(u8, values.next() orelse return error.InvalidValue, " \t");
+    if (first_text.len == 0) return error.InvalidValue;
+    const first = std.fmt.parseInt(u31, first_text, 10) catch return error.InvalidValue;
+    const second_text = values.next() orelse return .{ .first = first, .second = first };
+    if (values.next() != null) return error.InvalidValue;
+    const trimmed_second = std.mem.trim(u8, second_text, " \t");
+    if (trimmed_second.len == 0) return error.InvalidValue;
+    return .{
+        .first = first,
+        .second = std.fmt.parseInt(u31, trimmed_second, 10) catch return error.InvalidValue,
+    };
 }
 
 /// "#RRGGBB" or "RRGGBB".
@@ -305,6 +333,8 @@ test "defaults" {
     try std.testing.expectEqualStrings(default_app_id, config.app_id);
     try std.testing.expectEqualStrings("monospace", config.font_family);
     try std.testing.expectEqual(@as(u31, 16), config.font_size);
+    try std.testing.expectEqual(WindowPadding{}, config.window_padding_x);
+    try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.shell);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.pipe_command_output);
     try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
@@ -325,6 +355,8 @@ test "parse config" {
         \\app-id = com.example.scratchpad
         \\font-family = Fira Code
         \\font-size = 14
+        \\window-padding-x = 4
+        \\window-padding-y = 6, 10
         \\shell = /usr/bin/fish
         \\pipe-command-output = cat > /tmp/monstar-output
         \\linux-cgroup = always
@@ -343,6 +375,8 @@ test "parse config" {
     try std.testing.expectEqualStrings("Fira Code", config.font_family);
     // invalid re-assignment keeps the previous valid value
     try std.testing.expectEqual(@as(u31, 14), config.font_size);
+    try std.testing.expectEqual(WindowPadding{ .first = 4, .second = 4 }, config.window_padding_x);
+    try std.testing.expectEqual(WindowPadding{ .first = 6, .second = 10 }, config.window_padding_y);
     try std.testing.expectEqualStrings("/usr/bin/fish", config.shell.?);
     try std.testing.expectEqualStrings("cat > /tmp/monstar-output", config.pipe_command_output.?);
     try std.testing.expectEqual(LinuxCgroup.always, config.linux_cgroup);
@@ -353,6 +387,18 @@ test "parse config" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
+}
+
+test "invalid window padding keeps the previous value" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const config = parse(arena_state.allocator(),
+        \\window-padding-x = 3,7
+        \\window-padding-x = 1,2,3
+        \\window-padding-y = -1
+    );
+    try std.testing.expectEqual(WindowPadding{ .first = 3, .second = 7 }, config.window_padding_x);
+    try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
 }
 
 test "terminal colors from config" {

@@ -75,6 +75,25 @@ follow the desktop portal color scheme. The default is `system`:
 theme = light
 ```
 
+Add minimum padding around the terminal grid with Ghostty-style X/Y options:
+
+```conf
+window-padding-x = 4
+window-padding-y = 4
+```
+
+One value applies to both sides of an axis. Two comma-separated values set
+left/right or top/bottom independently:
+
+```conf
+window-padding-x = 4,8
+window-padding-y = 6,10
+```
+
+Padding is measured in logical pixels and follows the output scale. Any space
+left after fitting whole cells remains on the right and bottom. The default is
+zero padding.
+
 By default, child processes inherit Monstar's cgroup. To move each newly
 spawned child into a separate transient systemd scope, enable Linux cgroup
 isolation:

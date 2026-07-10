@@ -14,6 +14,10 @@ pub const Job = struct {
     source_pixels: ?[]const u32,
     width: u31,
     height: u31,
+    grid_x: u31,
+    grid_y: u31,
+    grid_width: u31,
+    grid_height: u31,
     age: usize,
     generation: u64,
     focused: bool,
@@ -326,6 +330,7 @@ fn workerMain(self: *AsyncRaster) void {
 
         self.renderer.focused = job.focused;
         self.renderer.hyperlink_hints = job.hyperlink_hints;
+        self.renderer.buffer_stride = job.width;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
 
@@ -338,6 +343,7 @@ fn workerMain(self: *AsyncRaster) void {
 }
 
 fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
+    const grid_pixels = gridPixels(job);
     // Overlays draw outside the grid rows that dirty tracking accounts
     // for, so an overlay frame is always a full render with full damage.
     if (job.hasOverlay()) {
@@ -350,42 +356,70 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             damage.* = .none;
             return;
         }
+        clearPadding(self.state, job);
         if (job.kitty_items.len > 0) {
-            try self.renderer.renderWithKittyItems(self.state, job.kitty_items, job.pixels, job.width, job.height);
+            try self.renderer.renderWithKittyItems(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height);
         } else {
-            try self.renderer.render(self.state, job.pixels, job.width, job.height);
+            try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
         }
         if (job.preedit) |text| {
-            try self.renderer.renderPreedit(self.state, job.pixels, job.width, job.height, text);
+            try self.renderer.renderPreedit(self.state, grid_pixels, job.grid_width, job.grid_height, text);
         }
         if (job.link_hint) |uri| {
-            try self.renderer.renderLinkHint(self.state, job.pixels, job.width, job.height, uri);
+            try self.renderer.renderLinkHint(self.state, grid_pixels, job.grid_width, job.grid_height, uri);
         }
         damage.* = .full;
         return;
     }
     switch (self.state.dirty) {
         .full => {
-            try self.renderer.render(self.state, job.pixels, job.width, job.height);
+            clearPadding(self.state, job);
+            try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
             damage.* = .full;
         },
         .partial => {
             if (!repairToPreviousFrame(job)) {
-                try self.renderer.render(self.state, job.pixels, job.width, job.height);
+                clearPadding(self.state, job);
+                try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
                 damage.* = .full;
                 return;
             }
-            try self.renderer.renderDirty(self.state, job.pixels, job.width, job.height);
+            try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
             damage.* = .partial;
         },
         .false => {
             if (!repairToPreviousFrame(job)) {
-                try self.renderer.render(self.state, job.pixels, job.width, job.height);
+                clearPadding(self.state, job);
+                try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
                 damage.* = .full;
                 return;
             }
             damage.* = .none;
         },
+    }
+}
+
+fn gridPixels(job: Job) []u32 {
+    std.debug.assert(job.grid_x + job.grid_width <= job.width);
+    std.debug.assert(job.grid_y + job.grid_height <= job.height);
+    const offset = @as(usize, job.grid_y) * job.width + job.grid_x;
+    return job.pixels[offset..];
+}
+
+fn clearPadding(state: *const vt.RenderState, job: Job) void {
+    const rgb = state.colors.background;
+    const color = 0xff000000 |
+        (@as(u32, rgb.r) << 16) |
+        (@as(u32, rgb.g) << 8) |
+        rgb.b;
+    @memset(job.pixels[0 .. @as(usize, job.grid_y) * job.width], color);
+    const grid_bottom = @as(usize, job.grid_y + job.grid_height) * job.width;
+    @memset(job.pixels[grid_bottom..], color);
+    for (job.grid_y..job.grid_y + job.grid_height) |y| {
+        const row = @as(usize, y) * job.width;
+        @memset(job.pixels[row .. row + job.grid_x], color);
+        const right = row + job.grid_x + job.grid_width;
+        @memset(job.pixels[right .. row + job.width], color);
     }
 }
 
@@ -405,6 +439,10 @@ test "repair previous frame" {
         .source_pixels = &source,
         .width = 2,
         .height = 2,
+        .grid_x = 0,
+        .grid_y = 0,
+        .grid_width = 2,
+        .grid_height = 2,
         .age = 0,
         .generation = 1,
         .focused = true,

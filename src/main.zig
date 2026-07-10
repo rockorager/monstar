@@ -9,6 +9,7 @@ const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Pty = @import("Pty.zig");
 const Renderer = @import("Renderer.zig");
+const TerminalLayout = @import("TerminalLayout.zig");
 const Window = @import("Window.zig");
 
 const log = std.log.scoped(.main);
