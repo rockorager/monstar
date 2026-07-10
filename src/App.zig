@@ -174,6 +174,8 @@ hold: bool,
 /// Session bus connection, used for notifications and future desktop settings.
 dbus: ?*c.DBusConnection,
 dbus_fd: posix.fd_t,
+/// URI held while the compositor creates a token for activating its handler.
+pending_open_uri: ?[]u8,
 notification_ids: std.AutoHashMapUnmanaged(u32, void),
 notification_tokens: std.AutoHashMapUnmanaged(u32, []u8),
 color_scheme: vt.device_status.ColorScheme,
@@ -641,6 +643,7 @@ pub fn init(
         .hold = options.hold,
         .dbus = dbus_connection,
         .dbus_fd = -1,
+        .pending_open_uri = null,
         .notification_ids = .empty,
         .notification_tokens = .empty,
         .color_scheme = .dark,
@@ -703,7 +706,7 @@ pub fn init(
     self.stream.handler.terminal_handler.effects = effects;
 
     self.initDbus();
-    window.setCallbacks(self, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged, redrawReady);
+    window.setCallbacks(self, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged, redrawReady, activationTokenReady);
     return self;
 }
 
@@ -982,7 +985,7 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
 
     var hints: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &hints) == 0) return error.OutOfMemory;
-    try dbusAppendStringHint(&hints, "desktop-entry", self.config.app_id);
+    try dbusAppendStringVariant(&hints, "desktop-entry", self.config.app_id);
     if (c.dbus_message_iter_close_container(&iter, &hints) == 0) return error.OutOfMemory;
 
     var expire_timeout: i32 = -1;
@@ -1036,7 +1039,7 @@ fn taskbarProgressValue(report: vt.osc.Command.ProgressReport) f64 {
     };
 }
 
-fn openUriPortal(self: *App, uri: []const u8) !void {
+fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !void {
     const connection = self.dbus orelse return error.DBusUnavailable;
 
     // The portal's OpenURI method rejects file:// URIs by design; local
@@ -1044,7 +1047,7 @@ fn openUriPortal(self: *App, uri: []const u8) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
     if (try osc7Path(arena_state.allocator(), uri)) |path| {
-        return openFilePortal(connection, path);
+        return openFilePortal(connection, path, activation_token);
     }
 
     const uri_z = try self.alloc.dupeZ(u8, uri);
@@ -1067,6 +1070,7 @@ fn openUriPortal(self: *App, uri: []const u8) !void {
 
     var options: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &options) == 0) return error.OutOfMemory;
+    if (activation_token) |token| try dbusAppendStringVariant(&options, "activation_token", token);
     if (c.dbus_message_iter_close_container(&iter, &options) == 0) return error.OutOfMemory;
 
     const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return error.DBusUnavailable;
@@ -1075,7 +1079,7 @@ fn openUriPortal(self: *App, uri: []const u8) !void {
 
 /// Open a local file or directory through the portal by passing an fd:
 /// files open with the default handler, directories in the file manager.
-fn openFilePortal(connection: *c.DBusConnection, path: [:0]const u8) !void {
+fn openFilePortal(connection: *c.DBusConnection, path: [:0]const u8, activation_token: ?[:0]const u8) !void {
     const linux = std.os.linux;
 
     // Directory-ness decides the portal method; O_DIRECTORY fails with
@@ -1118,6 +1122,7 @@ fn openFilePortal(connection: *c.DBusConnection, path: [:0]const u8) !void {
 
     var options: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(&iter, c.DBUS_TYPE_ARRAY, "{sv}", &options) == 0) return error.OutOfMemory;
+    if (activation_token) |token| try dbusAppendStringVariant(&options, "activation_token", token);
     if (c.dbus_message_iter_close_container(&iter, &options) == 0) return error.OutOfMemory;
 
     const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return error.DBusUnavailable;
@@ -1129,7 +1134,7 @@ fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void
     if (c.dbus_message_iter_append_basic(iter, type_, opaque_value) == 0) return error.OutOfMemory;
 }
 
-fn dbusAppendStringHint(iter: *c.DBusMessageIter, key: [:0]const u8, value: [:0]const u8) !void {
+fn dbusAppendStringVariant(iter: *c.DBusMessageIter, key: [:0]const u8, value: [:0]const u8) !void {
     var entry: c.DBusMessageIter = undefined;
     if (c.dbus_message_iter_open_container(iter, c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
     var key_ptr: [*:0]const u8 = key;
@@ -1313,6 +1318,7 @@ pub fn deinit(self: *App) void {
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
     self.write_queue.deinit(self.alloc);
+    if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
     _ = std.os.linux.close(self.taskbar_progress_fd);
     _ = std.os.linux.close(self.selection_autoscroll_fd);
@@ -2933,7 +2939,34 @@ fn hyperlinkAtPointer(self: *App) ?[]const u8 {
 
 fn openHyperlinkAtPointer(self: *App) void {
     const uri = self.hyperlinkAtPointer() orelse return;
-    self.openUriPortal(uri) catch |err| {
+    const owned = self.alloc.dupe(u8, uri) catch |err| {
+        log.warn("failed to save hyperlink URI: {}", .{err});
+        return;
+    };
+
+    if (self.pending_open_uri) |pending| self.alloc.free(pending);
+    self.pending_open_uri = owned;
+
+    const requested = self.window.requestActivationToken(self.last_serial) catch |err| requested: {
+        log.warn("failed to request hyperlink activation token: {}", .{err});
+        break :requested false;
+    };
+    if (requested) return;
+
+    self.openPendingUri(null);
+}
+
+fn activationTokenReady(ctx: *anyopaque, token: [:0]const u8) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.openPendingUri(token);
+}
+
+fn openPendingUri(self: *App, activation_token: ?[:0]const u8) void {
+    const uri = self.pending_open_uri orelse return;
+    self.pending_open_uri = null;
+    defer self.alloc.free(uri);
+
+    self.openUriPortal(uri, activation_token) catch |err| {
         log.warn("failed to open hyperlink through portal: {}", .{err});
     };
 }

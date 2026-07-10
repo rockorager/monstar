@@ -26,6 +26,7 @@ shm: *wl.Shm,
 wm_base: *xdg.WmBase,
 activation: ?*xdg.ActivationV1,
 activation_token: ?*xdg.ActivationTokenV1,
+activation_token_purpose: ?ActivationTokenPurpose,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
@@ -87,6 +88,7 @@ pointer_fn: ?PointerFn,
 text_input_fn: ?TextInputFn,
 scale_fn: ?ScaleFn,
 redraw_ready_fn: ?RedrawReadyFn,
+activation_token_fn: ?ActivationTokenFn,
 
 /// A full-width horizontal band of pixels, in buffer coordinates.
 pub const RowSpan = struct { y: u31, height: u31 };
@@ -109,6 +111,10 @@ pub const KeyboardFn = *const fn (ctx: *anyopaque, event: wl.Keyboard.Event) voi
 /// Raw wl_pointer events, forwarded as-is.
 pub const PointerFn = *const fn (ctx: *anyopaque, event: wl.Pointer.Event) void;
 
+/// A token requested from the compositor for activating another client.
+/// The string is only valid for the duration of the callback.
+pub const ActivationTokenFn = *const fn (ctx: *anyopaque, token: [:0]const u8) void;
+
 /// Raw text-input-v3 events, forwarded as-is. String pointers are only
 /// valid for the duration of the callback.
 pub const TextInputFn = *const fn (ctx: *anyopaque, event: zwp.TextInputV3.Event) void;
@@ -125,6 +131,11 @@ pub const TextInputRect = struct {
 pub const InitialSize = struct {
     width: u31 = default_width,
     height: u31 = default_height,
+};
+
+const ActivationTokenPurpose = enum {
+    activate_self,
+    activate_other,
 };
 
 /// Called when the output scale changed, before the resize/draw that
@@ -235,6 +246,7 @@ pub fn create(
         .wm_base = wm_base,
         .activation = globals.activation,
         .activation_token = null,
+        .activation_token_purpose = null,
         .seat = globals.seat,
         .keyboard = null,
         .pointer = null,
@@ -282,6 +294,7 @@ pub fn create(
         .text_input_fn = null,
         .scale_fn = null,
         .redraw_ready_fn = null,
+        .activation_token_fn = null,
     };
 
     if (toplevel_decoration) |decoration| decoration.setListener(*Window, decorationListener, self);
@@ -377,6 +390,7 @@ pub fn setCallbacks(
     text_input_fn: ?TextInputFn,
     scale_fn: ?ScaleFn,
     redraw_ready_fn: ?RedrawReadyFn,
+    activation_token_fn: ?ActivationTokenFn,
 ) void {
     self.render_ctx = ctx;
     self.resize_fn = resize_fn;
@@ -385,6 +399,7 @@ pub fn setCallbacks(
     self.text_input_fn = text_input_fn;
     self.scale_fn = scale_fn;
     self.redraw_ready_fn = redraw_ready_fn;
+    self.activation_token_fn = activation_token_fn;
 }
 
 pub fn setCursorShape(self: *Window, shape: CursorShape) void {
@@ -396,16 +411,46 @@ pub fn setCursorShape(self: *Window, shape: CursorShape) void {
 pub fn setUrgent(self: *Window, urgent: bool) !void {
     const activation = self.activation orelse return;
 
-    if (self.activation_token) |token| token.destroy();
-    self.activation_token = null;
+    if (!urgent) {
+        if (self.activation_token_purpose == .activate_self) self.cancelActivationToken();
+        return;
+    }
 
-    if (!urgent) return;
+    // A user-initiated launch takes precedence over an attention request.
+    // Let its token complete rather than stranding the pending launch.
+    if (self.activation_token_purpose == .activate_other) return;
+    self.cancelActivationToken();
 
     const token = try activation.getActivationToken();
     token.setSurface(self.surface);
     token.setListener(*Window, activationTokenListener, self);
     token.commit();
     self.activation_token = token;
+    self.activation_token_purpose = .activate_self;
+}
+
+/// Request a token for transferring the activation caused by an input event
+/// to another client. Returns false when the compositor lacks the protocol.
+pub fn requestActivationToken(self: *Window, serial: u32) !bool {
+    const activation = self.activation orelse return false;
+    const seat = self.seat orelse return false;
+
+    self.cancelActivationToken();
+
+    const token = try activation.getActivationToken();
+    token.setSerial(serial, seat);
+    token.setSurface(self.surface);
+    token.setListener(*Window, activationTokenListener, self);
+    token.commit();
+    self.activation_token = token;
+    self.activation_token_purpose = .activate_other;
+    return true;
+}
+
+fn cancelActivationToken(self: *Window) void {
+    if (self.activation_token) |token| token.destroy();
+    self.activation_token = null;
+    self.activation_token_purpose = null;
 }
 
 pub fn activate(self: *Window, token: [:0]const u8) void {
@@ -679,9 +724,15 @@ fn activationTokenListener(
 
     switch (event) {
         .done => |done| {
-            if (self.activation) |activation| activation.activate(done.token, self.surface);
+            const purpose = self.activation_token_purpose orelse return;
             token.destroy();
             self.activation_token = null;
+            self.activation_token_purpose = null;
+
+            switch (purpose) {
+                .activate_self => if (self.activation) |activation| activation.activate(done.token, self.surface),
+                .activate_other => if (self.activation_token_fn) |callback| callback(self.render_ctx.?, std.mem.span(done.token)),
+            }
         },
     }
 }
