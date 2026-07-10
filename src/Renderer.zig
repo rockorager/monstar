@@ -237,6 +237,20 @@ pub fn renderWithKittyItems(
 ) !void {
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
 
+    // An opaque above-text image covering the framebuffer determines
+    // every output pixel. Video players send exactly this shape, so do
+    // not clear and rasterize the terminal grid only to overwrite it.
+    if (items.len > 0) {
+        const final = items[items.len - 1];
+        const rect = kittyDestRect(final, self.font.cell_width, self.font.cell_height);
+        if (final.z >= 0 and kittyItemOpaque(final) and
+            rect.x0 <= 0 and rect.y0 <= 0 and rect.x1 >= width and rect.y1 >= height)
+        {
+            try self.renderKittyPlacement(pixels, width, height, final.image, final.viewport);
+            return;
+        }
+    }
+
     fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, argb(state.colors.background));
     if (state.rows == 0 or state.cols == 0) return;
 
@@ -520,6 +534,16 @@ pub fn collectKittyPlacements(
 
     try collectKittyVirtualPlacements(font, alloc, terminal, &placements);
 
+    // Video senders commonly retain every prior full-frame placement
+    // until the storage quota evicts it. If the final item in draw order
+    // is opaque and covers every other item, the sorted result would be
+    // that item alone. Detect that in linear time and avoid sorting and
+    // quadratic pairwise culling dozens of dead video frames.
+    if (keepOnlyFinalKittyCover(placements.items, font.cell_width, font.cell_height)) {
+        placements.items.len = 1;
+        return placements.toOwnedSlice(alloc);
+    }
+
     std.mem.sortUnstable(KittyRenderItem, placements.items, {}, kittyRenderItemLessThan);
     placements.items.len = cullOccludedKittyItems(
         placements.items,
@@ -555,6 +579,44 @@ fn kittyItemOpaque(item: KittyRenderItem) bool {
         .rgb, .gray => true,
         .rgba, .gray_alpha, .png => false,
     };
+}
+
+/// Replace the items with the final-drawn item when it is opaque and
+/// fully covers every other destination rectangle. Returns whether the
+/// caller may truncate the slice to one item. Unlike the general culler,
+/// this needs no sorting and is linear in the number of placements.
+fn keepOnlyFinalKittyCover(items: []KittyRenderItem, cell_width: u31, cell_height: u31) bool {
+    if (items.len < 2) return false;
+
+    var final_index: usize = 0;
+    var final_unique = true;
+    for (items[1..], 1..) |item, i| {
+        if (kittyRenderItemLessThan({}, items[final_index], item)) {
+            final_index = i;
+            final_unique = true;
+        } else if (!kittyRenderItemLessThan({}, item, items[final_index])) {
+            // Virtual placements can share every sort key while having
+            // different geometry. Unstable sorting gives no defined final
+            // item for a tie, so preserve the general path in that case.
+            final_unique = false;
+        }
+    }
+    if (!final_unique) return false;
+    const final = items[final_index];
+    if (!kittyItemOpaque(final)) return false;
+
+    const cover = kittyDestRect(final, cell_width, cell_height);
+    for (items, 0..) |item, i| {
+        if (i == final_index) continue;
+        const rect = kittyDestRect(item, cell_width, cell_height);
+        if (cover.x0 > rect.x0 or cover.y0 > rect.y0 or
+            cover.x1 < rect.x1 or cover.y1 < rect.y1)
+        {
+            return false;
+        }
+    }
+    items[0] = final;
+    return true;
 }
 
 /// Drop placements that a later-drawn opaque placement fully covers.
@@ -732,11 +794,7 @@ fn blitKittyUnscaled(
         const src = image.data[src_off..];
         const dst = pixels[(dest_row + row) * stride + dest_col ..][0..cols];
         switch (image.format) {
-            .rgb => for (dst, 0..) |*px, i| {
-                const source = src[i * 3 ..][0..3];
-                px.* = 0xff000000 |
-                    (@as(u32, source[0]) << 16) | (@as(u32, source[1]) << 8) | source[2];
-            },
+            .rgb => copyOpaqueRgbSpan(dst, src[0 .. cols * 3]),
             .rgba => for (dst, 0..) |*px, i| {
                 const s = src[i * 4 ..][0..4];
                 switch (s[3]) {
@@ -756,6 +814,48 @@ fn blitKittyUnscaled(
             },
             .png => unreachable,
         }
+    }
+}
+
+/// Expand packed RGB into the framebuffer's opaque ARGB8888 format.
+/// Kitty video frames are normally RGB and cover millions of pixels,
+/// so shuffle four pixels at a time instead of assembling each u32
+/// channel by channel. ARGB8888 is BGRA in memory only on little-endian
+/// targets; keep the channel-explicit fallback everywhere else.
+fn copyOpaqueRgbSpan(noalias dst: []u32, noalias src: []const u8) void {
+    std.debug.assert(src.len == dst.len * 3);
+    if (comptime builtin.target.cpu.arch.endian() != .little) {
+        for (dst, 0..) |*pixel, i| {
+            const rgb = src[i * 3 ..][0..3];
+            pixel.* = 0xff000000 |
+                (@as(u32, rgb[0]) << 16) | (@as(u32, rgb[1]) << 8) | rgb[2];
+        }
+        return;
+    }
+
+    const ByteVector = @Vector(16, u8);
+    const PixelVector = @Vector(4, u32);
+    const bgra_lanes: [16]i32 = .{
+        2,  1,  0, 12,
+        5,  4,  3, 13,
+        8,  7,  6, 14,
+        11, 10, 9, 15,
+    };
+    const alpha_mask: PixelVector = @splat(0xff000000);
+
+    var i: usize = 0;
+    // A vector load reads 16 bytes for 12 bytes of output. Leave enough
+    // source at the end of the span rather than reading across a row or
+    // past the image allocation.
+    while (i + 6 <= dst.len) : (i += 4) {
+        const source: ByteVector = src[i * 3 ..][0..16].*;
+        const bgra: ByteVector = @shuffle(u8, source, source, bgra_lanes);
+        dst[i..][0..4].* = @as(PixelVector, @bitCast(bgra)) | alpha_mask;
+    }
+    for (dst[i..], 0..) |*pixel, tail_i| {
+        const rgb = src[(i + tail_i) * 3 ..][0..3];
+        pixel.* = 0xff000000 |
+            (@as(u32, rgb[0]) << 16) | (@as(u32, rgb[1]) << 8) | rgb[2];
     }
 }
 
@@ -2059,6 +2159,26 @@ test "kitty unscaled blit honors rgba alpha" {
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
 }
 
+test "copyOpaqueRgbSpan matches scalar conversion across vector boundaries" {
+    var source: [3 + 23 * 3]u8 = undefined;
+    for (&source, 0..) |*byte, i| byte.* = @truncate(i * 37 + 11);
+
+    for ([_]usize{ 0, 1, 5, 6, 15, 16, 17, 23 }) |len| {
+        var actual = [_]u32{0} ** 23;
+        const rgb = source[3..][0 .. len * 3];
+        copyOpaqueRgbSpan(actual[0..len], rgb);
+        for (actual[0..len], 0..) |pixel, i| {
+            try std.testing.expectEqual(
+                0xff000000 |
+                    (@as(u32, rgb[i * 3]) << 16) |
+                    (@as(u32, rgb[i * 3 + 1]) << 8) |
+                    rgb[i * 3 + 2],
+                pixel,
+            );
+        }
+    }
+}
+
 test "cullOccludedKittyItems drops placements under later opaque covers" {
     const cell_w: u31 = 10;
     const cell_h: u31 = 20;
@@ -2108,6 +2228,24 @@ test "cullOccludedKittyItems drops placements under later opaque covers" {
         makeItem(2, 0, .rgb, 1, 0, 100, 100),
     };
     try std.testing.expectEqual(@as(usize, 2), cullOccludedKittyItems(&partial, cell_w, cell_h));
+
+    // The linear fast path finds the final item without pre-sorting.
+    var full_cover = [_]KittyRenderItem{
+        makeItem(8, 0, .rgb, 2, 1, 30, 40),
+        makeItem(10, 0, .rgb, 0, 0, 100, 100),
+        makeItem(9, 0, .rgb, 0, 0, 100, 100),
+    };
+    try std.testing.expect(keepOnlyFinalKittyCover(&full_cover, cell_w, cell_h));
+    try std.testing.expectEqual(@as(u32, 10), full_cover[0].image_id);
+    try std.testing.expect(!keepOnlyFinalKittyCover(&partial, cell_w, cell_h));
+
+    // Equal sort keys can occur for separate virtual fragments; their
+    // unstable-sort order is undefined, so the fast path must decline.
+    var tied = [_]KittyRenderItem{
+        makeItem(10, 0, .rgb, 0, 0, 100, 100),
+        makeItem(10, 0, .rgb, 2, 1, 30, 40),
+    };
+    try std.testing.expect(!keepOnlyFinalKittyCover(&tied, cell_w, cell_h));
 }
 
 test "blend endpoints" {
