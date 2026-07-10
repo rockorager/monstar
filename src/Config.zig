@@ -16,13 +16,20 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub const default_app_id = "dev.rockorager.monstar";
-pub const default_theme: Theme = .system;
-
-pub const Theme = enum { system, light, dark };
 
 pub const WindowPadding = struct {
     first: u31 = 0,
     second: u31 = 0,
+};
+
+pub const Command = union(enum) {
+    shell: [:0]const u8,
+    direct: []const [:0]const u8,
+};
+
+pub const MouseScrollMultiplier = struct {
+    precision: f64 = 1,
+    discrete: f64 = 3,
 };
 
 pub const ThemeColors = struct {
@@ -103,27 +110,27 @@ font_size: f32 = 12,
 /// both sides; two values are left/right for X and top/bottom for Y.
 window_padding_x: WindowPadding = .{},
 window_padding_y: WindowPadding = .{},
-/// Shell to run; unset falls back to $SHELL, then /bin/sh.
-shell: ?[:0]const u8 = null,
+/// Command to run; unset falls back to $SHELL, then /bin/sh.
+command: ?Command = null,
 /// Shell command that receives the last semantic command output on stdin.
 pipe_command_output: ?[:0]const u8 = null,
 /// Whether newly spawned children should be moved into their own transient
 /// systemd scope. This only affects startup; reloads do not move a live child.
 linux_cgroup: LinuxCgroup = .never,
-scrollback: usize = 10_000,
+/// Logical terminal page storage in bytes, including the active screen.
+scrollback_limit: usize = 50_000_000,
 /// Total storage limit in bytes for kitty graphics images per screen;
 /// 0 disables the protocol. A single image larger than this limit is
 /// rejected, so it must comfortably fit a fullscreen RGBA frame.
 image_storage_limit: usize = 320 * 1000 * 1000,
-wheel_scroll_lines: u31 = 3,
+mouse_scroll_multiplier: MouseScrollMultiplier = .{},
 
-theme: Theme = default_theme,
 background: ?vt.color.RGB = null,
 foreground: ?vt.color.RGB = null,
 cursor_color: ?vt.color.RGB = null,
 selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
-palette: [16]?vt.color.RGB = @splat(null),
+palette: [256]?vt.color.RGB = @splat(null),
 
 pub const LinuxCgroup = enum { never, always };
 
@@ -200,25 +207,21 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.window_padding_x = try parseWindowPadding(value);
     } else if (std.mem.eql(u8, key, "window-padding-y")) {
         self.window_padding_y = try parseWindowPadding(value);
-    } else if (std.mem.eql(u8, key, "shell")) {
-        self.shell = try arena.dupeZ(u8, value);
+    } else if (std.mem.eql(u8, key, "command")) {
+        self.command = try parseCommand(arena, value);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
         self.pipe_command_output = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "linux-cgroup")) {
         self.linux_cgroup = std.meta.stringToEnum(LinuxCgroup, value) orelse return error.InvalidValue;
-    } else if (std.mem.eql(u8, key, "scrollback")) {
-        self.scrollback = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "scrollback-limit")) {
+        self.scrollback_limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "image-storage-limit")) {
         const limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
         // Same cap as Ghostty's image-storage-limit (4GiB).
         if (limit > std.math.maxInt(u32)) return error.InvalidValue;
         self.image_storage_limit = limit;
-    } else if (std.mem.eql(u8, key, "wheel-scroll-lines")) {
-        const lines = std.fmt.parseInt(u31, value, 10) catch return error.InvalidValue;
-        if (lines == 0) return error.InvalidValue;
-        self.wheel_scroll_lines = lines;
-    } else if (std.mem.eql(u8, key, "theme")) {
-        self.theme = std.meta.stringToEnum(Theme, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "mouse-scroll-multiplier")) {
+        self.mouse_scroll_multiplier = try parseMouseScrollMultiplier(self.mouse_scroll_multiplier, value);
     } else if (std.mem.eql(u8, key, "background")) {
         self.background = try parseColor(value);
     } else if (std.mem.eql(u8, key, "foreground")) {
@@ -229,13 +232,84 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.selection_background = try parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-foreground")) {
         self.selection_foreground = try parseColor(value);
-    } else if (std.mem.startsWith(u8, key, "palette")) {
-        const idx = std.fmt.parseInt(u8, key["palette".len..], 10) catch return error.UnknownKey;
-        if (idx >= 16) return error.UnknownKey;
-        self.palette[idx] = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "palette")) {
+        const entry = try parsePaletteEntry(value);
+        self.palette[entry.index] = entry.color;
     } else {
         warn("unknown key '{s}', ignoring", .{key});
     }
+}
+
+fn parseCommand(arena: std.mem.Allocator, value: []const u8) SetError!Command {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    const mode: std.meta.Tag(Command), const text = mode: {
+        if (std.mem.startsWith(u8, trimmed, "direct:")) {
+            break :mode .{ .direct, std.mem.trim(u8, trimmed["direct:".len..], " \t") };
+        }
+        if (std.mem.startsWith(u8, trimmed, "shell:")) {
+            break :mode .{ .shell, std.mem.trim(u8, trimmed["shell:".len..], " \t") };
+        }
+        break :mode .{ .shell, trimmed };
+    };
+    if (text.len == 0) return error.InvalidValue;
+
+    return switch (mode) {
+        .shell => .{ .shell = try arena.dupeZ(u8, text) },
+        .direct => direct: {
+            var args: std.ArrayList([:0]const u8) = .empty;
+            var tokens = std.mem.tokenizeAny(u8, text, " \t");
+            while (tokens.next()) |arg| try args.append(arena, try arena.dupeZ(u8, arg));
+            if (args.items.len == 0) return error.InvalidValue;
+            break :direct .{ .direct = try args.toOwnedSlice(arena) };
+        },
+    };
+}
+
+fn parseMouseScrollMultiplier(current: MouseScrollMultiplier, value: []const u8) error{InvalidValue}!MouseScrollMultiplier {
+    if (std.mem.indexOfScalar(u8, value, ':') == null) {
+        const multiplier = try parseScrollMultiplier(value);
+        return .{ .precision = multiplier, .discrete = multiplier };
+    }
+
+    var result = current;
+    var entries = std.mem.splitScalar(u8, value, ',');
+    while (entries.next()) |entry| {
+        const colon = std.mem.indexOfScalar(u8, entry, ':') orelse return error.InvalidValue;
+        if (std.mem.indexOfScalarPos(u8, entry, colon + 1, ':') != null) return error.InvalidValue;
+        const name = std.mem.trim(u8, entry[0..colon], " \t");
+        const multiplier = try parseScrollMultiplier(entry[colon + 1 ..]);
+        if (std.mem.eql(u8, name, "precision")) {
+            result.precision = multiplier;
+        } else if (std.mem.eql(u8, name, "discrete")) {
+            result.discrete = multiplier;
+        } else {
+            return error.InvalidValue;
+        }
+    }
+    return result;
+}
+
+fn parseScrollMultiplier(value: []const u8) error{InvalidValue}!f64 {
+    const multiplier = std.fmt.parseFloat(f64, std.mem.trim(u8, value, " \t")) catch return error.InvalidValue;
+    if (!std.math.isFinite(multiplier)) return error.InvalidValue;
+    return std.math.clamp(multiplier, 0.01, 10_000);
+}
+
+const PaletteEntry = struct {
+    index: u8,
+    color: vt.color.RGB,
+};
+
+fn parsePaletteEntry(value: []const u8) error{InvalidValue}!PaletteEntry {
+    const eq = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidValue;
+    if (std.mem.indexOfScalarPos(u8, value, eq + 1, '=') != null) return error.InvalidValue;
+    const index_text = std.mem.trim(u8, value[0..eq], " \t");
+    const color_text = std.mem.trim(u8, value[eq + 1 ..], " \t");
+    if (index_text.len == 0 or color_text.len == 0) return error.InvalidValue;
+    return .{
+        .index = std.fmt.parseInt(u8, index_text, 0) catch return error.InvalidValue,
+        .color = try parseColor(color_text),
+    };
 }
 
 fn parseWindowPadding(value: []const u8) error{InvalidValue}!WindowPadding {
@@ -278,37 +352,26 @@ pub fn fontSizePixels(points: f32, scale120: u32) u31 {
     return @max(1, @as(u31, @intFromFloat(@round(pixels))));
 }
 
-pub fn themeColors(theme: Theme) ThemeColors {
-    return switch (theme) {
-        .system => dark_theme,
+pub fn colorsForScheme(color_scheme: vt.device_status.ColorScheme) ThemeColors {
+    return switch (color_scheme) {
         .light => light_theme,
         .dark => dark_theme,
     };
 }
 
-pub fn effectiveTheme(self: *const Config, color_scheme: vt.device_status.ColorScheme) Theme {
-    return switch (self.theme) {
-        .system => switch (color_scheme) {
-            .light => .light,
-            .dark => .dark,
-        },
-        .light, .dark => self.theme,
-    };
-}
-
 pub fn effectiveSelectionBackground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
-    return self.selection_background orelse themeColors(self.effectiveTheme(color_scheme)).selection_background;
+    return self.selection_background orelse colorsForScheme(color_scheme).selection_background;
 }
 
 pub fn effectiveSelectionForeground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
-    return self.selection_foreground orelse themeColors(self.effectiveTheme(color_scheme)).selection_foreground;
+    return self.selection_foreground orelse colorsForScheme(color_scheme).selection_foreground;
 }
 
 /// The terminal color options this config describes: config colors form
 /// the *default* layer, so OSC 10/11/12/4 can still override and reset.
 pub fn terminalColors(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.Terminal.Colors {
     var palette = vt.color.default;
-    const themed = themeColors(self.effectiveTheme(color_scheme));
+    const themed = colorsForScheme(color_scheme);
     for (themed.palette, 0..) |rgb, i| {
         palette[i] = rgb;
     }
@@ -349,10 +412,12 @@ test "defaults" {
     try std.testing.expectEqual(@as(f32, 12), config.font_size);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
-    try std.testing.expectEqual(@as(?[:0]const u8, null), config.shell);
+    try std.testing.expectEqual(@as(?Command, null), config.command);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.pipe_command_output);
     try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
-    try std.testing.expectEqual(default_theme, config.theme);
+    try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
+    try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
+    try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
     try std.testing.expectEqual(default_selection_background, config.effectiveSelectionBackground(.dark));
@@ -371,15 +436,16 @@ test "parse config" {
         \\font-size = 14.5
         \\window-padding-x = 4
         \\window-padding-y = 6, 10
-        \\shell = /usr/bin/fish
+        \\command = /usr/bin/fish --login
         \\pipe-command-output = cat > /tmp/monstar-output
         \\linux-cgroup = always
-        \\scrollback = 5000
+        \\scrollback-limit = 50000000
         \\image-storage-limit = 50000000
-        \\wheel-scroll-lines = 5
+        \\mouse-scroll-multiplier = precision:1.5,discrete:5
         \\background = #1a1b26
         \\foreground = c0caf5
-        \\palette1 = #f7768e
+        \\palette = 1=#f7768e
+        \\palette = 200=#123456
         \\
         \\bogus-key = whatever
         \\font-size = not-a-number
@@ -391,16 +457,50 @@ test "parse config" {
     try std.testing.expectEqual(@as(f32, 14.5), config.font_size);
     try std.testing.expectEqual(WindowPadding{ .first = 4, .second = 4 }, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{ .first = 6, .second = 10 }, config.window_padding_y);
-    try std.testing.expectEqualStrings("/usr/bin/fish", config.shell.?);
+    try std.testing.expectEqualStrings("/usr/bin/fish --login", config.command.?.shell);
     try std.testing.expectEqualStrings("cat > /tmp/monstar-output", config.pipe_command_output.?);
     try std.testing.expectEqual(LinuxCgroup.always, config.linux_cgroup);
-    try std.testing.expectEqual(@as(usize, 5000), config.scrollback);
+    try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
-    try std.testing.expectEqual(@as(u31, 5), config.wheel_scroll_lines);
+    try std.testing.expectEqual(@as(f64, 1.5), config.mouse_scroll_multiplier.precision);
+    try std.testing.expectEqual(@as(f64, 5), config.mouse_scroll_multiplier.discrete);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, config.palette[200].?);
+}
+
+test "direct command parsing" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const config = parse(arena_state.allocator(),
+        \\command = direct:fish --no-config
+    );
+    const command = config.command.?.direct;
+    try std.testing.expectEqual(@as(usize, 2), command.len);
+    try std.testing.expectEqualStrings("fish", command[0]);
+    try std.testing.expectEqualStrings("--no-config", command[1]);
+}
+
+test "mouse scroll multiplier forms and clamps" {
+    var config: Config = .{};
+    try config.set(std.testing.allocator, "mouse-scroll-multiplier", "2.5");
+    try std.testing.expectEqual(@as(f64, 2.5), config.mouse_scroll_multiplier.precision);
+    try std.testing.expectEqual(@as(f64, 2.5), config.mouse_scroll_multiplier.discrete);
+
+    try config.set(std.testing.allocator, "mouse-scroll-multiplier", "precision:0,discrete:20000");
+    try std.testing.expectEqual(@as(f64, 0.01), config.mouse_scroll_multiplier.precision);
+    try std.testing.expectEqual(@as(f64, 10_000), config.mouse_scroll_multiplier.discrete);
+}
+
+test "palette accepts all indices and numeric bases" {
+    var config: Config = .{};
+    try config.set(std.testing.allocator, "palette", "0x0f=#010203");
+    try config.set(std.testing.allocator, "palette", "255=040506");
+    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.palette[15].?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, config.palette[255].?);
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "palette", "256=#000000"));
 }
 
 test "font size points convert to scaled physical pixels" {
@@ -433,54 +533,36 @@ test "terminal colors from config" {
     try std.testing.expectEqual(default_palette[15], colors.palette.current[15]);
 }
 
-test "system theme follows color scheme" {
+test "built-in colors follow color scheme" {
     const config: Config = .{};
-    try std.testing.expectEqual(Theme.system, config.theme);
-    try std.testing.expectEqual(Theme.dark, config.effectiveTheme(.dark));
-    try std.testing.expectEqual(Theme.light, config.effectiveTheme(.light));
-
     const light_colors = config.terminalColors(.light);
     try std.testing.expectEqual(light_theme.background, light_colors.background.get().?);
     try std.testing.expectEqual(light_theme.foreground, light_colors.foreground.get().?);
     try std.testing.expectEqual(light_theme.selection_background, config.effectiveSelectionBackground(.light));
     try std.testing.expectEqual(light_theme.selection_foreground, config.effectiveSelectionForeground(.light));
+
+    const dark_colors = config.terminalColors(.dark);
+    try std.testing.expectEqual(dark_theme.background, dark_colors.background.get().?);
+    try std.testing.expectEqual(dark_theme.foreground, dark_colors.foreground.get().?);
+    try std.testing.expectEqual(dark_theme.cursor_color, dark_colors.cursor.get().?);
+    try std.testing.expectEqual(dark_theme.palette[1], dark_colors.palette.current[1]);
 }
 
-test "dark theme" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const config = parse(arena,
-        \\theme = dark
-    );
-
-    const colors = config.terminalColors(.light);
-    try std.testing.expectEqual(Theme.dark, config.theme);
-    try std.testing.expectEqual(dark_theme.background, colors.background.get().?);
-    try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
-    try std.testing.expectEqual(dark_theme.cursor_color, colors.cursor.get().?);
-    try std.testing.expectEqual(dark_theme.palette[1], colors.palette.current[1]);
-    try std.testing.expectEqual(dark_theme.selection_background, config.effectiveSelectionBackground(.light));
-    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.light));
-}
-
-test "theme does not replace explicit color overrides" {
+test "built-in colors do not replace explicit color overrides" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const config = parse(arena,
         \\background = #010203
-        \\palette1 = #040506
+        \\palette = 1=#040506
         \\selection-background = #070809
-        \\theme = dark
     );
 
-    const colors = config.terminalColors(.light);
+    const colors = config.terminalColors(.dark);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
     try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, colors.palette.current[1]);
-    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveSelectionBackground(.light));
-    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.light));
+    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveSelectionBackground(.dark));
+    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.dark));
 }

@@ -49,7 +49,7 @@ Useful launcher/scripting options include:
 ```sh
 monstar --title scratch --app-id com.example.scratchpad --hold \
   --window-size-chars 100x32 --font "Iosevka" \
-  -o scrollback=20000 -e fish
+  -o scrollback-limit=100000000 -e fish
 ```
 
 Run `monstar --help` for the full option list.
@@ -76,11 +76,40 @@ compositor/window-manager rules:
 app-id = com.example.scratchpad
 ```
 
-Set `theme` to choose the built-in light or dark color theme, or `system` to
-follow the desktop portal color scheme. The default is `system`:
+Set the command launched by default with Ghostty-compatible `command` syntax.
+Commands use `/bin/sh -c` unless prefixed with `direct:`:
 
 ```conf
-theme = light
+command = fish --login
+# command = direct:fish --no-config
+```
+
+When `command` is unset, Monstar uses `$SHELL`, then `/bin/sh`.
+
+`scrollback-limit` is the maximum terminal page storage in bytes, including
+the active screen. It defaults to 50,000,000 bytes:
+
+```conf
+scrollback-limit = 100000000
+```
+
+Control precision-device and discrete-wheel scrolling independently with
+Ghostty-compatible multiplier syntax. The defaults are `precision:1` and
+`discrete:3`:
+
+```conf
+mouse-scroll-multiplier = precision:0.5,discrete:4
+```
+
+Monstar follows the desktop portal's light/dark color scheme automatically.
+Individual colors can be overridden, and all 256 palette entries use the
+repeatable Ghostty syntax:
+
+```conf
+background = #1a1b26
+foreground = #c0caf5
+palette = 1=#f7768e
+palette = 200=#123456
 ```
 
 Add minimum padding around the terminal grid with Ghostty-style X/Y options:

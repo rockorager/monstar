@@ -304,9 +304,17 @@ fn buildCommand(
             path = try resolveCommandPath(arena, environ, command[0]);
             for (command) |arg| try argv.append(arena, arg.ptr);
         },
+    } else if (config.command) |configured| switch (configured) {
+        .shell => |value| {
+            path = "/bin/sh";
+            try argv.appendSlice(arena, &.{ "/bin/sh", "-c", value.ptr });
+        },
+        .direct => |args| {
+            path = try resolveCommandPath(arena, environ, args[0]);
+            for (args) |arg| try argv.append(arena, arg.ptr);
+        },
     } else {
-        const shell: [:0]const u8 = config.shell orelse
-            environ.getPosix("SHELL") orelse
+        const shell: [:0]const u8 = environ.getPosix("SHELL") orelse
             "/bin/sh";
         path = shell.ptr;
         try argv.append(arena, shell.ptr);
@@ -395,7 +403,7 @@ test "parse CLI options and config overrides" {
         "--config",            "/tmp/monstar.conf",
         "--title=Scratch",     "--app-id",
         "com.example.monstar", "--font=Iosevka",
-        "-o",                  "scrollback=42",
+        "-o",                  "scrollback-limit=42",
         "--window-size-chars", "100x40",
         "--working-directory", "/tmp",
         "--hold",              "-e",
@@ -413,9 +421,40 @@ test "parse CLI options and config overrides" {
     try std.testing.expectEqual(@as(usize, 3), cli.config_overrides.len);
     try std.testing.expectEqualStrings("app-id=com.example.monstar", cli.config_overrides[0]);
     try std.testing.expectEqualStrings("font-family=Iosevka", cli.config_overrides[1]);
-    try std.testing.expectEqualStrings("scrollback=42", cli.config_overrides[2]);
+    try std.testing.expectEqualStrings("scrollback-limit=42", cli.config_overrides[2]);
     try std.testing.expectEqual(@as(u16, 100), cli.initial_size.chars.cols);
     try std.testing.expectEqual(@as(u16, 40), cli.initial_size.chars.rows);
+}
+
+test "configured shell command runs through sh" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const command = try buildCommand(
+        arena_state.allocator(),
+        .{ .command = .{ .shell = "printf '%s' hello" } },
+        .empty,
+        .shell,
+        &.{},
+    );
+    try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.path));
+    try std.testing.expectEqualStrings("/bin/sh", std.mem.span(command.argv[0].?));
+    try std.testing.expectEqualStrings("-c", std.mem.span(command.argv[1].?));
+    try std.testing.expectEqualStrings("printf '%s' hello", std.mem.span(command.argv[2].?));
+}
+
+test "configured direct command preserves arguments" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const command = try buildCommand(
+        arena_state.allocator(),
+        .{ .command = .{ .direct = &.{ "/usr/bin/env", "A=B" } } },
+        .empty,
+        .shell,
+        &.{},
+    );
+    try std.testing.expectEqualStrings("/usr/bin/env", std.mem.span(command.path));
+    try std.testing.expectEqualStrings("/usr/bin/env", std.mem.span(command.argv[0].?));
+    try std.testing.expectEqualStrings("A=B", std.mem.span(command.argv[1].?));
 }
 
 test "parse CLI reserves bare words for future subcommands" {

@@ -203,7 +203,7 @@ pointer_y: f64,
 scroll_pixels: f64,
 scroll_clicks: i32,
 scroll_value120: i32,
-scroll_value120_remainder: i32,
+scroll_line_remainder: f64,
 scroll_had_discrete: bool,
 scroll_had_value120: bool,
 /// True while the left button is down for terminal-side selection.
@@ -285,7 +285,9 @@ const sync_output_reset_ms = 1000;
 const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
-const precision_scroll_multiplier = 10.0;
+/// Preserve Monstar's Wayland precision-scroll normalization before applying
+/// the user-facing Ghostty-compatible multiplier.
+const wayland_precision_scroll_scale = 10.0;
 
 /// Damage history length; shm buffers older than this get a full copy.
 const frame_damage_len = 8;
@@ -490,7 +492,7 @@ pub fn init(
     var term: vt.Terminal = try .init(io, alloc, .{
         .cols = startup_size.cols,
         .rows = startup_size.rows,
-        .max_scrollback = config.scrollback,
+        .max_scrollback = config.scrollback_limit,
         .colors = config.terminalColors(.dark),
         .default_modes = .{ .grapheme_cluster = true },
         // libghostty-vt defaults to a conservative 10MB, which rejects a
@@ -684,7 +686,7 @@ pub fn init(
         .scroll_pixels = 0,
         .scroll_clicks = 0,
         .scroll_value120 = 0,
-        .scroll_value120_remainder = 0,
+        .scroll_line_remainder = 0,
         .scroll_had_discrete = false,
         .scroll_had_value120 = false,
         .selecting = false,
@@ -3668,23 +3670,26 @@ fn formatDropPaste(self: *App, offer: *const ClipboardOffer, data: []const u8) !
 fn finishScrollFrame(self: *App) void {
     var lines: i32 = 0;
     if (self.scroll_had_value120) {
-        const scaled = self.scroll_value120 * @as(i32, @intCast(self.config.wheel_scroll_lines)) +
-            self.scroll_value120_remainder;
-        lines = @divTrunc(scaled, 120);
-        self.scroll_value120_remainder = @rem(scaled, 120);
+        const wheel_ticks = @as(f64, @floatFromInt(self.scroll_value120)) / 120.0;
+        const total = wheel_ticks * self.config.mouse_scroll_multiplier.discrete + self.scroll_line_remainder;
+        const whole = @trunc(total);
+        lines = @intFromFloat(whole);
+        self.scroll_line_remainder = total - whole;
     } else if (self.scroll_had_discrete) {
-        lines = self.scroll_clicks * @as(i32, @intCast(self.config.wheel_scroll_lines));
+        const total = @as(f64, @floatFromInt(self.scroll_clicks)) * self.config.mouse_scroll_multiplier.discrete +
+            self.scroll_line_remainder;
+        const whole = @trunc(total);
+        lines = @intFromFloat(whole);
+        self.scroll_line_remainder = total - whole;
     } else if (self.scroll_pixels != 0) {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
             @as(f64, @floatFromInt(self.window.scale120));
-        // Touchpad scroll deltas are surface-local distances. Ghostty boosts
-        // precision scrolls before converting them to rows; without that,
-        // Wayland touchpads require a large gesture to move a terminal line.
-        const pixels = self.scroll_pixels * precision_scroll_multiplier;
+        const multiplier = wayland_precision_scroll_scale * self.config.mouse_scroll_multiplier.precision;
+        const pixels = self.scroll_pixels * multiplier;
         const whole = @divTrunc(pixels, cell);
         lines = @intFromFloat(whole);
-        self.scroll_pixels -= whole * cell / precision_scroll_multiplier;
+        self.scroll_pixels -= whole * cell / multiplier;
     }
     if (self.scroll_had_value120 or self.scroll_had_discrete) self.scroll_pixels = 0;
     self.scroll_clicks = 0;
@@ -4179,9 +4184,20 @@ fn pinKittyJob(self: *App, items: []Renderer.KittyRenderItem) !void {
     errdefer self.alloc.free(items);
     var acquired: usize = 0;
     errdefer for (items[0..acquired]) |item|
-        self.kitty_cache.release(item.image.id, item.image.generation);
+        self.kitty_cache.release(
+            item.image.id,
+            item.image.generation,
+            if (item.native_bgra != null) .native_bgra else .source,
+        );
     for (items) |*item| {
-        item.image.data = try self.kitty_cache.acquire(self.alloc, item.image);
+        if (item.image.format == .rgb and
+            item.viewport.pixel_width == item.viewport.source_width and
+            item.viewport.pixel_height == item.viewport.source_height)
+        {
+            item.native_bgra = try self.kitty_cache.acquireNativeBgra(self.alloc, item.image);
+        } else {
+            item.image.data = try self.kitty_cache.acquire(self.alloc, item.image);
+        }
         acquired += 1;
     }
     self.async_job_kitty = items;
@@ -4197,7 +4213,11 @@ fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 /// already taken.
 fn releaseKittyJob(self: *App) void {
     for (self.async_job_kitty) |item| {
-        self.kitty_cache.release(item.image.id, item.image.generation);
+        self.kitty_cache.release(
+            item.image.id,
+            item.image.generation,
+            if (item.native_bgra != null) .native_bgra else .source,
+        );
     }
     self.alloc.free(self.async_job_kitty);
     self.async_job_kitty = &.{};

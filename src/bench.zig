@@ -33,7 +33,7 @@ pub fn run(init: std.process.Init) !void {
     var term: vt.Terminal = try .init(init.io, alloc, .{
         .cols = cols,
         .rows = rows,
-        .max_scrollback = config.scrollback,
+        .max_scrollback = config.scrollback_limit,
         .colors = config.terminalColors(.dark),
     });
     defer term.deinit(alloc);
@@ -195,7 +195,7 @@ fn benchFullGrid(
     var term: vt.Terminal = try .init(io, alloc, .{
         .cols = bench_cols,
         .rows = bench_rows,
-        .max_scrollback = config.scrollback,
+        .max_scrollback = config.scrollback_limit,
         .colors = config.terminalColors(.dark),
     });
     defer term.deinit(alloc);
@@ -300,7 +300,7 @@ fn benchShapePrefixChurn(
     var term: vt.Terminal = try .init(io, alloc, .{
         .cols = bench_cols,
         .rows = bench_rows,
-        .max_scrollback = config.scrollback,
+        .max_scrollback = config.scrollback_limit,
         .colors = config.terminalColors(.dark),
     });
     defer term.deinit(alloc);
