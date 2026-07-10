@@ -96,8 +96,9 @@ pub const default_palette: [16]vt.color.RGB = dark_theme.palette;
 /// Wayland app-id and desktop-entry hint for desktop integration.
 app_id: [:0]const u8 = default_app_id,
 font_family: [:0]const u8 = "monospace",
-/// Font size in logical pixels (scaled by the output's fractional scale).
-font_size: u31 = 16,
+/// Font size in typographic points. Rasterization uses a 96 DPI baseline and
+/// the output's fractional scale.
+font_size: f32 = 12,
 /// Minimum window padding in logical pixels. One configured value applies to
 /// both sides; two values are left/right for X and top/bottom for Y.
 window_padding_x: WindowPadding = .{},
@@ -192,8 +193,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else if (std.mem.eql(u8, key, "font-family")) {
         self.font_family = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "font-size")) {
-        const size = std.fmt.parseInt(u31, value, 10) catch return error.InvalidValue;
-        if (size == 0 or size > 512) return error.InvalidValue;
+        const size = std.fmt.parseFloat(f32, value) catch return error.InvalidValue;
+        if (!std.math.isFinite(size) or size <= 0 or size > 512) return error.InvalidValue;
         self.font_size = size;
     } else if (std.mem.eql(u8, key, "window-padding-x")) {
         self.window_padding_x = try parseWindowPadding(value);
@@ -264,6 +265,19 @@ fn parseColor(value: []const u8) error{InvalidValue}!vt.color.RGB {
     };
 }
 
+/// Convert a point size to physical pixels using the conventional Linux
+/// baseline of 96 DPI, then apply the Wayland output scale.
+pub fn fontSizePixels(points: f32, scale120: u32) u31 {
+    std.debug.assert(std.math.isFinite(points) and points > 0);
+    std.debug.assert(scale120 > 0);
+
+    const baseline_dpi = 96.0;
+    const points_per_inch = 72.0;
+    const output_scale = @as(f64, @floatFromInt(scale120)) / 120.0;
+    const pixels = @as(f64, points) * baseline_dpi / points_per_inch * output_scale;
+    return @max(1, @as(u31, @intFromFloat(@round(pixels))));
+}
+
 pub fn themeColors(theme: Theme) ThemeColors {
     return switch (theme) {
         .system => dark_theme,
@@ -332,7 +346,7 @@ test "defaults" {
     const config: Config = .{};
     try std.testing.expectEqualStrings(default_app_id, config.app_id);
     try std.testing.expectEqualStrings("monospace", config.font_family);
-    try std.testing.expectEqual(@as(u31, 16), config.font_size);
+    try std.testing.expectEqual(@as(f32, 12), config.font_size);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.shell);
@@ -354,7 +368,7 @@ test "parse config" {
         \\# a comment
         \\app-id = com.example.scratchpad
         \\font-family = Fira Code
-        \\font-size = 14
+        \\font-size = 14.5
         \\window-padding-x = 4
         \\window-padding-y = 6, 10
         \\shell = /usr/bin/fish
@@ -374,7 +388,7 @@ test "parse config" {
     try std.testing.expectEqualStrings("com.example.scratchpad", config.app_id);
     try std.testing.expectEqualStrings("Fira Code", config.font_family);
     // invalid re-assignment keeps the previous valid value
-    try std.testing.expectEqual(@as(u31, 14), config.font_size);
+    try std.testing.expectEqual(@as(f32, 14.5), config.font_size);
     try std.testing.expectEqual(WindowPadding{ .first = 4, .second = 4 }, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{ .first = 6, .second = 10 }, config.window_padding_y);
     try std.testing.expectEqualStrings("/usr/bin/fish", config.shell.?);
@@ -387,6 +401,13 @@ test "parse config" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
+}
+
+test "font size points convert to scaled physical pixels" {
+    try std.testing.expectEqual(@as(u31, 16), fontSizePixels(12, 120));
+    try std.testing.expectEqual(@as(u31, 24), fontSizePixels(12, 180));
+    try std.testing.expectEqual(@as(u31, 32), fontSizePixels(12, 240));
+    try std.testing.expectEqual(@as(u31, 17), fontSizePixels(12.5, 120));
 }
 
 test "invalid window padding keeps the previous value" {

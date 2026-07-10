@@ -21,7 +21,8 @@ pub fn run(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const config = Config.load(arena, init.minimal.environ);
 
-    var font: Font = try .init(alloc, config.font_family, config.font_size);
+    const font_size_px = Config.fontSizePixels(config.font_size, 120);
+    var font: Font = try .init(alloc, config.font_family, font_size_px);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -55,12 +56,12 @@ pub fn run(init: std.process.Init) !void {
     defer w.flush() catch {};
 
     try w.print(
-        "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame), font {s} {d}px\n\n",
+        "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame), font {s} {d:.1}pt ({d}px)\n\n",
         .{
             cols,                                          rows,
             width,                                         height,
             @as(f64, @floatFromInt(pixels.len * 4)) / 1e6, config.font_family,
-            config.font_size,
+            config.font_size,                              font_size_px,
         },
     );
 

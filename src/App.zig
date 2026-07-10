@@ -143,8 +143,8 @@ child_pid: posix.pid_t,
 font: Font,
 /// The physical pixel size the font is currently loaded at.
 font_size_px: u31,
-/// Runtime-only logical font-size override from keyboard shortcuts.
-runtime_font_size: ?u31,
+/// Runtime-only point-size override from keyboard shortcuts.
+runtime_font_size: ?f32,
 /// Current physical grid rectangle and effective padding.
 layout: TerminalLayout,
 /// Selection highlight colors, from config or OSC 17/19. Snapshotted
@@ -471,7 +471,8 @@ pub fn init(
     envp: [*:null]const ?[*:0]const u8,
     options: InitOptions,
 ) !*App {
-    var font: Font = try .init(alloc, config.font_family, config.font_size);
+    const font_size_px = Config.fontSizePixels(config.font_size, 120);
+    var font: Font = try .init(alloc, config.font_family, font_size_px);
     errdefer font.deinit(alloc);
 
     vt.sys.decode_png = decodePng;
@@ -646,7 +647,7 @@ pub fn init(
         .pipeline = try .init(pty.master),
         .child_pid = child_pid,
         .font = font,
-        .font_size_px = config.font_size,
+        .font_size_px = font_size_px,
         .runtime_font_size = null,
         .layout = startup_layout,
         .selection_bg = config.effectiveSelectionBackground(.dark),
@@ -767,7 +768,7 @@ fn decodePng(alloc: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.s
 /// to the new cell metrics.
 fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const size_px = scaledFontSize(self.effectiveFontSize(), scale120);
+    const size_px = Config.fontSizePixels(self.effectiveFontSize(), scale120);
     if (size_px == 0 or size_px == self.font_size_px) return;
 
     const new_font: Font = try .init(self.alloc, self.config.font_family, size_px);
@@ -2064,7 +2065,7 @@ test "formatUriListDrop shell quotes local file paths" {
 }
 
 fn applyConfig(self: *App, new_config: Config) !void {
-    const desired_font_size = scaledFontSize(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
+    const desired_font_size = Config.fontSizePixels(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
     const new_font: Font = try .init(self.alloc, new_config.font_family, desired_font_size);
 
     self.applyColorDefaultsForConfig(new_config);
@@ -2115,23 +2116,19 @@ fn applyColorDefaultsForConfig(self: *App, config: Config) void {
     self.selection_fg = config.effectiveSelectionForeground(self.color_scheme);
 }
 
-fn effectiveFontSize(self: *const App) u31 {
+fn effectiveFontSize(self: *const App) f32 {
     return self.runtime_font_size orelse self.config.font_size;
 }
 
-fn scaledFontSize(logical_size: u31, scale120: u32) u31 {
-    return @max(1, @as(u31, @intCast((@as(u64, logical_size) * scale120 + 60) / 120)));
-}
-
-fn setRuntimeFontSize(self: *App, logical_size: ?u31) void {
-    const next_size = logical_size orelse self.config.font_size;
-    const size_px = scaledFontSize(next_size, self.window.scale120);
+fn setRuntimeFontSize(self: *App, point_size: ?f32) void {
+    const next_size = point_size orelse self.config.font_size;
+    const size_px = Config.fontSizePixels(next_size, self.window.scale120);
     const new_font: Font = Font.init(self.alloc, self.config.font_family, size_px) catch |err| {
         log.warn("font size change failed: {}", .{err});
         return;
     };
 
-    self.runtime_font_size = logical_size;
+    self.runtime_font_size = point_size;
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
@@ -2148,8 +2145,8 @@ fn setRuntimeFontSize(self: *App, logical_size: ?u31) void {
 }
 
 fn adjustRuntimeFontSize(self: *App, delta: i32) void {
-    const current: i32 = @intCast(self.effectiveFontSize());
-    const next: u31 = @intCast(std.math.clamp(current + delta, 1, 512));
+    const current = self.effectiveFontSize();
+    const next = std.math.clamp(current + @as(f32, @floatFromInt(delta)), 1, 512);
     if (next == self.effectiveFontSize()) return;
     self.setRuntimeFontSize(next);
 }
