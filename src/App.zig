@@ -2923,11 +2923,12 @@ fn pinAtPointer(self: *App) ?vt.Pin {
 
 fn hyperlinkAtPointer(self: *App) ?[]const u8 {
     const pin = self.pinAtPointer() orelse return null;
+    const page = pin.node.page();
     const rac = pin.rowAndCell();
     if (!rac.cell.hyperlink) return null;
-    const link_id = pin.node.data.lookupHyperlink(rac.cell) orelse return null;
-    const entry = pin.node.data.hyperlink_set.get(pin.node.data.memory, link_id);
-    return entry.uri.slice(pin.node.data.memory);
+    const link_id = page.lookupHyperlink(rac.cell) orelse return null;
+    const entry = page.hyperlink_set.get(page.memory, link_id);
+    return entry.uri.slice(page.memory);
 }
 
 fn openHyperlinkAtPointer(self: *App) void {
