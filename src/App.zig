@@ -143,8 +143,9 @@ child_pid: posix.pid_t,
 font: Font,
 /// The physical pixel size the font is currently loaded at.
 font_size_px: u31,
-/// Runtime-only point-size override from keyboard shortcuts.
-runtime_font_size: ?f32,
+/// Runtime-only size override from keyboard shortcuts, preserving the
+/// configured point or logical-pixel unit.
+runtime_font_size: ?Config.FontSize,
 /// Current physical grid rectangle and effective padding.
 layout: TerminalLayout,
 /// Selection highlight colors, from config or OSC 17/19. Snapshotted
@@ -2150,19 +2151,19 @@ test "runtime color override survives default changes until reset" {
     try std.testing.expectEqual(next_default, colorWithRuntimeOverride(next_default, null));
 }
 
-fn effectiveFontSize(self: *const App) f32 {
+fn effectiveFontSize(self: *const App) Config.FontSize {
     return self.runtime_font_size orelse self.config.font_size;
 }
 
-fn setRuntimeFontSize(self: *App, point_size: ?f32) void {
-    const next_size = point_size orelse self.config.font_size;
+fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
+    const next_size = configured_size orelse self.config.font_size;
     const size_px = Config.fontSizePixels(next_size, self.window.scale120);
     const new_font: Font = Font.init(self.alloc, self.config.font_family, size_px) catch |err| {
         log.warn("font size change failed: {}", .{err});
         return;
     };
 
-    self.runtime_font_size = point_size;
+    self.runtime_font_size = configured_size;
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
@@ -2180,8 +2181,12 @@ fn setRuntimeFontSize(self: *App, point_size: ?f32) void {
 
 fn adjustRuntimeFontSize(self: *App, delta: i32) void {
     const current = self.effectiveFontSize();
-    const next = std.math.clamp(current + @as(f32, @floatFromInt(delta)), 1, 512);
-    if (next == self.effectiveFontSize()) return;
+    const amount = @as(f32, @floatFromInt(delta));
+    const next: Config.FontSize = switch (current) {
+        .points => |value| .{ .points = std.math.clamp(value + amount, 1, 512) },
+        .pixels => |value| .{ .pixels = std.math.clamp(value + amount, 1, 512) },
+    };
+    if (std.meta.eql(next, current)) return;
     self.setRuntimeFontSize(next);
 }
 

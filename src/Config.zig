@@ -10,6 +10,8 @@ const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 
 const log = std.log.scoped(.config);
+const baseline_dpi = 96.0;
+const points_per_inch = 72.0;
 
 fn warn(comptime fmt: []const u8, args: anytype) void {
     if (!builtin.is_test) log.warn(fmt, args);
@@ -35,6 +37,25 @@ pub const MouseScrollMultiplier = struct {
 pub const Theme = struct {
     light: [:0]const u8,
     dark: [:0]const u8,
+};
+
+pub const FontSize = union(enum) {
+    points: f32,
+    pixels: f32,
+
+    pub fn value(self: FontSize) f32 {
+        return switch (self) {
+            .points => |size| size,
+            .pixels => |size| size,
+        };
+    }
+
+    pub fn unit(self: FontSize) []const u8 {
+        return switch (self) {
+            .points => "pt",
+            .pixels => "px",
+        };
+    }
 };
 
 const ThemeOverrides = struct {
@@ -118,9 +139,9 @@ pub const default_palette: [16]vt.color.RGB = dark_theme.palette;
 /// Wayland app-id and desktop-entry hint for desktop integration.
 app_id: [:0]const u8 = default_app_id,
 font_family: [:0]const u8 = "monospace",
-/// Font size in typographic points. Rasterization uses a 96 DPI baseline and
-/// the output's fractional scale.
-font_size: f32 = 12,
+/// Bare and `pt` values are typographic points; `px` values are logical
+/// pixels. Both apply the output's fractional scale during rasterization.
+font_size: FontSize = .{ .points = 12 },
 /// Minimum window padding in logical pixels. One configured value applies to
 /// both sides; two values are left/right for X and top/bottom for Y.
 window_padding_x: WindowPadding = .{},
@@ -240,9 +261,7 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else if (std.mem.eql(u8, key, "font-family")) {
         self.font_family = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "font-size")) {
-        const size = std.fmt.parseFloat(f32, value) catch return error.InvalidValue;
-        if (!std.math.isFinite(size) or size <= 0 or size > 512) return error.InvalidValue;
-        self.font_size = size;
+        self.font_size = try parseFontSize(value);
     } else if (std.mem.eql(u8, key, "window-padding-x")) {
         self.window_padding_x = try parseWindowPadding(value);
     } else if (std.mem.eql(u8, key, "window-padding-y")) {
@@ -282,6 +301,25 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else {
         warn("unknown key '{s}', ignoring", .{key});
     }
+}
+
+fn parseFontSize(value: []const u8) error{InvalidValue}!FontSize {
+    var number = value;
+    var unit: std.meta.Tag(FontSize) = .points;
+    if (std.mem.endsWith(u8, value, "pt")) {
+        number = value[0 .. value.len - 2];
+    } else if (std.mem.endsWith(u8, value, "px")) {
+        number = value[0 .. value.len - 2];
+        unit = .pixels;
+    }
+    if (number.len == 0) return error.InvalidValue;
+
+    const size = std.fmt.parseFloat(f32, number) catch return error.InvalidValue;
+    if (!std.math.isFinite(size) or size <= 0 or size > 512) return error.InvalidValue;
+    return switch (unit) {
+        .points => .{ .points = size },
+        .pixels => .{ .pixels = size },
+    };
 }
 
 fn parseTheme(arena: std.mem.Allocator, value: []const u8) SetError!Theme {
@@ -513,16 +551,18 @@ fn parseThemeOverrides(text: []const u8) ThemeOverrides {
     return result;
 }
 
-/// Convert a point size to physical pixels using the conventional Linux
-/// baseline of 96 DPI, then apply the Wayland output scale.
-pub fn fontSizePixels(points: f32, scale120: u32) u31 {
-    std.debug.assert(std.math.isFinite(points) and points > 0);
+/// Convert a configured size to physical pixels. Point sizes use the
+/// conventional Linux 96 DPI baseline; pixel sizes are already logical pixels.
+pub fn fontSizePixels(size: FontSize, scale120: u32) u31 {
+    std.debug.assert(std.math.isFinite(size.value()) and size.value() > 0);
     std.debug.assert(scale120 > 0);
 
-    const baseline_dpi = 96.0;
-    const points_per_inch = 72.0;
     const output_scale = @as(f64, @floatFromInt(scale120)) / 120.0;
-    const pixels = @as(f64, points) * baseline_dpi / points_per_inch * output_scale;
+    const logical_pixels: f64 = switch (size) {
+        .points => |points| @as(f64, points) * baseline_dpi / points_per_inch,
+        .pixels => |pixels| pixels,
+    };
+    const pixels = logical_pixels * output_scale;
     return @max(1, @as(u31, @intFromFloat(@round(pixels))));
 }
 
@@ -612,7 +652,7 @@ test "defaults" {
     const config: Config = .{};
     try std.testing.expectEqualStrings(default_app_id, config.app_id);
     try std.testing.expectEqualStrings("monospace", config.font_family);
-    try std.testing.expectEqual(@as(f32, 12), config.font_size);
+    try std.testing.expectEqual(FontSize{ .points = 12 }, config.font_size);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
     try std.testing.expectEqual(@as(?Command, null), config.command);
@@ -660,7 +700,7 @@ test "parse config" {
     try std.testing.expectEqualStrings("com.example.scratchpad", config.app_id);
     try std.testing.expectEqualStrings("Fira Code", config.font_family);
     // invalid re-assignment keeps the previous valid value
-    try std.testing.expectEqual(@as(f32, 14.5), config.font_size);
+    try std.testing.expectEqual(FontSize{ .points = 14.5 }, config.font_size);
     try std.testing.expectEqual(WindowPadding{ .first = 4, .second = 4 }, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{ .first = 6, .second = 10 }, config.window_padding_y);
     try std.testing.expectEqualStrings("/usr/bin/fish --login", config.command.?.shell);
@@ -728,10 +768,33 @@ test "palette accepts all indices and numeric bases" {
 }
 
 test "font size points convert to scaled physical pixels" {
-    try std.testing.expectEqual(@as(u31, 16), fontSizePixels(12, 120));
-    try std.testing.expectEqual(@as(u31, 24), fontSizePixels(12, 180));
-    try std.testing.expectEqual(@as(u31, 32), fontSizePixels(12, 240));
-    try std.testing.expectEqual(@as(u31, 17), fontSizePixels(12.5, 120));
+    try std.testing.expectEqual(@as(u31, 16), fontSizePixels(.{ .points = 12 }, 120));
+    try std.testing.expectEqual(@as(u31, 24), fontSizePixels(.{ .points = 12 }, 180));
+    try std.testing.expectEqual(@as(u31, 32), fontSizePixels(.{ .points = 12 }, 240));
+    try std.testing.expectEqual(@as(u31, 17), fontSizePixels(.{ .points = 12.5 }, 120));
+}
+
+test "font size pixels scale directly with the output" {
+    try std.testing.expectEqual(@as(u31, 12), fontSizePixels(.{ .pixels = 12 }, 120));
+    try std.testing.expectEqual(@as(u31, 18), fontSizePixels(.{ .pixels = 12 }, 180));
+    try std.testing.expectEqual(@as(u31, 24), fontSizePixels(.{ .pixels = 12 }, 240));
+}
+
+test "font size accepts bare points and explicit point or pixel units" {
+    var config: Config = .{};
+
+    try config.set(std.testing.allocator, "font-size", "12");
+    try std.testing.expectEqual(FontSize{ .points = 12 }, config.font_size);
+    try config.set(std.testing.allocator, "font-size", "12pt");
+    try std.testing.expectEqual(FontSize{ .points = 12 }, config.font_size);
+    try config.set(std.testing.allocator, "font-size", "12px");
+    try std.testing.expectEqual(FontSize{ .pixels = 12 }, config.font_size);
+    try std.testing.expectEqual(@as(u31, 12), fontSizePixels(config.font_size, 120));
+
+    try config.set(std.testing.allocator, "font-size", "16.5px");
+    try std.testing.expectEqual(FontSize{ .pixels = 16.5 }, config.font_size);
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "font-size", "12em"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "font-size", "px"));
 }
 
 test "invalid window padding keeps the previous value" {

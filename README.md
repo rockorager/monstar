@@ -61,12 +61,17 @@ Send `SIGUSR1` to reload the config for a running process:
 pkill -USR1 monstar
 ```
 
-`font-size` is specified in typographic points and accepts fractional values.
-The default is 12 points, equivalent to 16 logical pixels at the standard
-Linux 96 DPI baseline:
+`font-size` accepts bare values or an explicit `pt` suffix for typographic
+points, and a `px` suffix for logical pixels. Fractional values are supported.
+Pixel values map directly to logical pixels before Wayland output scaling;
+they do not use the DPI conversion applied to point values.
+The default is 12 points, equivalent to 16 logical pixels at the standard Linux
+96 DPI baseline:
 
 ```conf
 font-size = 12.5
+# font-size = 12.5pt
+# font-size = 16px
 ```
 
 Set `app-id` to customize the Wayland app-id and desktop-entry hint used by

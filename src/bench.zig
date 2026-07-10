@@ -57,12 +57,13 @@ pub fn run(init: std.process.Init) !void {
     defer w.flush() catch {};
 
     try w.print(
-        "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame), font {s} {d:.1}pt ({d}px)\n\n",
+        "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame), font {s} {d:.1}{s} ({d}px)\n\n",
         .{
             cols,                                          rows,
             width,                                         height,
             @as(f64, @floatFromInt(pixels.len * 4)) / 1e6, config.font_family,
-            config.font_size,                              font_size_px,
+            config.font_size.value(),                      config.font_size.unit(),
+            font_size_px,
         },
     );
 
