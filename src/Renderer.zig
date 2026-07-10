@@ -485,7 +485,68 @@ pub fn collectKittyPlacements(
     try collectKittyVirtualPlacements(font, alloc, terminal, &placements);
 
     std.mem.sortUnstable(KittyRenderItem, placements.items, {}, kittyRenderItemLessThan);
+    placements.items.len = cullOccludedKittyItems(
+        placements.items,
+        font.cell_width,
+        font.cell_height,
+    );
     return placements.toOwnedSlice(alloc);
+}
+
+/// A placement's destination rectangle in framebuffer pixels,
+/// unclipped. Mirrors the dest math in renderKittyPlacement.
+fn kittyDestRect(item: KittyRenderItem, cell_width: u31, cell_height: u31) struct {
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+} {
+    const x0 = @as(i64, item.viewport.viewport_col) * cell_width + item.viewport.offset_x;
+    const y0 = @as(i64, item.viewport.viewport_row) * cell_height + item.viewport.offset_y;
+    return .{
+        .x0 = x0,
+        .y0 = y0,
+        .x1 = x0 + item.viewport.pixel_width,
+        .y1 = y0 + item.viewport.pixel_height,
+    };
+}
+
+/// True when the item overwrites every destination pixel it touches:
+/// alpha-free formats blit with alpha forced to 0xff on both the
+/// unscaled and resampled paths.
+fn kittyItemOpaque(item: KittyRenderItem) bool {
+    return switch (item.image.format) {
+        .rgb, .gray => true,
+        .rgba, .gray_alpha, .png => false,
+    };
+}
+
+/// Drop placements that a later-drawn opaque placement fully covers.
+/// Items must already be in draw order (z-sorted): a later item is
+/// composited after everything before it, so any earlier item whose
+/// dest rect sits inside a later opaque item's rect — along with any
+/// text between their layers — cannot affect the final pixels. Senders
+/// like mpv stream each video frame as a fresh full-screen image and
+/// rely on the terminal's storage quota for cleanup, stacking dozens
+/// of dead placements. Compacts in place and returns the new length.
+fn cullOccludedKittyItems(items: []KittyRenderItem, cell_width: u31, cell_height: u31) usize {
+    if (items.len < 2) return items.len;
+    var kept: usize = 0;
+    outer: for (items, 0..) |item, i| {
+        const rect = kittyDestRect(item, cell_width, cell_height);
+        for (items[i + 1 ..]) |later| {
+            if (!kittyItemOpaque(later)) continue;
+            const cover = kittyDestRect(later, cell_width, cell_height);
+            if (cover.x0 <= rect.x0 and cover.y0 <= rect.y0 and
+                cover.x1 >= rect.x1 and cover.y1 >= rect.y1)
+            {
+                continue :outer;
+            }
+        }
+        items[kept] = item;
+        kept += 1;
+    }
+    return kept;
 }
 
 fn renderKittyItems(
@@ -528,6 +589,21 @@ pub const KittyRenderItem = struct {
     viewport: KittyPlacementViewport,
 };
 
+/// True when two snapshots would render identical placements: same
+/// images (by id and generation) at the same viewport geometry. Image
+/// data pointers are ignored; a generation match means equal bytes.
+pub fn kittyItemsEqual(a: []const KittyRenderItem, b: []const KittyRenderItem) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.image_id != y.image_id) return false;
+        if (x.placement_id != y.placement_id) return false;
+        if (x.z != y.z) return false;
+        if (x.image.generation != y.image.generation) return false;
+        if (!std.meta.eql(x.viewport, y.viewport)) return false;
+    }
+    return true;
+}
+
 fn kittyRenderItemLessThan(_: void, lhs: KittyRenderItem, rhs: KittyRenderItem) bool {
     if (lhs.z != rhs.z) return lhs.z < rhs.z;
     if (lhs.image_id != rhs.image_id) return lhs.image_id < rhs.image_id;
@@ -552,6 +628,19 @@ fn renderKittyPlacement(
     const source_height = viewport.source_height;
     if (source_width == 0 or source_height == 0) return;
 
+    const dest_x = viewport.viewport_col * @as(i32, @intCast(self.font.cell_width)) +
+        @as(i32, @intCast(viewport.offset_x));
+    const dest_y = viewport.viewport_row * @as(i32, @intCast(self.font.cell_height)) +
+        @as(i32, @intCast(viewport.offset_y));
+
+    // Senders like mpv pre-scale frames to the cell area and place them
+    // without c=/r=, making dest dims equal source dims. Blit straight
+    // from the image bytes: no staging buffers, no resampler.
+    if (dest_width == source_width and dest_height == source_height) {
+        blitKittyUnscaled(pixels, width, height, image, viewport, dest_x, dest_y);
+        return;
+    }
+
     var source = try self.alloc.alloc(u8, @as(usize, source_width) * source_height * 4);
     defer self.alloc.free(source);
     if (!copyKittySourceRgba(&source, image, viewport)) return;
@@ -560,11 +649,77 @@ fn renderKittyPlacement(
     defer self.alloc.free(scaled);
     try resizeRgba(source, source_width, source_height, scaled, dest_width, dest_height);
 
-    const dest_x = viewport.viewport_col * @as(i32, @intCast(self.font.cell_width)) +
-        @as(i32, @intCast(viewport.offset_x));
-    const dest_y = viewport.viewport_row * @as(i32, @intCast(self.font.cell_height)) +
-        @as(i32, @intCast(viewport.offset_y));
     blendRgba(pixels, width, height, scaled, dest_width, dest_height, dest_x, dest_y);
+}
+
+/// Draw an unscaled placement directly from the terminal-owned image
+/// bytes: one pass per row with the destination rect clipped up front,
+/// converting from the image's wire format as it writes.
+fn blitKittyUnscaled(
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    image: KittyImage,
+    viewport: KittyPlacementViewport,
+    dest_x: i32,
+    dest_y: i32,
+) void {
+    std.debug.assert(viewport.pixel_width == viewport.source_width);
+    std.debug.assert(viewport.pixel_height == viewport.source_height);
+
+    const channels: usize = switch (image.format) {
+        .gray => 1,
+        .gray_alpha => 2,
+        .rgb => 3,
+        .rgba => 4,
+        .png => return,
+    };
+    const expected_len = @as(usize, image.width) * image.height * channels;
+    if (image.data.len < expected_len) return;
+
+    const x_begin: i64 = @max(dest_x, 0);
+    const y_begin: i64 = @max(dest_y, 0);
+    const x_end: i64 = @min(@as(i64, dest_x) + viewport.source_width, width);
+    const y_end: i64 = @min(@as(i64, dest_y) + viewport.source_height, height);
+    if (x_end <= x_begin or y_end <= y_begin) return;
+
+    const cols: usize = @intCast(x_end - x_begin);
+    const rows: usize = @intCast(y_end - y_begin);
+    const dest_col: usize = @intCast(x_begin);
+    const dest_row: usize = @intCast(y_begin);
+    const src_x = viewport.source_x + @as(usize, @intCast(x_begin - dest_x));
+    const src_y = viewport.source_y + @as(usize, @intCast(y_begin - dest_y));
+
+    for (0..rows) |row| {
+        const src_off = ((src_y + row) * image.width + src_x) * channels;
+        const src = image.data[src_off..];
+        const dst = pixels[(dest_row + row) * width + dest_col ..][0..cols];
+        switch (image.format) {
+            .rgb => for (dst, 0..) |*px, i| {
+                const s = src[i * 3 ..][0..3];
+                px.* = 0xff000000 |
+                    (@as(u32, s[0]) << 16) | (@as(u32, s[1]) << 8) | s[2];
+            },
+            .rgba => for (dst, 0..) |*px, i| {
+                const s = src[i * 4 ..][0..4];
+                switch (s[3]) {
+                    0 => {},
+                    0xff => px.* = 0xff000000 |
+                        (@as(u32, s[0]) << 16) | (@as(u32, s[1]) << 8) | s[2],
+                    else => px.* = blendPixel(px.*, s),
+                }
+            },
+            .gray => for (dst, 0..) |*px, i| {
+                const gray: u32 = src[i];
+                px.* = 0xff000000 | (gray << 16) | (gray << 8) | gray;
+            },
+            .gray_alpha => for (dst, 0..) |*px, i| {
+                const gray = src[i * 2];
+                px.* = blendPixel(px.*, &.{ gray, gray, gray, src[i * 2 + 1] });
+            },
+            .png => unreachable,
+        }
+    }
 }
 
 const KittyPlacementViewport = struct {
@@ -1699,7 +1854,12 @@ fn blendPremultipliedBgraSpan(noalias dst: []u32, noalias src: []const u8) void 
         const inverse = @as(WideVector, @splat(255)) - a;
         const background: WideVector = @as(ByteVector, @bitCast(dst[i..][0..4].*));
         const foreground: WideVector = source;
-        const mixed = foreground + (background * inverse) / @as(WideVector, @splat(255));
+        // Clamp: fonts ship glyphs whose color channels exceed their
+        // alpha (imperfect premultiplication), which would overflow u8.
+        const mixed = @min(
+            foreground + (background * inverse) / @as(WideVector, @splat(255)),
+            @as(WideVector, @splat(255)),
+        );
         const result: PixelVector = @bitCast(@as(ByteVector, @intCast(mixed)));
         dst[i..][0..4].* = result | @as(PixelVector, @splat(0xff000000));
     }
@@ -1752,10 +1912,137 @@ fn blendPremultipliedBgra(src: []const u8, bg: u32) u32 {
             @as(u32, src[0]);
     }
     const na: u32 = 255 - a;
-    const r = @as(u32, src[2]) + ((bg >> 16 & 0xff) * na) / 255;
-    const g = @as(u32, src[1]) + ((bg >> 8 & 0xff) * na) / 255;
-    const b = @as(u32, src[0]) + ((bg & 0xff) * na) / 255;
+    const r: u32 = @min(255, @as(u32, src[2]) + ((bg >> 16 & 0xff) * na) / 255);
+    const g: u32 = @min(255, @as(u32, src[1]) + ((bg >> 8 & 0xff) * na) / 255);
+    const b: u32 = @min(255, @as(u32, src[0]) + ((bg & 0xff) * na) / 255);
     return 0xff000000 | (r << 16) | (g << 8) | b;
+}
+
+test "kitty unscaled blit converts rgb and clips" {
+    const untouched: u32 = 0xff111111;
+    var pixels = [_]u32{untouched} ** 9; // 3x3 framebuffer
+    const image: KittyImage = .{
+        .width = 2,
+        .height = 2,
+        .format = .rgb,
+        .data = &.{
+            10, 20, 30, 40,  50,  60,
+            70, 80, 90, 100, 110, 120,
+        },
+    };
+    const viewport: KittyPlacementViewport = .{
+        .viewport_col = 0,
+        .viewport_row = 0,
+        .visible = true,
+        .offset_x = 0,
+        .offset_y = 0,
+        .pixel_width = 2,
+        .pixel_height = 2,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 2,
+        .source_height = 2,
+    };
+
+    // Left column clips off the framebuffer: only source column 1 lands.
+    blitKittyUnscaled(&pixels, 3, 3, image, viewport, -1, 1);
+    try std.testing.expectEqual(@as(u32, 0xff28323c), pixels[3]); // src (1,0)
+    try std.testing.expectEqual(@as(u32, 0xff646e78), pixels[6]); // src (1,1)
+    for ([_]usize{ 0, 1, 2, 4, 5, 7, 8 }) |i| {
+        try std.testing.expectEqual(untouched, pixels[i]);
+    }
+
+    // Fully off-screen placements draw nothing.
+    var before = pixels;
+    blitKittyUnscaled(&pixels, 3, 3, image, viewport, 3, 0);
+    try std.testing.expectEqualSlices(u32, &before, &pixels);
+}
+
+test "kitty unscaled blit honors rgba alpha" {
+    const bg: u32 = 0xff111111;
+    var pixels = [_]u32{bg} ** 4; // 2x2 framebuffer
+    const image: KittyImage = .{
+        .width = 2,
+        .height = 2,
+        .format = .rgba,
+        .data = &.{
+            200, 200, 200, 0,   200, 200, 200, 255,
+            200, 200, 200, 128, 0,   0,   0,   255,
+        },
+    };
+    const viewport: KittyPlacementViewport = .{
+        .viewport_col = 0,
+        .viewport_row = 0,
+        .visible = true,
+        .offset_x = 0,
+        .offset_y = 0,
+        .pixel_width = 2,
+        .pixel_height = 2,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 2,
+        .source_height = 2,
+    };
+
+    blitKittyUnscaled(&pixels, 2, 2, image, viewport, 0, 0);
+    try std.testing.expectEqual(bg, pixels[0]); // alpha 0 skipped
+    try std.testing.expectEqual(@as(u32, 0xffc8c8c8), pixels[1]); // opaque
+    try std.testing.expectEqual(
+        blendPixel(bg, &.{ 200, 200, 200, 128 }),
+        pixels[2],
+    ); // partial alpha blends
+    try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
+}
+
+test "cullOccludedKittyItems drops placements under later opaque covers" {
+    const cell_w: u31 = 10;
+    const cell_h: u31 = 20;
+    const makeItem = struct {
+        fn makeItem(id: u32, z: i32, format: @FieldType(KittyImage, "format"), col: i32, row: i32, w: u32, h: u32) KittyRenderItem {
+            return .{
+                .image_id = id,
+                .placement_id = 1,
+                .z = z,
+                .image = .{ .width = w, .height = h, .format = format, .data = &.{} },
+                .viewport = .{
+                    .viewport_col = col,
+                    .viewport_row = row,
+                    .visible = true,
+                    .offset_x = 0,
+                    .offset_y = 0,
+                    .pixel_width = w,
+                    .pixel_height = h,
+                    .source_x = 0,
+                    .source_y = 0,
+                    .source_width = w,
+                    .source_height = h,
+                },
+            };
+        }
+    }.makeItem;
+
+    // Draw order (already z/id sorted):
+    //   0: rgb  full-screen  — occluded by 2 (same rect, opaque, later)
+    //   1: rgb  small inset  — occluded by 2
+    //   2: rgb  full-screen  — kept: only a non-opaque item follows
+    //   3: rgba full-screen  — kept: nothing follows
+    var items = [_]KittyRenderItem{
+        makeItem(1, 0, .rgb, 0, 0, 100, 100),
+        makeItem(2, 0, .rgb, 2, 1, 30, 40),
+        makeItem(3, 0, .rgb, 0, 0, 100, 100),
+        makeItem(4, 1, .rgba, 0, 0, 100, 100),
+    };
+    const kept = cullOccludedKittyItems(&items, cell_w, cell_h);
+    try std.testing.expectEqual(@as(usize, 2), kept);
+    try std.testing.expectEqual(@as(u32, 3), items[0].image_id);
+    try std.testing.expectEqual(@as(u32, 4), items[1].image_id);
+
+    // A later opaque item that only partially covers must not cull.
+    var partial = [_]KittyRenderItem{
+        makeItem(1, 0, .rgb, 0, 0, 100, 100),
+        makeItem(2, 0, .rgb, 1, 0, 100, 100),
+    };
+    try std.testing.expectEqual(@as(usize, 2), cullOccludedKittyItems(&partial, cell_w, cell_h));
 }
 
 test "blend endpoints" {
@@ -1847,6 +2134,20 @@ test "blendPremultipliedBgraSpan matches scalar blend" {
     }
     blendPremultipliedBgraSpan(&mixed_got, &mixed_source);
     try std.testing.expectEqualSlices(u32, &mixed_want, &mixed_got);
+
+    // Imperfectly premultiplied glyphs (color > alpha) must clamp to
+    // white instead of overflowing; real emoji fonts ship these.
+    const over_source = [_]u8{
+        255, 255, 255, 128,
+        250, 250, 250, 200,
+        255, 255, 255, 1,
+        128, 128, 128, 127,
+    };
+    var over_got: [4]u32 = @splat(0xffffffff);
+    blendPremultipliedBgraSpan(&over_got, &over_source);
+    for (over_got) |pixel| {
+        try std.testing.expectEqual(@as(u32, 0xffffffff), pixel);
+    }
 
     var prng: std.Random.DefaultPrng = .init(0xb6a4);
     const random = prng.random();

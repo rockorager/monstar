@@ -113,6 +113,9 @@ held_frame: ?*Window.Buffer,
 /// and freed on deinit.
 async_job_preedit: ?[]u8,
 async_job_link_hint: ?[]u8,
+/// The hyperlink-hints flag submitted with the last async job, for
+/// detecting overlay changes between jobs.
+async_job_hyperlink_hints: bool,
 /// Kitty render items for the in-flight async job, with image data
 /// repointed at cache-pinned copies. Same lifetime as the overlay
 /// copies above.
@@ -429,6 +432,16 @@ const AppStreamHandler = struct {
     }
 };
 
+/// The directory for kitty t=t temporary-file transmissions, resolved
+/// like Ghostty: $TMPDIR, then $TMP, then /tmp. Returned slices point
+/// into the process environment and stay valid for its lifetime.
+fn tmpDirPath(environ: std.process.Environ) []const u8 {
+    const dir = environ.getPosix("TMPDIR") orelse
+        environ.getPosix("TMP") orelse
+        return "/tmp";
+    return std.mem.trimEnd(u8, dir, &.{std.fs.path.sep});
+}
+
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
 /// copies them via execve). `config` strings must remain valid until the
 /// first successful reload or App teardown.
@@ -459,6 +472,13 @@ pub fn init(
         // single fullscreen image on large displays (a 4K RGBA frame is
         // ~32MB). Default matches the Ghostty app (320MB).
         .kitty_image_storage_limit = config.image_storage_limit,
+        // Accept every kitty transmission medium, matching the Ghostty
+        // app. t=s shared memory matters most for throughput: senders
+        // like `mpv --vo=kitty --vo-kitty-use-shm=yes` move pixels
+        // through POSIX shm instead of base64 escape data, which is
+        // orders of magnitude cheaper to parse. t=t temporary files are
+        // only read (and then deleted) from inside the temp dir.
+        .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
     });
     errdefer term.deinit(alloc);
     term.width_px = startup_size.cols * font.cell_width;
@@ -585,6 +605,7 @@ pub fn init(
         .held_frame = null,
         .async_job_preedit = null,
         .async_job_link_hint = null,
+        .async_job_hyperlink_hints = false,
         .async_job_kitty = &.{},
         .kitty_cache = .empty,
         .geometry_redraw = false,
@@ -3977,15 +3998,15 @@ fn startAsyncRender(self: *App) !bool {
             return false;
         };
     }
-    const target = self.window.acquireRenderTarget() catch return false;
-    errdefer self.window.cancelRender(target.buffer);
-
     // DEC 2026: the terminal is mid-update, so the previous snapshot
     // (and its overlay/kitty copies) is re-rendered as-is — reachable
     // only for geometry redraws. Any pending snapshot rebuild stays
     // deferred until the freeze ends.
     const frozen = self.term.modes.get(.synchronized_output);
     var hyperlink_hints = self.keyboard.currentMods().ctrl;
+    // Frozen jobs re-render the previous snapshot at a new geometry, so
+    // they never take the unchanged-overlay shortcut.
+    var overlay_dirty = true;
     if (!frozen) {
         if (self.async_force_full) {
             self.render_state.rows = 0;
@@ -3997,31 +4018,52 @@ fn startAsyncRender(self: *App) !bool {
         if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) {
             self.render_state.dirty = .full;
         }
-        // Kitty placements are not tracked per row, so any frame with (or
-        // just after) graphics is a full render.
-        const kitty_dirty = self.term.screens.active.kitty_images.dirty;
-        const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
-        if (kitty_dirty or has_kitty_graphics) self.render_state.dirty = .full;
         // Snapshot overlay inputs; the worker cannot safely read App state.
         // The previous job's copies are dead: only one job exists at a time.
+        const new_link: ?[]const u8 = if (hyperlink_hints) self.hyperlinkAtPointer() else null;
+        overlay_dirty = hyperlink_hints != self.async_job_hyperlink_hints or
+            !optionalStrEql(self.async_job_preedit, self.ime_preedit) or
+            !optionalStrEql(self.async_job_link_hint, new_link);
         if (self.async_job_preedit) |old| self.alloc.free(old);
         self.async_job_preedit = null;
         if (self.async_job_link_hint) |old| self.alloc.free(old);
         self.async_job_link_hint = null;
         if (self.ime_preedit) |text| self.async_job_preedit = try self.alloc.dupe(u8, text);
-        if (hyperlink_hints) {
-            if (self.hyperlinkAtPointer()) |uri| {
-                self.async_job_link_hint = try self.alloc.dupe(u8, uri);
-            }
+        if (new_link) |uri| self.async_job_link_hint = try self.alloc.dupe(u8, uri);
+        self.async_job_hyperlink_hints = hyperlink_hints;
+
+        const kitty_dirty = self.term.screens.active.kitty_images.dirty;
+        const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
+        var kitty_changed = kitty_dirty;
+        if (has_kitty_graphics) {
+            const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
+            if (!Renderer.kittyItemsEqual(self.async_job_kitty, items)) kitty_changed = true;
+            self.releaseKittyJob();
+            try self.pinKittyJob(items);
+        } else {
+            if (self.async_job_kitty.len > 0) kitty_changed = true;
+            self.releaseKittyJob();
         }
-        self.releaseKittyJob();
-        if (has_kitty_graphics) try self.snapshotKittyJob();
         self.kitty_cache.sweep(self.alloc);
         if (kitty_dirty) self.term.screens.active.kitty_images.dirty = false;
+        // Kitty placements are not tracked per row, so any change to
+        // the graphics — or any content change underneath them — is a
+        // full render.
+        if (kitty_changed or (has_kitty_graphics and self.render_state.dirty != .false)) {
+            self.render_state.dirty = .full;
+        }
+        overlay_dirty = overlay_dirty or kitty_changed;
+        // Nothing to draw: content is clean and every overlay input
+        // matches the previous job. Parse batches that only stream
+        // kitty payload bytes land here; submitting would burn a job
+        // round-trip (and often a buffer repair copy) on a frame
+        // identical to the last one.
+        if (self.render_state.dirty == .false and !overlay_dirty) return false;
     } else {
         // Keep the hint flag consistent with the stale link-hint copy.
         hyperlink_hints = self.async_job_link_hint != null;
     }
+    const target = self.window.acquireRenderTarget() catch return false;
     self.async_generation +%= 1;
     async_raster.submit(.{
         .pixels = target.pixels,
@@ -4035,6 +4077,7 @@ fn startAsyncRender(self: *App) !bool {
         .preedit = self.async_job_preedit,
         .link_hint = self.async_job_link_hint,
         .kitty_items = self.async_job_kitty,
+        .overlay_dirty = overlay_dirty,
     }) catch |err| {
         self.window.cancelRender(target.buffer);
         self.releaseKittyJob();
@@ -4046,11 +4089,11 @@ fn startAsyncRender(self: *App) !bool {
     return true;
 }
 
-/// Snapshot the visible kitty placements for an async job, pinning
-/// copies of their image data in the cache.
-fn snapshotKittyJob(self: *App) !void {
+/// Pin the collected kitty placements for an async job, repointing
+/// their image data at cache-pinned copies. Takes ownership of `items`,
+/// also on error.
+fn pinKittyJob(self: *App, items: []Renderer.KittyRenderItem) !void {
     std.debug.assert(self.async_job_kitty.len == 0);
-    const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
     errdefer self.alloc.free(items);
     var acquired: usize = 0;
     errdefer for (items[0..acquired]) |item|
@@ -4060,6 +4103,11 @@ fn snapshotKittyJob(self: *App) !void {
         acquired += 1;
     }
     self.async_job_kitty = items;
+}
+
+fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 /// Drop the last job's kitty pins. Only safe while no worker job

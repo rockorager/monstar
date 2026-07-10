@@ -28,6 +28,10 @@ pub const Job = struct {
     /// data repointed at cache-pinned copies. Same ownership as
     /// `preedit`; empty when no graphics are visible.
     kitty_items: []const Renderer.KittyRenderItem,
+    /// Any overlay input (kitty snapshot, preedit, link hint, hint
+    /// flag) differs from the previously submitted job. Unchanged
+    /// overlays over clean content need no repaint.
+    overlay_dirty: bool,
 
     fn hasOverlay(self: *const Job) bool {
         return self.preedit != null or self.link_hint != null or self.kitty_items.len > 0;
@@ -337,6 +341,15 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     // Overlays draw outside the grid rows that dirty tracking accounts
     // for, so an overlay frame is always a full render with full damage.
     if (job.hasOverlay()) {
+        // Unless nothing changed at all: clean content plus the same
+        // overlays as the previous job reproduce the previous frame,
+        // so repair to it instead of re-rendering. Without this a
+        // visible kitty image turns every submitted job into a full
+        // render.
+        if (!job.overlay_dirty and self.state.dirty == .false and repairToPreviousFrame(job)) {
+            damage.* = .none;
+            return;
+        }
         if (job.kitty_items.len > 0) {
             try self.renderer.renderWithKittyItems(self.state, job.kitty_items, job.pixels, job.width, job.height);
         } else {
@@ -399,6 +412,7 @@ test "repair previous frame" {
         .preedit = null,
         .link_hint = null,
         .kitty_items = &.{},
+        .overlay_dirty = false,
     };
 
     try std.testing.expect(repairToPreviousFrame(base));
