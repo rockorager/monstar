@@ -86,10 +86,9 @@ pub fn run(init: std.process.Init) !void {
         try report(w, "full render", nowNs(init.io) - start, iters, null);
     }
 
-    // End-to-end scroll frame: one new line fed, then the same path
-    // the raster worker takes (update, then a dirty render — a scroll
-    // marks every row dirty, so this is effectively a full repaint).
-    // This is the hot path when a program streams output.
+    // Baseline end-to-end scroll frame without the application's async
+    // viewport-shift reuse. This remains useful as the full-repaint cost
+    // against which the live scroll-blit path is measured.
     {
         const scroll_line = comptime scrollLine();
         const iters = 100;

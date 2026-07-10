@@ -345,6 +345,30 @@ pub fn renderDirty(
     }
 }
 
+/// The overhang bits describe rendered row content, so move them with a
+/// scroll blit. Newly exposed rows are conservatively marked until their
+/// first repaint determines their actual overhang.
+pub fn shiftRowOverhang(self: *Renderer, rows: usize, shift_rows: isize) !void {
+    const shift: usize = @abs(shift_rows);
+    std.debug.assert(shift > 0 and shift < rows);
+    if (self.row_overhang.bit_length != rows) {
+        try self.row_overhang.resize(self.alloc, rows, true);
+        self.row_overhang.setRangeValue(.{ .start = 0, .end = rows }, true);
+    } else if (shift_rows > 0) {
+        for (0..rows - shift) |y| {
+            self.row_overhang.setValue(y, self.row_overhang.isSet(y + shift));
+        }
+        self.row_overhang.setRangeValue(.{ .start = rows - shift, .end = rows }, true);
+    } else {
+        var y = rows;
+        while (y > shift) {
+            y -= 1;
+            self.row_overhang.setValue(y, self.row_overhang.isSet(y - shift));
+        }
+        self.row_overhang.setRangeValue(.{ .start = 0, .end = shift }, true);
+    }
+}
+
 pub fn renderPreedit(
     self: *Renderer,
     state: *const vt.RenderState,

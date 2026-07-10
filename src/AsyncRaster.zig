@@ -36,6 +36,9 @@ pub const Job = struct {
     /// flag) differs from the previously submitted job. Unchanged
     /// overlays over clean content need no repaint.
     overlay_dirty: bool,
+    /// Whole terminal rows by which previous-frame pixels move. Positive
+    /// shifts content up; negative shifts it down.
+    scroll_shift: ?isize,
 
     fn hasOverlay(self: *const Job) bool {
         return self.preedit != null or self.link_hint != null or self.kitty_items.len > 0;
@@ -389,6 +392,22 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         damage.* = .full;
         return;
     }
+    if (job.scroll_shift) |shift| {
+        clearPadding(self.state, job);
+        if (scrollFromPreviousFrame(job, shift, self.font.cell_height)) {
+            try self.renderer.shiftRowOverhang(self.state.rows, shift);
+            try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
+            // Rasterization touched only dirty rows, but every retained row
+            // moved to a different surface location.
+            damage.* = .full;
+            return;
+        }
+        // App normally excludes this case before narrowing the dirty rows.
+        // A full render is still a safe fallback if the job is malformed.
+        try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
+        damage.* = .full;
+        return;
+    }
     switch (self.state.dirty) {
         .full => {
             clearPadding(self.state, job);
@@ -449,6 +468,40 @@ fn repairToPreviousFrame(job: Job) bool {
     return true;
 }
 
+/// Move retained framebuffer rows directly from the previous frame into
+/// their new positions. This avoids a full stale-buffer repair followed by
+/// a second in-place shift when source and destination differ.
+fn scrollFromPreviousFrame(job: Job, shift_rows: isize, cell_height: u31) bool {
+    const rows: usize = @abs(shift_rows);
+    if (rows == 0) return false;
+    const shift_pixels = rows * cell_height;
+    if (shift_pixels >= job.grid_height) return false;
+
+    const source = if (job.age == 1)
+        @as([]const u32, job.pixels)
+    else
+        job.source_pixels orelse return false;
+    if (source.len != job.pixels.len) return false;
+
+    const stride: usize = job.width;
+    const grid_start = @as(usize, job.grid_y) * stride;
+    const grid_end = @as(usize, job.grid_y + job.grid_height) * stride;
+    const offset = shift_pixels * stride;
+    const retained = grid_end - grid_start - offset;
+    if (shift_rows > 0) {
+        @memmove(
+            job.pixels[grid_start .. grid_start + retained],
+            source[grid_start + offset .. grid_end],
+        );
+    } else {
+        @memmove(
+            job.pixels[grid_start + offset .. grid_end],
+            source[grid_start .. grid_start + retained],
+        );
+    }
+    return true;
+}
+
 test "repair previous frame" {
     var target = [_]u32{ 1, 2, 3, 4 };
     const source = [_]u32{ 5, 6, 7, 8 };
@@ -469,6 +522,7 @@ test "repair previous frame" {
         .link_hint = null,
         .kitty_items = &.{},
         .overlay_dirty = false,
+        .scroll_shift = null,
     };
 
     try std.testing.expect(repairToPreviousFrame(base));
@@ -483,4 +537,56 @@ test "repair previous frame" {
 
     current.age = 0;
     try std.testing.expect(!repairToPreviousFrame(current));
+}
+
+test "scroll previous frame in place and from distinct source" {
+    var pixels = [_]u32{
+        0,  1,  2,
+        3,  4,  5,
+        6,  7,  8,
+        9,  10, 11,
+        12, 13, 14,
+    };
+    var job: Job = .{
+        .pixels = &pixels,
+        .source_pixels = null,
+        .width = 3,
+        .height = 5,
+        .grid_x = 0,
+        .grid_y = 1,
+        .grid_width = 3,
+        .grid_height = 3,
+        .age = 1,
+        .generation = 1,
+        .focused = true,
+        .hyperlink_hints = false,
+        .preedit = null,
+        .link_hint = null,
+        .kitty_items = &.{},
+        .overlay_dirty = false,
+        .scroll_shift = 1,
+    };
+
+    try std.testing.expect(scrollFromPreviousFrame(job, 1, 1));
+    try std.testing.expectEqualSlices(u32, &.{ 6, 7, 8, 9, 10, 11 }, pixels[3..9]);
+    // The newly exposed row is deliberately untouched for renderDirty.
+    try std.testing.expectEqualSlices(u32, &.{ 9, 10, 11 }, pixels[9..12]);
+
+    const source = [_]u32{
+        20, 21, 22,
+        23, 24, 25,
+        26, 27, 28,
+        29, 30, 31,
+        32, 33, 34,
+    };
+    @memset(&pixels, 99);
+    job.age = 0;
+    job.source_pixels = &source;
+    try std.testing.expect(scrollFromPreviousFrame(job, -1, 1));
+    try std.testing.expectEqualSlices(u32, &.{ 23, 24, 25, 26, 27, 28 }, pixels[6..12]);
+    try std.testing.expectEqualSlices(u32, &.{ 99, 99, 99 }, pixels[3..6]);
+
+    job.source_pixels = null;
+    try std.testing.expect(!scrollFromPreviousFrame(job, 1, 1));
+    try std.testing.expect(!scrollFromPreviousFrame(job, 3, 1));
 }

@@ -99,6 +99,9 @@ stream: AppStream,
 /// only on the main thread while no render target is checked out, so
 /// the async worker can read it without locks while a job is in flight.
 render_state: vt.RenderState,
+/// Main-thread scratch for recognizing viewport movement before
+/// RenderState.update consumes Ghostty's row dirtiness.
+scroll_detector: ScrollDetector,
 async_raster: ?AsyncRaster,
 async_raster_loader: ?AsyncRaster.Loader,
 async_generation: u64,
@@ -372,6 +375,124 @@ const FrameDamage = struct {
     height: u31,
 };
 
+const Scroll = struct {
+    /// Rows the content moved: positive moves content up, negative down.
+    shift: isize,
+};
+
+/// Detects whole-row viewport shifts by matching the previous render
+/// snapshot's row pins against the terminal's new viewport. Ghostty marks a
+/// viewport-pin change as a full redraw but does not report the displacement.
+const ScrollDetector = struct {
+    pins: std.ArrayList(vt.Pin) = .empty,
+    predirty: std.DynamicBitSetUnmanaged = .{},
+
+    fn deinit(self: *ScrollDetector, alloc: std.mem.Allocator) void {
+        self.pins.deinit(alloc);
+        self.predirty.deinit(alloc);
+    }
+
+    /// Must run immediately before RenderState.update while both the old row
+    /// pins and the terminal's unconsumed dirty flags are available.
+    fn detect(
+        self: *ScrollDetector,
+        alloc: std.mem.Allocator,
+        state: *const vt.RenderState,
+        term: *const vt.Terminal,
+    ) !?Scroll {
+        if (state.dirty != .false) return null;
+        const rows: usize = state.rows;
+        if (rows == 0 or state.row_data.len != rows) return null;
+        const screen = term.screens.active;
+        if (term.screens.active_key != state.screen) return null;
+        if (rows != screen.pages.rows or state.cols != screen.pages.cols) return null;
+
+        const TerminalDirtyInt = @typeInfo(vt.Terminal.Dirty).@"struct".backing_integer.?;
+        if (@as(TerminalDirtyInt, @bitCast(term.flags.dirty)) != 0) return null;
+        const ScreenDirtyInt = @typeInfo(vt.Screen.Dirty).@"struct".backing_integer.?;
+        if (@as(ScreenDirtyInt, @bitCast(screen.dirty)) != 0) return null;
+
+        // Selection pixels are tied to viewport positions and cannot safely
+        // be carried along with terminal content.
+        if (screen.selection != null) return null;
+        for (state.row_data.items(.selection)) |selection| {
+            if (selection != null) return null;
+        }
+
+        const old_viewport = state.viewport_pin orelse return null;
+        const new_viewport = screen.pages.getTopLeft(.viewport);
+        if (old_viewport.eql(new_viewport)) return null;
+
+        try self.pins.resize(alloc, rows);
+        try self.predirty.resize(alloc, rows, false);
+        self.predirty.unsetAll();
+        var it = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+        var y: usize = 0;
+        while (it.next()) |pin| : (y += 1) {
+            if (y >= rows) return null;
+            self.pins.items[y] = pin;
+            if (pin.node.page().dirty or pin.rowAndCell().row.dirty) self.predirty.set(y);
+        }
+        if (y != rows) return null;
+
+        const old_pins = state.row_data.items(.pin);
+        const new_pins = self.pins.items;
+        if (findPin(new_pins[0], old_pins)) |shift| {
+            if (pinsMatch(new_pins[0 .. rows - shift], old_pins[shift..rows])) {
+                return .{ .shift = @intCast(shift) };
+            }
+        }
+        if (findPin(old_pins[0], new_pins)) |shift| {
+            if (pinsMatch(new_pins[shift..rows], old_pins[0 .. rows - shift])) {
+                return .{ .shift = -@as(isize, @intCast(shift)) };
+            }
+        }
+        return null;
+    }
+
+    /// Replace Ghostty's all-row dirty result with the rows not supplied by
+    /// shifted pixels, plus terminal writes and cursor pixels.
+    fn prepare(self: *const ScrollDetector, state: *vt.RenderState, scroll: Scroll, old_cursor: vt.RenderState.Cursor) void {
+        const rows: usize = state.rows;
+        const shift: usize = @abs(scroll.shift);
+        std.debug.assert(shift > 0 and shift < rows);
+        std.debug.assert(self.predirty.bit_length == rows);
+
+        const dirty_rows = state.row_data.items(.dirty);
+        for (dirty_rows[0..rows], 0..) |*dirty, y| {
+            const entered = if (scroll.shift > 0) y >= rows - shift else y < shift;
+            dirty.* = entered or self.predirty.isSet(y);
+        }
+        if (old_cursor.visible) {
+            if (old_cursor.viewport) |old| {
+                const moved = @as(isize, @intCast(old.y)) - scroll.shift;
+                if (moved >= 0 and moved < rows) dirty_rows[@intCast(moved)] = true;
+            }
+        }
+        if (state.cursor.visible) {
+            if (state.cursor.viewport) |current| {
+                if (current.y < rows) dirty_rows[current.y] = true;
+            }
+        }
+        state.dirty = .partial;
+    }
+
+    fn findPin(needle: vt.Pin, pins: []const vt.Pin) ?usize {
+        for (pins[1..], 1..) |pin, index| {
+            if (needle.eql(pin)) return index;
+        }
+        return null;
+    }
+
+    fn pinsMatch(a: []const vt.Pin, b: []const vt.Pin) bool {
+        std.debug.assert(a.len == b.len);
+        for (a, b) |pin_a, pin_b| {
+            if (!pin_a.eql(pin_b)) return false;
+        }
+        return true;
+    }
+};
+
 const TerminalHandler = vt.TerminalStream.Handler;
 const AppStream = vt.Stream(AppStreamHandler);
 
@@ -630,6 +751,7 @@ pub fn init(
         .term = term,
         .stream = undefined, // needs the final Terminal address; set below
         .render_state = .empty,
+        .scroll_detector = .{},
         .async_raster = null,
         .async_raster_loader = null,
         .async_generation = 1,
@@ -785,9 +907,7 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
-    self.invalidateAsyncFrame();
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
+    self.requestFullAsyncRedraw();
 }
 
 const Handler = TerminalHandler;
@@ -1361,6 +1481,7 @@ pub fn deinit(self: *App) void {
     _ = std.os.linux.close(self.signal_fd);
     self.keyboard.deinit();
     self.window.destroy();
+    self.scroll_detector.deinit(self.alloc);
     self.render_state.deinit(self.alloc);
     self.stream.deinit();
     self.term.deinit(self.alloc);
@@ -2098,7 +2219,6 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = desired_font_size;
-    self.invalidateAsyncFrame();
     resizeForConfig(
         self,
         physicalDimension(self.window.width, self.window.scale120),
@@ -2108,15 +2228,12 @@ fn applyConfig(self: *App, new_config: Config) !void {
         log.warn("config reload resize failed: {}", .{err});
     };
 
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
+    self.requestFullAsyncRedraw();
 }
 
 fn applyColorDefaults(self: *App) void {
     self.applyColorDefaultsForConfig(self.config);
-    self.invalidateAsyncFrame();
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
+    self.requestFullAsyncRedraw();
 }
 
 fn applyColorDefaultsForConfig(self: *App, config: Config) void {
@@ -2167,7 +2284,6 @@ fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
-    self.invalidateAsyncFrame();
     resize(
         self,
         physicalDimension(self.window.width, self.window.scale120),
@@ -2175,8 +2291,7 @@ fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
     ) catch |err| {
         log.warn("font size change resize failed: {}", .{err});
     };
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
+    self.requestFullAsyncRedraw();
 }
 
 fn adjustRuntimeFontSize(self: *App, delta: i32) void {
@@ -2246,9 +2361,7 @@ fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
         },
         else => return,
     }
-    self.invalidateAsyncFrame();
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
+    self.requestFullAsyncRedraw();
 }
 
 fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
@@ -2266,9 +2379,7 @@ fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
         },
         else => return,
     }
-    self.invalidateAsyncFrame();
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
+    self.requestFullAsyncRedraw();
 }
 
 fn answerKittySelectionColorQueries(self: *App, request: vt.kitty.color.OSC) void {
@@ -2887,8 +2998,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             self.pointer_y = enter.surface_y.toDouble();
             self.syncCursorShape();
             if (self.keyboard.currentMods().ctrl) {
-                self.render_state.dirty = .full;
-                self.needs_redraw = true;
+                self.requestFullAsyncRedraw();
             }
         },
         .motion => |motion| {
@@ -2896,8 +3006,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             self.pointer_y = motion.surface_y.toDouble();
             self.syncCursorShape();
             if (self.keyboard.currentMods().ctrl) {
-                self.render_state.dirty = .full;
-                self.needs_redraw = true;
+                self.requestFullAsyncRedraw();
             }
             if (self.selecting) {
                 self.extendSelection();
@@ -3839,8 +3948,7 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             );
             if (ctrl_was_down != self.keyboard.currentMods().ctrl) {
                 self.syncCursorShape();
-                self.render_state.dirty = .full;
-                self.needs_redraw = true;
+                self.requestFullAsyncRedraw();
             }
         },
         .key => |key| {
@@ -3873,15 +3981,12 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
 fn setFocus(self: *App, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
-    self.invalidateAsyncFrame();
+    self.requestFullAsyncRedraw();
     if (focused) {
         self.window.setUrgent(false) catch |err| {
             log.warn("failed to clear window attention: {}", .{err});
         };
     }
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
-
     // Applications with focus reporting (mode 1004) get CSI I / CSI O.
     if (self.term.modes.get(.focus_event)) {
         var buf: [vt.input.max_focus_encode_size]u8 = undefined;
@@ -3934,8 +4039,7 @@ fn applyPendingIme(self: *App) void {
 
 fn setImePreedit(self: *App, text: ?[]const u8) void {
     self.replaceImeText(&self.ime_preedit, text);
-    self.render_state.dirty = .full;
-    self.needs_redraw = true;
+    self.requestFullAsyncRedraw();
 }
 
 fn replaceImeText(self: *App, slot: *?[]u8, text: ?[]const u8) void {
@@ -4141,12 +4245,26 @@ fn startAsyncRender(self: *App) !bool {
     // Frozen jobs re-render the previous snapshot at a new geometry, so
     // they never take the unchanged-overlay shortcut.
     var overlay_dirty = true;
+    var scroll: ?Scroll = null;
+    var old_cursor: vt.RenderState.Cursor = self.render_state.cursor;
     if (!frozen) {
+        const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
+        // Detection must precede update(). Both the previous and next frame
+        // must be free of overlays because their pixels do not move with
+        // terminal rows.
+        if (!self.async_force_full and
+            !hyperlink_hints and !self.async_job_hyperlink_hints and
+            self.ime_preedit == null and self.async_job_preedit == null and
+            self.async_job_link_hint == null and
+            !has_kitty_graphics and self.async_job_kitty.len == 0)
+        {
+            scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.term);
+        }
         if (self.async_force_full) {
             self.render_state.rows = 0;
             self.render_state.dirty = .full;
         }
-        const old_cursor = self.render_state.cursor;
+        old_cursor = self.render_state.cursor;
         try self.render_state.update(self.alloc, &self.term);
         self.dirtyCursorRows(old_cursor);
         if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) {
@@ -4165,9 +4283,7 @@ fn startAsyncRender(self: *App) !bool {
         if (self.ime_preedit) |text| self.async_job_preedit = try self.alloc.dupe(u8, text);
         if (new_link) |uri| self.async_job_link_hint = try self.alloc.dupe(u8, uri);
         self.async_job_hyperlink_hints = hyperlink_hints;
-
         const kitty_dirty = self.term.screens.active.kitty_images.dirty;
-        const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
         var kitty_changed = kitty_dirty;
         if (has_kitty_graphics) {
             const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
@@ -4187,6 +4303,7 @@ fn startAsyncRender(self: *App) !bool {
             self.render_state.dirty = .full;
         }
         overlay_dirty = overlay_dirty or kitty_changed;
+        if (overlay_dirty or self.render_state.dirty != .full) scroll = null;
         // Nothing to draw: content is clean and every overlay input
         // matches the previous job. Parse batches that only stream
         // kitty payload bytes land here; submitting would burn a job
@@ -4198,6 +4315,8 @@ fn startAsyncRender(self: *App) !bool {
         hyperlink_hints = self.async_job_link_hint != null;
     }
     const target = self.window.acquireRenderTarget() catch return false;
+    if (scroll != null and target.age != 1 and target.source_pixels == null) scroll = null;
+    if (scroll) |value| self.scroll_detector.prepare(&self.render_state, value, old_cursor);
     self.async_generation +%= 1;
     async_raster.submit(.{
         .pixels = target.pixels,
@@ -4216,6 +4335,7 @@ fn startAsyncRender(self: *App) !bool {
         .link_hint = self.async_job_link_hint,
         .kitty_items = self.async_job_kitty,
         .overlay_dirty = overlay_dirty,
+        .scroll_shift = if (scroll) |value| value.shift else null,
     }) catch |err| {
         self.window.cancelRender(target.buffer);
         self.releaseKittyJob();
@@ -4602,6 +4722,14 @@ fn clearStateDirty(state: *vt.RenderState) void {
     state.dirty = .false;
 }
 
+/// Renderer-only state changed. Invalidate any in-flight snapshot without
+/// touching RenderState while the worker may be reading it; startAsyncRender
+/// performs the full rebuild after the worker becomes idle.
+fn requestFullAsyncRedraw(self: *App) void {
+    self.invalidateAsyncFrame();
+    self.needs_redraw = true;
+}
+
 fn invalidateAsyncFrame(self: *App) void {
     self.async_generation +%= 1;
     self.async_force_full = true;
@@ -4654,6 +4782,47 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.geometry_redraw = true;
     self.needs_redraw = true;
+}
+
+test "scroll detector finds viewport shifts and narrows dirty rows" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{
+        .cols = 10,
+        .rows = 4,
+        .max_scrollback = 100,
+    });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    var detector: ScrollDetector = .{};
+    defer detector.deinit(alloc);
+
+    for (0..8) |i| {
+        var buf: [16]u8 = undefined;
+        stream.nextSlice(std.fmt.bufPrint(&buf, "line{d}\r\n", .{i}) catch unreachable);
+    }
+    try state.update(alloc, &term);
+    clearStateDirty(&state);
+
+    const old_cursor = state.cursor;
+    stream.nextSlice("next\r\n");
+    const down = (try detector.detect(alloc, &state, &term)).?;
+    try std.testing.expectEqual(@as(isize, 1), down.shift);
+    try state.update(alloc, &term);
+    detector.prepare(&state, down, old_cursor);
+    try std.testing.expectEqual(vt.RenderState.Dirty.partial, state.dirty);
+    try std.testing.expect(state.row_data.items(.dirty)[state.rows - 1]);
+    clearStateDirty(&state);
+
+    term.screens.active.pages.scroll(.{ .delta_row = -2 });
+    const up = (try detector.detect(alloc, &state, &term)).?;
+    try std.testing.expectEqual(@as(isize, -2), up.shift);
+    try state.update(alloc, &term);
+    detector.prepare(&state, up, state.cursor);
+    const dirty = state.row_data.items(.dirty);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, false, false }, dirty[0..4]);
 }
 
 test "semantic command output extracts most recent completed output" {
