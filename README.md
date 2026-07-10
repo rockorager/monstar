@@ -101,13 +101,31 @@ Ghostty-compatible multiplier syntax. The defaults are `precision:1` and
 mouse-scroll-multiplier = precision:0.5,discrete:4
 ```
 
-Monstar follows the desktop portal's light/dark color scheme automatically.
-Individual colors can be overridden, and all 256 palette entries use the
-repeatable Ghostty syntax:
+Monstar installs Ghostty's iTerm2 theme collection and accepts the same theme
+names. A single name is used in both color schemes:
+
+```conf
+theme = TokyoNight
+```
+
+Use Ghostty's light/dark syntax to follow the desktop portal while selecting a
+different named theme for each scheme. Both sides are required:
+
+```conf
+theme = light:Rose Pine Dawn,dark:Rose Pine
+```
+
+Custom themes can be placed in `$XDG_CONFIG_HOME/monstar/themes` or
+`~/.config/monstar/themes`; a theme file uses the same color keys shown below.
+Without a `theme` setting, Monstar's built-in colors follow the desktop portal.
+Individual colors override the selected theme, and all 256 palette entries use
+the repeatable Ghostty syntax:
 
 ```conf
 background = #1a1b26
 foreground = #c0caf5
+cursor-color = #c0caf5
+cursor-text = #1a1b26
 palette = 1=#f7768e
 palette = 200=#123456
 ```

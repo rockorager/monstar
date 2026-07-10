@@ -32,6 +32,21 @@ pub const MouseScrollMultiplier = struct {
     discrete: f64 = 3,
 };
 
+pub const Theme = struct {
+    light: [:0]const u8,
+    dark: [:0]const u8,
+};
+
+const ThemeOverrides = struct {
+    background: ?vt.color.RGB = null,
+    foreground: ?vt.color.RGB = null,
+    cursor_color: ?vt.color.RGB = null,
+    cursor_text: ?vt.color.RGB = null,
+    selection_background: ?vt.color.RGB = null,
+    selection_foreground: ?vt.color.RGB = null,
+    palette: [256]?vt.color.RGB = @splat(null),
+};
+
 pub const ThemeColors = struct {
     background: vt.color.RGB,
     foreground: vt.color.RGB,
@@ -125,9 +140,13 @@ scrollback_limit: usize = 50_000_000,
 image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
 
+theme: ?Theme = null,
+light_theme_overrides: ?ThemeOverrides = null,
+dark_theme_overrides: ?ThemeOverrides = null,
 background: ?vt.color.RGB = null,
 foreground: ?vt.color.RGB = null,
 cursor_color: ?vt.color.RGB = null,
+cursor_text: ?vt.color.RGB = null,
 selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
@@ -184,6 +203,27 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Config {
     return config;
 }
 
+/// Resolve configured theme names after the config file and command-line
+/// overrides have both been applied. User themes take priority over the
+/// installed iTerm2 theme collection.
+pub fn resolveThemes(
+    self: *Config,
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+) error{OutOfMemory}!void {
+    self.light_theme_overrides = null;
+    self.dark_theme_overrides = null;
+    const theme = self.theme orelse return;
+
+    self.light_theme_overrides = try loadThemeOverrides(io, arena, environ, theme.light);
+    if (std.mem.eql(u8, theme.light, theme.dark)) {
+        self.dark_theme_overrides = self.light_theme_overrides;
+    } else {
+        self.dark_theme_overrides = try loadThemeOverrides(io, arena, environ, theme.dark);
+    }
+}
+
 pub const SetError = error{ InvalidValue, UnknownKey, OutOfMemory };
 
 pub fn applyOverride(self: *Config, arena: std.mem.Allocator, text: []const u8) SetError!void {
@@ -222,12 +262,16 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.image_storage_limit = limit;
     } else if (std.mem.eql(u8, key, "mouse-scroll-multiplier")) {
         self.mouse_scroll_multiplier = try parseMouseScrollMultiplier(self.mouse_scroll_multiplier, value);
+    } else if (std.mem.eql(u8, key, "theme")) {
+        self.theme = try parseTheme(arena, value);
     } else if (std.mem.eql(u8, key, "background")) {
         self.background = try parseColor(value);
     } else if (std.mem.eql(u8, key, "foreground")) {
         self.foreground = try parseColor(value);
     } else if (std.mem.eql(u8, key, "cursor-color")) {
         self.cursor_color = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "cursor-text")) {
+        self.cursor_text = try parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-background")) {
         self.selection_background = try parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-foreground")) {
@@ -238,6 +282,41 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else {
         warn("unknown key '{s}', ignoring", .{key});
     }
+}
+
+fn parseTheme(arena: std.mem.Allocator, value: []const u8) SetError!Theme {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (trimmed.len == 0) return error.InvalidValue;
+
+    if (std.mem.indexOfAny(u8, trimmed, ",:=") == null) {
+        const name = try arena.dupeZ(u8, trimmed);
+        return .{ .light = name, .dark = name };
+    }
+
+    var light: ?[:0]const u8 = null;
+    var dark: ?[:0]const u8 = null;
+    var entries = std.mem.splitScalar(u8, trimmed, ',');
+    while (entries.next()) |raw_entry| {
+        const entry = std.mem.trim(u8, raw_entry, " \t");
+        const colon = std.mem.indexOfScalar(u8, entry, ':') orelse return error.InvalidValue;
+        if (std.mem.indexOfScalarPos(u8, entry, colon + 1, ':') != null) return error.InvalidValue;
+        const kind = std.mem.trim(u8, entry[0..colon], " \t");
+        const name = std.mem.trim(u8, entry[colon + 1 ..], " \t");
+        if (name.len == 0) return error.InvalidValue;
+        if (std.mem.eql(u8, kind, "light")) {
+            if (light != null) return error.InvalidValue;
+            light = try arena.dupeZ(u8, name);
+        } else if (std.mem.eql(u8, kind, "dark")) {
+            if (dark != null) return error.InvalidValue;
+            dark = try arena.dupeZ(u8, name);
+        } else {
+            return error.InvalidValue;
+        }
+    }
+    return .{
+        .light = light orelse return error.InvalidValue,
+        .dark = dark orelse return error.InvalidValue,
+    };
 }
 
 fn parseCommand(arena: std.mem.Allocator, value: []const u8) SetError!Command {
@@ -339,6 +418,101 @@ fn parseColor(value: []const u8) error{InvalidValue}!vt.color.RGB {
     };
 }
 
+fn loadThemeOverrides(
+    io: std.Io,
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    name: []const u8,
+) error{OutOfMemory}!?ThemeOverrides {
+    if (std.fs.path.isAbsolute(name)) {
+        const path = try arena.dupeZ(u8, name);
+        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
+        warn("theme '{s}' could not be read", .{name});
+        return null;
+    }
+    if (!std.mem.eql(u8, name, std.fs.path.basename(name))) {
+        warn("theme '{s}' cannot contain path separators", .{name});
+        return null;
+    }
+
+    if (environ.getPosix("XDG_CONFIG_HOME")) |base| {
+        const path = try std.fs.path.joinZ(arena, &.{ base, "monstar", "themes", name });
+        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
+    } else if (environ.getPosix("HOME")) |home| {
+        const path = try std.fs.path.joinZ(arena, &.{ home, ".config", "monstar", "themes", name });
+        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
+    }
+
+    if (environ.getPosix("MONSTAR_RESOURCES_DIR")) |resources| {
+        const path = try std.fs.path.joinZ(arena, &.{ resources, "themes", name });
+        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
+    }
+
+    var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.process.executableDirPath(io, &exe_dir_buf)) |len| {
+        const path = try std.fs.path.joinZ(arena, &.{
+            exe_dir_buf[0..len], "..", "share", "monstar", "themes", name,
+        });
+        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
+    } else |_| {}
+
+    warn("theme '{s}' not found", .{name});
+    return null;
+}
+
+fn parseThemeOverrides(text: []const u8) ThemeOverrides {
+    var result: ThemeOverrides = .{};
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |raw_line| {
+        line_no += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+
+        if (std.mem.eql(u8, key, "background")) {
+            result.background = parseColor(value) catch {
+                warn("theme line {d}: invalid background", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "foreground")) {
+            result.foreground = parseColor(value) catch {
+                warn("theme line {d}: invalid foreground", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "cursor-color")) {
+            result.cursor_color = parseColor(value) catch {
+                warn("theme line {d}: invalid cursor-color", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "cursor-text")) {
+            result.cursor_text = parseColor(value) catch {
+                warn("theme line {d}: invalid cursor-text", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "selection-background")) {
+            result.selection_background = parseColor(value) catch {
+                warn("theme line {d}: invalid selection-background", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "selection-foreground")) {
+            result.selection_foreground = parseColor(value) catch {
+                warn("theme line {d}: invalid selection-foreground", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "palette")) {
+            const entry = parsePaletteEntry(value) catch {
+                warn("theme line {d}: invalid palette", .{line_no});
+                continue;
+            };
+            result.palette[entry.index] = entry.color;
+        }
+    }
+    return result;
+}
+
 /// Convert a point size to physical pixels using the conventional Linux
 /// baseline of 96 DPI, then apply the Wayland output scale.
 pub fn fontSizePixels(points: f32, scale120: u32) u31 {
@@ -359,12 +533,36 @@ pub fn colorsForScheme(color_scheme: vt.device_status.ColorScheme) ThemeColors {
     };
 }
 
+fn namedThemeOverrides(self: *const Config, color_scheme: vt.device_status.ColorScheme) ?*const ThemeOverrides {
+    return switch (color_scheme) {
+        .light => if (self.light_theme_overrides) |*theme| theme else null,
+        .dark => if (self.dark_theme_overrides) |*theme| theme else null,
+    };
+}
+
+fn effectiveColor(
+    self: *const Config,
+    color_scheme: vt.device_status.ColorScheme,
+    comptime field: []const u8,
+) vt.color.RGB {
+    const named = if (self.namedThemeOverrides(color_scheme)) |theme|
+        @field(theme, field)
+    else
+        null;
+    return @field(self, field) orelse named orelse @field(colorsForScheme(color_scheme), field);
+}
+
 pub fn effectiveSelectionBackground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
-    return self.selection_background orelse colorsForScheme(color_scheme).selection_background;
+    return self.effectiveColor(color_scheme, "selection_background");
 }
 
 pub fn effectiveSelectionForeground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
-    return self.selection_foreground orelse colorsForScheme(color_scheme).selection_foreground;
+    return self.effectiveColor(color_scheme, "selection_foreground");
+}
+
+pub fn effectiveCursorText(self: *const Config, color_scheme: vt.device_status.ColorScheme) ?vt.color.RGB {
+    const named = if (self.namedThemeOverrides(color_scheme)) |theme| theme.cursor_text else null;
+    return self.cursor_text orelse named;
 }
 
 /// The terminal color options this config describes: config colors form
@@ -375,13 +573,18 @@ pub fn terminalColors(self: *const Config, color_scheme: vt.device_status.ColorS
     for (themed.palette, 0..) |rgb, i| {
         palette[i] = rgb;
     }
+    if (self.namedThemeOverrides(color_scheme)) |theme| {
+        for (theme.palette, 0..) |entry, i| {
+            if (entry) |rgb| palette[i] = rgb;
+        }
+    }
     for (self.palette, 0..) |entry, i| {
         if (entry) |rgb| palette[i] = rgb;
     }
     return .{
-        .background = .init(self.background orelse themed.background),
-        .foreground = .init(self.foreground orelse themed.foreground),
-        .cursor = .init(self.cursor_color orelse themed.cursor_color),
+        .background = .init(self.effectiveColor(color_scheme, "background")),
+        .foreground = .init(self.effectiveColor(color_scheme, "foreground")),
+        .cursor = .init(self.effectiveColor(color_scheme, "cursor_color")),
         .palette = .init(palette),
     };
 }
@@ -418,8 +621,10 @@ test "defaults" {
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
+    try std.testing.expectEqual(@as(?Theme, null), config.theme);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.cursor_text);
     try std.testing.expectEqual(default_selection_background, config.effectiveSelectionBackground(.dark));
     try std.testing.expectEqual(default_selection_foreground, config.effectiveSelectionForeground(.dark));
 }
@@ -444,6 +649,7 @@ test "parse config" {
         \\mouse-scroll-multiplier = precision:1.5,discrete:5
         \\background = #1a1b26
         \\foreground = c0caf5
+        \\cursor-text = #010203
         \\palette = 1=#f7768e
         \\palette = 200=#123456
         \\
@@ -466,6 +672,7 @@ test "parse config" {
     try std.testing.expectEqual(@as(f64, 5), config.mouse_scroll_multiplier.discrete);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.cursor_text.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, config.palette[200].?);
@@ -481,6 +688,23 @@ test "direct command parsing" {
     try std.testing.expectEqual(@as(usize, 2), command.len);
     try std.testing.expectEqualStrings("fish", command[0]);
     try std.testing.expectEqualStrings("--no-config", command[1]);
+}
+
+test "theme accepts a shared name or light and dark names" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var config: Config = .{};
+    try config.set(arena, "theme", "TokyoNight");
+    try std.testing.expectEqualStrings("TokyoNight", config.theme.?.light);
+    try std.testing.expectEqualStrings("TokyoNight", config.theme.?.dark);
+
+    try config.set(arena, "theme", " dark:Rose Pine , light:Rose Pine Dawn ");
+    try std.testing.expectEqualStrings("Rose Pine Dawn", config.theme.?.light);
+    try std.testing.expectEqualStrings("Rose Pine", config.theme.?.dark);
+    try std.testing.expectError(error.InvalidValue, config.set(arena, "theme", "light:Rose Pine Dawn"));
+    try std.testing.expectError(error.InvalidValue, config.set(arena, "theme", "light:One,dark:Two,dark:Three"));
 }
 
 test "mouse scroll multiplier forms and clamps" {
@@ -565,4 +789,68 @@ test "built-in colors do not replace explicit color overrides" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, colors.palette.current[1]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveSelectionBackground(.dark));
     try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.dark));
+}
+
+test "named themes follow color scheme and remain below explicit colors" {
+    var config: Config = .{};
+    config.light_theme_overrides = parseThemeOverrides(
+        \\background = #eeeeee
+        \\foreground = #111111
+        \\cursor-color = #222222
+        \\cursor-text = #fedcba
+        \\selection-background = #dddddd
+        \\selection-foreground = #333333
+        \\palette = 1=#440000
+        \\palette = 200=#abcdef
+    );
+    config.dark_theme_overrides = parseThemeOverrides(
+        \\background = #101010
+        \\foreground = #f0f0f0
+        \\selection-background = #303030
+        \\selection-foreground = #e0e0e0
+        \\palette = 1=#ff0000
+    );
+    config.background = .{ .r = 1, .g = 2, .b = 3 };
+    config.palette[1] = .{ .r = 4, .g = 5, .b = 6 };
+
+    const light = config.terminalColors(.light);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, light.background.get().?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x11, .g = 0x11, .b = 0x11 }, light.foreground.get().?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x22, .g = 0x22, .b = 0x22 }, light.cursor.get().?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, light.palette.current[1]);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xab, .g = 0xcd, .b = 0xef }, light.palette.current[200]);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xdd, .g = 0xdd, .b = 0xdd }, config.effectiveSelectionBackground(.light));
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xfe, .g = 0xdc, .b = 0xba }, config.effectiveCursorText(.light).?);
+
+    config.cursor_text = .{ .r = 7, .g = 8, .b = 9 };
+    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveCursorText(.light).?);
+
+    const dark = config.terminalColors(.dark);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, dark.foreground.get().?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, dark.palette.current[1]);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xe0, .g = 0xe0, .b = 0xe0 }, config.effectiveSelectionForeground(.dark));
+}
+
+test "absolute theme file resolves" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "custom-theme", .{});
+    try file.writeStreamingAll(std.testing.io,
+        \\background = #123456
+        \\palette = 15=#abcdef
+    );
+    file.close(std.testing.io);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(std.testing.io, "custom-theme", &path_buf);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = try arena.dupeZ(u8, path_buf[0..path_len]);
+
+    var config: Config = .{ .theme = .{ .light = path, .dark = path } };
+    try config.resolveThemes(std.testing.io, arena, .empty);
+    const colors = config.terminalColors(.dark);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, colors.background.get().?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xab, .g = 0xcd, .b = 0xef }, colors.palette.current[15]);
 }

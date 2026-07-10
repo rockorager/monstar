@@ -151,6 +151,10 @@ layout: TerminalLayout,
 /// into the raster worker's renderer on (re)configure.
 selection_bg: vt.color.RGB,
 selection_fg: ?vt.color.RGB,
+selection_bg_override: ?vt.color.RGB,
+selection_fg_override: ?vt.color.RGB,
+/// Configured text color beneath a focused block cursor.
+cursor_text: ?vt.color.RGB,
 window: *Window,
 keyboard: Keyboard,
 /// Terminal contents changed since the last committed frame.
@@ -654,6 +658,9 @@ pub fn init(
         .layout = startup_layout,
         .selection_bg = config.effectiveSelectionBackground(.dark),
         .selection_fg = config.effectiveSelectionForeground(.dark),
+        .selection_bg_override = null,
+        .selection_fg_override = null,
+        .cursor_text = config.effectiveCursorText(.dark),
         .window = window,
         .keyboard = try .init(),
         .needs_redraw = true,
@@ -1564,6 +1571,10 @@ fn reloadConfig(self: *App) void {
             return;
         };
     }
+    new_config.resolveThemes(self.io, arena, self.environ) catch |err| {
+        log.warn("theme reload failed: {}", .{err});
+        return;
+    };
     self.applyConfig(new_config) catch |err| {
         log.warn("config reload failed: {}", .{err});
         return;
@@ -2114,8 +2125,29 @@ fn applyColorDefaultsForConfig(self: *App, config: Config) void {
     self.term.colors.cursor.default = colors.cursor.default;
     self.term.colors.palette.changeDefault(colors.palette.original);
 
-    self.selection_bg = config.effectiveSelectionBackground(self.color_scheme);
-    self.selection_fg = config.effectiveSelectionForeground(self.color_scheme);
+    self.selection_bg = colorWithRuntimeOverride(
+        config.effectiveSelectionBackground(self.color_scheme),
+        self.selection_bg_override,
+    );
+    self.selection_fg = colorWithRuntimeOverride(
+        config.effectiveSelectionForeground(self.color_scheme),
+        self.selection_fg_override,
+    );
+    self.cursor_text = config.effectiveCursorText(self.color_scheme);
+}
+
+fn colorWithRuntimeOverride(default: vt.color.RGB, runtime: ?vt.color.RGB) vt.color.RGB {
+    return runtime orelse default;
+}
+
+test "runtime color override survives default changes until reset" {
+    const first_default: vt.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const next_default: vt.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+    const runtime: vt.color.RGB = .{ .r = 7, .g = 8, .b = 9 };
+
+    try std.testing.expectEqual(runtime, colorWithRuntimeOverride(first_default, runtime));
+    try std.testing.expectEqual(runtime, colorWithRuntimeOverride(next_default, runtime));
+    try std.testing.expectEqual(next_default, colorWithRuntimeOverride(next_default, null));
 }
 
 fn effectiveFontSize(self: *const App) f32 {
@@ -2197,8 +2229,14 @@ fn handleOscColorOperation(
 fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
     switch (set.target) {
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.selection_bg = set.color,
-            .highlight_foreground => self.selection_fg = set.color,
+            .highlight_background => {
+                self.selection_bg_override = set.color;
+                self.selection_bg = set.color;
+            },
+            .highlight_foreground => {
+                self.selection_fg_override = set.color;
+                self.selection_fg = set.color;
+            },
             else => return,
         },
         else => return,
@@ -2211,8 +2249,14 @@ fn setOscColor(self: *App, set: vt.osc.color.ColoredTarget) void {
 fn resetOscColor(self: *App, target: vt.osc.color.Target) void {
     switch (target) {
         .dynamic => |dynamic| switch (dynamic) {
-            .highlight_background => self.selection_bg = self.config.effectiveSelectionBackground(self.color_scheme),
-            .highlight_foreground => self.selection_fg = self.config.effectiveSelectionForeground(self.color_scheme),
+            .highlight_background => {
+                self.selection_bg_override = null;
+                self.selection_bg = self.config.effectiveSelectionBackground(self.color_scheme);
+            },
+            .highlight_foreground => {
+                self.selection_fg_override = null;
+                self.selection_fg = self.config.effectiveSelectionForeground(self.color_scheme);
+            },
             else => return,
         },
         else => return,
@@ -4071,11 +4115,13 @@ fn startAsyncRender(self: *App) !bool {
         self.font.discovery(),
         self.selection_bg,
         self.selection_fg,
+        self.cursor_text,
     )) {
         async_raster.reconfigure(
             self.font.discovery(),
             self.selection_bg,
             self.selection_fg,
+            self.cursor_text,
         ) catch |err| {
             self.rasterFatal(err);
             return false;
@@ -4184,20 +4230,9 @@ fn pinKittyJob(self: *App, items: []Renderer.KittyRenderItem) !void {
     errdefer self.alloc.free(items);
     var acquired: usize = 0;
     errdefer for (items[0..acquired]) |item|
-        self.kitty_cache.release(
-            item.image.id,
-            item.image.generation,
-            if (item.native_bgra != null) .native_bgra else .source,
-        );
+        self.kitty_cache.release(item.image.id, item.image.generation);
     for (items) |*item| {
-        if (item.image.format == .rgb and
-            item.viewport.pixel_width == item.viewport.source_width and
-            item.viewport.pixel_height == item.viewport.source_height)
-        {
-            item.native_bgra = try self.kitty_cache.acquireNativeBgra(self.alloc, item.image);
-        } else {
-            item.image.data = try self.kitty_cache.acquire(self.alloc, item.image);
-        }
+        item.image.data = try self.kitty_cache.acquire(self.alloc, item.image);
         acquired += 1;
     }
     self.async_job_kitty = items;
@@ -4213,11 +4248,7 @@ fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 /// already taken.
 fn releaseKittyJob(self: *App) void {
     for (self.async_job_kitty) |item| {
-        self.kitty_cache.release(
-            item.image.id,
-            item.image.generation,
-            if (item.native_bgra != null) .native_bgra else .source,
-        );
+        self.kitty_cache.release(item.image.id, item.image.generation);
     }
     self.alloc.free(self.async_job_kitty);
     self.async_job_kitty = &.{};
@@ -4301,6 +4332,7 @@ fn startAsyncRasterLoad(self: *App) void {
         self.font.discovery(),
         self.selection_bg,
         self.selection_fg,
+        self.cursor_text,
         &self.render_state,
     ) catch |err| {
         self.rasterFatal(err);
@@ -4329,6 +4361,7 @@ fn finishAsyncRasterLoad(self: *App) void {
                 self.font.discovery(),
                 self.selection_bg,
                 self.selection_fg,
+                self.cursor_text,
             )) {
                 // Config changed while loading; rebuild with the new one.
                 raster.deinit();

@@ -61,6 +61,7 @@ pub const Loader = struct {
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
+    cursor_text: ?vt.color.RGB,
     state: *vt.RenderState,
     thread: ?std.Thread = null,
     mutex: std.atomic.Mutex = .unlocked,
@@ -71,6 +72,7 @@ pub const Loader = struct {
         discovery: *Font.Discovery,
         selection_background: vt.color.RGB,
         selection_foreground: ?vt.color.RGB,
+        cursor_text: ?vt.color.RGB,
         state: *vt.RenderState,
     ) !Loader {
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -80,6 +82,7 @@ pub const Loader = struct {
             .discovery = discovery,
             .selection_background = selection_background,
             .selection_foreground = selection_foreground,
+            .cursor_text = cursor_text,
             .state = state,
             .complete_fd = @intCast(rc),
         };
@@ -120,6 +123,7 @@ pub const Loader = struct {
             self.discovery,
             self.selection_background,
             self.selection_foreground,
+            self.cursor_text,
             self.state,
         )) |raster|
             .{ .ready = raster }
@@ -157,6 +161,7 @@ pub fn init(
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
+    cursor_text: ?vt.color.RGB,
     state: *vt.RenderState,
 ) !AsyncRaster {
     const alloc = std.heap.smp_allocator;
@@ -165,6 +170,7 @@ pub fn init(
     var renderer: Renderer = try .init(alloc, &font, .{
         .selection_background = selection_background,
         .selection_foreground = selection_foreground,
+        .cursor_text = cursor_text,
     });
     errdefer renderer.deinit();
     const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -208,13 +214,23 @@ pub fn deinit(self: *AsyncRaster) void {
     self.* = undefined;
 }
 
-pub fn reconfigure(self: *AsyncRaster, discovery: *Font.Discovery, selection_background: vt.color.RGB, selection_foreground: ?vt.color.RGB) !void {
+pub fn reconfigure(
+    self: *AsyncRaster,
+    discovery: *Font.Discovery,
+    selection_background: vt.color.RGB,
+    selection_foreground: ?vt.color.RGB,
+    cursor_text: ?vt.color.RGB,
+) !void {
     self.lock();
     defer self.mutex.unlock();
     if (self.has_job or self.working or self.result != null) return error.Busy;
     var font: Font = try .initWithDiscovery(self.alloc, discovery);
     errdefer font.deinit(self.alloc);
-    var renderer: Renderer = try .init(self.alloc, &font, .{ .selection_background = selection_background, .selection_foreground = selection_foreground });
+    var renderer: Renderer = try .init(self.alloc, &font, .{
+        .selection_background = selection_background,
+        .selection_foreground = selection_foreground,
+        .cursor_text = cursor_text,
+    });
     errdefer renderer.deinit();
     self.renderer.deinit();
     self.font.deinit(self.alloc);
@@ -234,12 +250,14 @@ pub fn configuredFor(
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
+    cursor_text: ?vt.color.RGB,
 ) bool {
     self.lock();
     defer self.mutex.unlock();
     return self.font.discovery() == discovery and
         self.renderer.selection_bg.eql(selection_background) and
-        optionalRgbEql(self.renderer.selection_fg, selection_foreground);
+        optionalRgbEql(self.renderer.selection_fg, selection_foreground) and
+        optionalRgbEql(self.renderer.cursor_text, cursor_text);
 }
 
 pub fn submit(self: *AsyncRaster, job: Job) !void {

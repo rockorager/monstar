@@ -19,7 +19,8 @@ extern fn memcpy(noalias dest: ?*anyopaque, noalias src: ?*const anyopaque, n: u
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
     const arena = init.arena.allocator();
-    const config = Config.load(arena, init.minimal.environ);
+    var config = Config.load(arena, init.minimal.environ);
+    try config.resolveThemes(init.io, arena, init.minimal.environ);
 
     const font_size_px = Config.fontSizePixels(config.font_size, 120);
     var font: Font = try .init(alloc, config.font_family, font_size_px);

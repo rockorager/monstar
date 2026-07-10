@@ -26,6 +26,9 @@ hb_buf: *c.hb_buffer_t,
 /// Selection colors; a null foreground uses the default foreground.
 selection_bg: vt.color.RGB,
 selection_fg: ?vt.color.RGB,
+/// Explicit text color under a focused block cursor. Null preserves the
+/// terminal background fallback.
+cursor_text: ?vt.color.RGB,
 /// Keyboard focus: unfocused windows draw the cursor as a hollow
 /// rectangle regardless of the requested style. Set by the caller.
 focused: bool = true,
@@ -82,6 +85,7 @@ const ShapedGlyph = struct {
 pub const InitOptions = struct {
     selection_background: ?vt.color.RGB = null,
     selection_foreground: ?vt.color.RGB = null,
+    cursor_text: ?vt.color.RGB = null,
 };
 
 pub const ShapeStats = struct {
@@ -100,6 +104,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .hb_buf = hb_buf,
         .selection_bg = opts.selection_background orelse Config.default_selection_background,
         .selection_fg = opts.selection_foreground,
+        .cursor_text = opts.cursor_text,
         .fg_scratch = .empty,
         .face_scratch = .empty,
         .reverse_scratch = .empty,
@@ -1127,7 +1132,7 @@ fn prepareRow(
             state.cursor.visual_style == .block and self.focused)
         {
             bg = colors.cursor orelse colors.foreground;
-            fg = colors.background;
+            fg = self.cursor_text orelse colors.background;
             reverse_color_glyph = false;
         }
         self.fg_scratch.items[x] = fg;

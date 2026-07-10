@@ -87,9 +87,21 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
     b.installFile("dist/dev.rockorager.monstar.desktop", "share/applications/dev.rockorager.monstar.desktop");
+    if (b.lazyDependency("iterm2_themes", .{})) |themes| {
+        b.installDirectory(.{
+            .source_dir = themes.path(""),
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = "monstar/themes",
+            .exclude_extensions = &.{".md"},
+        });
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.setEnvironmentVariable(
+        "MONSTAR_RESOURCES_DIR",
+        b.getInstallPath(.prefix, "share/monstar"),
+    );
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }

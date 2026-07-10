@@ -255,6 +255,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
     for (cli.config_overrides) |override| {
         config.applyOverride(arena, override) catch return error.InvalidCli;
     }
+    try config.resolveThemes(init.io, arena, init.minimal.environ);
     if (cli.working_directory) |cwd| try validateWorkingDirectory(cwd);
 
     const command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command);

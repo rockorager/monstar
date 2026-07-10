@@ -16,6 +16,11 @@
             .url = "git+https://github.com/vancluever/z2d#3edb5d1bba7192352c17592a218eca8b646679dc",
             .hash = "z2d-0.12.0-j5P_HsE8EQAuRulQMsEkrCevU85rTFl4JIOz7uJdCYA-",
         },
+        .iterm2_themes = .{
+            .url = "https://deps.files.ghostty.org/ghostty-themes-release-20260629-161812-8c97c3c.tgz",
+            .hash = "N-V-__8AAAYpBACKY0n8sQbPfzY47xFRRtjXiF766UVF5ZyD",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
