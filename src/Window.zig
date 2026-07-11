@@ -92,6 +92,7 @@ rendering_pending: bool,
 /// renderer how stale a reused buffer is.
 frame_counter: u64,
 suspended: bool,
+resizing: bool,
 render_ctx: ?*anyopaque,
 resize_fn: ?ResizeFn,
 keyboard_fn: ?KeyboardFn,
@@ -389,6 +390,7 @@ pub fn create(
         .rendering_pending = false,
         .frame_counter = 0,
         .suspended = false,
+        .resizing = false,
         .render_ctx = null,
         .resize_fn = null,
         .keyboard_fn = null,
@@ -1175,8 +1177,25 @@ fn geometryChanged(self: *Window, resized: bool) void {
                 return;
             };
         }
+        self.commitResizedViewport();
     }
     self.scheduleDraw();
+}
+
+/// Apply an acked configure immediately by scaling the attached buffer to the
+/// new logical size. The full-resolution replacement can then rasterize in the
+/// background without making an interactive compositor wait for its commit.
+fn commitResizedViewport(self: *Window) void {
+    const viewport = self.viewport orelse return;
+    if (!self.resizing or self.frame_counter == 0 or self.suspended) return;
+    std.debug.assert(self.width > 0 and self.height > 0);
+
+    viewport.setDestination(self.width, self.height);
+    if (self.surface.getVersion() >= wl.Surface.damage_buffer_since_version)
+        self.surface.damageBuffer(0, 0, std.math.maxInt(i32), std.math.maxInt(i32))
+    else
+        self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
+    self.surface.commit();
 }
 
 fn scheduleDraw(self: *Window) void {
@@ -1201,6 +1220,7 @@ fn toplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, self: *Window) 
             if (configure.width > 0) self.pending_width = @intCast(configure.width);
             if (configure.height > 0) self.pending_height = @intCast(configure.height);
             self.suspended = toplevelState(configure.states, .suspended);
+            self.resizing = toplevelState(configure.states, .resizing);
         },
         .close => self.running = false,
         .configure_bounds, .wm_capabilities => {},
