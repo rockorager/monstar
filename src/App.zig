@@ -1317,24 +1317,23 @@ fn openFilePortal(connection: *c.DBusConnection, path: [:0]const u8, activation_
 /// that is absent and a request whose outcome is ambiguous. Falling back after
 /// a timeout could open the URI twice if the portal handles the request late.
 fn sendPortalCall(connection: *c.DBusConnection, message: *c.DBusMessage) !void {
-    var dbus_error: c.DBusError = undefined;
-    c.dbus_error_init(&dbus_error);
-    defer c.dbus_error_free(&dbus_error);
+    var call: ?*c.DBusPendingCall = null;
+    if (c.dbus_connection_send_with_reply(connection, message, &call, 1000) == 0)
+        return error.OutOfMemory;
+    const pending = call orelse return error.DBusUnavailable;
+    defer c.dbus_pending_call_unref(pending);
 
-    const reply = c.dbus_connection_send_with_reply_and_block(
-        connection,
-        message,
-        1000,
-        &dbus_error,
-    ) orelse {
-        if (dbus_error.name != null and
-            isPortalUnavailableErrorName(std.mem.span(dbus_error.name)))
-        {
-            return error.PortalUnavailable;
-        }
+    c.dbus_pending_call_block(pending);
+    const reply = c.dbus_pending_call_steal_reply(pending) orelse
         return error.DBusUnavailable;
-    };
-    c.dbus_message_unref(reply);
+    defer c.dbus_message_unref(reply);
+
+    if (c.dbus_message_get_type(reply) != c.DBUS_MESSAGE_TYPE_ERROR) return;
+    const name = c.dbus_message_get_error_name(reply);
+    if (name != null and isPortalUnavailableErrorName(std.mem.span(name))) {
+        return error.PortalUnavailable;
+    }
+    return error.DBusUnavailable;
 }
 
 fn isPortalUnavailableErrorName(name: []const u8) bool {
