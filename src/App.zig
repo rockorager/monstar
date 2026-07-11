@@ -198,6 +198,12 @@ repeat_keycode: ?u32,
 /// From wl_keyboard.repeat_info: characters per second and delay in ms.
 repeat_rate: i32,
 repeat_delay: i32,
+/// Kinetic touchpad scrolling after a finger-axis sequence stops.
+fling_fd: posix.fd_t,
+fling_active: bool,
+fling_velocity: f64,
+scroll_velocity: f64,
+last_scroll_time_ms: ?u32,
 /// Safety timer for DEC mode 2026 synchronized output.
 sync_output_fd: posix.fd_t,
 /// Timer for ghostty-vt selection autoscroll while dragging past an edge.
@@ -209,11 +215,16 @@ pointer_x: f64,
 pointer_y: f64,
 /// Wheel state accumulated between pointer frame events.
 scroll_pixels: f64,
+scroll_frame_pixels: f64,
 scroll_clicks: i32,
 scroll_value120: i32,
 scroll_line_remainder: f64,
+scroll_source: wl.Pointer.AxisSource,
+scroll_time_ms: u32,
+scroll_had_pixels: bool,
 scroll_had_discrete: bool,
 scroll_had_value120: bool,
+scroll_stopped: bool,
 /// True while the left button is down for terminal-side selection.
 selecting: bool,
 /// True when the active drag should produce a rectangular selection.
@@ -295,7 +306,14 @@ const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
 /// Preserve Monstar's Wayland precision-scroll normalization before applying
 /// the user-facing Ghostty-compatible multiplier.
-const wayland_precision_scroll_scale = 10.0;
+const wayland_precision_scroll_scale = 3.0;
+/// Kinetic scroll tuning, matching Keywork's touchpad fling behavior.
+const fling_decay_per_ms = 0.998;
+const fling_interval_ms = 8;
+const fling_start_velocity = 150.0;
+const fling_min_velocity = 30.0;
+const fling_max_velocity = 8000.0;
+const velocity_smoothing = 0.75;
 
 /// Damage history length; shm buffers older than this get a full copy.
 const frame_damage_len = 8;
@@ -711,6 +729,11 @@ pub fn init(
     const repeat_fd: posix.fd_t = @intCast(repeat_rc);
     errdefer _ = std.os.linux.close(repeat_fd);
 
+    const fling_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (std.os.linux.errno(fling_rc) != .SUCCESS) return error.TimerFdFailed;
+    const fling_fd: posix.fd_t = @intCast(fling_rc);
+    errdefer _ = std.os.linux.close(fling_fd);
+
     const sync_output_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
     if (std.os.linux.errno(sync_output_rc) != .SUCCESS) return error.TimerFdFailed;
     const sync_output_fd: posix.fd_t = @intCast(sync_output_rc);
@@ -808,17 +831,27 @@ pub fn init(
         .repeat_keycode = null,
         .repeat_rate = 25,
         .repeat_delay = 600,
+        .fling_fd = fling_fd,
+        .fling_active = false,
+        .fling_velocity = 0,
+        .scroll_velocity = 0,
+        .last_scroll_time_ms = null,
         .sync_output_fd = sync_output_fd,
         .selection_autoscroll_fd = selection_autoscroll_fd,
         .taskbar_progress_fd = taskbar_progress_fd,
         .pointer_x = 0,
         .pointer_y = 0,
         .scroll_pixels = 0,
+        .scroll_frame_pixels = 0,
         .scroll_clicks = 0,
         .scroll_value120 = 0,
         .scroll_line_remainder = 0,
+        .scroll_source = .wheel,
+        .scroll_time_ms = 0,
+        .scroll_had_pixels = false,
         .scroll_had_discrete = false,
         .scroll_had_value120 = false,
+        .scroll_stopped = false,
         .selecting = false,
         .selection_rectangle = false,
         .selection_gesture = .init,
@@ -1477,6 +1510,7 @@ pub fn deinit(self: *App) void {
     _ = std.os.linux.close(self.taskbar_progress_fd);
     _ = std.os.linux.close(self.selection_autoscroll_fd);
     _ = std.os.linux.close(self.sync_output_fd);
+    _ = std.os.linux.close(self.fling_fd);
     _ = std.os.linux.close(self.repeat_fd);
     _ = std.os.linux.close(self.signal_fd);
     self.keyboard.deinit();
@@ -1516,6 +1550,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.taskbar_progress_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.fling_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1528,6 +1563,7 @@ pub fn run(self: *App) !void {
     const taskbar_progress_fd = &fds[8];
     const dbus_fd = &fds[9];
     const async_fd = &fds[10];
+    const fling_fd = &fds[11];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
@@ -1604,6 +1640,10 @@ pub fn run(self: *App) !void {
 
         if (selection_autoscroll_fd.revents & posix.POLL.IN != 0) {
             self.fireSelectionAutoscroll();
+        }
+
+        if (fling_fd.revents & posix.POLL.IN != 0) {
+            self.fireFling();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -3020,17 +3060,24 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             }
         },
         .axis => |axis| {
+            self.stopFling();
             if (axis.axis == .vertical_scroll and !self.scroll_had_discrete and !self.scroll_had_value120) {
-                self.scroll_pixels += axis.value.toDouble();
+                const pixels = axis.value.toDouble();
+                self.scroll_pixels += pixels;
+                self.scroll_frame_pixels += pixels;
+                self.scroll_time_ms = axis.time;
+                self.scroll_had_pixels = true;
             }
         },
         .axis_discrete => |discrete| {
+            self.stopFling();
             if (discrete.axis == .vertical_scroll) {
                 self.scroll_clicks += discrete.discrete;
                 self.scroll_had_discrete = true;
             }
         },
         .axis_value120 => |axis| {
+            self.stopFling();
             if (axis.axis == .vertical_scroll) {
                 self.scroll_value120 += axis.value120;
                 self.scroll_had_value120 = true;
@@ -3039,6 +3086,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .frame => self.finishScrollFrame(),
         .button => |button| {
             self.last_serial = button.serial;
+            if (button.state == .pressed) self.stopFling();
             // Mouse reporting wins when the application asked for it,
             // except that shift bypasses it for terminal-side selection.
             const reporting = self.term.flags.mouse_event != .none and
@@ -3081,7 +3129,11 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                 self.beginPaste(.primary);
             }
         },
-        .leave, .axis_source, .axis_stop => {},
+        .axis_source => |source| self.scroll_source = source.axis_source,
+        .axis_stop => |stop| {
+            if (stop.axis == .vertical_scroll) self.scroll_stopped = true;
+        },
+        .leave => {},
     }
 }
 
@@ -3826,6 +3878,16 @@ fn formatDropPaste(self: *App, offer: *const ClipboardOffer, data: []const u8) !
 /// Convert accumulated wheel movement into scrolled lines: wheel clicks
 /// count fixed lines, smooth (touchpad) scroll counts cell heights.
 fn finishScrollFrame(self: *App) void {
+    if (self.scroll_had_pixels) {
+        if (self.scroll_source == .finger) {
+            self.trackScrollVelocity(self.scroll_frame_pixels, self.scroll_time_ms);
+        } else {
+            self.resetScrollVelocity();
+        }
+    } else if (self.scroll_had_discrete or self.scroll_had_value120) {
+        self.resetScrollVelocity();
+    }
+
     var lines: i32 = 0;
     if (self.scroll_had_value120) {
         const wheel_ticks = @as(f64, @floatFromInt(self.scroll_value120)) / 120.0;
@@ -3843,18 +3905,87 @@ fn finishScrollFrame(self: *App) void {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
             @as(f64, @floatFromInt(self.window.scale120));
-        const multiplier = wayland_precision_scroll_scale * self.config.mouse_scroll_multiplier.precision;
+        const multiplier = self.precisionScrollScale();
         const pixels = self.scroll_pixels * multiplier;
         const whole = @divTrunc(pixels, cell);
         lines = @intFromFloat(whole);
         self.scroll_pixels -= whole * cell / multiplier;
     }
     if (self.scroll_had_value120 or self.scroll_had_discrete) self.scroll_pixels = 0;
+    self.scroll_frame_pixels = 0;
     self.scroll_clicks = 0;
     self.scroll_value120 = 0;
+    self.scroll_source = .wheel;
+    self.scroll_had_pixels = false;
     self.scroll_had_discrete = false;
     self.scroll_had_value120 = false;
     if (lines != 0) self.scrollLines(lines);
+    if (self.scroll_stopped) {
+        self.scroll_stopped = false;
+        self.startFling();
+        self.resetScrollVelocity();
+    }
+}
+
+fn precisionScrollScale(self: *const App) f64 {
+    return wayland_precision_scroll_scale * self.config.mouse_scroll_multiplier.precision;
+}
+
+/// Fold one finger-scroll frame into an exponential moving average in
+/// effective content pixels per second.
+fn trackScrollVelocity(self: *App, pixels: f64, time_ms: u32) void {
+    defer self.last_scroll_time_ms = time_ms;
+    const last = self.last_scroll_time_ms orelse return;
+    const dt_ms: f64 = @floatFromInt(time_ms -% last);
+    if (dt_ms <= 0 or dt_ms > 200) return;
+    const velocity = pixels * self.precisionScrollScale() / dt_ms * 1000.0;
+    self.scroll_velocity = (1 - velocity_smoothing) * self.scroll_velocity + velocity_smoothing * velocity;
+}
+
+fn resetScrollVelocity(self: *App) void {
+    self.scroll_velocity = 0;
+    self.last_scroll_time_ms = null;
+}
+
+fn startFling(self: *App) void {
+    const velocity = std.math.clamp(self.scroll_velocity, -fling_max_velocity, fling_max_velocity);
+    if (@abs(velocity) < fling_start_velocity) return;
+
+    const interval = timespecFromNs(fling_interval_ms * std.time.ns_per_ms);
+    const spec: std.os.linux.itimerspec = .{ .it_value = interval, .it_interval = interval };
+    const rc = std.os.linux.timerfd_settime(self.fling_fd, .{}, &spec, null);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        log.err("fling timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
+        return;
+    }
+    self.fling_velocity = velocity;
+    self.fling_active = true;
+}
+
+fn stopFling(self: *App) void {
+    if (!self.fling_active) return;
+    self.fling_active = false;
+    const spec: std.os.linux.itimerspec = .{
+        .it_value = .{ .sec = 0, .nsec = 0 },
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    };
+    const rc = std.os.linux.timerfd_settime(self.fling_fd, .{}, &spec, null);
+    if (std.os.linux.errno(rc) != .SUCCESS) {
+        log.err("fling timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
+    }
+}
+
+fn fireFling(self: *App) void {
+    var expirations: u64 = 0;
+    const n = posix.read(self.fling_fd, std.mem.asBytes(&expirations)) catch return;
+    if (n != @sizeOf(u64) or expirations == 0 or !self.fling_active) return;
+
+    const dt_ms: f64 = @floatFromInt(fling_interval_ms * expirations);
+    self.scroll_pixels += self.fling_velocity * dt_ms / 1000.0 / self.precisionScrollScale();
+    self.finishScrollFrame();
+
+    self.fling_velocity *= std.math.pow(f64, fling_decay_per_ms, dt_ms);
+    if (@abs(self.fling_velocity) < fling_min_velocity) self.stopFling();
 }
 
 /// Route wheel scrolling (positive = towards newer content): mouse
@@ -4142,6 +4273,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     // and snaps a scrolled-back viewport to the bottom (ghostty's
     // selection-clear-on-typing behavior).
     if (wrote and action != .release and !event.key.modifier()) {
+        self.stopFling();
         self.clearSelection();
         if (self.term.screens.active.pages.viewport != .active) {
             self.term.screens.active.pages.scroll(.active);
