@@ -3171,7 +3171,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
 
             if (button.button == 272) { // BTN_LEFT
                 if (self.keyboard.currentMods().ctrl and self.hyperlinkAtPointer() != null) {
-                    if (button.state == .released) self.openHyperlinkAtPointer();
+                    if (button.state == .pressed) self.openHyperlinkAtPointer();
                     return;
                 }
                 switch (button.state) {
