@@ -4,7 +4,9 @@
 //! fonts, FreeType to rasterize glyphs, and exposes a HarfBuzz font per
 //! face for shaping. The primary face defines the cell metrics; fallback
 //! faces are loaded lazily (at the same pixel size) when the primary lacks
-//! a codepoint, walking the fontconfig sort order by charset coverage.
+//! a grapheme cluster, walking the fontconfig sort order and verifying
+//! that a candidate's cmap covers every non-ignorable codepoint in the
+//! cluster before accepting it.
 
 const Font = @This();
 
@@ -42,6 +44,9 @@ primary_ascii: [style_count]bool,
 sort_faces: std.AutoHashMapUnmanaged(SortFaceKey, u16),
 /// styled codepoint -> resolved faces index, including primary hits.
 codepoint_faces: std.AutoHashMapUnmanaged(CodepointFaceKey, u16),
+/// styled multi-codepoint cluster -> resolved faces index; keys own
+/// their codepoint slices.
+cluster_faces: std.HashMapUnmanaged(ClusterFaceKey, u16, ClusterFaceContext, std.hash_map.default_max_load_percentage),
 /// faces index of the embedded symbols face, if it loaded.
 embedded_face: ?u16,
 /// Procedural sprite glyphs, keyed by codepoint and occupied cell span
@@ -411,6 +416,23 @@ const CodepointFaceKey = struct {
     cp: u21,
 };
 
+const ClusterFaceKey = struct {
+    style: FaceStyle,
+    cps: []const u21,
+};
+
+const ClusterFaceContext = struct {
+    pub fn hash(_: ClusterFaceContext, key: ClusterFaceKey) u64 {
+        var hasher = std.hash.Wyhash.init(@intFromEnum(key.style));
+        hasher.update(std.mem.sliceAsBytes(key.cps));
+        return hasher.final();
+    }
+
+    pub fn eql(_: ClusterFaceContext, a: ClusterFaceKey, b: ClusterFaceKey) bool {
+        return a.style == b.style and std.mem.eql(u21, a.cps, b.cps);
+    }
+};
+
 const GlyphMetrics = struct {
     cell_width: u31 = 0,
     cell_height: u31 = 0,
@@ -761,6 +783,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         .primary_ascii = primary_ascii,
         .sort_faces = .empty,
         .codepoint_faces = .empty,
+        .cluster_faces = .empty,
         .embedded_face = embedded_face,
         .sprite_glyphs = .empty,
         .decoration_glyphs = .empty,
@@ -788,6 +811,9 @@ pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
     self.faces.deinit(alloc);
     self.sort_faces.deinit(alloc);
     self.codepoint_faces.deinit(alloc);
+    var cluster_keys = self.cluster_faces.keyIterator();
+    while (cluster_keys.next()) |key| alloc.free(key.cps);
+    self.cluster_faces.deinit(alloc);
     var sprite_it = self.sprite_glyphs.valueIterator();
     while (sprite_it.next()) |g| alloc.free(g.bitmap);
     self.sprite_glyphs.deinit(alloc);
@@ -868,75 +894,280 @@ pub fn decorationGlyph(
 /// over system fonts so icons render identically everywhere; it only
 /// contains symbols, so it never shadows regular text coverage.
 pub fn faceForCodepoint(self: *Font, alloc: std.mem.Allocator, cp: u21) u16 {
-    return self.faceForCodepointStyle(alloc, cp, .regular);
+    return self.faceForCluster(alloc, &.{cp}, .regular);
 }
 
-/// Like `faceForCodepoint`, but prefers font faces matching `style`.
-pub fn faceForCodepointStyle(
-    self: *Font,
-    alloc: std.mem.Allocator,
-    cp: u21,
-    style: FaceStyle,
-) u16 {
-    const primary_idx = self.primary_faces[@intFromEnum(style)];
-    if (cp >= 0x20 and cp < 0x7f and self.primary_ascii[@intFromEnum(style)]) return primary_idx;
+/// Codepoints per cluster the coverage requirement tracks; longer
+/// pathological clusters keep their leading codepoints, which only
+/// weakens verification, never rejects a usable face.
+const max_cluster_codepoints = 15;
 
-    // Sprites override fonts so grid glyphs are always seamless. There are no
-    // printable ASCII sprites, so the common text path above skips this range
-    // lookup entirely.
-    if (sprite.covers(cp)) return sprite_face_index;
+/// Coverage requirements and emoji-presentation signals derived from one
+/// grapheme cluster's codepoints.
+const ClusterInfo = struct {
+    /// Codepoints the chosen face must map. Joiners and variation
+    /// selectors are excluded: HarfBuzz hides unsupported
+    /// default-ignorables instead of emitting .notdef.
+    required: [max_cluster_codepoints]u21,
+    required_len: usize,
+    /// VS16, keycap, or a ZWJ emoji sequence: the cluster explicitly asks
+    /// for emoji presentation, so color faces win over the primary even
+    /// when the primary covers the base (text-style hearts, keycap digits).
+    explicit_emoji: bool,
+    /// The base codepoint defaults to emoji presentation: color faces are
+    /// preferred over other fallbacks, but a covering primary still wins.
+    default_emoji: bool,
 
-    const key: CodepointFaceKey = .{ .style = style, .cp = cp };
-    if (self.codepoint_faces.get(key)) |idx| return idx;
-
-    if (primary_idx != 0 and self.faces.items[primary_idx].hasCodepoint(cp)) {
-        self.codepoint_faces.put(alloc, key, primary_idx) catch {};
-        return primary_idx;
-    }
-    if (self.faces.items[0].hasCodepoint(cp)) {
-        self.codepoint_faces.put(alloc, key, 0) catch {};
-        return 0;
-    }
-
-    const idx = idx: {
-        if (self.embedded_face) |embedded| {
-            if (self.faces.items[embedded].hasCodepoint(cp)) break :idx embedded;
+    fn init(cps: []const u21) ClusterInfo {
+        std.debug.assert(cps.len > 0);
+        var info: ClusterInfo = .{
+            .required = undefined,
+            .required_len = 0,
+            .explicit_emoji = false,
+            .default_emoji = hasDefaultEmojiPresentation(cps[0]),
+        };
+        var force_text = false;
+        var has_zwj = false;
+        for (cps) |cp| {
+            switch (cp) {
+                0xFE0E => force_text = true,
+                0xFE0F => info.explicit_emoji = true,
+                0x200D => has_zwj = true,
+                0x20E3 => info.explicit_emoji = info.explicit_emoji or isKeycapBase(cps[0]),
+                else => {},
+            }
+            if (isCoverageExempt(cp)) continue;
+            if (info.required_len < info.required.len) {
+                info.required[info.required_len] = cp;
+                info.required_len += 1;
+            }
         }
-        break :idx self.searchFallback(alloc, cp, style) orelse 0;
+        if (has_zwj and !info.explicit_emoji) {
+            for (cps) |cp| {
+                if (hasDefaultEmojiPresentation(cp)) {
+                    info.explicit_emoji = true;
+                    break;
+                }
+            }
+        }
+        if (force_text) {
+            info.explicit_emoji = false;
+            info.default_emoji = false;
+        }
+        return info;
+    }
+
+    fn requiredSlice(self: *const ClusterInfo) []const u21 {
+        return self.required[0..self.required_len];
+    }
+};
+
+fn isKeycapBase(cp: u21) bool {
+    return switch (cp) {
+        '0'...'9', '#', '*' => true,
+        else => false,
     };
-    self.codepoint_faces.put(alloc, key, idx) catch {};
+}
+
+/// Codepoints a face need not map to render a cluster: HarfBuzz treats
+/// them as default-ignorable and hides them when the font lacks them.
+fn isCoverageExempt(cp: u21) bool {
+    return switch (cp) {
+        0x200C,
+        0x200D, // zero-width (non-)joiner
+        0x180B...0x180D, // Mongolian variation selectors
+        0xFE00...0xFE0F, // variation selectors
+        0xE0100...0xE01EF, // variation selectors supplement
+        => true,
+        else => false,
+    };
+}
+
+/// Walks fallback candidates for one grapheme cluster in preference order,
+/// yielding only faces whose actual cmap covers every required codepoint.
+/// Used for initial face resolution and for re-resolving clusters that
+/// shaped to .notdef; never yields the same face twice.
+pub const ClusterCandidates = struct {
+    font: *Font,
+    style: FaceStyle,
+    info: ClusterInfo,
+    stage: Stage,
+    sort_index: usize = 0,
+    returned: [max_returned]u16 = undefined,
+    returned_len: usize = 0,
+
+    /// Distinct faces one resolution can reasonably visit; later
+    /// duplicates slip through, which callers bound with attempt limits.
+    const max_returned = 8;
+
+    const Stage = enum { color_front, styled_primary, primary, embedded, color, any, done };
+
+    pub fn next(self: *ClusterCandidates, alloc: std.mem.Allocator) ?u16 {
+        while (true) {
+            switch (self.stage) {
+                .color_front => {
+                    if (self.nextSortCandidate(alloc, true)) |idx| {
+                        if (self.take(idx)) |taken| return taken;
+                    } else {
+                        self.stage = .styled_primary;
+                        self.sort_index = 0;
+                    }
+                },
+                .styled_primary => {
+                    self.stage = .primary;
+                    const idx = self.font.primary_faces[@intFromEnum(self.style)];
+                    if (idx != 0 and self.covers(idx)) {
+                        if (self.take(idx)) |taken| return taken;
+                    }
+                },
+                .primary => {
+                    self.stage = .embedded;
+                    if (self.covers(0)) {
+                        if (self.take(0)) |taken| return taken;
+                    }
+                },
+                .embedded => {
+                    self.stage = if (self.info.default_emoji and !self.info.explicit_emoji) .color else .any;
+                    if (self.font.embedded_face) |idx| {
+                        if (self.covers(idx)) {
+                            if (self.take(idx)) |taken| return taken;
+                        }
+                    }
+                },
+                .color => {
+                    if (self.nextSortCandidate(alloc, true)) |idx| {
+                        if (self.take(idx)) |taken| return taken;
+                    } else {
+                        self.stage = .any;
+                        self.sort_index = 0;
+                    }
+                },
+                .any => {
+                    if (self.nextSortCandidate(alloc, false)) |idx| {
+                        if (self.take(idx)) |taken| return taken;
+                    } else {
+                        self.stage = .done;
+                    }
+                },
+                .done => return null,
+            }
+        }
+    }
+
+    fn take(self: *ClusterCandidates, idx: u16) ?u16 {
+        for (self.returned[0..self.returned_len]) |seen| {
+            if (seen == idx) return null;
+        }
+        if (self.returned_len < self.returned.len) {
+            self.returned[self.returned_len] = idx;
+            self.returned_len += 1;
+        }
+        return idx;
+    }
+
+    fn covers(self: *const ClusterCandidates, idx: u16) bool {
+        return self.font.faceCoversAll(idx, self.info.requiredSlice());
+    }
+
+    fn nextSortCandidate(self: *ClusterCandidates, alloc: std.mem.Allocator, color_only: bool) ?u16 {
+        const font = self.font;
+        const sort_set = font.discovery_data.sort_sets[@intFromEnum(self.style)];
+        const nfont: usize = @intCast(sort_set.*.nfont);
+        const start: usize = if (self.style == .regular) 1 else 0;
+        var i: usize = @max(self.sort_index, start);
+        while (i < nfont) : (i += 1) {
+            const pattern = sort_set.*.fonts[i];
+            if (color_only and !patternHasColor(pattern)) continue;
+            if (!patternCoversAll(pattern, self.info.requiredSlice())) continue;
+            const idx = font.loadFallbackAt(alloc, self.style, i) orelse continue;
+            // The fontconfig charset can drift from the font file on
+            // disk; trust only the loaded face's cmap.
+            if (!font.faceCoversAll(idx, self.info.requiredSlice())) continue;
+            self.sort_index = i + 1;
+            return idx;
+        }
+        self.sort_index = nfont;
+        return null;
+    }
+};
+
+/// Candidate faces for a cluster, in fallback preference order.
+pub fn clusterCandidates(self: *Font, cps: []const u21, style: FaceStyle) ClusterCandidates {
+    const info: ClusterInfo = .init(cps);
+    return .{
+        .font = self,
+        .style = style,
+        .info = info,
+        .stage = if (info.explicit_emoji) .color_front else .styled_primary,
+    };
+}
+
+/// Like `faceForCodepoint` for a whole grapheme cluster (base codepoint
+/// first): the chosen face must cover every non-ignorable codepoint, so
+/// combining marks and ZWJ-sequence participants never shape to .notdef,
+/// and emoji-presentation signals prefer color faces.
+pub fn faceForCluster(self: *Font, alloc: std.mem.Allocator, cps: []const u21, style: FaceStyle) u16 {
+    std.debug.assert(cps.len > 0);
+    const primary_idx = self.primary_faces[@intFromEnum(style)];
+    const base = cps[0];
+    if (cps.len == 1 and base >= 0x20 and base < 0x7f and self.primary_ascii[@intFromEnum(style)])
+        return primary_idx;
+
+    const info: ClusterInfo = .init(cps);
+
+    // Sprites override fonts so grid glyphs are always seamless; an
+    // explicit emoji presentation defers to a color face instead. There
+    // are no printable ASCII sprites, so the text path above never pays
+    // for this range lookup.
+    if (sprite.covers(base) and !info.explicit_emoji) return sprite_face_index;
+
+    if (info.required_len == 0) return primary_idx;
+
+    if (cps.len == 1) {
+        const key: CodepointFaceKey = .{ .style = style, .cp = base };
+        if (self.codepoint_faces.get(key)) |idx| return idx;
+        const idx = self.resolveCluster(alloc, info, style);
+        self.codepoint_faces.put(alloc, key, idx) catch {};
+        return idx;
+    }
+
+    const key: ClusterFaceKey = .{ .style = style, .cps = cps };
+    if (self.cluster_faces.getContext(key, .{})) |idx| return idx;
+    const idx = self.resolveCluster(alloc, info, style);
+    if (alloc.dupe(u21, cps)) |owned| {
+        self.cluster_faces.putContext(alloc, .{ .style = style, .cps = owned }, idx, .{}) catch alloc.free(owned);
+    } else |_| {}
     return idx;
 }
 
-/// Walk the fontconfig sort order for the first usable face whose
-/// charset covers `cp`.
-fn searchFallback(self: *Font, alloc: std.mem.Allocator, cp: u21, style: FaceStyle) ?u16 {
-    if (hasDefaultEmojiPresentation(cp)) {
-        if (self.searchFallbackPass(alloc, cp, style, true)) |face_idx| return face_idx;
-    }
-    return self.searchFallbackPass(alloc, cp, style, false);
+/// First covering candidate, or 0 (primary) when nothing covers the
+/// cluster and the primary's .notdef is the honest result.
+fn resolveCluster(self: *Font, alloc: std.mem.Allocator, info: ClusterInfo, style: FaceStyle) u16 {
+    var candidates: ClusterCandidates = .{
+        .font = self,
+        .style = style,
+        .info = info,
+        .stage = if (info.explicit_emoji) .color_front else .styled_primary,
+    };
+    return candidates.next(alloc) orelse 0;
 }
 
-fn searchFallbackPass(
-    self: *Font,
-    alloc: std.mem.Allocator,
-    cp: u21,
-    style: FaceStyle,
-    color_only: bool,
-) ?u16 {
-    const sort_set = self.discovery_data.sort_sets[@intFromEnum(style)];
-    const nfont: usize = @intCast(sort_set.*.nfont);
-    const start: usize = if (style == .regular) 1 else 0;
-    for (start..nfont) |i| {
-        const pattern = sort_set.*.fonts[i];
-        var charset: ?*c.FcCharSet = null;
-        if (c.FcPatternGetCharSet(pattern, c.FC_CHARSET, 0, &charset) != c.FcResultMatch)
-            continue;
-        if (c.FcCharSetHasChar(charset, cp) != c.FcTrue) continue;
-        if (color_only and !patternHasColor(pattern)) continue;
-        if (self.loadFallbackAt(alloc, style, i, cp)) |face_idx| return face_idx;
+fn faceCoversAll(self: *const Font, idx: u16, cps: []const u21) bool {
+    const candidate = &self.faces.items[idx];
+    for (cps) |cp| {
+        if (!candidate.hasCodepoint(cp)) return false;
     }
-    return null;
+    return true;
+}
+
+fn patternCoversAll(pattern: ?*c.FcPattern, cps: []const u21) bool {
+    var charset: ?*c.FcCharSet = null;
+    if (c.FcPatternGetCharSet(pattern, c.FC_CHARSET, 0, &charset) != c.FcResultMatch)
+        return false;
+    for (cps) |cp| {
+        if (c.FcCharSetHasChar(charset, cp) != c.FcTrue) return false;
+    }
+    return true;
 }
 
 fn loadFallbackAt(
@@ -944,7 +1175,6 @@ fn loadFallbackAt(
     alloc: std.mem.Allocator,
     style: FaceStyle,
     sort_index: usize,
-    cp: u21,
 ) ?u16 {
     const pattern = self.discovery_data.sort_sets[@intFromEnum(style)].*.fonts[sort_index];
     const key: SortFaceKey = .{ .style = style, .sort_index = @intCast(sort_index) };
@@ -969,7 +1199,7 @@ fn loadFallbackAt(
         return null;
     };
     self.sort_faces.put(alloc, key, face_idx) catch {};
-    log.debug("loaded fallback face {d} for U+{X} ({})", .{ face_idx, cp, style });
+    log.debug("loaded fallback face {d} (sort {d}, {})", .{ face_idx, sort_index, style });
     return face_idx;
 }
 
@@ -987,6 +1217,27 @@ test "default emoji presentation uses Unicode data" {
     try std.testing.expect(hasDefaultEmojiPresentation(0x2B1B)); // ⬛
     try std.testing.expect(!hasDefaultEmojiPresentation(0x2600)); // ☀ defaults to text
     try std.testing.expect(!hasDefaultEmojiPresentation('A'));
+}
+
+test "cluster info derives coverage requirements and emoji signals" {
+    const keycap: ClusterInfo = .init(&.{ '1', 0xFE0F, 0x20E3 });
+    try std.testing.expect(keycap.explicit_emoji);
+    try std.testing.expectEqualSlices(u21, &.{ '1', 0x20E3 }, keycap.requiredSlice());
+
+    const zwj: ClusterInfo = .init(&.{ 0x2764, 0xFE0F, 0x200D, 0x1F525 }); // heart on fire
+    try std.testing.expect(zwj.explicit_emoji);
+    try std.testing.expectEqualSlices(u21, &.{ 0x2764, 0x1F525 }, zwj.requiredSlice());
+
+    // VS15 forces text presentation even for default-emoji codepoints.
+    const text_star: ClusterInfo = .init(&.{ 0x2B50, 0xFE0E });
+    try std.testing.expect(!text_star.explicit_emoji);
+    try std.testing.expect(!text_star.default_emoji);
+    try std.testing.expectEqualSlices(u21, &.{0x2B50}, text_star.requiredSlice());
+
+    // Combining marks are required coverage, not exempt.
+    const marks: ClusterInfo = .init(&.{ 'e', 0x0301 });
+    try std.testing.expect(!marks.explicit_emoji);
+    try std.testing.expectEqualSlices(u21, &.{ 'e', 0x0301 }, marks.requiredSlice());
 }
 
 fn loadFromPattern(
@@ -1050,7 +1301,7 @@ test "styled primary faces are selected when available" {
 
     const bold_idx = font.primary_faces[@intFromEnum(FaceStyle.bold)];
     if (bold_idx == 0) return error.SkipZigTest;
-    try std.testing.expectEqual(bold_idx, font.faceForCodepointStyle(alloc, 'A', .bold));
+    try std.testing.expectEqual(bold_idx, font.faceForCluster(alloc, &.{'A'}, .bold));
 }
 
 test "embedded symbols face serves nerd font codepoints" {

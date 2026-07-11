@@ -61,6 +61,8 @@ shape_cache: std.StringHashMapUnmanaged([]ShapedGlyph),
 shape_key: std.ArrayList(u32),
 /// Scratch codepoints for cluster-width measurement of overlay text.
 codepoint_scratch: std.ArrayList(u21),
+/// Scratch codepoints for per-cell grapheme cluster face resolution.
+cluster_scratch: std.ArrayList(u21),
 /// Shape cache counters for benchmarks/profiling. Production rendering does
 /// not read these, so they stay deliberately cheap and approximate.
 shape_stats: ShapeStats = .{},
@@ -77,10 +79,18 @@ const ShapedGlyph = struct {
     glyph: u32,
     /// Cell offset from the run start.
     cluster: u32,
+    /// Face the glyph index belongs to. Usually the run's face; differs
+    /// for clusters that shaped to .notdef and were repaired against a
+    /// further fallback candidate.
+    face: u16,
     x_advance: i32,
     x_offset: i32,
     y_offset: i32,
 };
+
+/// Fallback candidates tried when a cluster shapes to .notdef before
+/// accepting the tofu box.
+const max_notdef_retries = 3;
 
 pub const InitOptions = struct {
     selection_background: ?vt.color.RGB = null,
@@ -113,6 +123,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .shape_cache = .empty,
         .shape_key = .empty,
         .codepoint_scratch = .empty,
+        .cluster_scratch = .empty,
         .shape_stats = .{},
         .buffer_stride = 0,
     };
@@ -129,6 +140,7 @@ pub fn deinit(self: *Renderer) void {
     self.shape_cache.deinit(self.alloc);
     self.shape_key.deinit(self.alloc);
     self.codepoint_scratch.deinit(self.alloc);
+    self.cluster_scratch.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -1222,14 +1234,17 @@ fn prepareRow(
                 .codepoint, .codepoint_grapheme => {},
                 else => break :face 0,
             }
-            const cp = faceCodepoint(
-                raws[x],
-                if (raws[x].content_tag == .codepoint_grapheme) graphemes[x] else &.{},
-            );
-            if (cp == 0 or cp == ' ' or cp == kitty_placeholder) break :face 0;
-            break :face self.font.faceForCodepointStyle(
+            const cp = raws[x].content.codepoint.data;
+            if (cp == 0 or cp == kitty_placeholder) break :face 0;
+            const extras: []const u21 =
+                if (raws[x].content_tag == .codepoint_grapheme) graphemes[x] else &.{};
+            if (cp == ' ' and extras.len == 0) break :face 0;
+            self.cluster_scratch.clearRetainingCapacity();
+            try self.cluster_scratch.append(self.alloc, cp);
+            try self.cluster_scratch.appendSlice(self.alloc, extras);
+            break :face self.font.faceForCluster(
                 self.alloc,
-                cp,
+                self.cluster_scratch.items,
                 .init(style.flags.bold, style.flags.italic),
             );
         };
@@ -1358,11 +1373,11 @@ fn renderRowForeground(
             raws[x].style_id != raws[run_start].style_id or
             faces[x] != faces[run_start];
         if (breaks_run) {
-            try self.drawRun(raws, graphemes, run_start, x, cols, y, pixels, width, height);
+            try self.drawRun(raws, styles, graphemes, run_start, x, cols, y, pixels, width, height);
             run_start = if (has_text) x else x + 1;
         }
     }
-    try self.drawRun(raws, graphemes, run_start, cols, cols, y, pixels, width, height);
+    try self.drawRun(raws, styles, graphemes, run_start, cols, cols, y, pixels, width, height);
 
     // Decoration pass: underlines, strikethrough, overline, and hyperlink
     // hints overlay the glyphs, in the style's underline color (or the
@@ -1462,6 +1477,7 @@ fn blitDecoration(
 fn drawRun(
     self: *Renderer,
     raws: []const vt.Cell,
+    styles: []const vt.Style,
     graphemes: []const []const u21,
     start: u31,
     end: u31,
@@ -1502,7 +1518,8 @@ fn drawRun(
     }
 
     const face_index = self.face_scratch.items[start];
-    const face = font.face(face_index);
+    const run_style: vt.Style = if (raws[start].style_id == 0) .{} else styles[start];
+    const face_style: Font.FaceStyle = .init(run_style.flags.bold, run_style.flags.italic);
 
     // Build the run's cache key: the face plus (run-relative cluster,
     // codepoint) pairs. Relative clusters make the shape result
@@ -1527,7 +1544,7 @@ fn drawRun(
     } else shaped: {
         self.shape_stats.cache_misses += 1;
         self.shape_stats.shaped_cells += end - start;
-        break :shaped try self.shapeRun(face);
+        break :shaped try self.shapeRun(face_index, face_style);
     };
 
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
@@ -1543,7 +1560,7 @@ fn drawRun(
         const cluster_x: usize = @intCast(cluster);
         const constraint_width = constraintWidth(raws, cluster_x, cols);
         const cp = cellCodepoint(raws[cluster_x]);
-        const g = face.glyph(
+        const g = font.face(sg.face).glyph(
             self.alloc,
             sg.glyph,
             constraint_width,
@@ -1551,7 +1568,7 @@ fn drawRun(
         ) catch |err| switch (err) {
             error.FontLoadFailed, error.GlyphResizeFailed => {
                 log.warn("skipping glyph render face={d} glyph={d} codepoint=U+{X}: {}", .{
-                    face_index,
+                    sg.face,
                     sg.glyph,
                     cp,
                     err,
@@ -1578,9 +1595,11 @@ fn drawRun(
 }
 
 /// Shape the run described by shape_key with HarfBuzz and cache the
-/// result under a copy of the key.
-fn shapeRun(self: *Renderer, face: *Font.Face) ![]ShapedGlyph {
+/// result under a copy of the key. Clusters that shape to .notdef are
+/// re-resolved against further fallback candidates before caching.
+fn shapeRun(self: *Renderer, face_index: u16, style: Font.FaceStyle) ![]ShapedGlyph {
     const key = self.shape_key.items;
+    const face = self.font.face(face_index);
 
     c.hb_buffer_clear_contents(self.hb_buf);
     var i: usize = 1;
@@ -1595,19 +1614,23 @@ fn shapeRun(self: *Renderer, face: *Font.Face) ![]ShapedGlyph {
     const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
     const positions = c.hb_buffer_get_glyph_positions(self.hb_buf, &glyph_count);
 
-    const shaped = try self.alloc.alloc(ShapedGlyph, glyph_count);
+    var shaped = try self.alloc.alloc(ShapedGlyph, glyph_count);
     errdefer self.alloc.free(shaped);
+    var has_notdef = false;
     if (glyph_count > 0) {
         for (shaped, infos[0..glyph_count], positions[0..glyph_count]) |*sg, info, pos| {
             sg.* = .{
                 .glyph = info.codepoint,
                 .cluster = info.cluster,
+                .face = face_index,
                 .x_advance = pos.x_advance >> 6,
                 .x_offset = pos.x_offset >> 6,
                 .y_offset = pos.y_offset >> 6,
             };
+            if (info.codepoint == 0) has_notdef = true;
         }
     }
+    if (has_notdef) shaped = try self.repairNotdefClusters(shaped, face_index, style);
 
     // Full cache: reset wholesale. Terminal content is repetitive
     // enough that the working set repopulates within a frame or two.
@@ -1619,6 +1642,117 @@ fn shapeRun(self: *Renderer, face: *Font.Face) ![]ShapedGlyph {
     errdefer self.alloc.free(owned_key);
     try self.shape_cache.put(self.alloc, owned_key, shaped);
     return shaped;
+}
+
+/// Replaces .notdef glyphs in a freshly shaped run by re-resolving the
+/// failing clusters against further fallback candidates and re-shaping
+/// each in isolation. Cluster origins snap to their cells at draw time,
+/// so per-cluster splices cannot disturb the rest of the run. Frees
+/// `shaped` and returns the corrected run; clusters no candidate can
+/// shape keep their original .notdef glyphs.
+fn repairNotdefClusters(
+    self: *Renderer,
+    shaped: []ShapedGlyph,
+    face_index: u16,
+    style: Font.FaceStyle,
+) ![]ShapedGlyph {
+    const key = self.shape_key.items;
+    var out: std.ArrayList(ShapedGlyph) = .empty;
+    errdefer out.deinit(self.alloc);
+    var cps: std.ArrayList(u21) = .empty;
+    defer cps.deinit(self.alloc);
+    // Clusters already replaced, in case HarfBuzz reordered one into
+    // non-contiguous groups; later fragments are dropped.
+    var repaired: std.ArrayList(u32) = .empty;
+    defer repaired.deinit(self.alloc);
+
+    var i: usize = 0;
+    while (i < shaped.len) {
+        const cluster = shaped[i].cluster;
+        var end = i + 1;
+        var has_notdef = shaped[i].glyph == 0;
+        while (end < shaped.len and shaped[end].cluster == cluster) : (end += 1) {
+            if (shaped[end].glyph == 0) has_notdef = true;
+        }
+        if (std.mem.findScalar(u32, repaired.items, cluster) != null) {
+            i = end;
+            continue;
+        }
+        if (!has_notdef) {
+            try out.appendSlice(self.alloc, shaped[i..end]);
+            i = end;
+            continue;
+        }
+
+        cps.clearRetainingCapacity();
+        var k: usize = 1;
+        while (k + 1 < key.len) : (k += 2) {
+            if (key[k] == cluster) try cps.append(self.alloc, @intCast(key[k + 1]));
+        }
+
+        var fixed = false;
+        if (cps.items.len > 0) {
+            var candidates = self.font.clusterCandidates(cps.items, style);
+            var attempts: usize = 0;
+            while (attempts < max_notdef_retries) {
+                const candidate = candidates.next(self.alloc) orelse break;
+                if (candidate == face_index) continue;
+                attempts += 1;
+                if (try self.shapeClusterWith(candidate, cluster, cps.items, &out)) {
+                    fixed = true;
+                    break;
+                }
+            }
+        }
+        if (fixed) {
+            try repaired.append(self.alloc, cluster);
+        } else {
+            try out.appendSlice(self.alloc, shaped[i..end]);
+        }
+        i = end;
+    }
+
+    self.alloc.free(shaped);
+    return out.toOwnedSlice(self.alloc);
+}
+
+/// Shapes `cps` as one isolated cluster with `face_index`, appending the
+/// glyphs to `out`. Returns false (leaving `out` untouched) when the
+/// result still contains .notdef.
+fn shapeClusterWith(
+    self: *Renderer,
+    face_index: u16,
+    cluster: u32,
+    cps: []const u21,
+    out: *std.ArrayList(ShapedGlyph),
+) !bool {
+    const face = self.font.face(face_index);
+    c.hb_buffer_clear_contents(self.hb_buf);
+    for (cps) |cp| c.hb_buffer_add(self.hb_buf, cp, cluster);
+    c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
+    c.hb_buffer_guess_segment_properties(self.hb_buf);
+    c.hb_shape(face.hb_font, self.hb_buf, null, 0);
+
+    var glyph_count: c_uint = 0;
+    const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
+    const positions = c.hb_buffer_get_glyph_positions(self.hb_buf, &glyph_count);
+    for (infos[0..glyph_count]) |info| {
+        if (info.codepoint == 0) return false;
+    }
+
+    const start = out.items.len;
+    errdefer out.shrinkRetainingCapacity(start);
+    for (infos[0..glyph_count], positions[0..glyph_count]) |info, pos| {
+        try out.append(self.alloc, .{
+            .glyph = info.codepoint,
+            .cluster = cluster,
+            .face = face_index,
+            .x_advance = pos.x_advance >> 6,
+            .x_offset = pos.x_offset >> 6,
+            .y_offset = pos.y_offset >> 6,
+        });
+    }
+    return true;
 }
 
 fn appendShapeKeyCodepoints(self: *Renderer, rel: u32, cp: u21, grapheme: []const u21) !void {
@@ -1666,40 +1800,6 @@ fn cellCodepoint(cell: vt.Cell) u21 {
         .codepoint, .codepoint_grapheme => cell.content.codepoint.data,
         else => 0,
     };
-}
-
-const emoji_presentation_face_codepoint: u21 = 0x1F600; // GRINNING FACE
-const emoji_keycap_face_codepoint: u21 = 0x1F51F; // KEYCAP: 10
-
-fn faceCodepoint(cell: vt.Cell, grapheme: []const u21) u21 {
-    const cp = cellCodepoint(cell);
-    if (cell.content_tag != .codepoint_grapheme) return cp;
-
-    if (isKeycapBase(cp) and std.mem.findScalar(u21, grapheme, 0x20E3) != null) {
-        return emoji_keycap_face_codepoint;
-    }
-    if (needsEmojiPresentationFace(cp, grapheme)) return emoji_presentation_face_codepoint;
-    return cp;
-}
-
-fn isKeycapBase(cp: u21) bool {
-    return switch (cp) {
-        '0'...'9', '#', '*' => true,
-        else => false,
-    };
-}
-
-fn needsEmojiPresentationFace(cp: u21, grapheme: []const u21) bool {
-    if (std.mem.findScalar(u21, grapheme, 0xFE0F) != null) return true;
-
-    if (std.mem.findScalar(u21, grapheme, 0x200D) != null) {
-        if (Font.hasDefaultEmojiPresentation(cp)) return true;
-        for (grapheme) |extra| {
-            if (Font.hasDefaultEmojiPresentation(extra)) return true;
-        }
-    }
-
-    return false;
 }
 
 fn isSymbol(cp: u21) bool {
@@ -2429,12 +2529,14 @@ test "emoji keycap grapheme selects emoji fallback face" {
     try testing.expectEqual(.codepoint_grapheme, raws[0].content_tag);
     try testing.expectEqual(@as(u21, '1'), raws[0].content.codepoint.data);
     try testing.expectEqualSlices(u21, &.{ 0xFE0F, 0x20E3 }, graphemes[0]);
-    try testing.expectEqual(emoji_keycap_face_codepoint, faceCodepoint(raws[0], graphemes[0]));
 
     var font: Font = try .init(alloc, "monospace", 16);
     defer font.deinit(alloc);
-    const keycap_face = font.faceForCodepoint(alloc, emoji_keycap_face_codepoint);
+    const keycap_face = font.faceForCluster(alloc, &.{ '1', 0xFE0F, 0x20E3 }, .regular);
     if (keycap_face == 0) return error.SkipZigTest;
+    // The chosen face must cover the whole cluster, keycap included.
+    try testing.expect(font.face(keycap_face).hasCodepoint('1'));
+    try testing.expect(font.face(keycap_face).hasCodepoint(0x20E3));
 
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -2450,7 +2552,7 @@ test "emoji keycap grapheme selects emoji fallback face" {
     try renderer.shape_key.append(alloc, keycap_face);
     try renderer.appendShapeKeyCodepoints(0, raws[0].content.codepoint.data, graphemes[0]);
     try testing.expectEqualSlices(u32, &.{ keycap_face, 0, '1', 0, 0xFE0F, 0, 0x20E3 }, renderer.shape_key.items);
-    try testing.expect(try renderer.shapeKeyHasColorGlyph(font.face(keycap_face)));
+    try testing.expect(try renderer.shapeKeyHasColorGlyph(keycap_face));
 
     try renderer.render(&state, pixels, width, height);
     try testing.expect(chromaticPixelCount(pixels) > 0);
@@ -2459,12 +2561,13 @@ test "emoji keycap grapheme selects emoji fallback face" {
 test "emoji presentation graphemes select emoji fallback face" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const grinning: u21 = 0x1F600;
 
     var font: Font = try .init(alloc, "monospace", 16);
     defer font.deinit(alloc);
-    const emoji_face = font.faceForCodepoint(alloc, emoji_presentation_face_codepoint);
+    const emoji_face = font.faceForCodepoint(alloc, grinning);
     if (emoji_face == 0) return error.SkipZigTest;
-    const emoji_glyph_idx = c.FT_Get_Char_Index(font.face(emoji_face).ft_face, emoji_presentation_face_codepoint);
+    const emoji_glyph_idx = c.FT_Get_Char_Index(font.face(emoji_face).ft_face, grinning);
     if (emoji_glyph_idx == 0) return error.SkipZigTest;
     const emoji_glyph = try font.face(emoji_face).glyph(alloc, emoji_glyph_idx, 2, false);
     if (emoji_glyph.format != .bgra) return error.SkipZigTest;
@@ -2499,19 +2602,26 @@ test "emoji presentation graphemes select emoji fallback face" {
         try state.update(alloc, &term);
 
         const cells = state.row_data.get(0).cells.slice();
-        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
-        try testing.expectEqual(emoji_face, renderer.face_scratch.items[0]);
-
         const raws = cells.items(.raw);
         const graphemes = cells.items(.grapheme);
+        renderer.cluster_scratch.clearRetainingCapacity();
+        try renderer.cluster_scratch.append(alloc, raws[0].content.codepoint.data);
+        if (raws[0].content_tag == .codepoint_grapheme)
+            try renderer.cluster_scratch.appendSlice(alloc, graphemes[0]);
+        const case_face = font.faceForCluster(alloc, renderer.cluster_scratch.items, .regular);
+        try testing.expect(case_face != 0);
+
+        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+        try testing.expectEqual(case_face, renderer.face_scratch.items[0]);
+
         renderer.shape_key.clearRetainingCapacity();
-        try renderer.shape_key.append(alloc, emoji_face);
+        try renderer.shape_key.append(alloc, case_face);
         try renderer.appendShapeKeyCodepoints(
             0,
             raws[0].content.codepoint.data,
             if (raws[0].content_tag == .codepoint_grapheme) graphemes[0] else &.{},
         );
-        try testing.expect(try renderer.shapeKeyHasColorGlyph(font.face(emoji_face)));
+        try testing.expect(try renderer.shapeKeyHasColorGlyph(case_face));
 
         try renderer.render(&state, pixels, width, height);
         try testing.expect(chromaticPixelCount(pixels) > 0);
@@ -2522,11 +2632,12 @@ test "default emoji presentation squares select emoji fallback face" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
+    const grinning: u21 = 0x1F600;
     var font: Font = try .init(alloc, "monospace", 16);
     defer font.deinit(alloc);
-    const emoji_face = font.faceForCodepoint(alloc, emoji_presentation_face_codepoint);
+    const emoji_face = font.faceForCodepoint(alloc, grinning);
     if (emoji_face == 0) return error.SkipZigTest;
-    const emoji_glyph_idx = c.FT_Get_Char_Index(font.face(emoji_face).ft_face, emoji_presentation_face_codepoint);
+    const emoji_glyph_idx = c.FT_Get_Char_Index(font.face(emoji_face).ft_face, grinning);
     if (emoji_glyph_idx == 0) return error.SkipZigTest;
     const emoji_glyph = try font.face(emoji_face).glyph(alloc, emoji_glyph_idx, 2, false);
     if (emoji_glyph.format != .bgra) return error.SkipZigTest;
@@ -2563,28 +2674,31 @@ test "default emoji presentation squares select emoji fallback face" {
         try state.update(alloc, &term);
 
         const cells = state.row_data.get(0).cells.slice();
-        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
-        try testing.expectEqual(emoji_face, renderer.face_scratch.items[0]);
-
         const raws = cells.items(.raw);
         const graphemes = cells.items(.grapheme);
+        const case_face = font.faceForCodepoint(alloc, raws[0].content.codepoint.data);
+        try testing.expect(case_face != 0);
+
+        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+        try testing.expectEqual(case_face, renderer.face_scratch.items[0]);
+
         renderer.shape_key.clearRetainingCapacity();
-        try renderer.shape_key.append(alloc, emoji_face);
+        try renderer.shape_key.append(alloc, case_face);
         try renderer.appendShapeKeyCodepoints(
             0,
             raws[0].content.codepoint.data,
             if (raws[0].content_tag == .codepoint_grapheme) graphemes[0] else &.{},
         );
-        try testing.expect(try renderer.shapeKeyHasColorGlyph(font.face(emoji_face)));
+        try testing.expect(try renderer.shapeKeyHasColorGlyph(case_face));
 
         try renderer.render(&state, pixels, width, height);
     }
 }
 
-fn shapeKeyHasColorGlyph(self: *Renderer, face: *Font.Face) !bool {
-    const shaped = try self.shapeRun(face);
+fn shapeKeyHasColorGlyph(self: *Renderer, face_index: u16) !bool {
+    const shaped = try self.shapeRun(face_index, .regular);
     for (shaped) |sg| {
-        const glyph = face.glyph(self.alloc, sg.glyph, 2, false) catch continue;
+        const glyph = self.font.face(sg.face).glyph(self.alloc, sg.glyph, 2, false) catch continue;
         if (glyph.format == .bgra) return true;
     }
     return false;
