@@ -1226,7 +1226,7 @@ fn taskbarProgressValue(report: vt.osc.Command.ProgressReport) f64 {
 }
 
 fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !void {
-    const connection = self.dbus orelse return error.DBusUnavailable;
+    const connection = self.dbus orelse return error.PortalUnavailable;
 
     // The portal's OpenURI method rejects file:// URIs by design; local
     // paths go through the fd-passing OpenFile/OpenDirectory methods.
@@ -1259,8 +1259,7 @@ fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !
     if (activation_token) |token| try dbusAppendStringVariant(&options, "activation_token", token);
     if (c.dbus_message_iter_close_container(&iter, &options) == 0) return error.OutOfMemory;
 
-    const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return error.DBusUnavailable;
-    c.dbus_message_unref(reply);
+    try sendPortalCall(connection, message);
 }
 
 /// Open a local file or directory through the portal by passing an fd:
@@ -1311,8 +1310,60 @@ fn openFilePortal(connection: *c.DBusConnection, path: [:0]const u8, activation_
     if (activation_token) |token| try dbusAppendStringVariant(&options, "activation_token", token);
     if (c.dbus_message_iter_close_container(&iter, &options) == 0) return error.OutOfMemory;
 
-    const reply = c.dbus_connection_send_with_reply_and_block(connection, message, 1000, null) orelse return error.DBusUnavailable;
+    try sendPortalCall(connection, message);
+}
+
+/// Send a portal request while preserving the distinction between a portal
+/// that is absent and a request whose outcome is ambiguous. Falling back after
+/// a timeout could open the URI twice if the portal handles the request late.
+fn sendPortalCall(connection: *c.DBusConnection, message: *c.DBusMessage) !void {
+    var dbus_error: c.DBusError = undefined;
+    c.dbus_error_init(&dbus_error);
+    defer c.dbus_error_free(&dbus_error);
+
+    const reply = c.dbus_connection_send_with_reply_and_block(
+        connection,
+        message,
+        1000,
+        &dbus_error,
+    ) orelse {
+        if (dbus_error.name != null and
+            isPortalUnavailableErrorName(std.mem.span(dbus_error.name)))
+        {
+            return error.PortalUnavailable;
+        }
+        return error.DBusUnavailable;
+    };
     c.dbus_message_unref(reply);
+}
+
+fn isPortalUnavailableErrorName(name: []const u8) bool {
+    const unavailable = [_][]const u8{
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+        "org.freedesktop.DBus.Error.NameHasNoOwner",
+        "org.freedesktop.DBus.Error.UnknownMethod",
+        "org.freedesktop.DBus.Error.UnknownInterface",
+        "org.freedesktop.DBus.Error.UnknownObject",
+    };
+    for (unavailable) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+test "only definitive portal errors enable fallback" {
+    try std.testing.expect(isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+    ));
+    try std.testing.expect(isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.UnknownMethod",
+    ));
+    try std.testing.expect(!isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.NoReply",
+    ));
+    try std.testing.expect(!isPortalUnavailableErrorName(
+        "org.freedesktop.DBus.Error.TimedOut",
+    ));
 }
 
 fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void {
@@ -1762,7 +1813,7 @@ fn spawnNewWindow(self: *App) void {
         break :pwd osc7Path(arena, url) catch null;
     };
 
-    const envp = self.spawnEnvp(arena, pwd) catch |err| {
+    const envp = self.spawnEnvp(arena, pwd, null) catch |err| {
         log.err("spawn env setup failed: {}", .{err});
         return;
     };
@@ -1771,7 +1822,8 @@ fn spawnNewWindow(self: *App) void {
     if (self.spawnSystemdRun(arena, envp, exe_path, pwd)) return;
     if (self.spawnSwayExec(arena, envp, exe_path, pwd)) return;
     if (self.spawnHyprlandExec(arena, envp, exe_path, pwd)) return;
-    spawnDetachedMonstar(envp, exe_path, pwd);
+    const argv = [_:null]?[*:0]const u8{"monstar"};
+    _ = spawnDetached(exe_path.ptr, &argv, envp, pwd, "monstar");
 }
 
 fn spawnSystemdRun(
@@ -1910,40 +1962,44 @@ fn spawnLauncher(
     return waitStatusExitedZero(status);
 }
 
-fn spawnDetachedMonstar(
+fn spawnDetached(
+    path: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
-    exe_path: [:0]const u8,
     pwd: ?[:0]const u8,
-) void {
+    label: []const u8,
+) bool {
     const linux = std.os.linux;
-    const argv = [_:null]?[*:0]const u8{"monstar"};
 
-    // Double fork: the intermediate child exits immediately so init
-    // adopts the new window and it never lingers as our zombie.
+    // Double fork: the intermediate child exits immediately so init adopts
+    // the launched process and it never lingers as our zombie.
     const fork_rc = linux.fork();
     if (linux.errno(fork_rc) != .SUCCESS) {
-        log.err("spawn fork failed: {}", .{linux.errno(fork_rc)});
-        return;
+        log.err("{s} fork failed: {}", .{ label, linux.errno(fork_rc) });
+        return false;
     }
     const pid: posix.pid_t = @intCast(fork_rc);
 
     if (pid == 0) {
         // Intermediate child. Only async-signal-safe calls from here on.
-        // We block SIGCHLD/SIGUSR1 for our signalfd; the new window must
+        // We block SIGCHLD/SIGUSR1 for our signalfd; the launched process must
         // start with a clean mask and its own session.
         const empty_mask = posix.sigemptyset();
         posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
         _ = linux.setsid();
-        if (linux.fork() != 0) linux.exit(0); // second-fork parent, or fork failure
+        const detached_rc = linux.fork();
+        if (linux.errno(detached_rc) != .SUCCESS) linux.exit(127);
+        if (detached_rc != 0) linux.exit(0);
 
         if (pwd) |p| _ = linux.chdir(p.ptr);
-        _ = linux.execve(exe_path.ptr, &argv, envp);
+        _ = linux.execve(path, argv, envp);
         linux.exit(127); // exec failed
     }
 
     // Reap the intermediate child; it exits right after the second fork.
     var status: u32 = undefined;
     _ = linux.wait4(pid, &status, 0, null);
+    return waitStatusExitedZero(status);
 }
 
 fn waitStatusExitedZero(status: u32) bool {
@@ -2012,7 +2068,7 @@ fn pipeCommandOutput(self: *App) void {
         const url = self.term.getPwd() orelse break :pwd null;
         break :pwd osc7Path(arena, url) catch null;
     };
-    const envp = self.spawnEnvp(arena, pwd) catch |err| {
+    const envp = self.spawnEnvp(arena, pwd, null) catch |err| {
         log.err("pipe command env setup failed: {}", .{err});
         return;
     };
@@ -2134,21 +2190,29 @@ fn writeAllFd(fd: posix.fd_t, data: []const u8) void {
     }
 }
 
-/// Environment for a spawned window: our own environment with PWD
-/// rewritten to match the child's starting directory.
+/// Environment for a spawned process, with optional PWD and activation-token
+/// overrides.
 fn spawnEnvp(
     self: *App,
     arena: std.mem.Allocator,
     pwd: ?[:0]const u8,
+    activation_token: ?[:0]const u8,
 ) ![*:null]const ?[*:0]const u8 {
     var list: std.ArrayList(?[*:0]const u8) = .empty;
     for (self.environ.block.slice) |entry| {
         const e = entry orelse continue;
         if (pwd != null and std.mem.startsWith(u8, std.mem.span(e), "PWD=")) continue;
+        // Activation tokens are single-use and must not leak from the process
+        // that launched us into unrelated children.
+        if (std.mem.startsWith(u8, std.mem.span(e), "XDG_ACTIVATION_TOKEN=")) continue;
         try list.append(arena, e);
     }
     if (pwd) |p| {
         const entry = try std.mem.joinZ(arena, "", &.{ "PWD=", p });
+        try list.append(arena, entry.ptr);
+    }
+    if (activation_token) |token| {
+        const entry = try std.mem.joinZ(arena, "", &.{ "XDG_ACTIVATION_TOKEN=", token });
         try list.append(arena, entry.ptr);
     }
     const slice = try list.toOwnedSliceSentinel(arena, null);
@@ -3215,8 +3279,30 @@ fn openPendingUri(self: *App, activation_token: ?[:0]const u8) void {
     defer self.alloc.free(uri);
 
     self.openUriPortal(uri, activation_token) catch |err| {
+        if (err == error.PortalUnavailable) {
+            self.openUriXdg(uri, activation_token) catch |fallback_err| {
+                log.warn("failed to open hyperlink with xdg-open: {}", .{fallback_err});
+            };
+            return;
+        }
         log.warn("failed to open hyperlink through portal: {}", .{err});
     };
+}
+
+fn openUriXdg(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const xdg_open = try resolveCommandPathZ(arena, self.environ, "xdg-open");
+    if (std.mem.indexOfScalar(u8, xdg_open, '/') == null) return error.XdgOpenUnavailable;
+
+    const uri_z = try arena.dupeZ(u8, uri);
+    const envp = try self.spawnEnvp(arena, null, activation_token);
+    const argv = [_:null]?[*:0]const u8{ "xdg-open", uri_z.ptr };
+    if (!spawnDetached(xdg_open.ptr, &argv, envp, null, "xdg-open")) {
+        return error.SpawnFailed;
+    }
 }
 
 fn pointerPhysical(self: *App) struct { x: f64, y: f64 } {
