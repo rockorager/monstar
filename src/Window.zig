@@ -806,27 +806,22 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
     }
 }
 
-/// Return a free shm buffer of the requested size, creating one if
-/// needed. Frees stale buffers of other sizes as they are released.
+/// Return a free shm buffer of the requested size, reshaping a released slot
+/// when possible so interactive resizing does not rebuild its shm storage.
 fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
-    var candidate: ?*Buffer = null;
-    var i: usize = 0;
-    while (i < self.buffers.items.len) {
-        const buffer = self.buffers.items[i];
-        if (buffer.busy or buffer.rendering) {
-            i += 1;
-            continue;
-        }
+    var available: ?*Buffer = null;
+    for (self.buffers.items) |buffer| {
+        if (buffer.busy or buffer.rendering) continue;
         if (buffer.width == width and buffer.height == height and buffer.format == self.buffer_format) {
-            if (candidate == null) candidate = buffer;
-            i += 1;
-            continue;
+            return buffer;
         }
-        if (self.newest_buffer == buffer) self.newest_buffer = null;
-        buffer.destroy(self.alloc);
-        _ = self.buffers.swapRemove(i);
+        if (available == null) available = buffer;
     }
-    if (candidate) |buffer| return buffer;
+    if (available) |buffer| {
+        if (self.newest_buffer == buffer) self.newest_buffer = null;
+        try buffer.reshape(width, height, self.buffer_format);
+        return buffer;
+    }
 
     const buffer = try Buffer.create(self.alloc, self.shm, width, height, self.buffer_format);
     errdefer buffer.destroy(self.alloc);
@@ -1224,6 +1219,8 @@ fn toplevelState(states: anytype, needle: xdg.Toplevel.State) bool {
 /// holds the buffer; the release event clears it.
 pub const Buffer = struct {
     wl_buffer: *wl.Buffer,
+    pool: *wl.ShmPool,
+    fd: posix.fd_t,
     data: []align(std.heap.page_size_min) u8,
     width: u31,
     height: u31,
@@ -1242,16 +1239,16 @@ pub const Buffer = struct {
         format: BufferFormat,
     ) !*Buffer {
         std.debug.assert(width > 0 and height > 0);
-        const stride: u31 = width * 4;
-        const size: u31 = stride * height;
+        const dimensions = try bufferDimensions(width, height);
+        const capacity = try grownBufferCapacity(0, dimensions.size);
 
         const fd = try posix.memfd_create("monstar-shm", linux.MFD.CLOEXEC);
-        defer _ = linux.close(fd);
-        if (linux.errno(linux.ftruncate(fd, size)) != .SUCCESS) return error.ShmFailed;
+        errdefer _ = linux.close(fd);
+        if (linux.errno(linux.ftruncate(fd, @intCast(capacity))) != .SUCCESS) return error.ShmFailed;
 
         const data = try posix.mmap(
             null,
-            size,
+            capacity,
             .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd,
@@ -1259,17 +1256,16 @@ pub const Buffer = struct {
         );
         errdefer posix.munmap(data);
 
-        const pool = try shm.createPool(fd, size);
-        defer pool.destroy();
-        const wl_buffer = try pool.createBuffer(0, width, height, stride, switch (format) {
-            .xrgb8888 => .xrgb8888,
-            .argb8888 => .argb8888,
-        });
+        const pool = try shm.createPool(fd, @intCast(capacity));
+        errdefer pool.destroy();
+        const wl_buffer = try pool.createBuffer(0, width, height, dimensions.stride, shmFormat(format));
         errdefer wl_buffer.destroy();
 
         const self = try alloc.create(Buffer);
         self.* = .{
             .wl_buffer = wl_buffer,
+            .pool = pool,
+            .fd = fd,
             .data = data,
             .width = width,
             .height = height,
@@ -1282,14 +1278,47 @@ pub const Buffer = struct {
         return self;
     }
 
+    fn reshape(self: *Buffer, width: u31, height: u31, format: BufferFormat) !void {
+        std.debug.assert(!self.busy and !self.rendering);
+        std.debug.assert(width > 0 and height > 0);
+        const dimensions = try bufferDimensions(width, height);
+        if (dimensions.size > self.data.len) {
+            const capacity = try grownBufferCapacity(self.data.len, dimensions.size);
+            if (linux.errno(linux.ftruncate(self.fd, @intCast(capacity))) != .SUCCESS) return error.ShmFailed;
+            const data = try posix.mmap(
+                null,
+                capacity,
+                .{ .READ = true, .WRITE = true },
+                .{ .TYPE = .SHARED },
+                self.fd,
+                0,
+            );
+            self.pool.resize(@intCast(capacity));
+            posix.munmap(self.data);
+            self.data = data;
+        }
+
+        const wl_buffer = try self.pool.createBuffer(0, width, height, dimensions.stride, shmFormat(format));
+        wl_buffer.setListener(*Buffer, bufferListener, self);
+        self.wl_buffer.destroy();
+        self.wl_buffer = wl_buffer;
+        self.width = width;
+        self.height = height;
+        self.format = format;
+        self.frame = 0;
+    }
+
     fn destroy(self: *Buffer, alloc: std.mem.Allocator) void {
         self.wl_buffer.destroy();
+        self.pool.destroy();
         posix.munmap(self.data);
+        _ = linux.close(self.fd);
         alloc.destroy(self);
     }
 
     pub fn pixels(self: *Buffer) []u32 {
-        return @alignCast(std.mem.bytesAsSlice(u32, self.data));
+        const pixel_count = @as(usize, self.width) * @as(usize, self.height);
+        return @alignCast(std.mem.bytesAsSlice(u32, self.data)[0..pixel_count]);
     }
 
     fn bufferListener(_: *wl.Buffer, event: wl.Buffer.Event, self: *Buffer) void {
@@ -1298,3 +1327,41 @@ pub const Buffer = struct {
         }
     }
 };
+
+const BufferDimensions = struct {
+    stride: i32,
+    size: usize,
+};
+
+fn bufferDimensions(width: u31, height: u31) !BufferDimensions {
+    const stride = @as(usize, width) * @sizeOf(u32);
+    const size = stride * @as(usize, height);
+    if (stride > std.math.maxInt(i32) or size > std.math.maxInt(i32)) return error.ShmBufferTooLarge;
+    return .{ .stride = @intCast(stride), .size = size };
+}
+
+fn grownBufferCapacity(current: usize, required: usize) !usize {
+    const max_capacity: usize = std.math.maxInt(i32);
+    if (required > max_capacity) return error.ShmBufferTooLarge;
+    const geometric = current +| current / 2;
+    const wanted = @max(required, @max(std.heap.page_size_min, geometric));
+    const aligned = std.mem.alignForward(usize, wanted, std.heap.page_size_min);
+    return if (aligned <= max_capacity) aligned else required;
+}
+
+fn shmFormat(format: BufferFormat) wl.Shm.Format {
+    return switch (format) {
+        .xrgb8888 => .xrgb8888,
+        .argb8888 => .argb8888,
+    };
+}
+
+test "SHM buffer capacity grows geometrically and remains page aligned" {
+    const initial = try grownBufferCapacity(0, 1000);
+    try std.testing.expect(initial >= 1000);
+    try std.testing.expectEqual(@as(usize, 0), initial % std.heap.page_size_min);
+
+    const grown = try grownBufferCapacity(initial, initial + 1);
+    try std.testing.expect(grown >= initial + initial / 2);
+    try std.testing.expectEqual(@as(usize, 0), grown % std.heap.page_size_min);
+}
