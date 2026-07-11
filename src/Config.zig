@@ -78,7 +78,7 @@ pub const ThemeColors = struct {
 };
 
 pub const light_theme: ThemeColors = .{
-    .background = .{ .r = 0xf9, .g = 0xf9, .b = 0xfb },
+    .background = .{ .r = 0xf0, .g = 0xf0, .b = 0xf3 },
     .foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
     .cursor_color = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
     .selection_background = .{ .r = 0xc2, .g = 0xe5, .b = 0xff },
@@ -104,7 +104,7 @@ pub const light_theme: ThemeColors = .{
 };
 
 pub const dark_theme: ThemeColors = .{
-    .background = .{ .r = 0x18, .g = 0x19, .b = 0x1b },
+    .background = .{ .r = 0x21, .g = 0x22, .b = 0x25 },
     .foreground = .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
     .cursor_color = .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
     .selection_background = .{ .r = 0x10, .g = 0x4d, .b = 0x87 },
