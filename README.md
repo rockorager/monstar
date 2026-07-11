@@ -4,6 +4,10 @@ monstar is a small Wayland terminal emulator written in Zig, built on Ghostty's 
 
 ## Building
 
+The generated bindings require the Wayland 1.25 core schema and
+wayland-protocols 1.49 (runtime support is negotiated and older compositors
+remain supported).
+
 ```sh
 zig build
 ```

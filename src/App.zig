@@ -875,13 +875,6 @@ pub fn init(
         .terminal_handler = .init(&self.term),
     });
 
-    if (window.data_device) |device| {
-        device.setListener(*App, dataDeviceListener, self);
-    }
-    if (window.primary_device) |device| {
-        device.setListener(*App, primaryDeviceListener, self);
-    }
-
     // Handle sequences that need responses or side effects.
     var effects: Effects = .readonly;
     effects.write_pty = effectWritePty;
@@ -895,7 +888,17 @@ pub fn init(
     self.stream.handler.terminal_handler.effects = effects;
 
     self.initDbus();
-    window.setCallbacks(self, resize, keyboardEvent, pointerEvent, textInputEvent, scaleChanged, redrawReady, activationTokenReady);
+    window.setCallbacks(
+        self,
+        resize,
+        keyboardEvent,
+        pointerEvent,
+        textInputEvent,
+        scaleChanged,
+        redrawReady,
+        activationTokenReady,
+        clipboardDevicesChanged,
+    );
     return self;
 }
 
@@ -1014,11 +1017,7 @@ fn effectTitleChanged(handler: *Handler) void {
 }
 
 fn effectBell(handler: *Handler) void {
-    const self = appFromHandler(handler);
-    if (self.focused) return;
-    self.window.setUrgent(true) catch |err| {
-        log.warn("failed to request window attention: {}", .{err});
-    };
+    appFromHandler(handler).window.ringBell();
 }
 
 fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void {
@@ -1620,14 +1619,14 @@ pub fn run(self: *App) !void {
         self.window.flushPending();
 
         if (signal_fd.revents & posix.POLL.IN != 0) {
-            self.drainSignals();
+            try self.drainSignals();
         }
 
         if (pty_write_fd.revents & posix.POLL.OUT != 0) {
             self.flushWriteQueue();
         }
         if (pipeline_fd.revents & posix.POLL.IN != 0) {
-            self.drainPipeline();
+            try self.drainPipeline();
         }
 
         if (repeat_fd.revents & posix.POLL.IN != 0) {
@@ -1695,7 +1694,7 @@ fn hangupChild(self: *App) void {
 
 /// Signal events arrived. SIGCHLD is the only place the terminal decides
 /// the session is over; SIGUSR1 reloads process-local configuration.
-fn drainSignals(self: *App) void {
+fn drainSignals(self: *App) !void {
     var info: std.os.linux.signalfd_siginfo = undefined;
     var saw_sigchld = false;
     var saw_sigusr1 = false;
@@ -1710,7 +1709,7 @@ fn drainSignals(self: *App) void {
     }
     if (saw_sigusr1) self.reloadConfig();
     if (saw_sigchld) {
-        if (Pty.tryWait(self.child_pid)) |status| {
+        if (try Pty.tryWait(self.child_pid)) |status| {
             log.debug("child exited with status {d}", .{status});
             self.child_exited = true;
         }
@@ -1951,7 +1950,7 @@ fn waitStatusExitedZero(status: u32) bool {
     return (status & 0x7f) == 0 and (status >> 8) == 0;
 }
 
-fn resolveCommandPath(
+pub fn resolveCommandPath(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
     command: [:0]const u8,
@@ -1959,7 +1958,7 @@ fn resolveCommandPath(
     return (try resolveCommandPathZ(arena, environ, command)).ptr;
 }
 
-fn resolveCommandPathZ(
+pub fn resolveCommandPathZ(
     arena: std.mem.Allocator,
     environ: std.process.Environ,
     command: [:0]const u8,
@@ -1971,7 +1970,18 @@ fn resolveCommandPathZ(
     while (dirs.next()) |dir| {
         const base = if (dir.len == 0) "." else dir;
         const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, command }, 0);
-        if (std.os.linux.errno(std.os.linux.access(candidate, std.os.linux.X_OK)) == .SUCCESS) {
+        var stat = std.mem.zeroes(std.os.linux.Statx);
+        const stat_rc = std.os.linux.statx(
+            std.os.linux.AT.FDCWD,
+            candidate,
+            std.os.linux.AT.NO_AUTOMOUNT,
+            .{ .TYPE = true },
+            &stat,
+        );
+        if (std.os.linux.errno(stat_rc) == .SUCCESS and stat.mask.TYPE and
+            std.os.linux.S.ISREG(stat.mode) and
+            std.os.linux.errno(std.os.linux.access(candidate, std.os.linux.X_OK)) == .SUCCESS)
+        {
             return candidate;
         }
     }
@@ -2261,8 +2271,8 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.font_size_px = desired_font_size;
     resizeForConfig(
         self,
-        physicalDimension(self.window.width, self.window.scale120),
-        physicalDimension(self.window.height, self.window.scale120),
+        Window.physicalDimension(self.window.width, self.window.scale120),
+        Window.physicalDimension(self.window.height, self.window.scale120),
         new_config,
     ) catch |err| {
         log.warn("config reload resize failed: {}", .{err});
@@ -2326,8 +2336,8 @@ fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
     self.font_size_px = size_px;
     resize(
         self,
-        physicalDimension(self.window.width, self.window.scale120),
-        physicalDimension(self.window.height, self.window.scale120),
+        Window.physicalDimension(self.window.width, self.window.scale120),
+        Window.physicalDimension(self.window.height, self.window.scale120),
     ) catch |err| {
         log.warn("font size change resize failed: {}", .{err});
     };
@@ -2356,7 +2366,7 @@ fn resetRuntimeFontSize(self: *App) void {
 ///
 /// The master can never return EIO/EOF because Pty.spawn retains a
 /// slave fd in this process; only SIGCHLD ends the session.
-fn drainPipeline(self: *App) void {
+fn drainPipeline(self: *App) !void {
     self.pipeline.clearReady();
     for (0..ReadPipeline.buffer_count) |_| {
         const batch = self.pipeline.take() orelse break;
@@ -2365,6 +2375,7 @@ fn drainPipeline(self: *App) void {
         self.needs_redraw = true;
     }
     self.pipeline.rearm();
+    if (self.pipeline.hasFailed()) return error.PtyReadFailed;
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
     self.syncActiveScreen();
@@ -3068,6 +3079,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                 self.scroll_time_ms = axis.time;
                 self.scroll_had_pixels = true;
             }
+            if (!self.window.pointerHasFrames()) self.finishScrollFrame();
         },
         .axis_discrete => |discrete| {
             self.stopFling();
@@ -3133,6 +3145,9 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .axis_stop => |stop| {
             if (stop.axis == .vertical_scroll) self.scroll_stopped = true;
         },
+        // Terminal scrolling follows the compositor-provided logical axis;
+        // the physical direction hint does not change that behavior.
+        .axis_relative_direction => {},
         .leave => {},
     }
 }
@@ -3223,24 +3238,13 @@ fn selectionGeometry(self: *App) vt.SelectionGesture.Drag.Geometry {
     };
 }
 
-fn physicalDimension(logical: u31, scale120: u32) u31 {
-    return @intCast((@as(u64, logical) * scale120 + 60) / 120);
-}
-
 fn physicalPadding(config: Config, scale120: u32) TerminalLayout.Padding {
     return .{
-        .left = scaledConfigDimension(config.window_padding_x.first, scale120),
-        .right = scaledConfigDimension(config.window_padding_x.second, scale120),
-        .top = scaledConfigDimension(config.window_padding_y.first, scale120),
-        .bottom = scaledConfigDimension(config.window_padding_y.second, scale120),
+        .left = Window.physicalDimension(config.window_padding_x.first, scale120),
+        .right = Window.physicalDimension(config.window_padding_x.second, scale120),
+        .top = Window.physicalDimension(config.window_padding_y.first, scale120),
+        .bottom = Window.physicalDimension(config.window_padding_y.second, scale120),
     };
-}
-
-fn scaledConfigDimension(logical: u31, scale120: u32) u31 {
-    return @intCast(@min(
-        std.math.maxInt(u31),
-        (@as(u64, logical) * scale120 + 60) / 120,
-    ));
 }
 
 fn selectionTimestamp(ms: u32) std.Io.Timestamp {
@@ -3694,6 +3698,16 @@ fn primaryDeviceListener(
     }
 }
 
+fn clipboardDevicesChanged(
+    ctx: *anyopaque,
+    data_device: ?*wl.DataDevice,
+    primary_device: ?*zwp.PrimarySelectionDeviceV1,
+) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    if (data_device) |device| device.setListener(*App, dataDeviceListener, self);
+    if (primary_device) |device| device.setListener(*App, primaryDeviceListener, self);
+}
+
 /// The current selection's text, allocated, or null if nothing selected.
 fn selectionText(self: *App) ?[:0]const u8 {
     const screen = self.term.screens.active;
@@ -4087,6 +4101,7 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             const action: vt.input.KeyAction = switch (key.state) {
                 .pressed => .press,
                 .released => .release,
+                .repeated => .repeat,
                 else => return,
             };
             self.onKey(key.key, action);
@@ -4113,11 +4128,6 @@ fn setFocus(self: *App, focused: bool) void {
     if (self.focused == focused) return;
     self.focused = focused;
     self.requestFullAsyncRedraw();
-    if (focused) {
-        self.window.setUrgent(false) catch |err| {
-            log.warn("failed to clear window attention: {}", .{err});
-        };
-    }
     // Applications with focus reporting (mode 1004) get CSI I / CSI O.
     if (self.term.modes.get(.focus_event)) {
         var buf: [vt.input.max_focus_encode_size]u8 = undefined;
@@ -4552,8 +4562,8 @@ fn redrawIfNeeded(self: *App) !void {
 fn commitHeldFrame(self: *App) void {
     const buffer = self.held_frame orelse return;
     self.held_frame = null;
-    if (buffer.width != physicalDimension(self.window.width, self.window.scale120) or
-        buffer.height != physicalDimension(self.window.height, self.window.scale120))
+    if (buffer.width != Window.physicalDimension(self.window.width, self.window.scale120) or
+        buffer.height != Window.physicalDimension(self.window.height, self.window.scale120))
     {
         self.window.cancelRender(buffer);
         self.async_force_full = true;
@@ -4666,8 +4676,8 @@ fn finishAsyncRender(self: *App) void {
     }
     if (result.job.generation != self.async_generation or
         self.window.suspended or
-        result.job.width != physicalDimension(self.window.width, self.window.scale120) or
-        result.job.height != physicalDimension(self.window.height, self.window.scale120))
+        result.job.width != Window.physicalDimension(self.window.width, self.window.scale120) or
+        result.job.height != Window.physicalDimension(self.window.height, self.window.scale120))
     {
         self.window.cancelRender(buffer);
         self.async_force_full = true;

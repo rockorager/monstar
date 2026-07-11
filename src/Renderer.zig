@@ -66,6 +66,12 @@ cluster_scratch: std.ArrayList(u21),
 /// Shape cache counters for benchmarks/profiling. Production rendering does
 /// not read these, so they stay deliberately cheap and approximate.
 shape_stats: ShapeStats = .{},
+/// Final RGBA bytes for scaled Kitty variants. Unlike the terminal-owned
+/// source data, these remain valid across renders of the long-lived worker.
+kitty_scale_cache: std.AutoHashMapUnmanaged(KittyScaleKey, []u8),
+kitty_scale_cache_bytes: usize = 0,
+/// Private observable for the focused cache test and profiling.
+kitty_scale_count: usize = 0,
 /// Physical framebuffer row stride. Zero means the visible width, which is
 /// convenient for standalone renderer tests and tightly packed buffers.
 buffer_stride: u31 = 0,
@@ -73,6 +79,22 @@ buffer_stride: u31 = 0,
 /// Shape cache entry limit; at ~300 bytes per typical entry the cache
 /// tops out around a few megabytes before it resets.
 const shape_cache_max_entries = 8192;
+const kitty_scale_cache_max_entries = 32;
+const kitty_scale_cache_max_bytes = 32 * 1024 * 1024;
+
+const KittyScaleKey = struct {
+    image_id: u32,
+    generation: u64,
+    format: @FieldType(KittyImage, "format"),
+    image_width: u32,
+    image_height: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    dest_width: u32,
+    dest_height: u32,
+};
 
 /// One glyph of a shaped run, positions already in pixels.
 const ShapedGlyph = struct {
@@ -125,6 +147,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .codepoint_scratch = .empty,
         .cluster_scratch = .empty,
         .shape_stats = .{},
+        .kitty_scale_cache = .empty,
         .buffer_stride = 0,
     };
 }
@@ -141,7 +164,16 @@ pub fn deinit(self: *Renderer) void {
     self.shape_key.deinit(self.alloc);
     self.codepoint_scratch.deinit(self.alloc);
     self.cluster_scratch.deinit(self.alloc);
+    self.clearKittyScaleCache();
+    self.kitty_scale_cache.deinit(self.alloc);
     self.* = undefined;
+}
+
+fn clearKittyScaleCache(self: *Renderer) void {
+    var it = self.kitty_scale_cache.valueIterator();
+    while (it.next()) |bytes| self.alloc.free(bytes.*);
+    self.kitty_scale_cache.clearRetainingCapacity();
+    self.kitty_scale_cache_bytes = 0;
 }
 
 /// Drop all cached shaping results. Must be called when the font (and
@@ -775,15 +807,53 @@ fn renderKittyPlacement(
         return;
     }
 
-    var source = try self.alloc.alloc(u8, @as(usize, source_width) * source_height * 4);
+    const scaled = try self.scaledKittyRgba(image, viewport) orelse return;
+    defer if (!scaled.cached) self.alloc.free(scaled.bytes);
+
+    blendRgba(pixels, self.pixelStride(width), width, height, scaled.bytes, dest_width, dest_height, dest_x, dest_y);
+}
+
+fn scaledKittyRgba(
+    self: *Renderer,
+    image: KittyImage,
+    viewport: KittyPlacementViewport,
+) !?struct { bytes: []const u8, cached: bool } {
+    const key: KittyScaleKey = .{
+        .image_id = image.id,
+        .generation = image.generation,
+        .format = image.format,
+        .image_width = image.width,
+        .image_height = image.height,
+        .source_x = viewport.source_x,
+        .source_y = viewport.source_y,
+        .source_width = viewport.source_width,
+        .source_height = viewport.source_height,
+        .dest_width = viewport.pixel_width,
+        .dest_height = viewport.pixel_height,
+    };
+    if (self.kitty_scale_cache.get(key)) |bytes| return .{ .bytes = bytes, .cached = true };
+
+    const scaled_len = @as(usize, viewport.pixel_width) * viewport.pixel_height * 4;
+    const cacheable = scaled_len <= kitty_scale_cache_max_bytes;
+    if (cacheable and (self.kitty_scale_cache.count() >= kitty_scale_cache_max_entries or
+        self.kitty_scale_cache_bytes + scaled_len > kitty_scale_cache_max_bytes))
+    {
+        self.clearKittyScaleCache();
+    }
+
+    var source = try self.alloc.alloc(u8, @as(usize, viewport.source_width) * viewport.source_height * 4);
     defer self.alloc.free(source);
-    if (!copyKittySourceRgba(&source, image, viewport)) return;
+    if (!copyKittySourceRgba(&source, image, viewport)) return null;
 
-    const scaled = try self.alloc.alloc(u8, @as(usize, dest_width) * dest_height * 4);
-    defer self.alloc.free(scaled);
-    try resizeRgba(source, source_width, source_height, scaled, dest_width, dest_height);
+    const scaled = try self.alloc.alloc(u8, scaled_len);
+    errdefer self.alloc.free(scaled);
+    try resizeRgba(source, viewport.source_width, viewport.source_height, scaled, viewport.pixel_width, viewport.pixel_height);
+    self.kitty_scale_count += 1;
+    if (!cacheable) return .{ .bytes = scaled, .cached = false };
 
-    blendRgba(pixels, self.pixelStride(width), width, height, scaled, dest_width, dest_height, dest_x, dest_y);
+    try self.kitty_scale_cache.put(self.alloc, key, scaled);
+    self.kitty_scale_cache_bytes += scaled.len;
+    return .{ .bytes = scaled, .cached = true };
 }
 
 /// Draw an unscaled placement directly from the terminal-owned image
@@ -2281,6 +2351,49 @@ test "kitty unscaled blit honors rgba alpha" {
         pixels[2],
     ); // partial alpha blends
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
+}
+
+test "scaled kitty placement reuses cached rgba variant" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const image: KittyImage = .{
+        .id = 17,
+        .width = 2,
+        .height = 2,
+        .format = .rgb,
+        .data = &.{
+            10, 20, 30, 40,  50,  60,
+            70, 80, 90, 100, 110, 120,
+        },
+        .generation = 3,
+    };
+    const viewport: KittyPlacementViewport = .{
+        .viewport_col = 0,
+        .viewport_row = 0,
+        .visible = true,
+        .offset_x = 0,
+        .offset_y = 0,
+        .pixel_width = 3,
+        .pixel_height = 3,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 2,
+        .source_height = 2,
+    };
+    var pixels = [_]u32{0xff000000} ** 9;
+
+    try renderer.renderKittyPlacement(&pixels, 3, 3, image, viewport);
+    const first = pixels;
+    @memset(&pixels, 0xff000000);
+    try renderer.renderKittyPlacement(&pixels, 3, 3, image, viewport);
+
+    try std.testing.expectEqualSlices(u32, &first, &pixels);
+    try std.testing.expectEqual(@as(usize, 1), renderer.kitty_scale_count);
+    try std.testing.expectEqual(@as(u32, 1), renderer.kitty_scale_cache.count());
 }
 
 test "copyOpaqueRgbSpan matches scalar conversion across vector boundaries" {

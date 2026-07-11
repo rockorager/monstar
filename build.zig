@@ -12,19 +12,27 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-system-bell/xdg-system-bell-v1.xml");
+    scanner.addSystemProtocol("staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/text-input/text-input-unstable-v3.xml");
-    scanner.generate("wl_compositor", 4);
-    scanner.generate("wl_shm", 1);
-    scanner.generate("wl_seat", 8);
-    scanner.generate("xdg_wm_base", 6);
+    // Generate against current stable protocol definitions. Runtime binding
+    // still negotiates the compositor-advertised version, and Window keeps
+    // fallbacks for every optional/versioned feature it uses.
+    scanner.generate("wl_compositor", 7);
+    scanner.generate("wl_output", 4);
+    scanner.generate("wl_shm", 2);
+    scanner.generate("wl_seat", 10);
+    scanner.generate("xdg_wm_base", 7);
     scanner.generate("xdg_activation_v1", 1);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
-    scanner.generate("wp_cursor_shape_manager_v1", 1);
-    scanner.generate("zxdg_decoration_manager_v1", 1);
-    scanner.generate("wl_data_device_manager", 3);
+    scanner.generate("wp_cursor_shape_manager_v1", 2);
+    scanner.generate("xdg_system_bell_v1", 1);
+    scanner.generate("xdg_toplevel_icon_manager_v1", 1);
+    scanner.generate("zxdg_decoration_manager_v1", 2);
+    scanner.generate("wl_data_device_manager", 4);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);
     scanner.generate("zwp_text_input_manager_v3", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
@@ -37,6 +45,7 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
+    root_module.linkSystemLibrary("wayland-cursor", .{});
 
     const ghostty_dep = b.lazyDependency("ghostty", .{
         .target = target,

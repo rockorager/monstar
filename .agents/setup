@@ -10,7 +10,13 @@ ZIG_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
 ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
 ZIG_DIR="${HOME}/.local/opt/zig-${ZIG_VERSION}"
 
+WAYLAND_VERSION=1.25.0
+WAYLAND_SHA256=c065f040afdff3177680600f249727e41a1afc22fccf27222f15f5306faa1f03
+WAYLAND_URL="https://gitlab.freedesktop.org/wayland/wayland/-/releases/${WAYLAND_VERSION}/downloads/wayland-${WAYLAND_VERSION}.tar.xz"
+WAYLAND_DIR="/opt/wayland-${WAYLAND_VERSION}"
+
 WAYLAND_PROTOCOLS_VERSION=1.49
+WAYLAND_PROTOCOLS_SHA256=ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14
 WAYLAND_PROTOCOLS_URL="https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/${WAYLAND_PROTOCOLS_VERSION}/downloads/wayland-protocols-${WAYLAND_PROTOCOLS_VERSION}.tar.xz"
 WAYLAND_PROTOCOLS_DIR="/opt/wayland-protocols-${WAYLAND_PROTOCOLS_VERSION}"
 
@@ -62,13 +68,29 @@ fi
 
 ln -sfn "${ZIG_DIR}/zig" "${HOME}/.local/bin/zig"
 
+# Debian's core wayland.xml is older than its runtime can interoperate with.
+# Pin the latest stable schema used to generate Monstar's client bindings;
+# runtime interface versions are still negotiated with each compositor.
+if [ ! -f "${WAYLAND_DIR}/protocol/wayland.xml" ]; then
+  tmpdir=$(mktemp -d)
+  trap 'rm -rf "${tmpdir}"' EXIT
+  curl -fsSLo "${tmpdir}/wayland.tar.xz" "${WAYLAND_URL}"
+  printf '%s  %s\n' "${WAYLAND_SHA256}" "${tmpdir}/wayland.tar.xz" | sha256sum -c -
+  tar -C "${tmpdir}" -xf "${tmpdir}/wayland.tar.xz"
+  "${SUDO[@]}" rm -rf "${WAYLAND_DIR}"
+  "${SUDO[@]}" mv "${tmpdir}/wayland-${WAYLAND_VERSION}" "${WAYLAND_DIR}"
+  rm -rf "${tmpdir}"
+  trap - EXIT
+fi
+
 # Debian bookworm ships wayland-protocols 1.31, but Monstar's build expects
-# newer stable/tablet protocol paths. Install a newer protocol data directory
-# and a pkg-config override in a default pkg-config search path.
+# current cursor-shape, text-input, bell, and icon definitions. Install a
+# pinned protocol data directory and pkg-config override.
 if [ ! -f "${WAYLAND_PROTOCOLS_DIR}/stable/tablet/tablet-v2.xml" ]; then
   tmpdir=$(mktemp -d)
   trap 'rm -rf "${tmpdir}"' EXIT
   curl -fsSLo "${tmpdir}/wayland-protocols.tar.xz" "${WAYLAND_PROTOCOLS_URL}"
+  printf '%s  %s\n' "${WAYLAND_PROTOCOLS_SHA256}" "${tmpdir}/wayland-protocols.tar.xz" | sha256sum -c -
   tar -C "${tmpdir}" -xf "${tmpdir}/wayland-protocols.tar.xz"
   "${SUDO[@]}" rm -rf "${WAYLAND_PROTOCOLS_DIR}"
   "${SUDO[@]}" mv "${tmpdir}/wayland-protocols-${WAYLAND_PROTOCOLS_VERSION}" "${WAYLAND_PROTOCOLS_DIR}"
@@ -77,6 +99,19 @@ if [ ! -f "${WAYLAND_PROTOCOLS_DIR}/stable/tablet/tablet-v2.xml" ]; then
 fi
 
 "${SUDO[@]}" mkdir -p /usr/local/share/pkgconfig
+cat > /tmp/wayland-scanner.pc <<EOF
+prefix=${WAYLAND_DIR}
+bindir=/usr/bin
+pkgdatadir=\${prefix}/protocol
+wayland_scanner=\${bindir}/wayland-scanner
+
+Name: Wayland Scanner Data
+Description: Wayland core protocol file
+Version: ${WAYLAND_VERSION}
+EOF
+"${SUDO[@]}" install -m 0644 /tmp/wayland-scanner.pc /usr/local/share/pkgconfig/wayland-scanner.pc
+rm -f /tmp/wayland-scanner.pc
+
 cat > /tmp/wayland-protocols.pc <<EOF
 prefix=${WAYLAND_PROTOCOLS_DIR}
 pkgdatadir=\${prefix}

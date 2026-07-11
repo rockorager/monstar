@@ -67,6 +67,9 @@ tail: usize,
 /// thread only writes the idle pipe when this is set, so interactive
 /// output never pays the extra syscall.
 bridging: std.atomic.Value(bool),
+/// An unexpected terminal read failure occurred. SIGCHLD still owns
+/// session lifetime, but the main loop must report this as fatal.
+failed: std.atomic.Value(bool),
 
 bufs: [buffer_count][buffer_capacity]u8,
 
@@ -111,6 +114,7 @@ pub fn init(master: posix.fd_t) Error!ReadPipeline {
         .head = 0,
         .tail = 0,
         .bridging = .init(false),
+        .failed = .init(false),
         .bufs = undefined,
     };
 }
@@ -178,6 +182,10 @@ pub fn release(self: *ReadPipeline) void {
 /// the next poll iteration continues without waiting for a new publish.
 pub fn rearm(self: *ReadPipeline) void {
     if (self.count.load(.acquire) > 0) bump(self.ready_fd);
+}
+
+pub fn hasFailed(self: *const ReadPipeline) bool {
+    return self.failed.load(.acquire);
 }
 
 fn bump(fd: posix.fd_t) void {
@@ -276,7 +284,8 @@ fn waitSlotFree(self: *ReadPipeline) bool {
 /// makes impossible in normal operation. Log and park until stop():
 /// reads are over, but session lifetime belongs to SIGCHLD.
 fn parkUntilQuit(self: *ReadPipeline) void {
-    log.warn("unexpected EIO/EOF on pty master; pty reads stopped", .{});
+    self.failed.store(true, .release);
+    bump(self.ready_fd);
     var fds = [_]posix.pollfd{
         .{ .fd = self.quit_fds[0], .events = posix.POLL.IN, .revents = 0 },
     };
@@ -325,11 +334,13 @@ fn gatherMain(self: *ReadPipeline) void {
                     }
                 },
                 else => {
+                    log.err("unexpected pty master read failure: {}", .{err});
                     failed = true;
                     break :gather;
                 },
             };
             if (n == 0) {
+                log.warn("unexpected EOF on pty master", .{});
                 failed = true;
                 break :gather;
             }
@@ -396,11 +407,12 @@ test "pipeline delivers batches and stops cleanly after EOF" {
     pipeline.release();
     try std.testing.expectEqual(null, pipeline.take());
 
-    // EOF (write end closed) parks the gather thread on the quit pipe;
-    // deinit must still stop and join it without hanging.
+    // EOF wakes the main-loop fd and remains parked for a clean join.
     _ = linux.close(pipe_fds[1]);
-    const ts: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-    _ = linux.nanosleep(&ts, null);
+    fds[0].revents = 0;
+    try std.testing.expect(try posix.poll(&fds, 1000) == 1);
+    pipeline.clearReady();
+    try std.testing.expect(pipeline.hasFailed());
 }
 
 fn releaseAfterBridgeArmed(pipeline: *ReadPipeline) void {

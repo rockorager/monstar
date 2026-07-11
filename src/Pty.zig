@@ -162,13 +162,16 @@ pub fn wait(pid: posix.pid_t) Error!u32 {
 }
 
 /// Reap the child if it has exited; null while it is still running.
-pub fn tryWait(pid: posix.pid_t) ?u32 {
+pub fn tryWait(pid: posix.pid_t) Error!?u32 {
     var status: u32 = undefined;
     const rc = linux.wait4(pid, &status, linux.W.NOHANG, null);
     return switch (linux.errno(rc)) {
         .SUCCESS => if (rc == 0) null else status,
-        // ECHILD and friends: nothing left to wait for.
-        else => 0,
+        .CHILD => 0,
+        else => |err| {
+            log.err("wait4 failed: {}", .{err});
+            return error.PtyFailed;
+        },
     };
 }
 

@@ -328,18 +328,7 @@ fn resolveCommandPath(
     environ: std.process.Environ,
     command: [:0]const u8,
 ) ![*:0]const u8 {
-    if (std.mem.indexOfScalar(u8, command, '/') != null) return command.ptr;
-
-    const path_env = environ.getPosix("PATH") orelse "/usr/local/bin:/usr/bin:/bin";
-    var dirs = std.mem.splitScalar(u8, path_env, ':');
-    while (dirs.next()) |dir| {
-        const base = if (dir.len == 0) "." else dir;
-        const candidate = try std.fmt.allocPrintSentinel(arena, "{s}/{s}", .{ base, command }, 0);
-        if (std.os.linux.errno(std.os.linux.access(candidate, std.os.linux.X_OK)) == .SUCCESS) {
-            return candidate.ptr;
-        }
-    }
-    return command.ptr;
+    return App.resolveCommandPath(arena, environ, command);
 }
 
 fn validateWorkingDirectory(path: [:0]const u8) !void {

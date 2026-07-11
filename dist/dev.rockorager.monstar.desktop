@@ -2,6 +2,7 @@
 Type=Application
 Name=monstar
 Comment=Wayland terminal emulator
+Icon=utilities-terminal
 Exec=monstar
 Terminal=false
 StartupNotify=true

@@ -29,5 +29,6 @@
         "LICENSE",
         "README.md",
         "src",
+        "vendor",
     },
 }

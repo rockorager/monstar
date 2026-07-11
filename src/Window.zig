@@ -21,17 +21,22 @@ const default_height = 600;
 alloc: std.mem.Allocator,
 display: *wl.Display,
 registry: *wl.Registry,
+registry_state: *Globals,
 compositor: *wl.Compositor,
 shm: *wl.Shm,
 wm_base: *xdg.WmBase,
 activation: ?*xdg.ActivationV1,
 activation_token: ?*xdg.ActivationTokenV1,
 activation_token_purpose: ?ActivationTokenPurpose,
+system_bell: ?*xdg.SystemBellV1,
+toplevel_icon_manager: ?*xdg.ToplevelIconManagerV1,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
 cursor_shape_manager: ?*wp.CursorShapeManagerV1,
 cursor_shape_device: ?*wp.CursorShapeDeviceV1,
+cursor_theme: ?*wl.CursorTheme,
+cursor_surface: ?*wl.Surface,
 cursor_shape: CursorShape,
 pointer_enter_serial: ?u32,
 /// Clipboard: managers create sources (copy); devices carry offers
@@ -63,6 +68,9 @@ pending_height: u31,
 /// Output scale in 1/120ths (wp_fractional_scale unit); 120 == 1.0.
 /// Buffers are sized in physical pixels: logical * scale120 / 120.
 scale120: u32,
+/// Core wl_surface v6 preference, when available. Fractional-scale-v1 takes
+/// priority; wl_output.scale remains the fallback before this event arrives.
+surface_preferred_scale: ?u32,
 /// Wayland callbacks update pending state; expensive/app-visible work is
 /// flushed once after the current dispatch batch.
 pending_scale_changed: bool,
@@ -89,6 +97,7 @@ text_input_fn: ?TextInputFn,
 scale_fn: ?ScaleFn,
 redraw_ready_fn: ?RedrawReadyFn,
 activation_token_fn: ?ActivationTokenFn,
+clipboard_devices_fn: ?ClipboardDevicesFn,
 
 /// A full-width horizontal band of pixels, in buffer coordinates.
 pub const RowSpan = struct { y: u31, height: u31 };
@@ -115,6 +124,13 @@ pub const PointerFn = *const fn (ctx: *anyopaque, event: wl.Pointer.Event) void;
 /// The string is only valid for the duration of the callback.
 pub const ActivationTokenFn = *const fn (ctx: *anyopaque, token: [:0]const u8) void;
 
+/// Clipboard devices change when a seat is removed or re-announced.
+pub const ClipboardDevicesFn = *const fn (
+    ctx: *anyopaque,
+    data_device: ?*wl.DataDevice,
+    primary_device: ?*zwp.PrimarySelectionDeviceV1,
+) void;
+
 /// Raw text-input-v3 events, forwarded as-is. String pointers are only
 /// valid for the duration of the callback.
 pub const TextInputFn = *const fn (ctx: *anyopaque, event: zwp.TextInputV3.Event) void;
@@ -134,7 +150,6 @@ pub const InitialSize = struct {
 };
 
 const ActivationTokenPurpose = enum {
-    activate_self,
     activate_other,
 };
 
@@ -147,13 +162,35 @@ pub const ScaleFn = *const fn (ctx: *anyopaque, scale120: u32) anyerror!void;
 /// scheduling; Window never draws or commits on its own initiative.
 pub const RedrawReadyFn = *const fn (ctx: *anyopaque) void;
 
-/// Globals collected during the initial registry roundtrip.
+const OutputState = struct {
+    global_name: u32,
+    proxy: *wl.Output,
+    scale: u32 = 1,
+    entered: bool = false,
+    registry_state: *Globals,
+
+    fn destroy(self: *OutputState) void {
+        if (self.proxy.getVersion() >= wl.Output.release_since_version)
+            self.proxy.release()
+        else
+            self.proxy.destroy();
+        self.registry_state.alloc.destroy(self);
+    }
+};
+
+/// Persistent registry callback state. Registry listeners cannot be removed,
+/// so this must outlive the stack frame that performs the initial roundtrip.
 const Globals = struct {
+    alloc: std.mem.Allocator,
+    window: ?*Window = null,
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
     wm_base: ?*xdg.WmBase = null,
     activation: ?*xdg.ActivationV1 = null,
+    system_bell: ?*xdg.SystemBellV1 = null,
+    toplevel_icon_manager: ?*xdg.ToplevelIconManagerV1 = null,
     seat: ?*wl.Seat = null,
+    seat_name: ?u32 = null,
     viewporter: ?*wp.Viewporter = null,
     fractional_manager: ?*wp.FractionalScaleManagerV1 = null,
     cursor_shape_manager: ?*wp.CursorShapeManagerV1 = null,
@@ -161,6 +198,26 @@ const Globals = struct {
     primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1 = null,
     text_input_manager: ?*zwp.TextInputManagerV3 = null,
     decoration_manager: ?*zxdg.DecorationManagerV1 = null,
+    outputs: std.ArrayList(*OutputState) = .empty,
+
+    fn deinit(self: *Globals) void {
+        for (self.outputs.items) |output| output.destroy();
+        self.outputs.deinit(self.alloc);
+        self.alloc.destroy(self);
+    }
+
+    fn removeOutput(self: *Globals, global_name: u32) void {
+        for (self.outputs.items, 0..) |output, i| {
+            if (output.global_name != global_name) continue;
+            const entered = output.entered;
+            output.destroy();
+            _ = self.outputs.swapRemove(i);
+            if (entered) {
+                if (self.window) |window| window.updateIntegerScale();
+            }
+            return;
+        }
+    }
 };
 
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
@@ -174,8 +231,11 @@ pub fn create(
     errdefer display.disconnect();
 
     const registry = try display.getRegistry();
-    var globals: Globals = .{};
-    registry.setListener(*Globals, registryListener, &globals);
+    errdefer registry.destroy();
+    const globals = try alloc.create(Globals);
+    globals.* = .{ .alloc = alloc };
+    errdefer globals.deinit();
+    registry.setListener(*Globals, registryListener, globals);
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
 
     const compositor = globals.compositor orelse return error.NoWlCompositor;
@@ -187,6 +247,14 @@ pub fn create(
     const toplevel = try xdg_surface.getToplevel();
     toplevel.setAppId(app_id);
     toplevel.setTitle(title);
+
+    if (globals.toplevel_icon_manager) |manager| {
+        if (manager.createIcon()) |icon| {
+            icon.setName("utilities-terminal");
+            manager.setIcon(toplevel, icon);
+            icon.destroy();
+        } else |_| {}
+    }
 
     const toplevel_decoration = decoration: {
         const manager = globals.decoration_manager orelse break :decoration null;
@@ -200,7 +268,7 @@ pub fn create(
 
     // Fractional scaling needs both protocols: the scale event and a
     // viewport to map the physical-pixel buffer onto the logical size.
-    // Without them we render 1:1 and let the compositor scale.
+    // Core wl_output integer scaling is installed below as the fallback.
     var viewport: ?*wp.Viewport = null;
     var fractional_scale: ?*wp.FractionalScaleV1 = null;
     if (globals.viewporter) |viewporter| {
@@ -210,6 +278,10 @@ pub fn create(
             viewport = viewporter.getViewport(surface) catch null;
             if (viewport != null) {
                 fractional_scale = manager.getFractionalScale(surface) catch null;
+                if (fractional_scale == null) {
+                    viewport.?.destroy();
+                    viewport = null;
+                }
             }
         }
     } else if (globals.fractional_manager) |manager| {
@@ -235,23 +307,43 @@ pub fn create(
         }
     }
 
+    var cursor_theme: ?*wl.CursorTheme = null;
+    var cursor_surface: ?*wl.Surface = null;
+    if (globals.cursor_shape_manager == null) {
+        cursor_theme = wl.CursorTheme.load(null, 24, shm) catch null;
+        if (cursor_theme != null) {
+            cursor_surface = compositor.createSurface() catch null;
+            if (cursor_surface == null) {
+                cursor_theme.?.destroy();
+                cursor_theme = null;
+            }
+        }
+    }
+    errdefer if (cursor_surface) |value| value.destroy();
+    errdefer if (cursor_theme) |value| value.destroy();
+
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
     self.* = .{
         .alloc = alloc,
         .display = display,
         .registry = registry,
+        .registry_state = globals,
         .compositor = compositor,
         .shm = shm,
         .wm_base = wm_base,
         .activation = globals.activation,
         .activation_token = null,
         .activation_token_purpose = null,
+        .system_bell = globals.system_bell,
+        .toplevel_icon_manager = globals.toplevel_icon_manager,
         .seat = globals.seat,
         .keyboard = null,
         .pointer = null,
         .cursor_shape_manager = globals.cursor_shape_manager,
         .cursor_shape_device = null,
+        .cursor_theme = cursor_theme,
+        .cursor_surface = cursor_surface,
         .cursor_shape = .text,
         .pointer_enter_serial = null,
         .data_manager = globals.data_manager,
@@ -278,6 +370,7 @@ pub fn create(
         .pending_width = initial_size.width,
         .pending_height = initial_size.height,
         .scale120 = 120,
+        .surface_preferred_scale = null,
         .pending_scale_changed = false,
         .pending_geometry_changed = false,
         .pending_draw = false,
@@ -295,13 +388,16 @@ pub fn create(
         .scale_fn = null,
         .redraw_ready_fn = null,
         .activation_token_fn = null,
+        .clipboard_devices_fn = null,
     };
+    globals.window = self;
 
     if (toplevel_decoration) |decoration| decoration.setListener(*Window, decorationListener, self);
     if (fractional_scale) |fs| fs.setListener(*Window, fractionalScaleListener, self);
     if (text_input) |ti| ti.setListener(*Window, textInputListener, self);
     if (globals.seat) |seat| seat.setListener(*Window, seatListener, self);
     wm_base.setListener(*Window, wmBaseListener, self);
+    surface.setListener(*Window, surfaceListener, self);
     xdg_surface.setListener(*Window, xdgSurfaceListener, self);
     toplevel.setListener(*Window, toplevelListener, self);
     surface.commit();
@@ -317,14 +413,25 @@ pub fn create(
 }
 
 pub fn destroy(self: *Window) void {
+    self.registry_state.window = null;
     for (self.buffers.items) |buffer| buffer.destroy(self.alloc);
     self.buffers.deinit(self.alloc);
     if (self.fractional_scale) |fs| fs.destroy();
     if (self.viewport) |viewport| viewport.destroy();
     if (self.cursor_shape_device) |device| device.destroy();
+    if (self.pointer) |pointer| destroyPointer(pointer);
+    if (self.keyboard) |keyboard| destroyKeyboard(keyboard);
+    if (self.data_device) |device| destroyDataDevice(device);
+    if (self.seat) |seat| destroySeat(seat);
+    if (self.cursor_surface) |surface| surface.destroy();
+    if (self.cursor_theme) |theme| theme.destroy();
     if (self.cursor_shape_manager) |manager| manager.destroy();
-    if (self.data_device) |device| device.release();
-    if (self.data_manager) |manager| manager.destroy();
+    if (self.data_manager) |manager| {
+        if (manager.getVersion() >= wl.DataDeviceManager.release_since_version)
+            manager.release()
+        else
+            manager.destroy();
+    }
     if (self.primary_device) |device| device.destroy();
     if (self.primary_manager) |manager| manager.destroy();
     if (self.text_input) |text_input| text_input.destroy();
@@ -333,16 +440,22 @@ pub fn destroy(self: *Window) void {
     if (self.decoration_manager) |manager| manager.destroy();
     if (self.activation_token) |token| token.destroy();
     if (self.activation) |activation| activation.destroy();
-    if (self.pointer) |pointer| pointer.release();
-    if (self.keyboard) |keyboard| keyboard.release();
-    if (self.seat) |seat| seat.release();
+    if (self.system_bell) |bell| bell.destroy();
+    if (self.toplevel_icon_manager) |manager| manager.destroy();
     self.toplevel.destroy();
     self.xdg_surface.destroy();
     self.surface.destroy();
     self.wm_base.destroy();
-    self.shm.destroy();
-    self.compositor.destroy();
+    if (self.shm.getVersion() >= wl.Shm.release_since_version)
+        self.shm.release()
+    else
+        self.shm.destroy();
+    if (self.compositor.getVersion() >= wl.Compositor.release_since_version)
+        self.compositor.release()
+    else
+        self.compositor.destroy();
     self.registry.destroy();
+    self.registry_state.deinit();
     self.display.disconnect();
     self.alloc.destroy(self);
 }
@@ -391,6 +504,7 @@ pub fn setCallbacks(
     scale_fn: ?ScaleFn,
     redraw_ready_fn: ?RedrawReadyFn,
     activation_token_fn: ?ActivationTokenFn,
+    clipboard_devices_fn: ?ClipboardDevicesFn,
 ) void {
     self.render_ctx = ctx;
     self.resize_fn = resize_fn;
@@ -400,6 +514,8 @@ pub fn setCallbacks(
     self.scale_fn = scale_fn;
     self.redraw_ready_fn = redraw_ready_fn;
     self.activation_token_fn = activation_token_fn;
+    self.clipboard_devices_fn = clipboard_devices_fn;
+    self.notifyClipboardDevices();
 }
 
 pub fn setCursorShape(self: *Window, shape: CursorShape) void {
@@ -408,25 +524,14 @@ pub fn setCursorShape(self: *Window, shape: CursorShape) void {
     self.applyCursorShape();
 }
 
-pub fn setUrgent(self: *Window, urgent: bool) !void {
-    const activation = self.activation orelse return;
+pub fn ringBell(self: *Window) void {
+    const bell = self.system_bell orelse return;
+    bell.ring(self.surface);
+}
 
-    if (!urgent) {
-        if (self.activation_token_purpose == .activate_self) self.cancelActivationToken();
-        return;
-    }
-
-    // A user-initiated launch takes precedence over an attention request.
-    // Let its token complete rather than stranding the pending launch.
-    if (self.activation_token_purpose == .activate_other) return;
-    self.cancelActivationToken();
-
-    const token = try activation.getActivationToken();
-    token.setSurface(self.surface);
-    token.setListener(*Window, activationTokenListener, self);
-    token.commit();
-    self.activation_token = token;
-    self.activation_token_purpose = .activate_self;
+pub fn pointerHasFrames(self: *const Window) bool {
+    const pointer = self.pointer orelse return true;
+    return pointer.getVersion() >= wl.Pointer.Event.frame_since_version;
 }
 
 /// Request a token for transferring the activation caused by an input event
@@ -490,13 +595,105 @@ pub fn setTextInputCursorRect(self: *Window, rect: TextInputRect) void {
 
 fn applyCursorShape(self: *Window) void {
     const serial = self.pointer_enter_serial orelse return;
-    const device = self.cursor_shape_device orelse return;
-    device.setShape(serial, self.cursor_shape);
+    if (self.cursor_shape_device) |device| {
+        device.setShape(serial, self.cursor_shape);
+        return;
+    }
+
+    const pointer = self.pointer orelse return;
+    const theme = self.cursor_theme orelse return;
+    const surface = self.cursor_surface orelse return;
+    const cursor = theme.getCursor(cursorName(self.cursor_shape)) orelse
+        theme.getCursor("default") orelse
+        theme.getCursor("left_ptr") orelse return;
+    if (cursor.image_count == 0) return;
+    const image = cursor.images[0];
+    const buffer = image.getBuffer() catch return;
+    surface.attach(buffer, 0, 0);
+    if (surface.getVersion() >= wl.Surface.damage_buffer_since_version)
+        surface.damageBuffer(0, 0, @intCast(image.width), @intCast(image.height))
+    else
+        surface.damage(0, 0, @intCast(image.width), @intCast(image.height));
+    surface.commit();
+    pointer.setCursor(serial, surface, @intCast(image.hotspot_x), @intCast(image.hotspot_y));
+}
+
+fn cursorName(shape: CursorShape) [*:0]const u8 {
+    return switch (shape) {
+        .default => "default",
+        .context_menu => "context-menu",
+        .help => "help",
+        .pointer => "pointer",
+        .progress => "progress",
+        .wait => "wait",
+        .cell => "cell",
+        .crosshair => "crosshair",
+        .text => "text",
+        .vertical_text => "vertical-text",
+        .alias => "alias",
+        .copy => "copy",
+        .move => "move",
+        .no_drop => "no-drop",
+        .not_allowed => "not-allowed",
+        .grab => "grab",
+        .grabbing => "grabbing",
+        .e_resize => "e-resize",
+        .n_resize => "n-resize",
+        .ne_resize => "ne-resize",
+        .nw_resize => "nw-resize",
+        .s_resize => "s-resize",
+        .se_resize => "se-resize",
+        .sw_resize => "sw-resize",
+        .w_resize => "w-resize",
+        .ew_resize => "ew-resize",
+        .ns_resize => "ns-resize",
+        .nesw_resize => "nesw-resize",
+        .nwse_resize => "nwse-resize",
+        .col_resize => "col-resize",
+        .row_resize => "row-resize",
+        .all_scroll => "all-scroll",
+        .zoom_in => "zoom-in",
+        .zoom_out => "zoom-out",
+        else => "default",
+    };
+}
+
+fn updateIntegerScale(self: *Window) void {
+    if (self.fractional_scale != null) return;
+    var scale: u32 = self.surface_preferred_scale orelse 1;
+    if (self.surface.getVersion() >= wl.Surface.set_buffer_scale_since_version) {
+        if (self.surface_preferred_scale == null) {
+            for (self.registry_state.outputs.items) |output| {
+                if (output.entered) scale = @max(scale, output.scale);
+            }
+        }
+        self.surface.setBufferScale(@intCast(scale));
+    }
+    self.setScale120(scale * 120);
+}
+
+fn setScale120(self: *Window, scale120: u32) void {
+    std.debug.assert(scale120 > 0);
+    if (scale120 == self.scale120) return;
+    log.debug("scale changed to {d}/120", .{scale120});
+    self.scale120 = scale120;
+    self.pending_scale_changed = true;
+    if (self.width > 0) {
+        self.pending_geometry_changed = true;
+        self.pending_draw = true;
+    }
 }
 
 /// Convert a logical dimension to physical pixels (rounded).
 fn physical(self: *const Window, logical: u31) u31 {
-    return @intCast((@as(u64, logical) * self.scale120 + 60) / 120);
+    return physicalDimension(logical, self.scale120);
+}
+
+pub fn physicalDimension(logical: u31, scale120: u32) u31 {
+    return @intCast(@min(
+        std.math.maxInt(u31),
+        (@as(u64, logical) * scale120 + 60) / 120,
+    ));
 }
 
 pub const RenderTarget = struct {
@@ -556,11 +753,19 @@ pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
     }
 
     self.surface.attach(buffer.wl_buffer, 0, 0);
-    switch (damage) {
-        .full => self.surface.damageBuffer(0, 0, phys_width, phys_height),
-        .spans => |spans| for (spans) |span| {
-            self.surface.damageBuffer(0, span.y, phys_width, span.height);
-        },
+    if (self.surface.getVersion() >= wl.Surface.damage_buffer_since_version) {
+        switch (damage) {
+            .full => self.surface.damageBuffer(0, 0, phys_width, phys_height),
+            .spans => |spans| for (spans) |span| {
+                self.surface.damageBuffer(0, span.y, phys_width, span.height);
+            },
+        }
+    } else switch (damage) {
+        // Older surfaces only accept surface-local damage. Full damage is
+        // conservative and avoids lossy conversion of fractional row spans.
+        .full => self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32)),
+        .spans => |spans| if (spans.len > 0)
+            self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32)),
     }
     self.surface.commit();
     buffer.busy = true;
@@ -604,33 +809,204 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
     switch (event) {
         .global => |global| {
             if (std.mem.orderZ(u8, global.interface, wl.Compositor.interface.name) == .eq) {
-                globals.compositor = registry.bind(global.name, wl.Compositor, 4) catch return;
+                if (globals.compositor == null)
+                    globals.compositor = registry.bind(
+                        global.name,
+                        wl.Compositor,
+                        @min(global.version, wl.Compositor.generated_version),
+                    ) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wl.Output.interface.name) == .eq) {
+                const proxy = registry.bind(
+                    global.name,
+                    wl.Output,
+                    @min(global.version, wl.Output.generated_version),
+                ) catch return;
+                const output = globals.alloc.create(OutputState) catch {
+                    if (proxy.getVersion() >= wl.Output.release_since_version)
+                        proxy.release()
+                    else
+                        proxy.destroy();
+                    return;
+                };
+                output.* = .{
+                    .global_name = global.name,
+                    .proxy = proxy,
+                    .registry_state = globals,
+                };
+                globals.outputs.append(globals.alloc, output) catch {
+                    output.destroy();
+                    return;
+                };
+                proxy.setListener(*OutputState, outputListener, output);
             } else if (std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
-                globals.shm = registry.bind(global.name, wl.Shm, 1) catch return;
+                if (globals.shm == null)
+                    globals.shm = registry.bind(global.name, wl.Shm, @min(global.version, wl.Shm.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
-                globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, 6)) catch return;
+                if (globals.wm_base == null)
+                    globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, xdg.WmBase.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.ActivationV1.interface.name) == .eq) {
-                globals.activation = registry.bind(global.name, xdg.ActivationV1, 1) catch return;
+                if (globals.activation == null)
+                    globals.activation = registry.bind(global.name, xdg.ActivationV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, xdg.SystemBellV1.interface.name) == .eq) {
+                if (globals.system_bell == null)
+                    globals.system_bell = registry.bind(global.name, xdg.SystemBellV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, xdg.ToplevelIconManagerV1.interface.name) == .eq) {
+                if (globals.toplevel_icon_manager == null)
+                    globals.toplevel_icon_manager = registry.bind(global.name, xdg.ToplevelIconManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
-                globals.seat = registry.bind(global.name, wl.Seat, @min(global.version, 8)) catch return;
+                if (globals.seat == null) {
+                    const seat = registry.bind(global.name, wl.Seat, @min(global.version, wl.Seat.generated_version)) catch return;
+                    globals.seat = seat;
+                    globals.seat_name = global.name;
+                    if (globals.window) |window| window.installSeat(seat);
+                }
             } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
-                globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
+                if (globals.viewporter == null)
+                    globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
-                globals.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
+                if (globals.fractional_manager == null)
+                    globals.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.CursorShapeManagerV1.interface.name) == .eq) {
-                globals.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, 1) catch return;
+                if (globals.cursor_shape_manager == null)
+                    globals.cursor_shape_manager = registry.bind(global.name, wp.CursorShapeManagerV1, @min(global.version, wp.CursorShapeManagerV1.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wl.DataDeviceManager.interface.name) == .eq) {
-                globals.data_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, 3)) catch return;
+                if (globals.data_manager == null)
+                    globals.data_manager = registry.bind(global.name, wl.DataDeviceManager, @min(global.version, wl.DataDeviceManager.generated_version)) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zwp.PrimarySelectionDeviceManagerV1.interface.name) == .eq) {
-                globals.primary_manager = registry.bind(global.name, zwp.PrimarySelectionDeviceManagerV1, 1) catch return;
+                if (globals.primary_manager == null)
+                    globals.primary_manager = registry.bind(global.name, zwp.PrimarySelectionDeviceManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zwp.TextInputManagerV3.interface.name) == .eq) {
-                globals.text_input_manager = registry.bind(global.name, zwp.TextInputManagerV3, 1) catch return;
+                if (globals.text_input_manager == null)
+                    globals.text_input_manager = registry.bind(global.name, zwp.TextInputManagerV3, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
-                globals.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, 1) catch return;
+                if (globals.decoration_manager == null)
+                    globals.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, @min(global.version, zxdg.DecorationManagerV1.generated_version)) catch return;
             }
         },
-        .global_remove => {},
+        .global_remove => |removed| {
+            globals.removeOutput(removed.name);
+            if (globals.seat_name == removed.name) {
+                if (globals.window) |window|
+                    window.removeSeat()
+                else if (globals.seat) |seat|
+                    destroySeat(seat);
+                globals.seat = null;
+                globals.seat_name = null;
+            }
+        },
     }
+}
+
+fn outputListener(_: *wl.Output, event: wl.Output.Event, output: *OutputState) void {
+    switch (event) {
+        .scale => |scale| {
+            if (scale.factor <= 0) return;
+            const factor: u32 = @intCast(scale.factor);
+            if (factor == output.scale) return;
+            output.scale = factor;
+            if (output.entered) {
+                if (output.registry_state.window) |window| window.updateIntegerScale();
+            }
+        },
+        else => {},
+    }
+}
+
+fn surfaceListener(_: *wl.Surface, event: wl.Surface.Event, self: *Window) void {
+    const output_proxy = switch (event) {
+        .enter => |enter| enter.output,
+        .leave => |leave| leave.output,
+        .preferred_buffer_scale => |preferred| {
+            if (preferred.factor <= 0) return;
+            self.surface_preferred_scale = @intCast(preferred.factor);
+            self.updateIntegerScale();
+            return;
+        },
+        // Monstar renders in the compositor's normal surface orientation.
+        // Ignoring this optimization hint is always protocol-correct.
+        .preferred_buffer_transform => return,
+    } orelse return;
+    const entered = event == .enter;
+    for (self.registry_state.outputs.items) |output| {
+        if (output.proxy.getId() != output_proxy.getId()) continue;
+        if (output.entered == entered) return;
+        output.entered = entered;
+        self.updateIntegerScale();
+        return;
+    }
+}
+
+fn installSeat(self: *Window, seat: *wl.Seat) void {
+    std.debug.assert(self.seat == null);
+    self.seat = seat;
+    seat.setListener(*Window, seatListener, self);
+    if (self.data_manager) |manager| {
+        self.data_device = manager.getDataDevice(seat) catch null;
+    }
+    if (self.primary_manager) |manager| {
+        self.primary_device = manager.getDevice(seat) catch null;
+    }
+    if (self.text_input_manager) |manager| {
+        self.text_input = manager.getTextInput(seat) catch null;
+        if (self.text_input) |text_input| {
+            text_input.setListener(*Window, textInputListener, self);
+        }
+    }
+    self.notifyClipboardDevices();
+}
+
+fn removeSeat(self: *Window) void {
+    if (self.cursor_shape_device) |device| device.destroy();
+    self.cursor_shape_device = null;
+    if (self.pointer) |pointer| destroyPointer(pointer);
+    self.pointer = null;
+    self.pointer_enter_serial = null;
+    if (self.keyboard) |keyboard| destroyKeyboard(keyboard);
+    self.keyboard = null;
+    if (self.data_device) |device| destroyDataDevice(device);
+    self.data_device = null;
+    if (self.primary_device) |device| device.destroy();
+    self.primary_device = null;
+    self.notifyClipboardDevices();
+    if (self.text_input) |text_input| text_input.destroy();
+    self.text_input = null;
+    self.text_input_enabled = false;
+    self.text_input_rect = null;
+    if (self.seat) |seat| destroySeat(seat);
+    self.seat = null;
+}
+
+fn notifyClipboardDevices(self: *Window) void {
+    const callback = self.clipboard_devices_fn orelse return;
+    callback(self.render_ctx.?, self.data_device, self.primary_device);
+}
+
+fn destroySeat(seat: *wl.Seat) void {
+    if (seat.getVersion() >= wl.Seat.release_since_version)
+        seat.release()
+    else
+        seat.destroy();
+}
+
+fn destroyPointer(pointer: *wl.Pointer) void {
+    if (pointer.getVersion() >= wl.Pointer.release_since_version)
+        pointer.release()
+    else
+        pointer.destroy();
+}
+
+fn destroyKeyboard(keyboard: *wl.Keyboard) void {
+    if (keyboard.getVersion() >= wl.Keyboard.release_since_version)
+        keyboard.release()
+    else
+        keyboard.destroy();
+}
+
+fn destroyDataDevice(device: *wl.DataDevice) void {
+    if (device.getVersion() >= wl.DataDevice.release_since_version)
+        device.release()
+    else
+        device.destroy();
 }
 
 fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
@@ -646,7 +1022,7 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
                     keyboard.setListener(*Window, keyboardListener, self);
                 }
             } else if (!has_keyboard and self.keyboard != null) {
-                self.keyboard.?.release();
+                destroyKeyboard(self.keyboard.?);
                 self.keyboard = null;
             }
 
@@ -665,7 +1041,7 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
             } else if (!has_pointer and self.pointer != null) {
                 if (self.cursor_shape_device) |device| device.destroy();
                 self.cursor_shape_device = null;
-                self.pointer.?.release();
+                destroyPointer(self.pointer.?);
                 self.pointer = null;
             }
         },
@@ -730,7 +1106,6 @@ fn activationTokenListener(
             self.activation_token_purpose = null;
 
             switch (purpose) {
-                .activate_self => if (self.activation) |activation| activation.activate(done.token, self.surface),
                 .activate_other => if (self.activation_token_fn) |callback| callback(self.render_ctx.?, std.mem.span(done.token)),
             }
         },
@@ -791,16 +1166,7 @@ fn fractionalScaleListener(
     self: *Window,
 ) void {
     switch (event) {
-        .preferred_scale => |preferred| {
-            if (preferred.scale == self.scale120) return;
-            log.debug("scale changed to {d}/120", .{preferred.scale});
-            self.scale120 = preferred.scale;
-            self.pending_scale_changed = true;
-            if (self.width > 0) {
-                self.pending_geometry_changed = true;
-                self.pending_draw = true;
-            }
-        },
+        .preferred_scale => |preferred| self.setScale120(preferred.scale),
     }
 }
 
@@ -859,7 +1225,7 @@ pub const Buffer = struct {
 
         const pool = try shm.createPool(fd, size);
         defer pool.destroy();
-        const wl_buffer = try pool.createBuffer(0, width, height, stride, .argb8888);
+        const wl_buffer = try pool.createBuffer(0, width, height, stride, .xrgb8888);
         errdefer wl_buffer.destroy();
 
         const self = try alloc.create(Buffer);
