@@ -29,6 +29,9 @@ selection_fg: ?vt.color.RGB,
 /// Explicit text color under a focused block cursor. Null preserves the
 /// terminal background fallback.
 cursor_text: ?vt.color.RGB,
+/// Alpha applied only to the default terminal background and window padding.
+/// Explicit cell backgrounds, selections, cursors, and foregrounds stay opaque.
+background_alpha: u8,
 /// Keyboard focus: unfocused windows draw the cursor as a hollow
 /// rectangle regardless of the requested style. Set by the caller.
 focused: bool = true,
@@ -118,6 +121,7 @@ pub const InitOptions = struct {
     selection_background: ?vt.color.RGB = null,
     selection_foreground: ?vt.color.RGB = null,
     cursor_text: ?vt.color.RGB = null,
+    background_alpha: u8 = 255,
 };
 
 pub const ShapeStats = struct {
@@ -137,6 +141,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .selection_bg = opts.selection_background orelse Config.default_selection_background,
         .selection_fg = opts.selection_foreground,
         .cursor_text = opts.cursor_text,
+        .background_alpha = opts.background_alpha,
         .fg_scratch = .empty,
         .face_scratch = .empty,
         .reverse_scratch = .empty,
@@ -217,7 +222,7 @@ pub fn render(
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
 
     if (state.rows == 0 or state.cols == 0) {
-        fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, argb(state.colors.background));
+        fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
         return;
     }
     try self.row_overhang.resize(self.alloc, state.rows, false);
@@ -250,7 +255,7 @@ pub fn render(
             @intCast(grid_bottom),
             width,
             height - @as(u31, @intCast(grid_bottom)),
-            argb(state.colors.background),
+            self.backgroundPixel(state.colors.background),
         );
     }
 }
@@ -295,7 +300,7 @@ pub fn renderWithKittyItems(
         }
     }
 
-    fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, argb(state.colors.background));
+    fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
     if (state.rows == 0 or state.cols == 0) return;
 
     try self.renderKittyItems(items, pixels, width, height, .below_bg);
@@ -451,7 +456,7 @@ pub fn renderPreedit(
             y * self.font.cell_height,
             clipped_span * self.font.cell_width,
             self.font.cell_height,
-            argb(state.colors.background),
+            self.backgroundPixel(state.colors.background),
         );
 
         const face_idx = self.font.faceForCodepoint(self.alloc, cp);
@@ -1238,10 +1243,12 @@ fn blendPixel(dst: u32, src: *const [4]u8) u32 {
     const dst_r = (dst >> 16) & 0xff;
     const dst_g = (dst >> 8) & 0xff;
     const dst_b = dst & 0xff;
+    const dst_a = dst >> 24;
     const r = (@as(u32, src[0]) * alpha + dst_r * inv_alpha + 127) / 255;
     const g = (@as(u32, src[1]) * alpha + dst_g * inv_alpha + 127) / 255;
     const b = (@as(u32, src[2]) * alpha + dst_b * inv_alpha + 127) / 255;
-    return 0xff000000 | (r << 16) | (g << 8) | b;
+    const a = (255 * alpha + dst_a * inv_alpha + 127) / 255;
+    return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
 fn renderRow(
@@ -1347,21 +1354,22 @@ fn prepareRow(
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
         if (backgrounds != .none) {
-            const cell_bg: ?vt.color.RGB = bg orelse switch (backgrounds) {
-                .all => colors.background,
+            const color: ?u32 = if (bg) |bg_color|
+                argb(bg_color)
+            else switch (backgrounds) {
+                .all => self.backgroundPixel(colors.background),
                 else => null,
             };
-            if (cell_bg) |bg_color| {
-                const color = argb(bg_color);
+            if (color) |pixel| {
                 const px_start = @as(u31, @intCast(x)) * font.cell_width;
                 const px_end = px_start + font.cell_width * cellSpan(raws[x]);
                 // Wide heads overlap their spacer tail; extend instead
                 // of restarting when the color holds.
-                if (bg_run.active and color == bg_run.color and px_start <= bg_run.end_px) {
+                if (bg_run.active and pixel == bg_run.color and px_start <= bg_run.end_px) {
                     bg_run.end_px = @max(bg_run.end_px, px_end);
                 } else {
                     bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
-                    bg_run = .{ .active = true, .color = color, .start_px = px_start, .end_px = px_end };
+                    bg_run = .{ .active = true, .color = pixel, .start_px = px_start, .end_px = px_end };
                 }
             } else {
                 bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
@@ -1373,7 +1381,7 @@ fn prepareRow(
     if (backgrounds == .all) {
         const margin_start: u31 = cols * font.cell_width;
         if (margin_start < width) {
-            const color = argb(colors.background);
+            const color = self.backgroundPixel(colors.background);
             if (bg_run.active and color == bg_run.color) {
                 bg_run.end_px = width;
             } else {
@@ -1992,6 +2000,19 @@ fn argb(rgb: vt.color.RGB) u32 {
         @as(u32, rgb.b);
 }
 
+/// Pack the default background in wl_shm's premultiplied ARGB8888 form.
+pub fn backgroundPixel(self: *const Renderer, rgb: vt.color.RGB) u32 {
+    return premultipliedArgb(rgb, self.background_alpha);
+}
+
+fn premultipliedArgb(rgb: vt.color.RGB, alpha_u8: u8) u32 {
+    const alpha: u32 = alpha_u8;
+    const r = (@as(u32, rgb.r) * alpha + 127) / 255;
+    const g = (@as(u32, rgb.g) * alpha + 127) / 255;
+    const b = (@as(u32, rgb.b) * alpha + 127) / 255;
+    return (alpha << 24) | (r << 16) | (g << 8) | b;
+}
+
 fn fillRect(
     pixels: []u32,
     stride: u31,
@@ -2127,9 +2148,8 @@ fn blitAlphaGlyph(
 /// background (all-zero groups skip the store entirely).
 fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) void {
     std.debug.assert(dst.len == coverage.len);
-    // Scalar `blend` returns `fg` unmasked at full coverage; the
-    // vector path always forces an opaque alpha byte. Identical only
-    // for opaque colors, which is all `argb` produces.
+    // Foregrounds are opaque. Coverage becomes source alpha and is
+    // composited over the framebuffer's premultiplied destination.
     std.debug.assert(color >> 24 == 0xff);
     const V = @Vector(16, u16);
     const fg: V = @as(@Vector(16, u8), @bitCast([_]u32{color} ** 4));
@@ -2148,7 +2168,7 @@ fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) 
         const bg: V = @as(@Vector(16, u8), @bitCast(dst[i..][0..4].*));
         const mixed = (fg * a + bg * na) / @as(V, @splat(255));
         const px: @Vector(4, u32) = @bitCast(@as(@Vector(16, u8), @intCast(mixed)));
-        dst[i..][0..4].* = px | @as(@Vector(4, u32), @splat(0xff000000));
+        dst[i..][0..4].* = px;
     }
     for (dst[i..], coverage[i..]) |*pixel, cov| {
         if (cov == 0) continue;
@@ -2212,14 +2232,18 @@ fn blendPremultipliedBgraSpan(noalias dst: []u32, noalias src: []const u8) void 
         const inverse = @as(WideVector, @splat(255)) - a;
         const background: WideVector = @as(ByteVector, @bitCast(dst[i..][0..4].*));
         const foreground: WideVector = source;
-        // Clamp: fonts ship glyphs whose color channels exceed their
-        // alpha (imperfect premultiplication), which would overflow u8.
-        const mixed = @min(
+        // Fonts ship glyphs whose color channels exceed their alpha. Clamp
+        // every output channel to its resulting alpha so wl_shm's
+        // premultiplied-alpha invariant still holds over transparent pixels.
+        const unclamped = @min(
             foreground + (background * inverse) / @as(WideVector, @splat(255)),
             @as(WideVector, @splat(255)),
         );
+        const output_alpha: @Vector(4, u16) = @shuffle(u16, unclamped, undefined, alpha_lanes);
+        const alpha_limit: WideVector = @shuffle(u16, output_alpha, undefined, expand_alpha);
+        const mixed = @min(unclamped, alpha_limit);
         const result: PixelVector = @bitCast(@as(ByteVector, @intCast(mixed)));
-        dst[i..][0..4].* = result | @as(PixelVector, @splat(0xff000000));
+        dst[i..][0..4].* = result;
     }
     for (dst[i..], 0..) |*pixel, tail_i| {
         const cell = src[(i + tail_i) * 4 ..][0..4];
@@ -2259,7 +2283,8 @@ fn blend(fg: u32, bg: u32, alpha: u8) u32 {
     const r = ((fg >> 16 & 0xff) * a + (bg >> 16 & 0xff) * na) / 255;
     const g = ((fg >> 8 & 0xff) * a + (bg >> 8 & 0xff) * na) / 255;
     const b = ((fg & 0xff) * a + (bg & 0xff) * na) / 255;
-    return 0xff000000 | (r << 16) | (g << 8) | b;
+    const out_alpha = ((fg >> 24) * a + (bg >> 24) * na) / 255;
+    return (out_alpha << 24) | (r << 16) | (g << 8) | b;
 }
 
 fn blendPremultipliedBgra(src: []const u8, bg: u32) u32 {
@@ -2271,10 +2296,11 @@ fn blendPremultipliedBgra(src: []const u8, bg: u32) u32 {
             @as(u32, src[0]);
     }
     const na: u32 = 255 - a;
-    const r: u32 = @min(255, @as(u32, src[2]) + ((bg >> 16 & 0xff) * na) / 255);
-    const g: u32 = @min(255, @as(u32, src[1]) + ((bg >> 8 & 0xff) * na) / 255);
-    const b: u32 = @min(255, @as(u32, src[0]) + ((bg & 0xff) * na) / 255);
-    return 0xff000000 | (r << 16) | (g << 8) | b;
+    const out_alpha: u32 = @min(255, a + ((bg >> 24) * na) / 255);
+    const r: u32 = @min(out_alpha, @as(u32, src[2]) + ((bg >> 16 & 0xff) * na) / 255);
+    const g: u32 = @min(out_alpha, @as(u32, src[1]) + ((bg >> 8 & 0xff) * na) / 255);
+    const b: u32 = @min(out_alpha, @as(u32, src[0]) + ((bg & 0xff) * na) / 255);
+    return (out_alpha << 24) | (r << 16) | (g << 8) | b;
 }
 
 test "kitty unscaled blit converts rgb and clips" {
@@ -2488,10 +2514,27 @@ test "cullOccludedKittyItems drops placements under later opaque covers" {
 test "blend endpoints" {
     try std.testing.expectEqual(@as(u32, 0xffffffff), blend(0xffffffff, 0xff000000, 255));
     try std.testing.expectEqual(@as(u32, 0xff000000), blend(0xffffffff, 0xff000000, 0));
+    try std.testing.expectEqual(@as(u32, 0x80808080), blend(0xffffffff, 0x00000000, 128));
+    try std.testing.expectEqual(@as(u32, 0xbf808080), blend(0xffffffff, 0x80000000, 128));
+    try std.testing.expectEqual(
+        @as(u32, 0x80643219),
+        blendPixel(0, &.{ 200, 100, 50, 128 }),
+    );
     try std.testing.expectEqual(
         @as(u32, 0xff804000),
         blendPremultipliedBgra(&.{ 0x00, 0x40, 0x80, 0xff }, 0xff000000),
     );
+    try std.testing.expectEqual(
+        @as(u32, 0x801e140a),
+        blendPremultipliedBgra(&.{ 10, 20, 30, 128 }, 0),
+    );
+}
+
+test "default background pixels are premultiplied" {
+    const rgb: vt.color.RGB = .{ .r = 128, .g = 64, .b = 32 };
+    try std.testing.expectEqual(@as(u32, 0), premultipliedArgb(rgb, 0));
+    try std.testing.expectEqual(@as(u32, 0x80402010), premultipliedArgb(rgb, 128));
+    try std.testing.expectEqual(@as(u32, 0xff804020), premultipliedArgb(rgb, 255));
 }
 
 test "blendAlphaSpan matches scalar blend" {
@@ -2511,7 +2554,11 @@ test "blendAlphaSpan matches scalar blend" {
                     1 => 0xff,
                     else => random.int(u8),
                 };
-                const bg = random.int(u32) | 0xff000000;
+                const bg_alpha = random.int(u8);
+                const bg = (@as(u32, bg_alpha) << 24) |
+                    (@as(u32, random.intRangeAtMost(u8, 0, bg_alpha)) << 16) |
+                    (@as(u32, random.intRangeAtMost(u8, 0, bg_alpha)) << 8) |
+                    random.intRangeAtMost(u8, 0, bg_alpha);
                 g.* = bg;
                 w.* = if (cov.* == 0) bg else blend(color, bg, cov.*);
             }
@@ -2607,7 +2654,11 @@ test "blendPremultipliedBgraSpan matches scalar blend" {
                 cell[1] = random.intRangeAtMost(u8, 0, alpha);
                 cell[2] = random.intRangeAtMost(u8, 0, alpha);
                 cell[3] = alpha;
-                const bg = random.int(u32) | 0xff000000;
+                const bg_alpha = random.int(u8);
+                const bg = (@as(u32, bg_alpha) << 24) |
+                    (@as(u32, random.intRangeAtMost(u8, 0, bg_alpha)) << 16) |
+                    (@as(u32, random.intRangeAtMost(u8, 0, bg_alpha)) << 8) |
+                    random.intRangeAtMost(u8, 0, bg_alpha);
                 g.* = bg;
                 w.* = if (alpha == 0) bg else blendPremultipliedBgra(cell, bg);
             }
@@ -3085,6 +3136,37 @@ test "render a simple grid" {
         if (px != bg) non_bg += 1;
     }
     try std.testing.expect(non_bg > 0);
+}
+
+test "background opacity does not fade explicit cell backgrounds" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l\x1b[41m \x1b[0m ");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{ .background_alpha = 128 });
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 2;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    try renderer.render(&state, pixels, width, height);
+
+    const y = font.cell_height / 2;
+    const explicit_bg = pixels[@as(usize, y) * width + font.cell_width / 2];
+    const default_bg = pixels[@as(usize, y) * width + font.cell_width + font.cell_width / 2];
+    try std.testing.expectEqual(@as(u32, 0xff), explicit_bg >> 24);
+    try std.testing.expectEqual(renderer.backgroundPixel(state.colors.background), default_bg);
 }
 
 test "render rectangular selection spans" {

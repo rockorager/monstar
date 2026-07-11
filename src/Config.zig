@@ -160,6 +160,9 @@ scrollback_limit: usize = 50_000_000,
 /// rejected, so it must comfortably fit a fullscreen RGBA frame.
 image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
+/// Effective alpha of the default terminal background. Keeping this as an
+/// 8-bit value matches the wl_shm buffer and makes the opaque fast path exact.
+background_opacity: u8 = 255,
 
 theme: ?Theme = null,
 light_theme_overrides: ?ThemeOverrides = null,
@@ -281,6 +284,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.image_storage_limit = limit;
     } else if (std.mem.eql(u8, key, "mouse-scroll-multiplier")) {
         self.mouse_scroll_multiplier = try parseMouseScrollMultiplier(self.mouse_scroll_multiplier, value);
+    } else if (std.mem.eql(u8, key, "background-opacity")) {
+        self.background_opacity = try parseOpacity(value);
     } else if (std.mem.eql(u8, key, "theme")) {
         self.theme = try parseTheme(arena, value);
     } else if (std.mem.eql(u8, key, "background")) {
@@ -410,6 +415,13 @@ fn parseScrollMultiplier(value: []const u8) error{InvalidValue}!f64 {
     const multiplier = std.fmt.parseFloat(f64, std.mem.trim(u8, value, " \t")) catch return error.InvalidValue;
     if (!std.math.isFinite(multiplier)) return error.InvalidValue;
     return std.math.clamp(multiplier, 0.01, 10_000);
+}
+
+fn parseOpacity(value: []const u8) error{InvalidValue}!u8 {
+    const opacity = std.fmt.parseFloat(f64, std.mem.trim(u8, value, " \t")) catch return error.InvalidValue;
+    if (!std.math.isFinite(opacity) or opacity < 0 or opacity > 1) return error.InvalidValue;
+    if (opacity == 1) return 255;
+    return @min(254, @as(u8, @intFromFloat(@round(opacity * 255))));
 }
 
 const PaletteEntry = struct {
@@ -661,6 +673,7 @@ test "defaults" {
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
+    try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
     try std.testing.expectEqual(@as(?Theme, null), config.theme);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
@@ -687,6 +700,7 @@ test "parse config" {
         \\scrollback-limit = 50000000
         \\image-storage-limit = 50000000
         \\mouse-scroll-multiplier = precision:1.5,discrete:5
+        \\background-opacity = 0.8
         \\background = #1a1b26
         \\foreground = c0caf5
         \\cursor-text = #010203
@@ -710,6 +724,7 @@ test "parse config" {
     try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1.5), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 5), config.mouse_scroll_multiplier.discrete);
+    try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.cursor_text.?);
@@ -756,6 +771,21 @@ test "mouse scroll multiplier forms and clamps" {
     try config.set(std.testing.allocator, "mouse-scroll-multiplier", "precision:0,discrete:20000");
     try std.testing.expectEqual(@as(f64, 0.01), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 10_000), config.mouse_scroll_multiplier.discrete);
+}
+
+test "background opacity accepts the closed unit interval" {
+    var config: Config = .{};
+    try config.set(std.testing.allocator, "background-opacity", "0");
+    try std.testing.expectEqual(@as(u8, 0), config.background_opacity);
+    try config.set(std.testing.allocator, "background-opacity", "0.5");
+    try std.testing.expectEqual(@as(u8, 128), config.background_opacity);
+    try config.set(std.testing.allocator, "background-opacity", "1");
+    try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
+    try config.set(std.testing.allocator, "background-opacity", "0.999");
+    try std.testing.expectEqual(@as(u8, 254), config.background_opacity);
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "background-opacity", "-0.1"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "background-opacity", "1.1"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "background-opacity", "nan"));
 }
 
 test "palette accepts all indices and numeric bases" {

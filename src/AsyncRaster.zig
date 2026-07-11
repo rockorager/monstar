@@ -65,6 +65,7 @@ pub const Loader = struct {
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
+    background_alpha: u8,
     state: *vt.RenderState,
     thread: ?std.Thread = null,
     mutex: std.atomic.Mutex = .unlocked,
@@ -76,6 +77,7 @@ pub const Loader = struct {
         selection_background: vt.color.RGB,
         selection_foreground: ?vt.color.RGB,
         cursor_text: ?vt.color.RGB,
+        background_alpha: u8,
         state: *vt.RenderState,
     ) !Loader {
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -86,6 +88,7 @@ pub const Loader = struct {
             .selection_background = selection_background,
             .selection_foreground = selection_foreground,
             .cursor_text = cursor_text,
+            .background_alpha = background_alpha,
             .state = state,
             .complete_fd = @intCast(rc),
         };
@@ -127,6 +130,7 @@ pub const Loader = struct {
             self.selection_background,
             self.selection_foreground,
             self.cursor_text,
+            self.background_alpha,
             self.state,
         )) |raster|
             .{ .ready = raster }
@@ -165,6 +169,7 @@ pub fn init(
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
+    background_alpha: u8,
     state: *vt.RenderState,
 ) !AsyncRaster {
     const alloc = std.heap.smp_allocator;
@@ -174,6 +179,7 @@ pub fn init(
         .selection_background = selection_background,
         .selection_foreground = selection_foreground,
         .cursor_text = cursor_text,
+        .background_alpha = background_alpha,
     });
     errdefer renderer.deinit();
     const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -223,6 +229,7 @@ pub fn reconfigure(
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
+    background_alpha: u8,
 ) !void {
     self.lock();
     defer self.mutex.unlock();
@@ -233,6 +240,7 @@ pub fn reconfigure(
         .selection_background = selection_background,
         .selection_foreground = selection_foreground,
         .cursor_text = cursor_text,
+        .background_alpha = background_alpha,
     });
     errdefer renderer.deinit();
     self.renderer.deinit();
@@ -254,13 +262,15 @@ pub fn configuredFor(
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
+    background_alpha: u8,
 ) bool {
     self.lock();
     defer self.mutex.unlock();
     return self.font.discovery() == discovery and
         self.renderer.selection_bg.eql(selection_background) and
         optionalRgbEql(self.renderer.selection_fg, selection_foreground) and
-        optionalRgbEql(self.renderer.cursor_text, cursor_text);
+        optionalRgbEql(self.renderer.cursor_text, cursor_text) and
+        self.renderer.background_alpha == background_alpha;
 }
 
 pub fn submit(self: *AsyncRaster, job: Job) !void {
@@ -377,7 +387,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             damage.* = .none;
             return;
         }
-        clearPadding(self.state, job);
+        clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
         if (job.kitty_items.len > 0) {
             try self.renderer.renderWithKittyItems(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height);
         } else {
@@ -393,7 +403,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         return;
     }
     if (job.scroll_shift) |shift| {
-        clearPadding(self.state, job);
+        clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
         if (scrollFromPreviousFrame(job, shift, self.font.cell_height)) {
             try self.renderer.shiftRowOverhang(self.state.rows, shift);
             try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
@@ -410,13 +420,13 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     }
     switch (self.state.dirty) {
         .full => {
-            clearPadding(self.state, job);
+            clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
             try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
             damage.* = .full;
         },
         .partial => {
             if (!repairToPreviousFrame(job)) {
-                clearPadding(self.state, job);
+                clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
                 try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
                 damage.* = .full;
                 return;
@@ -426,7 +436,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         },
         .false => {
             if (!repairToPreviousFrame(job)) {
-                clearPadding(self.state, job);
+                clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
                 try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
                 damage.* = .full;
                 return;
@@ -443,12 +453,7 @@ fn gridPixels(job: Job) []u32 {
     return job.pixels[offset..];
 }
 
-fn clearPadding(state: *const vt.RenderState, job: Job) void {
-    const rgb = state.colors.background;
-    const color = 0xff000000 |
-        (@as(u32, rgb.r) << 16) |
-        (@as(u32, rgb.g) << 8) |
-        rgb.b;
+fn clearPadding(job: Job, color: u32) void {
     @memset(job.pixels[0 .. @as(usize, job.grid_y) * job.width], color);
     const grid_bottom = @as(usize, job.grid_y + job.grid_height) * job.width;
     @memset(job.pixels[grid_bottom..], color);

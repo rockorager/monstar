@@ -139,6 +139,15 @@ palette = 1=#f7768e
 palette = 200=#123456
 ```
 
+Make the default terminal background translucent with `background-opacity`,
+from `0` (fully transparent) to `1` (fully opaque, the default). Explicit cell
+backgrounds, selections, cursors, and text remain opaque; terminal graphics
+retain their own alpha:
+
+```conf
+background-opacity = 0.85
+```
+
 Add minimum padding around the terminal grid with Ghostty-style X/Y options:
 
 ```conf

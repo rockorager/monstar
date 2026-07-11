@@ -719,6 +719,7 @@ pub fn init(
 
     const window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
     errdefer window.destroy();
+    window.setBufferAlpha(config.background_opacity < 255);
 
     // Timerfds must be nonblocking: disarming a timerfd clears its
     // pending expirations, so a reader acting on stale poll revents
@@ -2317,6 +2318,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     const new_font: Font = try .init(self.alloc, new_config.font_family, desired_font_size);
 
     self.applyColorDefaultsForConfig(new_config);
+    self.window.setBufferAlpha(new_config.background_opacity < 255);
     self.window.toplevel.setAppId(new_config.app_id);
 
     if (new_config.image_storage_limit != self.config.image_storage_limit) {
@@ -4452,12 +4454,14 @@ fn startAsyncRender(self: *App) !bool {
         self.selection_bg,
         self.selection_fg,
         self.cursor_text,
+        self.config.background_opacity,
     )) {
         async_raster.reconfigure(
             self.font.discovery(),
             self.selection_bg,
             self.selection_fg,
             self.cursor_text,
+            self.config.background_opacity,
         ) catch |err| {
             self.rasterFatal(err);
             return false;
@@ -4685,6 +4689,7 @@ fn startAsyncRasterLoad(self: *App) void {
         self.selection_bg,
         self.selection_fg,
         self.cursor_text,
+        self.config.background_opacity,
         &self.render_state,
     ) catch |err| {
         self.rasterFatal(err);
@@ -4714,6 +4719,7 @@ fn finishAsyncRasterLoad(self: *App) void {
                 self.selection_bg,
                 self.selection_fg,
                 self.cursor_text,
+                self.config.background_opacity,
             )) {
                 // Config changed while loading; rebuild with the new one.
                 raster.deinit();

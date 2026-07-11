@@ -57,6 +57,9 @@ surface: *wl.Surface,
 xdg_surface: *xdg.Surface,
 toplevel: *xdg.Toplevel,
 buffers: std.ArrayList(*Buffer),
+/// Format new render buffers use. Old-format buffers may remain in the list
+/// while the compositor owns them; acquireBuffer retires them after release.
+buffer_format: BufferFormat,
 /// Most recently committed buffer. Its memory may still be busy with the
 /// compositor, but wl_shm memory remains readable and can seed stale buffers.
 newest_buffer: ?*Buffer,
@@ -151,6 +154,11 @@ pub const InitialSize = struct {
 
 const ActivationTokenPurpose = enum {
     activate_other,
+};
+
+const BufferFormat = enum {
+    xrgb8888,
+    argb8888,
 };
 
 /// Called when the output scale changed, before the resize/draw that
@@ -362,6 +370,7 @@ pub fn create(
         .xdg_surface = xdg_surface,
         .toplevel = toplevel,
         .buffers = .empty,
+        .buffer_format = .xrgb8888,
         .newest_buffer = null,
         // Zero until the first configure so the resize callback always
         // fires before the first draw.
@@ -522,6 +531,18 @@ pub fn setCursorShape(self: *Window, shape: CursorShape) void {
     if (self.cursor_shape == shape) return;
     self.cursor_shape = shape;
     self.applyCursorShape();
+}
+
+/// Select whether future render buffers carry alpha. Existing busy buffers
+/// cannot be destroyed until wl_buffer.release, so they are retired lazily.
+/// After startup, callers must invalidate any in-flight or held frame.
+pub fn setBufferAlpha(self: *Window, enabled: bool) void {
+    const format: BufferFormat = if (enabled) .argb8888 else .xrgb8888;
+    if (format == self.buffer_format) return;
+    self.buffer_format = format;
+    if (self.newest_buffer) |newest| {
+        if (newest.format != format) self.newest_buffer = null;
+    }
 }
 
 pub fn ringBell(self: *Window) void {
@@ -719,7 +740,8 @@ fn beginRender(self: *Window, phys_width: u31, phys_height: u31) !RenderTarget {
     self.rendering_pending = true;
     const age: usize = if (buffer.frame == 0) 0 else @intCast(self.frame_counter + 1 - buffer.frame);
     const source_pixels: ?[]const u32 = if (self.newest_buffer) |newest|
-        if (newest.frame != 0 and newest.width == phys_width and newest.height == phys_height)
+        if (newest.frame != 0 and newest.width == phys_width and newest.height == phys_height and
+            newest.format == buffer.format)
             newest.pixels()
         else
             null
@@ -735,6 +757,7 @@ pub fn cancelRender(self: *Window, buffer: *Buffer) void {
 
 pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
     std.debug.assert(buffer.rendering);
+    std.debug.assert(buffer.format == self.buffer_format);
     buffer.rendering = false;
     self.rendering_pending = false;
     self.frame_counter += 1;
@@ -786,6 +809,7 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
 /// Return a free shm buffer of the requested size, creating one if
 /// needed. Frees stale buffers of other sizes as they are released.
 fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
+    var candidate: ?*Buffer = null;
     var i: usize = 0;
     while (i < self.buffers.items.len) {
         const buffer = self.buffers.items[i];
@@ -793,13 +817,18 @@ fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
             i += 1;
             continue;
         }
-        if (buffer.width == width and buffer.height == height) return buffer;
+        if (buffer.width == width and buffer.height == height and buffer.format == self.buffer_format) {
+            if (candidate == null) candidate = buffer;
+            i += 1;
+            continue;
+        }
         if (self.newest_buffer == buffer) self.newest_buffer = null;
         buffer.destroy(self.alloc);
         _ = self.buffers.swapRemove(i);
     }
+    if (candidate) |buffer| return buffer;
 
-    const buffer = try Buffer.create(self.alloc, self.shm, width, height);
+    const buffer = try Buffer.create(self.alloc, self.shm, width, height, self.buffer_format);
     errdefer buffer.destroy(self.alloc);
     try self.buffers.append(self.alloc, buffer);
     return buffer;
@@ -1198,13 +1227,20 @@ pub const Buffer = struct {
     data: []align(std.heap.page_size_min) u8,
     width: u31,
     height: u31,
+    format: BufferFormat,
     busy: bool,
     rendering: bool,
     /// Window.frame_counter value when this buffer was last drawn;
     /// 0 means never (content undefined).
     frame: u64,
 
-    fn create(alloc: std.mem.Allocator, shm: *wl.Shm, width: u31, height: u31) !*Buffer {
+    fn create(
+        alloc: std.mem.Allocator,
+        shm: *wl.Shm,
+        width: u31,
+        height: u31,
+        format: BufferFormat,
+    ) !*Buffer {
         std.debug.assert(width > 0 and height > 0);
         const stride: u31 = width * 4;
         const size: u31 = stride * height;
@@ -1225,7 +1261,10 @@ pub const Buffer = struct {
 
         const pool = try shm.createPool(fd, size);
         defer pool.destroy();
-        const wl_buffer = try pool.createBuffer(0, width, height, stride, .xrgb8888);
+        const wl_buffer = try pool.createBuffer(0, width, height, stride, switch (format) {
+            .xrgb8888 => .xrgb8888,
+            .argb8888 => .argb8888,
+        });
         errdefer wl_buffer.destroy();
 
         const self = try alloc.create(Buffer);
@@ -1234,6 +1273,7 @@ pub const Buffer = struct {
             .data = data,
             .width = width,
             .height = height,
+            .format = format,
             .busy = false,
             .rendering = false,
             .frame = 0,
