@@ -376,18 +376,10 @@ fn gatherMain(self: *ReadPipeline) void {
     }
 }
 
-fn setNonblocking(fd: posix.fd_t) void {
-    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
-    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-    if (linux.errno(flags) != .SUCCESS) return;
-    _ = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
-}
-
 test "pipeline delivers batches and stops cleanly after EOF" {
     var pipe_fds: [2]posix.fd_t = undefined;
-    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })));
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
     defer _ = linux.close(pipe_fds[0]);
-    setNonblocking(pipe_fds[0]);
 
     var pipeline: ReadPipeline = try .init(pipe_fds[0]);
     defer pipeline.deinit();
@@ -426,10 +418,9 @@ fn releaseAfterBridgeArmed(pipeline: *ReadPipeline) void {
 
 test "bridge wait wakes when consumer releases last batch" {
     var pipe_fds: [2]posix.fd_t = undefined;
-    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })));
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
     defer _ = linux.close(pipe_fds[0]);
     defer _ = linux.close(pipe_fds[1]);
-    setNonblocking(pipe_fds[0]);
 
     var pipeline: ReadPipeline = try .init(pipe_fds[0]);
     defer pipeline.deinit();
