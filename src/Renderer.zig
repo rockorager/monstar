@@ -138,7 +138,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .alloc = alloc,
         .font = font,
         .hb_buf = hb_buf,
-        .selection_bg = opts.selection_background orelse Config.default_selection_background,
+        .selection_bg = opts.selection_background orelse Config.dark_theme.selection_background,
         .selection_fg = opts.selection_foreground,
         .cursor_text = opts.cursor_text,
         .background_alpha = opts.background_alpha,

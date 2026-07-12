@@ -129,13 +129,6 @@ pub const dark_theme: ThemeColors = .{
     },
 };
 
-pub const default_background: vt.color.RGB = dark_theme.background;
-pub const default_foreground: vt.color.RGB = dark_theme.foreground;
-pub const default_cursor_color: vt.color.RGB = dark_theme.cursor_color;
-pub const default_selection_background: vt.color.RGB = dark_theme.selection_background;
-pub const default_selection_foreground: vt.color.RGB = dark_theme.selection_foreground;
-pub const default_palette: [16]vt.color.RGB = dark_theme.palette;
-
 /// Wayland app-id and desktop-entry hint for desktop integration.
 app_id: [:0]const u8 = default_app_id,
 font_family: [:0]const u8 = "monospace",
@@ -146,14 +139,16 @@ font_size: FontSize = .{ .points = 12 },
 /// both sides; two values are left/right for X and top/bottom for Y.
 window_padding_x: WindowPadding = .{},
 window_padding_y: WindowPadding = .{},
-/// Command to run; unset falls back to $SHELL, then /bin/sh.
+/// Command to run; unset falls back to $SHELL, then /bin/sh. This only
+/// affects startup because reloading does not replace a running child.
 command: ?Command = null,
 /// Shell command that receives the last semantic command output on stdin.
 pipe_command_output: ?[:0]const u8 = null,
 /// Whether newly spawned children should be moved into their own transient
 /// systemd scope. This only affects startup; reloads do not move a live child.
 linux_cgroup: LinuxCgroup = .never,
-/// Logical terminal page storage in bytes, including the active screen.
+/// Logical terminal page storage in bytes, including the active screen. This
+/// only affects startup because libghostty-vt does not resize live scrollback.
 scrollback_limit: usize = 50_000_000,
 /// Total storage limit in bytes for kitty graphics images per screen;
 /// 0 disables the protocol. A single image larger than this limit is
@@ -220,8 +215,9 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Config {
             continue;
         }
 
-        config.set(arena, key, value) catch {
-            warn("line {d}: invalid value for '{s}': {s}", .{ line_no, key, value });
+        config.set(arena, key, value) catch |err| switch (err) {
+            error.UnknownKey => warn("line {d}: unknown key '{s}', ignoring", .{ line_no, key }),
+            else => warn("line {d}: invalid value for '{s}': {s}", .{ line_no, key, value }),
         };
     }
     return config;
@@ -304,7 +300,7 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         const entry = try parsePaletteEntry(value);
         self.palette[entry.index] = entry.color;
     } else {
-        warn("unknown key '{s}', ignoring", .{key});
+        return error.UnknownKey;
     }
 }
 
@@ -558,6 +554,8 @@ fn parseThemeOverrides(text: []const u8) ThemeOverrides {
                 continue;
             };
             result.palette[entry.index] = entry.color;
+        } else {
+            warn("theme line {d}: unknown key '{s}', ignoring", .{ line_no, key });
         }
     }
     return result;
@@ -671,15 +669,22 @@ test "defaults" {
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.pipe_command_output);
     try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
+    try std.testing.expectEqual(@as(usize, 320_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
     try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
     try std.testing.expectEqual(@as(?Theme, null), config.theme);
+    try std.testing.expectEqual(@as(?ThemeOverrides, null), config.light_theme_overrides);
+    try std.testing.expectEqual(@as(?ThemeOverrides, null), config.dark_theme_overrides);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.cursor_color);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.cursor_text);
-    try std.testing.expectEqual(default_selection_background, config.effectiveSelectionBackground(.dark));
-    try std.testing.expectEqual(default_selection_foreground, config.effectiveSelectionForeground(.dark));
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.selection_background);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.selection_foreground);
+    for (config.palette) |entry| try std.testing.expectEqual(@as(?vt.color.RGB, null), entry);
+    try std.testing.expectEqual(dark_theme.selection_background, config.effectiveSelectionBackground(.dark));
+    try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.dark));
 }
 
 test "parse config" {
@@ -703,7 +708,10 @@ test "parse config" {
         \\background-opacity = 0.8
         \\background = #1a1b26
         \\foreground = c0caf5
+        \\cursor-color = #aabbcc
         \\cursor-text = #010203
+        \\selection-background = #040506
+        \\selection-foreground = #070809
         \\palette = 1=#f7768e
         \\palette = 200=#123456
         \\
@@ -727,10 +735,21 @@ test "parse config" {
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xaa, .g = 0xbb, .b = 0xcc }, config.cursor_color.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.cursor_text.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, config.selection_background.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.selection_foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, config.palette[200].?);
+}
+
+test "unknown override is rejected" {
+    var config: Config = .{};
+    try std.testing.expectError(
+        error.UnknownKey,
+        config.applyOverride(std.testing.allocator, "font-famly=monospace"),
+    );
 }
 
 test "direct command parsing" {
@@ -844,10 +863,10 @@ test "terminal colors from config" {
     config.background = .{ .r = 1, .g = 2, .b = 3 };
     const colors = config.terminalColors(.dark);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
-    try std.testing.expectEqual(default_foreground, colors.foreground.get().?);
-    try std.testing.expectEqual(default_cursor_color, colors.cursor.get().?);
-    try std.testing.expectEqual(default_palette[0], colors.palette.current[0]);
-    try std.testing.expectEqual(default_palette[15], colors.palette.current[15]);
+    try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
+    try std.testing.expectEqual(dark_theme.cursor_color, colors.cursor.get().?);
+    try std.testing.expectEqual(dark_theme.palette[0], colors.palette.current[0]);
+    try std.testing.expectEqual(dark_theme.palette[15], colors.palette.current[15]);
 }
 
 test "built-in colors follow color scheme" {

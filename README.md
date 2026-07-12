@@ -65,6 +65,17 @@ Send `SIGUSR1` to reload the config for a running process:
 pkill -USR1 monstar
 ```
 
+Visual and interaction settings apply to the running window. `command`,
+`linux-cgroup`, and `scrollback-limit` configure resources created at startup,
+so changes to those settings apply to new windows.
+
+Set the font family with `font-family`; the default asks fontconfig for
+`monospace`:
+
+```conf
+font-family = Iosevka
+```
+
 `font-size` accepts bare values or an explicit `pt` suffix for typographic
 points, and a `px` suffix for logical pixels. Fractional values are supported.
 Pixel values map directly to logical pixels before Wayland output scaling;
@@ -102,6 +113,14 @@ the active screen. It defaults to 50,000,000 bytes:
 scrollback-limit = 100000000
 ```
 
+`image-storage-limit` caps kitty graphics image data per terminal screen. It
+defaults to 320,000,000 bytes, may not exceed 4,294,967,295 bytes, and can be
+set to `0` to disable the image protocol:
+
+```conf
+image-storage-limit = 320000000
+```
+
 Control precision-device and discrete-wheel scrolling independently with
 Ghostty-compatible multiplier syntax. The defaults are `precision:1` and
 `discrete:3`:
@@ -135,6 +154,8 @@ background = #1a1b26
 foreground = #c0caf5
 cursor-color = #c0caf5
 cursor-text = #1a1b26
+selection-background = #33467c
+selection-foreground = #c0caf5
 palette = 1=#f7768e
 palette = 200=#123456
 ```
