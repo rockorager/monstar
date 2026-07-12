@@ -1388,18 +1388,8 @@ fn dbusAppendBasic(iter: *c.DBusMessageIter, type_: c_int, value: anytype) !void
 }
 
 fn dbusAppendStringVariant(iter: *c.DBusMessageIter, key: [:0]const u8, value: [:0]const u8) !void {
-    var entry: c.DBusMessageIter = undefined;
-    if (c.dbus_message_iter_open_container(iter, c.DBUS_TYPE_DICT_ENTRY, null, &entry) == 0) return error.OutOfMemory;
-    var key_ptr: [*:0]const u8 = key;
-    try dbusAppendBasic(&entry, c.DBUS_TYPE_STRING, &key_ptr);
-
-    var variant: c.DBusMessageIter = undefined;
-    if (c.dbus_message_iter_open_container(&entry, c.DBUS_TYPE_VARIANT, "s", &variant) == 0) return error.OutOfMemory;
     var value_ptr: [*:0]const u8 = value;
-    try dbusAppendBasic(&variant, c.DBUS_TYPE_STRING, &value_ptr);
-    if (c.dbus_message_iter_close_container(&entry, &variant) == 0) return error.OutOfMemory;
-
-    if (c.dbus_message_iter_close_container(iter, &entry) == 0) return error.OutOfMemory;
+    try dbusAppendVariant(iter, key, "s", c.DBUS_TYPE_STRING, &value_ptr);
 }
 
 fn dbusAppendBoolVariant(iter: *c.DBusMessageIter, key: [:0]const u8, value: bool) !void {
