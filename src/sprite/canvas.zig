@@ -211,38 +211,6 @@ pub const Canvas = struct {
         }
     }
 
-    /// Only really useful for test purposes, since the clipping region is
-    /// automatically excluded when writing to an atlas with `writeAtlas`.
-    pub fn clearClippingRegions(self: *Canvas) void {
-        const buf = std.mem.sliceAsBytes(self.sfc.image_surface_alpha8.buf);
-        const width: usize = @intCast(self.sfc.getWidth());
-        const height: usize = @intCast(self.sfc.getHeight());
-
-        for (0..height) |y| {
-            for (0..self.clip_left) |x| {
-                buf[y * width + x] = 0;
-            }
-        }
-
-        for (0..height) |y| {
-            for (width - self.clip_right..width) |x| {
-                buf[y * width + x] = 0;
-            }
-        }
-
-        for (0..self.clip_top) |y| {
-            for (0..width) |x| {
-                buf[y * width + x] = 0;
-            }
-        }
-
-        for (height - self.clip_bottom..height) |y| {
-            for (0..width) |x| {
-                buf[y * width + x] = 0;
-            }
-        }
-    }
-
     /// Return a transformation representing the translation for our padding.
     pub fn transformation(self: Canvas) z2d.Transformation {
         return .{
@@ -495,20 +463,5 @@ pub const Canvas = struct {
             }
         }
         std.mem.swap(u32, &self.clip_left, &self.clip_right);
-    }
-
-    /// Mirror the canvas vertically.
-    pub fn flipVertical(self: *Canvas) Allocator.Error!void {
-        const buf = std.mem.sliceAsBytes(self.sfc.image_surface_alpha8.buf);
-        const clone = try self.alloc.dupe(u8, buf);
-        defer self.alloc.free(clone);
-        const width: usize = @intCast(self.sfc.getWidth());
-        const height: usize = @intCast(self.sfc.getHeight());
-        for (0..height) |y| {
-            for (0..width) |x| {
-                buf[y * width + x] = clone[(height - y - 1) * width + x];
-            }
-        }
-        std.mem.swap(u32, &self.clip_top, &self.clip_bottom);
     }
 };

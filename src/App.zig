@@ -2781,10 +2781,6 @@ fn answerOscSelectionColorQuery(
     }
 }
 
-fn writeOscPaletteReport(self: *App, idx: u8, terminator: vt.osc.Terminator) void {
-    self.writeOscColorReport(.{ .palette = idx }, self.term.colors.palette.current[idx], terminator);
-}
-
 fn writeOscDynamicReport(
     self: *App,
     dynamic: u16,
@@ -2842,10 +2838,6 @@ fn formatOscColorReport(
 
 fn effectiveForeground(self: *const App) vt.color.RGB {
     return self.term.colors.foreground.get() orelse self.term.colors.palette.current[7];
-}
-
-fn effectiveBackground(self: *const App) vt.color.RGB {
-    return self.term.colors.background.get() orelse self.term.colors.palette.current[0];
 }
 
 fn syncCursorShape(self: *App) void {
