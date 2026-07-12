@@ -34,6 +34,8 @@ pub const Job = struct {
     focused: bool,
     /// Underline hovered hyperlinks in the base render.
     hyperlink_hints: bool,
+    /// Hovered automatically detected link in viewport cell coordinates.
+    link_range: ?Renderer.LinkRange,
     /// IME preedit overlay text. Owned by the submitter; must stay valid
     /// until the job's result is taken.
     preedit: ?[]const u8,
@@ -376,6 +378,7 @@ fn workerMain(self: *AsyncRaster) void {
 
         self.renderer.focused = job.focused;
         self.renderer.hyperlink_hints = job.hyperlink_hints;
+        self.renderer.link_range = job.link_range;
         self.renderer.buffer_stride = job.width;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
@@ -558,6 +561,7 @@ test "repair previous frame" {
         .generation = 1,
         .focused = true,
         .hyperlink_hints = false,
+        .link_range = null,
         .preedit = null,
         .link_hint = null,
         .kitty_items = &.{},
@@ -622,6 +626,7 @@ test "scroll previous frame in place and from distinct source" {
         .generation = 1,
         .focused = true,
         .hyperlink_hints = false,
+        .link_range = null,
         .preedit = null,
         .link_hint = null,
         .kitty_items = &.{},

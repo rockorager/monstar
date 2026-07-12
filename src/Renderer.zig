@@ -37,6 +37,8 @@ background_alpha: u8,
 focused: bool = true,
 /// When true, OSC 8 hyperlink cells get an underline affordance.
 hyperlink_hints: bool = false,
+/// Hovered automatically detected link, in viewport cell coordinates.
+link_range: ?LinkRange = null,
 /// Per-cell resolved foreground colors for the row being rendered.
 fg_scratch: std.ArrayList(vt.color.RGB),
 /// Per-cell font face indices for the row being rendered.
@@ -129,6 +131,21 @@ pub const ShapeStats = struct {
     cache_misses: usize = 0,
     shaped_cells: usize = 0,
     cache_clears: usize = 0,
+};
+
+pub const LinkRange = struct {
+    start: vt.Coordinate,
+    end: vt.Coordinate,
+
+    fn contains(self: LinkRange, x: usize, y: u31) bool {
+        if (y < self.start.y or y > self.end.y) return false;
+        if (self.start.y == self.end.y) {
+            return x >= self.start.x and x <= self.end.x;
+        }
+        if (y == self.start.y) return x >= self.start.x;
+        if (y == self.end.y) return x <= self.end.x;
+        return true;
+    }
 };
 
 pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer {
@@ -1461,7 +1478,8 @@ fn renderRowForeground(
     // hints overlay the glyphs, in the style's underline color (or the
     // resolved fg).
     for (0..cols) |dx| {
-        const show_hyperlink = self.hyperlink_hints and raws[dx].hyperlink;
+        const show_hyperlink = (self.hyperlink_hints and raws[dx].hyperlink) or
+            if (self.link_range) |range| range.contains(dx, y) else false;
         if (raws[dx].style_id == 0 and !show_hyperlink) continue;
         const style: vt.Style = if (raws[dx].style_id == 0) .{} else styles[dx];
         const underline: ?vt.sgr.Attribute.Underline = switch (style.flags.underline) {

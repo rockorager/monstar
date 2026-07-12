@@ -18,6 +18,7 @@ const vt = @import("ghostty-vt");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
+const Link = @import("Link.zig");
 const Pty = @import("Pty.zig");
 const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
@@ -86,6 +87,16 @@ fn tcapString(comptime v: []const u8) []const u8 {
     }
 }
 
+const HoveredLink = struct {
+    uri: []u8,
+    range: ?Renderer.LinkRange,
+};
+
+const LinkPress = struct {
+    uri: []u8,
+    cell: vt.Coordinate,
+};
+
 alloc: std.mem.Allocator,
 io: std.Io,
 config_arena: std.heap.ArenaAllocator,
@@ -117,6 +128,8 @@ held_frame: ?*Window.Buffer,
 /// and freed on deinit.
 async_job_preedit: ?[]u8,
 async_job_link_hint: ?[]u8,
+/// Viewport cells for the automatic link submitted with the last async job.
+async_job_link_range: ?Renderer.LinkRange,
 /// The hyperlink-hints flag submitted with the last async job, for
 /// detecting overlay changes between jobs.
 async_job_hyperlink_hints: bool,
@@ -216,6 +229,13 @@ taskbar_progress_fd: posix.fd_t,
 /// Pointer position in logical surface coordinates.
 pointer_x: f64,
 pointer_y: f64,
+pointer_inside: bool,
+/// Demand-driven link detection cache. The URI is owned by App.
+hovered_link: ?HoveredLink,
+link_checked_cell: ?vt.Coordinate,
+link_active: bool,
+/// A link click opens only if release occurs over the original cell.
+link_press: ?LinkPress,
 /// Wheel state accumulated between pointer frame events.
 scroll_pixels: f64,
 scroll_frame_pixels: f64,
@@ -786,6 +806,7 @@ pub fn init(
         .held_frame = null,
         .async_job_preedit = null,
         .async_job_link_hint = null,
+        .async_job_link_range = null,
         .async_job_hyperlink_hints = false,
         .async_job_kitty = &.{},
         .kitty_cache = .empty,
@@ -851,6 +872,11 @@ pub fn init(
         .taskbar_progress_fd = taskbar_progress_fd,
         .pointer_x = 0,
         .pointer_y = 0,
+        .pointer_inside = false,
+        .hovered_link = null,
+        .link_checked_cell = null,
+        .link_active = false,
+        .link_press = null,
         .scroll_pixels = 0,
         .scroll_frame_pixels = 0,
         .scroll_clicks = 0,
@@ -1541,6 +1567,8 @@ pub fn deinit(self: *App) void {
     if (self.async_raster) |*async_raster| async_raster.deinit();
     if (self.async_job_preedit) |text| self.alloc.free(text);
     if (self.async_job_link_hint) |uri| self.alloc.free(uri);
+    if (self.hovered_link) |link| self.alloc.free(link.uri);
+    if (self.link_press) |press| self.alloc.free(press.uri);
     self.alloc.free(self.async_job_kitty);
     self.kitty_cache.deinit(self.alloc);
     self.damage_spans.deinit(self.alloc);
@@ -1962,6 +1990,7 @@ fn jumpPrompt(self: *App, delta: isize) void {
     screen.pages.scroll(.{ .delta_prompt = delta });
     self.clearSelection();
     self.needs_redraw = true;
+    self.syncHoveredLink(true);
 }
 
 /// Ctrl+Shift+G: pipe the most recent OSC 133-delimited command output to
@@ -2344,10 +2373,12 @@ fn resetRuntimeFontSize(self: *App) void {
 /// slave fd in this process; only SIGCHLD ends the session.
 fn drainPipeline(self: *App) !void {
     self.pipeline.clearReady();
+    var consumed = false;
     for (0..ReadPipeline.buffer_count) |_| {
         const batch = self.pipeline.take() orelse break;
         self.stream.nextSlice(batch);
         self.pipeline.release();
+        consumed = true;
         self.needs_redraw = true;
     }
     self.pipeline.rearm();
@@ -2355,6 +2386,7 @@ fn drainPipeline(self: *App) !void {
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
     self.syncActiveScreen();
+    if (consumed) self.syncHoveredLink(true);
 }
 
 fn handleOscColorOperation(
@@ -2739,9 +2771,21 @@ fn syncCursorShape(self: *App) void {
 }
 
 fn currentCursorShape(self: *App) Window.CursorShape {
-    if (self.keyboard.currentMods().ctrl and self.hyperlinkAtPointer() != null) return .pointer;
+    if (self.hoveredLinkUri() != null) return .pointer;
     if (self.mouse_shape_explicit) return cursorShapeFromMouseShape(self.term.mouse_shape);
     return if (self.term.flags.mouse_event != .none) .default else .text;
+}
+
+fn linkModifiersActive(mods: vt.input.KeyMods, mouse_reporting: bool) bool {
+    if (!mods.ctrl or mods.alt or mods.super) return false;
+    return mods.shift or !mouse_reporting;
+}
+
+fn linksActive(self: *App) bool {
+    return linkModifiersActive(
+        self.keyboard.currentMods(),
+        self.term.flags.mouse_event != .none,
+    );
 }
 
 fn cursorShapeFromMouseShape(shape: vt.MouseShape) Window.CursorShape {
@@ -2781,6 +2825,17 @@ fn cursorShapeFromMouseShape(shape: vt.MouseShape) Window.CursorShape {
         .zoom_in => .zoom_in,
         .zoom_out => .zoom_out,
     };
+}
+
+test "link modifiers are exact and shift bypasses mouse reporting" {
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true }, false));
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true, .shift = true }, false));
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true, .caps_lock = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .ctrl = true, .alt = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .ctrl = true, .super = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .shift = true }, false));
+    try std.testing.expect(!linkModifiersActive(.{ .ctrl = true }, true));
+    try std.testing.expect(linkModifiersActive(.{ .ctrl = true, .shift = true }, true));
 }
 
 test "OSC color reports use 16-bit rgb format" {
@@ -2991,18 +3046,14 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .enter => |enter| {
             self.pointer_x = enter.surface_x.toDouble();
             self.pointer_y = enter.surface_y.toDouble();
+            self.pointer_inside = true;
+            self.syncHoveredLink(false);
             self.syncCursorShape();
-            if (self.keyboard.currentMods().ctrl) {
-                self.requestFullAsyncRedraw();
-            }
         },
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
-            self.syncCursorShape();
-            if (self.keyboard.currentMods().ctrl) {
-                self.requestFullAsyncRedraw();
-            }
+            self.syncHoveredLink(false);
             if (self.selecting) {
                 self.extendSelection();
             } else if (self.mouse_button != null or self.reportingMouse()) {
@@ -3050,10 +3101,11 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             const mouse_button = mouseButtonFromEvdev(button.button);
 
             if (button.button == 272) { // BTN_LEFT
-                if (self.keyboard.currentMods().ctrl and self.hyperlinkAtPointer() != null) {
-                    if (button.state == .pressed) self.openHyperlinkAtPointer();
-                    return;
+                if (button.state == .pressed) {
+                    if (self.armLinkPress()) return;
+                    self.cancelLinkPress();
                 }
+                if (button.state == .released and self.finishLinkPress()) return;
                 switch (button.state) {
                     .pressed => if (reporting) {
                         self.forwardMouseButton(button, mouse_button.?);
@@ -3092,7 +3144,10 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         // Terminal scrolling follows the compositor-provided logical axis;
         // the physical direction hint does not change that behavior.
         .axis_relative_direction => {},
-        .leave => {},
+        .leave => {
+            self.pointer_inside = false;
+            self.syncHoveredLink(false);
+        },
     }
 }
 
@@ -3119,8 +3174,30 @@ fn pinAtPointer(self: *App) ?vt.Pin {
     });
 }
 
-fn hyperlinkAtPointer(self: *App) ?[]const u8 {
-    const pin = self.pinAtPointer() orelse return null;
+/// Unlike selection coordinates, link coordinates must be inside the grid;
+/// padding must not clamp to a clickable edge cell.
+fn linkCellAtPointer(self: *App) ?vt.Coordinate {
+    if (!self.pointer_inside) return null;
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    const px = self.pointer_x * scale;
+    const py = self.pointer_y * scale;
+    const grid_x: f64 = @floatFromInt(self.layout.grid_x);
+    const grid_y: f64 = @floatFromInt(self.layout.grid_y);
+    const grid_right: f64 = @floatFromInt(self.layout.grid_x + self.layout.grid_width);
+    const grid_bottom: f64 = @floatFromInt(self.layout.grid_y + self.layout.grid_height);
+    if (px < grid_x or px >= grid_right or py < grid_y or py >= grid_bottom) return null;
+    return .{
+        .x = @intFromFloat((px - grid_x) / @as(f64, @floatFromInt(self.font.cell_width))),
+        .y = @intFromFloat((py - grid_y) / @as(f64, @floatFromInt(self.font.cell_height))),
+    };
+}
+
+fn linkPinAtPointer(self: *App) ?vt.Pin {
+    const cell = self.linkCellAtPointer() orelse return null;
+    return self.term.screens.active.pages.pin(.{ .viewport = cell });
+}
+
+fn oscHyperlinkAtPin(pin: vt.Pin) ?[]const u8 {
     const page = pin.node.page();
     const rac = pin.rowAndCell();
     if (!rac.cell.hyperlink) return null;
@@ -3129,8 +3206,138 @@ fn hyperlinkAtPointer(self: *App) ?[]const u8 {
     return entry.uri.slice(page.memory);
 }
 
-fn openHyperlinkAtPointer(self: *App) void {
-    const uri = self.hyperlinkAtPointer() orelse return;
+fn detectHoveredLink(self: *App) !?HoveredLink {
+    const pin = self.linkPinAtPointer() orelse return null;
+    if (oscHyperlinkAtPin(pin)) |uri| {
+        return .{ .uri = try self.alloc.dupe(u8, uri), .range = null };
+    }
+
+    const screen = self.term.screens.active;
+    const line = screen.selectLine(.{
+        .pin = pin,
+        .whitespace = null,
+        .semantic_prompt_boundary = true,
+    }) orelse return null;
+    var strmap: vt.StringMap = undefined;
+    const text = try screen.selectionString(self.alloc, .{
+        .sel = line,
+        .trim = false,
+        .map = &strmap,
+    });
+    defer self.alloc.free(text);
+    defer strmap.deinit(self.alloc);
+
+    var offset: usize = 0;
+    while (Link.find(text, offset)) |match| {
+        if (match.end > strmap.map.len) break;
+        const selection: vt.Selection = .init(
+            strmap.map[match.start],
+            strmap.map[match.end - 1],
+            false,
+        );
+        if (selection.contains(screen, pin)) {
+            return .{
+                .uri = try self.alloc.dupe(u8, text[match.start..match.end]),
+                .range = self.linkRange(selection),
+            };
+        }
+        offset = match.end;
+    }
+    return null;
+}
+
+fn linkRange(self: *App, selection: vt.Selection) ?Renderer.LinkRange {
+    const screen = self.term.screens.active;
+    const tl = screen.pages.pointFromPin(.screen, selection.topLeft(screen)) orelse return null;
+    const br = screen.pages.pointFromPin(.screen, selection.bottomRight(screen)) orelse return null;
+    const viewport = screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)) orelse return null;
+    const last_y = viewport.screen.y + self.term.rows - 1;
+    if (br.screen.y < viewport.screen.y or tl.screen.y > last_y) return null;
+
+    return .{
+        .start = .{
+            .x = if (tl.screen.y < viewport.screen.y) 0 else tl.screen.x,
+            .y = @max(tl.screen.y, viewport.screen.y) - viewport.screen.y,
+        },
+        .end = .{
+            .x = if (br.screen.y > last_y) self.term.cols - 1 else br.screen.x,
+            .y = @min(br.screen.y, last_y) - viewport.screen.y,
+        },
+    };
+}
+
+fn hoveredLinksEqual(a: ?HoveredLink, b: ?HoveredLink) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?.uri, b.?.uri) and std.meta.eql(a.?.range, b.?.range);
+}
+
+/// Recompute the link only while the exact activation modifiers are held.
+/// Repeated pointer motion inside one cell is deliberately a no-op.
+fn syncHoveredLink(self: *App, force: bool) void {
+    const active = self.linksActive();
+    const activation_changed = active != self.link_active;
+    self.link_active = active;
+    const cell = if (active) self.linkCellAtPointer() else null;
+    if (!force and !activation_changed and std.meta.eql(cell, self.link_checked_cell)) return;
+    self.link_checked_cell = cell;
+
+    const next: ?HoveredLink = if (cell != null)
+        self.detectHoveredLink() catch |err| next: {
+            log.warn("automatic link detection failed: {}", .{err});
+            break :next null;
+        }
+    else
+        null;
+    const changed = !hoveredLinksEqual(self.hovered_link, next);
+    if (changed) {
+        if (self.hovered_link) |old| self.alloc.free(old.uri);
+        self.hovered_link = next;
+    } else if (next) |unchanged| {
+        self.alloc.free(unchanged.uri);
+    }
+    if (changed or activation_changed) self.requestFullAsyncRedraw();
+    self.syncCursorShape();
+}
+
+fn hoveredLinkUri(self: *App) ?[]const u8 {
+    if (!self.linksActive()) return null;
+    const link = self.hovered_link orelse return null;
+    return link.uri;
+}
+
+fn armLinkPress(self: *App) bool {
+    const uri = self.hoveredLinkUri() orelse return false;
+    const cell = self.linkCellAtPointer() orelse return false;
+    const owned = self.alloc.dupe(u8, uri) catch |err| {
+        log.warn("failed to save pressed link: {}", .{err});
+        return false;
+    };
+    if (self.link_press) |old| self.alloc.free(old.uri);
+    self.link_press = .{ .uri = owned, .cell = cell };
+    return true;
+}
+
+fn cancelLinkPress(self: *App) void {
+    if (self.link_press) |press| self.alloc.free(press.uri);
+    self.link_press = null;
+}
+
+fn finishLinkPress(self: *App) bool {
+    const press = self.link_press orelse return false;
+    self.link_press = null;
+    defer self.alloc.free(press.uri);
+
+    const cell = self.linkCellAtPointer();
+    const uri = self.hoveredLinkUri();
+    if (cell != null and uri != null and
+        std.meta.eql(cell.?, press.cell) and std.mem.eql(u8, uri.?, press.uri))
+    {
+        self.openUri(press.uri);
+    }
+    return true;
+}
+
+fn openUri(self: *App, uri: []const u8) void {
     const owned = self.alloc.dupe(u8, uri) catch |err| {
         log.warn("failed to save hyperlink URI: {}", .{err});
         return;
@@ -3340,6 +3547,7 @@ fn fireSelectionAutoscroll(self: *App) void {
     });
     self.applySelection(selection, false);
     self.needs_redraw = true;
+    self.syncHoveredLink(true);
     self.syncSelectionAutoscrollTimer();
 }
 
@@ -3961,6 +4169,7 @@ fn scrollLines(self: *App, lines_down: i32) void {
 
     self.term.screens.active.pages.scroll(.{ .delta_row = lines_down });
     self.needs_redraw = true;
+    self.syncHoveredLink(true);
 }
 
 fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
@@ -4010,16 +4219,15 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             };
         },
         .modifiers => |mods| {
-            const ctrl_was_down = self.keyboard.currentMods().ctrl;
+            const links_were_active = self.linksActive();
             self.keyboard.updateMods(
                 mods.mods_depressed,
                 mods.mods_latched,
                 mods.mods_locked,
                 mods.group,
             );
-            if (ctrl_was_down != self.keyboard.currentMods().ctrl) {
-                self.syncCursorShape();
-                self.requestFullAsyncRedraw();
+            if (links_were_active != self.linksActive()) {
+                self.syncHoveredLink(true);
             }
         },
         .key => |key| {
@@ -4096,6 +4304,7 @@ fn applyPendingIme(self: *App) void {
             self.clearSelection();
             if (self.term.screens.active.pages.viewport != .active) {
                 self.term.screens.active.pages.scroll(.active);
+                self.syncHoveredLink(true);
             }
         }
     }
@@ -4222,6 +4431,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
         if (self.term.screens.active.pages.viewport != .active) {
             self.term.screens.active.pages.scroll(.active);
             self.needs_redraw = true;
+            self.syncHoveredLink(true);
         }
     }
 }
@@ -4319,7 +4529,7 @@ fn startAsyncRender(self: *App) !bool {
     // only for geometry redraws. Any pending snapshot rebuild stays
     // deferred until the freeze ends.
     const frozen = self.term.modes.get(.synchronized_output);
-    var hyperlink_hints = self.keyboard.currentMods().ctrl;
+    var hyperlink_hints = self.linksActive();
     // Frozen jobs re-render the previous snapshot at a new geometry, so
     // they never take the unchanged-overlay shortcut.
     var overlay_dirty = true;
@@ -4350,16 +4560,20 @@ fn startAsyncRender(self: *App) !bool {
         }
         // Snapshot overlay inputs; the worker cannot safely read App state.
         // The previous job's copies are dead: only one job exists at a time.
-        const new_link: ?[]const u8 = if (hyperlink_hints) self.hyperlinkAtPointer() else null;
+        const hovered = if (hyperlink_hints) self.hovered_link else null;
+        const new_link: ?[]const u8 = if (hovered) |link| link.uri else null;
+        const new_range: ?Renderer.LinkRange = if (hovered) |link| link.range else null;
         overlay_dirty = hyperlink_hints != self.async_job_hyperlink_hints or
             !optionalStrEql(self.async_job_preedit, self.ime_preedit) or
-            !optionalStrEql(self.async_job_link_hint, new_link);
+            !optionalStrEql(self.async_job_link_hint, new_link) or
+            !std.meta.eql(self.async_job_link_range, new_range);
         if (self.async_job_preedit) |old| self.alloc.free(old);
         self.async_job_preedit = null;
         if (self.async_job_link_hint) |old| self.alloc.free(old);
         self.async_job_link_hint = null;
         if (self.ime_preedit) |text| self.async_job_preedit = try self.alloc.dupe(u8, text);
         if (new_link) |uri| self.async_job_link_hint = try self.alloc.dupe(u8, uri);
+        self.async_job_link_range = new_range;
         self.async_job_hyperlink_hints = hyperlink_hints;
         const kitty_dirty = self.term.screens.active.kitty_images.dirty;
         var kitty_changed = kitty_dirty;
@@ -4389,8 +4603,8 @@ fn startAsyncRender(self: *App) !bool {
         // identical to the last one.
         if (self.render_state.dirty == .false and !overlay_dirty) return false;
     } else {
-        // Keep the hint flag consistent with the stale link-hint copy.
-        hyperlink_hints = self.async_job_link_hint != null;
+        // Keep link affordances consistent with the stale snapshot.
+        hyperlink_hints = self.async_job_hyperlink_hints;
     }
     std.debug.assert(self.held_frame == null);
     const target = self.window.acquireRenderTarget() catch return false;
@@ -4415,6 +4629,7 @@ fn startAsyncRender(self: *App) !bool {
         .generation = self.async_generation,
         .focused = self.focused,
         .hyperlink_hints = hyperlink_hints,
+        .link_range = self.async_job_link_range,
         .preedit = self.async_job_preedit,
         .link_hint = self.async_job_link_hint,
         .kitty_items = self.async_job_kitty,
@@ -4949,6 +5164,7 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.geometry_redraw = true;
     self.needs_redraw = true;
+    self.syncHoveredLink(true);
 }
 
 test "scroll detector finds viewport shifts and narrows dirty rows" {

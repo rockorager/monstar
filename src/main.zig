@@ -7,6 +7,7 @@ const vt = @import("ghostty-vt");
 const App = @import("App.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
+const Link = @import("Link.zig");
 const Pty = @import("Pty.zig");
 const Renderer = @import("Renderer.zig");
 const TerminalLayout = @import("TerminalLayout.zig");
@@ -359,6 +360,7 @@ test {
     _ = @import("cgroup.zig");
     _ = @import("Keyboard.zig");
     _ = @import("KittyImageCache.zig");
+    _ = Link;
     _ = Pty;
     _ = @import("ReadPipeline.zig");
     _ = Renderer;

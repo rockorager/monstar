@@ -222,5 +222,9 @@ pipe-command-output = cat > /tmp/monstar-output
 | `Ctrl++` / `Ctrl+=` | Increase font size for this window |
 | `Ctrl+-` | Decrease font size for this window |
 | `Ctrl+0` | Reset font size for this window |
-| `Ctrl` + left click | Open OSC 8 hyperlink |
+| `Ctrl` + left click | Open OSC 8 hyperlink or detected URI (`Ctrl+Shift` when the application captures the mouse) |
 | `Ctrl` + drag | Rectangular text selection |
+
+Detected URIs may use `http`, `https`, `ftp`, `mailto`, `file`, `ssh`, `git`,
+`tel`, `magnet`, `ipfs`, `ipns`, `gemini`, `gopher`, or `news`. Bare domains,
+email addresses, and filesystem paths are not detected.
