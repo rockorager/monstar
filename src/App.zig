@@ -1801,9 +1801,8 @@ fn reloadConfig(self: *App) void {
 }
 
 /// Ctrl+Shift+N: spawn an independent monstar window in the shell's
-/// current directory. Prefer the user service manager so the new window
-/// is not adopted by this monstar's launcher; fall back through known
-/// compositor launchers and finally a direct detached fork.
+/// current directory through the user service manager so the new window
+/// is not adopted by this monstar's launcher.
 fn spawnNewWindow(self: *App) void {
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
@@ -1820,11 +1819,9 @@ fn spawnNewWindow(self: *App) void {
     };
     const exe_path = resolveCommandPathZ(arena, self.environ, "monstar") catch "monstar";
 
-    if (self.spawnSystemdRun(arena, envp, exe_path, pwd)) return;
-    if (self.spawnSwayExec(arena, envp, exe_path, pwd)) return;
-    if (self.spawnHyprlandExec(arena, envp, exe_path, pwd)) return;
-    const argv = [_:null]?[*:0]const u8{"monstar"};
-    _ = spawnDetached(exe_path.ptr, &argv, envp, pwd, "monstar");
+    self.spawnSystemdRun(arena, envp, exe_path, pwd) catch |err| {
+        log.err("new window launch failed: {}", .{err});
+    };
 }
 
 fn spawnSystemdRun(
@@ -1833,100 +1830,20 @@ fn spawnSystemdRun(
     envp: [*:null]const ?[*:0]const u8,
     exe_path: [:0]const u8,
     pwd: ?[:0]const u8,
-) bool {
-    const systemd_run = resolveCommandPath(arena, self.environ, "systemd-run") catch |err| {
-        log.warn("systemd-run lookup failed: {}", .{err});
-        return false;
-    };
+) !void {
+    const systemd_run = try resolveCommandPath(arena, self.environ, "systemd-run");
 
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
-    argv.appendSlice(arena, &.{ "systemd-run", "--user", "--collect" }) catch |err| {
-        log.err("systemd-run argv setup failed: {}", .{err});
-        return false;
-    };
+    try argv.appendSlice(arena, &.{ "systemd-run", "--user", "--collect" });
     if (pwd) |p| {
-        const cwd_arg = std.fmt.allocPrintSentinel(arena, "--working-directory={s}", .{p}, 0) catch |err| {
-            log.err("systemd-run cwd setup failed: {}", .{err});
-            return false;
-        };
-        argv.append(arena, cwd_arg.ptr) catch |err| {
-            log.err("systemd-run argv setup failed: {}", .{err});
-            return false;
-        };
+        const cwd_arg = try std.fmt.allocPrintSentinel(arena, "--working-directory={s}", .{p}, 0);
+        try argv.append(arena, cwd_arg.ptr);
     }
-    argv.append(arena, exe_path.ptr) catch |err| {
-        log.err("systemd-run argv setup failed: {}", .{err});
-        return false;
-    };
-    const argv_slice = argv.toOwnedSliceSentinel(arena, null) catch |err| {
-        log.err("systemd-run argv setup failed: {}", .{err});
-        return false;
-    };
-    return spawnLauncher(systemd_run, argv_slice.ptr, envp, "systemd-run");
-}
-
-fn spawnSwayExec(
-    self: *App,
-    arena: std.mem.Allocator,
-    envp: [*:null]const ?[*:0]const u8,
-    exe_path: [:0]const u8,
-    pwd: ?[:0]const u8,
-) bool {
-    if (self.environ.getPosix("SWAYSOCK") == null) return false;
-    const swaymsg = resolveCommandPath(arena, self.environ, "swaymsg") catch |err| {
-        log.warn("swaymsg lookup failed: {}", .{err});
-        return false;
-    };
-    const command = spawnNewWindowShellCommand(arena, exe_path, pwd) catch |err| {
-        log.err("sway exec command setup failed: {}", .{err});
-        return false;
-    };
-    const argv = [_:null]?[*:0]const u8{ "swaymsg", "exec", command.ptr };
-    return spawnLauncher(swaymsg, &argv, envp, "swaymsg exec");
-}
-
-fn spawnHyprlandExec(
-    self: *App,
-    arena: std.mem.Allocator,
-    envp: [*:null]const ?[*:0]const u8,
-    exe_path: [:0]const u8,
-    pwd: ?[:0]const u8,
-) bool {
-    if (self.environ.getPosix("HYPRLAND_INSTANCE_SIGNATURE") == null) return false;
-    const hyprctl = resolveCommandPath(arena, self.environ, "hyprctl") catch |err| {
-        log.warn("hyprctl lookup failed: {}", .{err});
-        return false;
-    };
-    const command = spawnNewWindowShellCommand(arena, exe_path, pwd) catch |err| {
-        log.err("hyprland exec command setup failed: {}", .{err});
-        return false;
-    };
-    const argv = [_:null]?[*:0]const u8{ "hyprctl", "dispatch", "exec", command.ptr };
-    return spawnLauncher(hyprctl, &argv, envp, "hyprctl exec");
-}
-
-fn spawnNewWindowShellCommand(
-    arena: std.mem.Allocator,
-    exe_path: [:0]const u8,
-    pwd: ?[:0]const u8,
-) ![:0]const u8 {
-    const exe = try shellQuote(arena, exe_path);
-    const dir = pwd orelse return try arena.dupeZ(u8, exe);
-    const quoted = try shellQuote(arena, dir);
-    return try std.fmt.allocPrintSentinel(arena, "{s} --working-directory {s}", .{ exe, quoted }, 0);
-}
-
-fn shellQuote(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
-    var writer: std.Io.Writer.Allocating = .init(arena);
-    defer writer.deinit();
-    try writeShellQuoted(&writer.writer, value);
-    return writer.toOwnedSlice();
-}
-
-test "shell quote for launcher commands" {
-    const actual = try shellQuote(std.testing.allocator, "/tmp/it isn't here");
-    defer std.testing.allocator.free(actual);
-    try std.testing.expectEqualStrings("'/tmp/it isn'\\''t here'", actual);
+    try argv.append(arena, exe_path.ptr);
+    const argv_slice = try argv.toOwnedSliceSentinel(arena, null);
+    if (!spawnLauncher(systemd_run, argv_slice.ptr, envp, "systemd-run")) {
+        return error.SystemdRunFailed;
+    }
 }
 
 fn spawnLauncher(
