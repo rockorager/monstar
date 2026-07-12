@@ -302,7 +302,7 @@ fn buildCommand(
             try argv.appendSlice(arena, &.{ "/bin/sh", "-c", try std.mem.joinZ(arena, " ", command) });
         },
         .exec => {
-            path = try resolveCommandPath(arena, environ, command[0]);
+            path = try App.resolveCommandPath(arena, environ, command[0]);
             for (command) |arg| try argv.append(arena, arg.ptr);
         },
     } else if (config.command) |configured| switch (configured) {
@@ -311,7 +311,7 @@ fn buildCommand(
             try argv.appendSlice(arena, &.{ "/bin/sh", "-c", value.ptr });
         },
         .direct => |args| {
-            path = try resolveCommandPath(arena, environ, args[0]);
+            path = try App.resolveCommandPath(arena, environ, args[0]);
             for (args) |arg| try argv.append(arena, arg.ptr);
         },
     } else {
@@ -321,14 +321,6 @@ fn buildCommand(
         try argv.append(arena, shell.ptr);
     }
     return .{ .path = path, .argv = try argv.toOwnedSliceSentinel(arena, null) };
-}
-
-fn resolveCommandPath(
-    arena: std.mem.Allocator,
-    environ: std.process.Environ,
-    command: [:0]const u8,
-) ![*:0]const u8 {
-    return App.resolveCommandPath(arena, environ, command);
 }
 
 fn validateWorkingDirectory(path: [:0]const u8) !void {
