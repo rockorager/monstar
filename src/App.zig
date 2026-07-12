@@ -3489,9 +3489,9 @@ fn syncActiveScreen(self: *App) void {
 
 const MimeMask = u32;
 
-fn mimeBit(mime_type: [*:0]const u8) ?MimeMask {
+fn mimeBit(preferences: []const [:0]const u8, mime_type: [*:0]const u8) ?MimeMask {
     const offered = std.mem.span(mime_type);
-    inline for (paste_mime_preference, 0..) |candidate, i| {
+    for (preferences, 0..) |candidate, i| {
         if (std.mem.eql(u8, offered, candidate[0..candidate.len])) {
             return @as(MimeMask, 1) << @intCast(i);
         }
@@ -3499,25 +3499,8 @@ fn mimeBit(mime_type: [*:0]const u8) ?MimeMask {
     return null;
 }
 
-fn dndMimeBit(mime_type: [*:0]const u8) ?MimeMask {
-    const offered = std.mem.span(mime_type);
-    inline for (dnd_mime_preference, 0..) |candidate, i| {
-        if (std.mem.eql(u8, offered, candidate[0..candidate.len])) {
-            return @as(MimeMask, 1) << @intCast(i);
-        }
-    }
-    return null;
-}
-
-fn bestPasteMime(mask: MimeMask) ?[*:0]const u8 {
-    inline for (paste_mime_preference, 0..) |candidate, i| {
-        if (mask & (@as(MimeMask, 1) << @intCast(i)) != 0) return candidate.ptr;
-    }
-    return null;
-}
-
-fn bestDndMimeForMask(mask: MimeMask) ?[*:0]const u8 {
-    inline for (dnd_mime_preference, 0..) |candidate, i| {
+fn preferredMime(preferences: []const [:0]const u8, mask: MimeMask) ?[*:0]const u8 {
+    for (preferences, 0..) |candidate, i| {
         if (mask & (@as(MimeMask, 1) << @intCast(i)) != 0) return candidate.ptr;
     }
     return null;
@@ -3531,16 +3514,16 @@ const ClipboardOffer = struct {
     dnd_action: wl.DataDeviceManager.DndAction = .{},
 
     fn noteMime(self: *ClipboardOffer, mime_type: [*:0]const u8) void {
-        if (mimeBit(mime_type)) |bit| self.mimes |= bit;
-        if (dndMimeBit(mime_type)) |bit| self.dnd_mimes |= bit;
+        if (mimeBit(&paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
+        if (mimeBit(&dnd_mime_preference, mime_type)) |bit| self.dnd_mimes |= bit;
     }
 
     fn bestMime(self: *const ClipboardOffer) ?[*:0]const u8 {
-        return bestPasteMime(self.mimes);
+        return preferredMime(&paste_mime_preference, self.mimes);
     }
 
     fn bestDndMime(self: *const ClipboardOffer) ?[*:0]const u8 {
-        return bestDndMimeForMask(self.dnd_mimes);
+        return preferredMime(&dnd_mime_preference, self.dnd_mimes);
     }
 
     fn destroy(self: *ClipboardOffer) void {
@@ -3559,11 +3542,11 @@ const PrimaryOffer = struct {
     mimes: MimeMask = 0,
 
     fn noteMime(self: *PrimaryOffer, mime_type: [*:0]const u8) void {
-        if (mimeBit(mime_type)) |bit| self.mimes |= bit;
+        if (mimeBit(&paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
     }
 
     fn bestMime(self: *const PrimaryOffer) ?[*:0]const u8 {
-        return bestPasteMime(self.mimes);
+        return preferredMime(&paste_mime_preference, self.mimes);
     }
 
     fn destroy(self: *PrimaryOffer) void {
