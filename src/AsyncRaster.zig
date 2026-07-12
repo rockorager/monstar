@@ -9,6 +9,17 @@ const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
 const Renderer = @import("Renderer.zig");
 
+pub const RepairSpan = struct {
+    y: u31,
+    height: u31,
+};
+
+pub const Repair = union(enum) {
+    none,
+    full,
+    spans: []const RepairSpan,
+};
+
 pub const Job = struct {
     pixels: []u32,
     source_pixels: ?[]const u32,
@@ -39,6 +50,10 @@ pub const Job = struct {
     /// Whole terminal rows by which previous-frame pixels move. Positive
     /// shifts content up; negative shifts it down.
     scroll_shift: ?isize,
+    /// Work needed to bring a stale target up to the previous committed
+    /// frame. Span storage belongs to the submitter and remains valid until
+    /// the result is taken.
+    repair: Repair,
 
     fn hasOverlay(self: *const Job) bool {
         return self.preedit != null or self.link_hint != null or self.kitty_items.len > 0;
@@ -466,11 +481,27 @@ fn clearPadding(job: Job, color: u32) void {
 }
 
 fn repairToPreviousFrame(job: Job) bool {
-    if (job.age == 1) return true;
-    const source = job.source_pixels orelse return false;
-    std.debug.assert(source.len == job.pixels.len);
-    if (source.ptr != job.pixels.ptr) Renderer.copyPixels(job.pixels, source);
-    return true;
+    return switch (job.repair) {
+        .none => true,
+        .full => repair: {
+            const source = job.source_pixels orelse break :repair false;
+            if (source.len != job.pixels.len) break :repair false;
+            if (source.ptr != job.pixels.ptr) Renderer.copyPixels(job.pixels, source);
+            break :repair true;
+        },
+        .spans => |spans| repair: {
+            const source = job.source_pixels orelse break :repair false;
+            if (source.len != job.pixels.len) break :repair false;
+            if (source.ptr == job.pixels.ptr) break :repair true;
+            for (spans) |span| {
+                if (span.y > job.height or span.height > job.height - span.y) break :repair false;
+                const offset = @as(usize, span.y) * job.width;
+                const len = @as(usize, span.height) * job.width;
+                Renderer.copyPixels(job.pixels[offset..][0..len], source[offset..][0..len]);
+            }
+            break :repair true;
+        },
+    };
 }
 
 /// Move retained framebuffer rows directly from the previous frame into
@@ -494,15 +525,19 @@ fn scrollFromPreviousFrame(job: Job, shift_rows: isize, cell_height: u31) bool {
     const offset = shift_pixels * stride;
     const retained = grid_end - grid_start - offset;
     if (shift_rows > 0) {
-        @memmove(
-            job.pixels[grid_start .. grid_start + retained],
-            source[grid_start + offset .. grid_end],
-        );
+        const dst = job.pixels[grid_start .. grid_start + retained];
+        const src = source[grid_start + offset .. grid_end];
+        if (source.ptr == job.pixels.ptr)
+            @memmove(dst, src)
+        else
+            Renderer.copyPixels(dst, src);
     } else {
-        @memmove(
-            job.pixels[grid_start + offset .. grid_end],
-            source[grid_start .. grid_start + retained],
-        );
+        const dst = job.pixels[grid_start + offset .. grid_end];
+        const src = source[grid_start .. grid_start + retained];
+        if (source.ptr == job.pixels.ptr)
+            @memmove(dst, src)
+        else
+            Renderer.copyPixels(dst, src);
     }
     return true;
 }
@@ -528,6 +563,7 @@ test "repair previous frame" {
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = null,
+        .repair = .full,
     };
 
     try std.testing.expect(repairToPreviousFrame(base));
@@ -537,10 +573,31 @@ test "repair previous frame" {
     var current = base;
     current.source_pixels = null;
     current.age = 1;
+    current.repair = .none;
     try std.testing.expect(repairToPreviousFrame(current));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, &target);
 
+    const spans = [_]RepairSpan{.{ .y = 1, .height = 1 }};
+    current = base;
+    current.repair = .{ .spans = &spans };
+    try std.testing.expect(repairToPreviousFrame(current));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 7, 8 }, &target);
+
+    target = .{ 1, 2, 3, 4 };
+    current.repair = .{ .spans = &.{} };
+    try std.testing.expect(repairToPreviousFrame(current));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, &target);
+
+    const invalid_spans = [_]RepairSpan{
+        .{ .y = 0, .height = 1 },
+        .{ .y = 2, .height = 1 },
+    };
+    current.repair = .{ .spans = &invalid_spans };
+    try std.testing.expect(!repairToPreviousFrame(current));
+
+    current.source_pixels = null;
     current.age = 0;
+    current.repair = .full;
     try std.testing.expect(!repairToPreviousFrame(current));
 }
 
@@ -570,6 +627,7 @@ test "scroll previous frame in place and from distinct source" {
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = 1,
+        .repair = .none,
     };
 
     try std.testing.expect(scrollFromPreviousFrame(job, 1, 1));

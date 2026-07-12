@@ -138,6 +138,9 @@ frame_damage: [frame_damage_len]FrameDamage,
 frame_damage_index: usize,
 /// Scratch for the damage spans reported to the window each frame.
 damage_spans: std.ArrayList(Window.RowSpan),
+/// Repair spans owned by the main thread and borrowed by the in-flight
+/// raster job. Kept separate from surface-damage scratch used at commit.
+repair_spans: std.ArrayList(AsyncRaster.RepairSpan),
 pty: Pty,
 /// Gather-thread pipeline draining the pty master; the main loop
 /// consumes parsed batches via its ready_fd in the poll set.
@@ -391,6 +394,12 @@ const FrameDamage = struct {
     /// Pixel geometry this entry was recorded at.
     width: u31,
     height: u31,
+    grid_x: u31,
+    grid_y: u31,
+    grid_width: u31,
+    grid_height: u31,
+    cell_width: u31,
+    cell_height: u31,
 };
 
 const Scroll = struct {
@@ -793,9 +802,16 @@ pub fn init(
             .bottom_strip = false,
             .width = 0,
             .height = 0,
+            .grid_x = 0,
+            .grid_y = 0,
+            .grid_width = 0,
+            .grid_height = 0,
+            .cell_width = 0,
+            .cell_height = 0,
         }),
         .frame_damage_index = 0,
         .damage_spans = .empty,
+        .repair_spans = .empty,
         .pty = pty,
         .pipeline = try .init(pty.master),
         .child_pid = child_pid,
@@ -1544,6 +1560,7 @@ pub fn deinit(self: *App) void {
     self.alloc.free(self.async_job_kitty);
     self.kitty_cache.deinit(self.alloc);
     self.damage_spans.deinit(self.alloc);
+    self.repair_spans.deinit(self.alloc);
     self.clearImeText();
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
@@ -4545,9 +4562,15 @@ fn startAsyncRender(self: *App) !bool {
         // Keep the hint flag consistent with the stale link-hint copy.
         hyperlink_hints = self.async_job_link_hint != null;
     }
+    std.debug.assert(self.held_frame == null);
     const target = self.window.acquireRenderTarget() catch return false;
+    errdefer self.window.cancelRender(target.buffer);
     if (scroll != null and target.age != 1 and target.source_pixels == null) scroll = null;
     if (scroll) |value| self.scroll_detector.prepare(&self.render_state, value, old_cursor);
+    const repair: AsyncRaster.Repair = if (scroll == null)
+        try self.planFrameRepair(target.age, target.width, target.height)
+    else
+        .none;
     self.async_generation +%= 1;
     async_raster.submit(.{
         .pixels = target.pixels,
@@ -4567,6 +4590,7 @@ fn startAsyncRender(self: *App) !bool {
         .kitty_items = self.async_job_kitty,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,
+        .repair = repair,
     }) catch |err| {
         self.window.cancelRender(target.buffer);
         self.releaseKittyJob();
@@ -4655,6 +4679,7 @@ fn commitHeldFrame(self: *App) void {
         buffer.height != Window.physicalDimension(self.window.height, self.window.scale120))
     {
         self.window.cancelRender(buffer);
+        self.invalidateFrameDamageHistory();
         self.async_force_full = true;
         self.needs_redraw = true;
         return;
@@ -4817,6 +4842,12 @@ fn beginFrameDamage(self: *App, width: u31, height: u31) *FrameDamage {
     damage.bottom_strip = false;
     damage.width = width;
     damage.height = height;
+    damage.grid_x = self.layout.grid_x;
+    damage.grid_y = self.layout.grid_y;
+    damage.grid_width = self.layout.grid_width;
+    damage.grid_height = self.layout.grid_height;
+    damage.cell_width = self.font.cell_width;
+    damage.cell_height = self.font.cell_height;
     return damage;
 }
 
@@ -4840,6 +4871,75 @@ fn frameDamageBack(self: *const App, back: usize) *const FrameDamage {
     return &self.frame_damage[(self.frame_damage_index + frame_damage_len - back) % frame_damage_len];
 }
 
+/// Describe the rows a stale target missed since it last represented a
+/// committed frame. The worker applies these before painting current dirt.
+fn planFrameRepair(self: *App, age: usize, width: u31, height: u31) !AsyncRaster.Repair {
+    self.repair_spans.clearRetainingCapacity();
+    if (self.render_state.dirty == .full or age == 1) return .none;
+    if (age == 0 or age > frame_damage_len + 1) return .full;
+
+    const missed_frames = age - 1;
+    const rows: usize = self.render_state.rows;
+    for (0..missed_frames) |back| {
+        const entry = self.frameDamageBack(back);
+        if (entry.full or
+            entry.width != width or entry.height != height or
+            entry.grid_x != self.layout.grid_x or entry.grid_y != self.layout.grid_y or
+            entry.grid_width != self.layout.grid_width or entry.grid_height != self.layout.grid_height or
+            entry.cell_width != self.font.cell_width or entry.cell_height != self.font.cell_height or
+            entry.rows.bit_length != rows)
+        {
+            return .full;
+        }
+    }
+
+    const cell_height: usize = self.font.cell_height;
+    const grid_y: usize = self.layout.grid_y;
+    var y: usize = 0;
+    while (y < rows) {
+        if (!self.rowDamagedSince(y, missed_frames)) {
+            y += 1;
+            continue;
+        }
+        const start = y;
+        while (y < rows and self.rowDamagedSince(y, missed_frames)) y += 1;
+        const px_start = @min(grid_y + start * cell_height, height);
+        const px_end = @min(grid_y + y * cell_height, height);
+        if (px_end > px_start) try self.repair_spans.append(self.alloc, .{
+            .y = @intCast(px_start),
+            .height = @intCast(px_end - px_start),
+        });
+    }
+    if (height >= self.font.cell_height and self.bottomStripDamagedSince(missed_frames)) {
+        try self.repair_spans.append(self.alloc, .{
+            .y = @intCast(@min(
+                height - self.font.cell_height,
+                self.layout.grid_y + self.layout.grid_height -| self.font.cell_height,
+            )),
+            .height = self.font.cell_height,
+        });
+    }
+    return .{ .spans = self.repair_spans.items };
+}
+
+fn rowDamagedSince(self: *const App, row: usize, frames: usize) bool {
+    for (0..frames) |back| {
+        if (self.frameDamageBack(back).rows.isSet(row)) return true;
+    }
+    return false;
+}
+
+fn bottomStripDamagedSince(self: *const App, frames: usize) bool {
+    for (0..frames) |back| {
+        if (self.frameDamageBack(back).bottom_strip) return true;
+    }
+    return false;
+}
+
+fn invalidateFrameDamageHistory(self: *App) void {
+    for (&self.frame_damage) |*damage| damage.full = true;
+}
+
 fn allRenderRowsDirty(self: *const App) bool {
     return allStateRowsDirty(&self.render_state);
 }
@@ -4857,7 +4957,7 @@ fn allStateRowsDirty(state: *const vt.RenderState) bool {
 fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
     const entry = self.frameDamageBack(0);
     if (entry.full) return .full;
-    const cell_height: usize = self.font.cell_height;
+    const cell_height: usize = entry.cell_height;
     self.damage_spans.clearRetainingCapacity();
     var y: usize = 0;
     while (y < entry.rows.bit_length) {
@@ -4867,8 +4967,8 @@ fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
         }
         const start = y;
         while (y < entry.rows.bit_length and entry.rows.isSet(y)) y += 1;
-        const px_start = @min(@as(usize, self.layout.grid_y) + start * cell_height, height);
-        const px_end = @min(@as(usize, self.layout.grid_y) + y * cell_height, height);
+        const px_start = @min(@as(usize, entry.grid_y) + start * cell_height, height);
+        const px_end = @min(@as(usize, entry.grid_y) + y * cell_height, height);
         if (px_end > px_start) try self.damage_spans.append(self.alloc, .{
             .y = @intCast(px_start),
             .height = @intCast(px_end - px_start),
@@ -4878,7 +4978,7 @@ fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
         try self.damage_spans.append(self.alloc, .{
             .y = @intCast(@min(
                 height - cell_height,
-                self.layout.grid_y + self.layout.grid_height -| @as(u31, @intCast(cell_height)),
+                entry.grid_y + entry.grid_height -| @as(u31, @intCast(cell_height)),
             )),
             .height = @intCast(cell_height),
         });
@@ -4971,6 +5071,7 @@ fn invalidateAsyncFrame(self: *App) void {
     if (self.held_frame) |buffer| {
         self.held_frame = null;
         self.window.cancelRender(buffer);
+        self.invalidateFrameDamageHistory();
         self.needs_redraw = true;
     }
 }

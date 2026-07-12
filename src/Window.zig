@@ -812,13 +812,16 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
 /// when possible so interactive resizing does not rebuild its shm storage.
 fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
     var available: ?*Buffer = null;
+    var matching: ?*Buffer = null;
     for (self.buffers.items) |buffer| {
         if (buffer.busy or buffer.rendering) continue;
         if (buffer.width == width and buffer.height == height and buffer.format == self.buffer_format) {
-            return buffer;
+            if (matching == null or buffer.frame > matching.?.frame) matching = buffer;
+            continue;
         }
         if (available == null) available = buffer;
     }
+    if (matching) |buffer| return buffer;
     if (available) |buffer| {
         if (self.newest_buffer == buffer) self.newest_buffer = null;
         try buffer.reshape(width, height, self.buffer_format);
