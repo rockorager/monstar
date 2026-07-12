@@ -4895,14 +4895,17 @@ fn planFrameRepair(self: *App, age: usize, width: u31, height: u31) !AsyncRaster
 
     const cell_height: usize = self.font.cell_height;
     const grid_y: usize = self.layout.grid_y;
+    const current_dirty = self.render_state.row_data.items(.dirty);
     var y: usize = 0;
     while (y < rows) {
-        if (!self.rowDamagedSince(y, missed_frames)) {
+        // renderDirty fully repaints current dirty rows, so repairing their
+        // stale pixels would only copy bytes that the worker overwrites.
+        if (current_dirty[y] or !self.rowDamagedSince(y, missed_frames)) {
             y += 1;
             continue;
         }
         const start = y;
-        while (y < rows and self.rowDamagedSince(y, missed_frames)) y += 1;
+        while (y < rows and !current_dirty[y] and self.rowDamagedSince(y, missed_frames)) y += 1;
         const px_start = @min(grid_y + start * cell_height, height);
         const px_end = @min(grid_y + y * cell_height, height);
         if (px_end > px_start) try self.repair_spans.append(self.alloc, .{
