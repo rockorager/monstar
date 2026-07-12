@@ -307,6 +307,10 @@ const sync_output_reset_ms = 1000;
 const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
+const disarmed_timer: std.os.linux.itimerspec = .{
+    .it_value = .{ .sec = 0, .nsec = 0 },
+    .it_interval = .{ .sec = 0, .nsec = 0 },
+};
 /// Preserve Monstar's Wayland precision-scroll normalization before applying
 /// the user-facing Ghostty-compatible multiplier.
 const wayland_precision_scroll_scale = 3.0;
@@ -734,29 +738,19 @@ pub fn init(
     // pending expirations, so a reader acting on stale poll revents
     // (event dispatched earlier in the same loop iteration disarmed
     // the timer) would otherwise block the whole loop forever.
-    const repeat_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
-    if (std.os.linux.errno(repeat_rc) != .SUCCESS) return error.TimerFdFailed;
-    const repeat_fd: posix.fd_t = @intCast(repeat_rc);
+    const repeat_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(repeat_fd);
 
-    const fling_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
-    if (std.os.linux.errno(fling_rc) != .SUCCESS) return error.TimerFdFailed;
-    const fling_fd: posix.fd_t = @intCast(fling_rc);
+    const fling_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(fling_fd);
 
-    const sync_output_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
-    if (std.os.linux.errno(sync_output_rc) != .SUCCESS) return error.TimerFdFailed;
-    const sync_output_fd: posix.fd_t = @intCast(sync_output_rc);
+    const sync_output_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(sync_output_fd);
 
-    const selection_autoscroll_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
-    if (std.os.linux.errno(selection_autoscroll_rc) != .SUCCESS) return error.TimerFdFailed;
-    const selection_autoscroll_fd: posix.fd_t = @intCast(selection_autoscroll_rc);
+    const selection_autoscroll_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(selection_autoscroll_fd);
 
-    const taskbar_progress_rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
-    if (std.os.linux.errno(taskbar_progress_rc) != .SUCCESS) return error.TimerFdFailed;
-    const taskbar_progress_fd: posix.fd_t = @intCast(taskbar_progress_rc);
+    const taskbar_progress_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(taskbar_progress_fd);
 
     // Scope confirmation ran concurrently with the window setup above,
@@ -3033,30 +3027,18 @@ fn syncSynchronizedOutput(self: *App) void {
 
     self.sync_output = enabled;
     if (enabled) {
-        self.setSyncOutputTimer(.{
+        _ = setTimer(self.sync_output_fd, .{
             .it_value = timespecFromNs(sync_output_reset_ms * std.time.ns_per_ms),
             .it_interval = .{ .sec = 0, .nsec = 0 },
-        });
+        }, "synchronized output");
     } else {
-        self.setSyncOutputTimer(.{
-            .it_value = .{ .sec = 0, .nsec = 0 },
-            .it_interval = .{ .sec = 0, .nsec = 0 },
-        });
+        _ = setTimer(self.sync_output_fd, disarmed_timer, "synchronized output");
         self.needs_redraw = true;
     }
 }
 
-fn setSyncOutputTimer(self: *App, spec: std.os.linux.itimerspec) void {
-    const rc = std.os.linux.timerfd_settime(self.sync_output_fd, .{}, &spec, null);
-    if (std.os.linux.errno(rc) != .SUCCESS) {
-        log.err("sync output timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
-    }
-}
-
 fn fireSyncOutputReset(self: *App) void {
-    var expirations: u64 = 0;
-    const n = posix.read(self.sync_output_fd, std.mem.asBytes(&expirations)) catch return;
-    if (n != @sizeOf(u64) or expirations == 0) return;
+    _ = readTimer(self.sync_output_fd) orelse return;
     if (self.term.modes.get(.synchronized_output)) {
         log.debug("synchronized output timed out; forcing redraw", .{});
         self.term.modes.set(.synchronized_output, false);
@@ -3065,30 +3047,18 @@ fn fireSyncOutputReset(self: *App) void {
 }
 
 fn armTaskbarProgressTimer(self: *App) void {
-    self.setTaskbarProgressTimer(.{
+    _ = setTimer(self.taskbar_progress_fd, .{
         .it_value = .{ .sec = taskbar_progress_timeout_seconds, .nsec = 0 },
         .it_interval = .{ .sec = 0, .nsec = 0 },
-    });
+    }, "taskbar progress");
 }
 
 fn stopTaskbarProgressTimer(self: *App) void {
-    self.setTaskbarProgressTimer(.{
-        .it_value = .{ .sec = 0, .nsec = 0 },
-        .it_interval = .{ .sec = 0, .nsec = 0 },
-    });
-}
-
-fn setTaskbarProgressTimer(self: *App, spec: std.os.linux.itimerspec) void {
-    const rc = std.os.linux.timerfd_settime(self.taskbar_progress_fd, .{}, &spec, null);
-    if (std.os.linux.errno(rc) != .SUCCESS) {
-        log.err("taskbar progress timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
-    }
+    _ = setTimer(self.taskbar_progress_fd, disarmed_timer, "taskbar progress");
 }
 
 fn fireTaskbarProgressTimeout(self: *App) void {
-    var expirations: u64 = 0;
-    const n = posix.read(self.taskbar_progress_fd, std.mem.asBytes(&expirations)) catch return;
-    if (n != @sizeOf(u64) or expirations == 0) return;
+    _ = readTimer(self.taskbar_progress_fd) orelse return;
     self.sendTaskbarProgress(.{ .state = .remove }) catch |err| {
         if (err != error.DBusUnavailable) {
             log.warn("failed to clear stale taskbar progress: {}", .{err});
@@ -3427,30 +3397,19 @@ fn syncSelectionAutoscrollTimer(self: *App) void {
         return;
     }
     const interval = timespecFromNs(selection_autoscroll_ms * std.time.ns_per_ms);
-    self.setSelectionAutoscrollTimer(.{
+    _ = setTimer(self.selection_autoscroll_fd, .{
         .it_value = interval,
         .it_interval = interval,
-    });
+    }, "selection autoscroll");
 }
 
 fn stopSelectionAutoscrollTimer(self: *App) void {
-    self.setSelectionAutoscrollTimer(.{
-        .it_value = .{ .sec = 0, .nsec = 0 },
-        .it_interval = .{ .sec = 0, .nsec = 0 },
-    });
-}
-
-fn setSelectionAutoscrollTimer(self: *App, spec: std.os.linux.itimerspec) void {
-    const rc = std.os.linux.timerfd_settime(self.selection_autoscroll_fd, .{}, &spec, null);
-    if (std.os.linux.errno(rc) != .SUCCESS) {
-        log.err("selection autoscroll timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
-    }
+    _ = setTimer(self.selection_autoscroll_fd, disarmed_timer, "selection autoscroll");
 }
 
 fn fireSelectionAutoscroll(self: *App) void {
-    var expirations: u64 = 0;
-    const n = posix.read(self.selection_autoscroll_fd, std.mem.asBytes(&expirations)) catch return;
-    if (n != @sizeOf(u64) or expirations == 0 or !self.selecting) return;
+    _ = readTimer(self.selection_autoscroll_fd) orelse return;
+    if (!self.selecting) return;
 
     const cell = self.cellAtPointer();
     const pos = self.pointerPhysical();
@@ -4029,11 +3988,7 @@ fn startFling(self: *App) void {
 
     const interval = timespecFromNs(fling_interval_ms * std.time.ns_per_ms);
     const spec: std.os.linux.itimerspec = .{ .it_value = interval, .it_interval = interval };
-    const rc = std.os.linux.timerfd_settime(self.fling_fd, .{}, &spec, null);
-    if (std.os.linux.errno(rc) != .SUCCESS) {
-        log.err("fling timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
-        return;
-    }
+    if (!setTimer(self.fling_fd, spec, "fling")) return;
     self.fling_velocity = velocity;
     self.fling_active = true;
 }
@@ -4041,20 +3996,12 @@ fn startFling(self: *App) void {
 fn stopFling(self: *App) void {
     if (!self.fling_active) return;
     self.fling_active = false;
-    const spec: std.os.linux.itimerspec = .{
-        .it_value = .{ .sec = 0, .nsec = 0 },
-        .it_interval = .{ .sec = 0, .nsec = 0 },
-    };
-    const rc = std.os.linux.timerfd_settime(self.fling_fd, .{}, &spec, null);
-    if (std.os.linux.errno(rc) != .SUCCESS) {
-        log.err("fling timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
-    }
+    _ = setTimer(self.fling_fd, disarmed_timer, "fling");
 }
 
 fn fireFling(self: *App) void {
-    var expirations: u64 = 0;
-    const n = posix.read(self.fling_fd, std.mem.asBytes(&expirations)) catch return;
-    if (n != @sizeOf(u64) or expirations == 0 or !self.fling_active) return;
+    const expirations = readTimer(self.fling_fd) orelse return;
+    if (!self.fling_active) return;
 
     const dt_ms: f64 = @floatFromInt(fling_interval_ms * expirations);
     self.scroll_pixels += self.fling_velocity * dt_ms / 1000.0 / self.precisionScrollScale();
@@ -4274,25 +4221,35 @@ fn armRepeat(self: *App, evdev_keycode: u32) void {
 
     const delay_ms: u64 = @intCast(self.repeat_delay);
     const interval_ns: u64 = @divTrunc(std.time.ns_per_s, @as(u64, @intCast(self.repeat_rate)));
-    self.setRepeatTimer(.{
+    _ = setTimer(self.repeat_fd, .{
         .it_value = timespecFromNs(delay_ms * std.time.ns_per_ms),
         .it_interval = timespecFromNs(interval_ns),
-    });
+    }, "key repeat");
 }
 
 fn cancelRepeat(self: *App) void {
     self.repeat_keycode = null;
-    self.setRepeatTimer(.{
-        .it_value = .{ .sec = 0, .nsec = 0 },
-        .it_interval = .{ .sec = 0, .nsec = 0 },
-    });
+    _ = setTimer(self.repeat_fd, disarmed_timer, "key repeat");
 }
 
-fn setRepeatTimer(self: *App, spec: std.os.linux.itimerspec) void {
-    const rc = std.os.linux.timerfd_settime(self.repeat_fd, .{}, &spec, null);
-    if (std.os.linux.errno(rc) != .SUCCESS) {
-        log.err("timerfd_settime failed: {}", .{std.os.linux.errno(rc)});
-    }
+fn createTimerFd() !posix.fd_t {
+    const rc = std.os.linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (std.os.linux.errno(rc) != .SUCCESS) return error.TimerFdFailed;
+    return @intCast(rc);
+}
+
+fn setTimer(fd: posix.fd_t, spec: std.os.linux.itimerspec, label: []const u8) bool {
+    const rc = std.os.linux.timerfd_settime(fd, .{}, &spec, null);
+    const err = std.os.linux.errno(rc);
+    if (err == .SUCCESS) return true;
+    log.err("{s} timerfd_settime failed: {}", .{ label, err });
+    return false;
+}
+
+fn readTimer(fd: posix.fd_t) ?u64 {
+    var expirations: u64 = 0;
+    const n = posix.read(fd, std.mem.asBytes(&expirations)) catch return null;
+    return if (n == @sizeOf(u64) and expirations > 0) expirations else null;
 }
 
 fn timespecFromNs(ns: u64) std.os.linux.timespec {
@@ -4304,9 +4261,7 @@ fn timespecFromNs(ns: u64) std.os.linux.timespec {
 
 /// The repeat timer expired: re-send the held key.
 fn fireRepeat(self: *App) void {
-    var expirations: u64 = 0;
-    const n = posix.read(self.repeat_fd, std.mem.asBytes(&expirations)) catch return;
-    if (n != @sizeOf(u64)) return;
+    const expirations = readTimer(self.repeat_fd) orelse return;
     const keycode = self.repeat_keycode orelse return;
     // Cap the burst so a stalled loop can't flood the PTY.
     for (0..@min(expirations, 8)) |_| self.onKey(keycode, .repeat);
