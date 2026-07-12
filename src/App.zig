@@ -1933,17 +1933,10 @@ fn spawnNewWindowShellCommand(
 }
 
 fn shellQuote(arena: std.mem.Allocator, value: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    try buf.append(arena, '\'');
-    for (value) |byte| {
-        if (byte == '\'') {
-            try buf.appendSlice(arena, "'\\''");
-        } else {
-            try buf.append(arena, byte);
-        }
-    }
-    try buf.append(arena, '\'');
-    return buf.toOwnedSlice(arena);
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    defer writer.deinit();
+    try writeShellQuoted(&writer.writer, value);
+    return writer.toOwnedSlice();
 }
 
 test "shell quote for launcher commands" {
