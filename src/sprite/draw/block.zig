@@ -18,17 +18,6 @@ const fill = common.fill;
 const font = @import("../metrics.zig");
 const sprite = @import("../canvas.zig");
 
-// Utility names for common fractions
-const one_eighth: f64 = 0.125;
-const one_quarter: f64 = 0.25;
-const one_third: f64 = (1.0 / 3.0);
-const three_eighths: f64 = 0.375;
-const half: f64 = 0.5;
-const five_eighths: f64 = 0.625;
-const two_thirds: f64 = (2.0 / 3.0);
-const three_quarters: f64 = 0.75;
-const seven_eighths: f64 = 0.875;
-
 pub fn draw2580_259F(
     cp: u32,
     canvas: *sprite.Canvas,
@@ -41,40 +30,40 @@ pub fn draw2580_259F(
 
     switch (cp) {
         // '▀' UPPER HALF BLOCK
-        0x2580 => block(metrics, canvas, .upper, 1, half),
+        0x2580 => block(metrics, canvas, .upper, 1, common.half),
         // '▁' LOWER ONE EIGHTH BLOCK
-        0x2581 => block(metrics, canvas, .lower, 1, one_eighth),
+        0x2581 => block(metrics, canvas, .lower, 1, common.one_eighth),
         // '▂' LOWER ONE QUARTER BLOCK
-        0x2582 => block(metrics, canvas, .lower, 1, one_quarter),
+        0x2582 => block(metrics, canvas, .lower, 1, common.one_quarter),
         // '▃' LOWER THREE EIGHTHS BLOCK
-        0x2583 => block(metrics, canvas, .lower, 1, three_eighths),
+        0x2583 => block(metrics, canvas, .lower, 1, common.three_eighths),
         // '▄' LOWER HALF BLOCK
-        0x2584 => block(metrics, canvas, .lower, 1, half),
+        0x2584 => block(metrics, canvas, .lower, 1, common.half),
         // '▅' LOWER FIVE EIGHTHS BLOCK
-        0x2585 => block(metrics, canvas, .lower, 1, five_eighths),
+        0x2585 => block(metrics, canvas, .lower, 1, common.five_eighths),
         // '▆' LOWER THREE QUARTERS BLOCK
-        0x2586 => block(metrics, canvas, .lower, 1, three_quarters),
+        0x2586 => block(metrics, canvas, .lower, 1, common.three_quarters),
         // '▇' LOWER SEVEN EIGHTHS BLOCK
-        0x2587 => block(metrics, canvas, .lower, 1, seven_eighths),
+        0x2587 => block(metrics, canvas, .lower, 1, common.seven_eighths),
         // '█' FULL BLOCK
         0x2588 => fullBlockShade(metrics, canvas, .on),
         // '▉' LEFT SEVEN EIGHTHS BLOCK
-        0x2589 => block(metrics, canvas, .left, seven_eighths, 1),
+        0x2589 => block(metrics, canvas, .left, common.seven_eighths, 1),
         // '▊' LEFT THREE QUARTERS BLOCK
-        0x258a => block(metrics, canvas, .left, three_quarters, 1),
+        0x258a => block(metrics, canvas, .left, common.three_quarters, 1),
         // '▋' LEFT FIVE EIGHTHS BLOCK
-        0x258b => block(metrics, canvas, .left, five_eighths, 1),
+        0x258b => block(metrics, canvas, .left, common.five_eighths, 1),
         // '▌' LEFT HALF BLOCK
-        0x258c => block(metrics, canvas, .left, half, 1),
+        0x258c => block(metrics, canvas, .left, common.half, 1),
         // '▍' LEFT THREE EIGHTHS BLOCK
-        0x258d => block(metrics, canvas, .left, three_eighths, 1),
+        0x258d => block(metrics, canvas, .left, common.three_eighths, 1),
         // '▎' LEFT ONE QUARTER BLOCK
-        0x258e => block(metrics, canvas, .left, one_quarter, 1),
+        0x258e => block(metrics, canvas, .left, common.one_quarter, 1),
         // '▏' LEFT ONE EIGHTH BLOCK
-        0x258f => block(metrics, canvas, .left, one_eighth, 1),
+        0x258f => block(metrics, canvas, .left, common.one_eighth, 1),
 
         // '▐' RIGHT HALF BLOCK
-        0x2590 => block(metrics, canvas, .right, half, 1),
+        0x2590 => block(metrics, canvas, .right, common.half, 1),
         // '░'
         0x2591 => fullBlockShade(metrics, canvas, .light),
         // '▒'
@@ -82,9 +71,9 @@ pub fn draw2580_259F(
         // '▓'
         0x2593 => fullBlockShade(metrics, canvas, .dark),
         // '▔' UPPER ONE EIGHTH BLOCK
-        0x2594 => block(metrics, canvas, .upper, 1, one_eighth),
+        0x2594 => block(metrics, canvas, .upper, 1, common.one_eighth),
         // '▕' RIGHT ONE EIGHTH BLOCK
-        0x2595 => block(metrics, canvas, .right, one_eighth, 1),
+        0x2595 => block(metrics, canvas, .right, common.one_eighth, 1),
         // '▖'
         0x2596 => quadrant(metrics, canvas, .{ .bl = true }),
         // '▗'

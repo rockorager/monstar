@@ -42,17 +42,6 @@ const geo = @import("geometric_shapes.zig");
 const font = @import("../metrics.zig");
 const sprite = @import("../canvas.zig");
 
-// Utility names for common fractions
-const one_eighth: f64 = 0.125;
-const one_quarter: f64 = 0.25;
-const one_third: f64 = (1.0 / 3.0);
-const three_eighths: f64 = 0.375;
-const half: f64 = 0.5;
-const five_eighths: f64 = 0.625;
-const two_thirds: f64 = (2.0 / 3.0);
-const three_quarters: f64 = 0.75;
-const seven_eighths: f64 = 0.875;
-
 const SmoothMosaic = packed struct(u10) {
     tl: bool,
     ul: bool,
@@ -606,28 +595,28 @@ pub fn draw1FB7C_1FB97(
 
         // '🭼' LEFT AND LOWER ONE EIGHTH BLOCK
         0x1fb7c => {
-            block.block(metrics, canvas, .left, one_eighth, 1);
-            block.block(metrics, canvas, .lower, 1, one_eighth);
+            block.block(metrics, canvas, .left, common.one_eighth, 1);
+            block.block(metrics, canvas, .lower, 1, common.one_eighth);
         },
         // '🭽' LEFT AND UPPER ONE EIGHTH BLOCK
         0x1fb7d => {
-            block.block(metrics, canvas, .left, one_eighth, 1);
-            block.block(metrics, canvas, .upper, 1, one_eighth);
+            block.block(metrics, canvas, .left, common.one_eighth, 1);
+            block.block(metrics, canvas, .upper, 1, common.one_eighth);
         },
         // '🭾' RIGHT AND UPPER ONE EIGHTH BLOCK
         0x1fb7e => {
-            block.block(metrics, canvas, .right, one_eighth, 1);
-            block.block(metrics, canvas, .upper, 1, one_eighth);
+            block.block(metrics, canvas, .right, common.one_eighth, 1);
+            block.block(metrics, canvas, .upper, 1, common.one_eighth);
         },
         // '🭿' RIGHT AND LOWER ONE EIGHTH BLOCK
         0x1fb7f => {
-            block.block(metrics, canvas, .right, one_eighth, 1);
-            block.block(metrics, canvas, .lower, 1, one_eighth);
+            block.block(metrics, canvas, .right, common.one_eighth, 1);
+            block.block(metrics, canvas, .lower, 1, common.one_eighth);
         },
         // '🮀' UPPER AND LOWER ONE EIGHTH BLOCK
         0x1fb80 => {
-            block.block(metrics, canvas, .upper, 1, one_eighth);
-            block.block(metrics, canvas, .lower, 1, one_eighth);
+            block.block(metrics, canvas, .upper, 1, common.one_eighth);
+            block.block(metrics, canvas, .lower, 1, common.one_eighth);
         },
         // '🮁' Horizontal One Eighth Block 1358
         0x1fb81 => {
@@ -642,47 +631,47 @@ pub fn draw1FB7C_1FB97(
         },
 
         // '🮂' UPPER ONE QUARTER BLOCK
-        0x1fb82 => block.block(metrics, canvas, .upper, 1, one_quarter),
+        0x1fb82 => block.block(metrics, canvas, .upper, 1, common.one_quarter),
         // '🮃' UPPER THREE EIGHTHS BLOCK
-        0x1fb83 => block.block(metrics, canvas, .upper, 1, three_eighths),
+        0x1fb83 => block.block(metrics, canvas, .upper, 1, common.three_eighths),
         // '🮄' UPPER FIVE EIGHTHS BLOCK
-        0x1fb84 => block.block(metrics, canvas, .upper, 1, five_eighths),
+        0x1fb84 => block.block(metrics, canvas, .upper, 1, common.five_eighths),
         // '🮅' UPPER THREE QUARTERS BLOCK
-        0x1fb85 => block.block(metrics, canvas, .upper, 1, three_quarters),
+        0x1fb85 => block.block(metrics, canvas, .upper, 1, common.three_quarters),
         // '🮆' UPPER SEVEN EIGHTHS BLOCK
-        0x1fb86 => block.block(metrics, canvas, .upper, 1, seven_eighths),
+        0x1fb86 => block.block(metrics, canvas, .upper, 1, common.seven_eighths),
 
         // '🮇' RIGHT ONE QUARTER BLOCK
-        0x1fb87 => block.block(metrics, canvas, .right, one_quarter, 1),
+        0x1fb87 => block.block(metrics, canvas, .right, common.one_quarter, 1),
         // '🮈' RIGHT THREE EIGHTHS BLOCK
-        0x1fb88 => block.block(metrics, canvas, .right, three_eighths, 1),
+        0x1fb88 => block.block(metrics, canvas, .right, common.three_eighths, 1),
         // '🮉' RIGHT FIVE EIGHTHS BLOCK
-        0x1fb89 => block.block(metrics, canvas, .right, five_eighths, 1),
+        0x1fb89 => block.block(metrics, canvas, .right, common.five_eighths, 1),
         // '🮊' RIGHT THREE QUARTERS BLOCK
-        0x1fb8a => block.block(metrics, canvas, .right, three_quarters, 1),
+        0x1fb8a => block.block(metrics, canvas, .right, common.three_quarters, 1),
         // '🮋' RIGHT SEVEN EIGHTHS BLOCK/
-        0x1fb8b => block.block(metrics, canvas, .right, seven_eighths, 1),
+        0x1fb8b => block.block(metrics, canvas, .right, common.seven_eighths, 1),
 
         // '🮌'
-        0x1fb8c => block.blockShade(metrics, canvas, .left, half, 1, .medium),
+        0x1fb8c => block.blockShade(metrics, canvas, .left, common.half, 1, .medium),
         // '🮍'
-        0x1fb8d => block.blockShade(metrics, canvas, .right, half, 1, .medium),
+        0x1fb8d => block.blockShade(metrics, canvas, .right, common.half, 1, .medium),
         // '🮎'
-        0x1fb8e => block.blockShade(metrics, canvas, .upper, 1, half, .medium),
+        0x1fb8e => block.blockShade(metrics, canvas, .upper, 1, common.half, .medium),
         // '🮏'
-        0x1fb8f => block.blockShade(metrics, canvas, .lower, 1, half, .medium),
+        0x1fb8f => block.blockShade(metrics, canvas, .lower, 1, common.half, .medium),
 
         // '🮐'
         0x1fb90 => block.fullBlockShade(metrics, canvas, .medium),
         // '🮑'
         0x1fb91 => {
             block.fullBlockShade(metrics, canvas, .medium);
-            block.block(metrics, canvas, .upper, 1, half);
+            block.block(metrics, canvas, .upper, 1, common.half);
         },
         // '🮒'
         0x1fb92 => {
             block.fullBlockShade(metrics, canvas, .medium);
-            block.block(metrics, canvas, .lower, 1, half);
+            block.block(metrics, canvas, .lower, 1, common.half);
         },
         0x1fb93 => {
             // NOTE: This codepoint is currently un-allocated, it's a hole
@@ -692,7 +681,7 @@ pub fn draw1FB7C_1FB97(
         // '🮔'
         0x1fb94 => {
             block.fullBlockShade(metrics, canvas, .medium);
-            block.block(metrics, canvas, .right, half, 1);
+            block.block(metrics, canvas, .right, common.half, 1);
         },
         // '🮕'
         0x1fb95 => checkerboardFill(metrics, canvas, 0),
@@ -975,7 +964,7 @@ pub fn draw1FBCE(
     _ = width;
     _ = height;
 
-    block.block(metrics, canvas, .left, two_thirds, 1);
+    block.block(metrics, canvas, .left, common.two_thirds, 1);
 }
 
 // 🯏
@@ -990,7 +979,7 @@ pub fn draw1FBCF(
     _ = width;
     _ = height;
 
-    block.block(metrics, canvas, .left, one_third, 1);
+    block.block(metrics, canvas, .left, common.one_third, 1);
 }
 
 /// Cell diagonals.
