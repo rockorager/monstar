@@ -190,8 +190,8 @@ dbus: ?*c.DBusConnection,
 dbus_fd: posix.fd_t,
 /// URI held while the compositor creates a token for activating its handler.
 pending_open_uri: ?[]u8,
-notification_ids: std.AutoHashMapUnmanaged(u32, void),
-notification_tokens: std.AutoHashMapUnmanaged(u32, []u8),
+/// A null value means the notification is awaiting its activation token.
+notifications: std.AutoHashMapUnmanaged(u32, ?[]u8),
 color_scheme: vt.device_status.ColorScheme,
 /// signalfd for process-local signals, polled in the event loop.
 signal_fd: posix.fd_t,
@@ -840,8 +840,7 @@ pub fn init(
         .dbus = dbus_connection,
         .dbus_fd = -1,
         .pending_open_uri = null,
-        .notification_ids = .empty,
-        .notification_tokens = .empty,
+        .notifications = .empty,
         .color_scheme = .dark,
         .signal_fd = signal_fd,
         .repeat_fd = repeat_fd,
@@ -1093,11 +1092,11 @@ fn initDbus(self: *App) void {
 
 fn deinitDbus(self: *App) void {
     self.sendTaskbarProgress(.{ .state = .remove }) catch {};
-    self.notification_ids.deinit(self.alloc);
-
-    var it = self.notification_tokens.valueIterator();
-    while (it.next()) |token| self.alloc.free(token.*);
-    self.notification_tokens.deinit(self.alloc);
+    var it = self.notifications.valueIterator();
+    while (it.next()) |token| {
+        if (token.*) |value| self.alloc.free(value);
+    }
+    self.notifications.deinit(self.alloc);
 
     if (self.dbus) |connection| {
         c.dbus_connection_remove_filter(connection, dbusFilter, self);
@@ -1198,7 +1197,9 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
     defer c.dbus_message_unref(reply);
 
     const notification_id = dbusMessageUint32(reply) orelse return;
-    try self.notification_ids.put(self.alloc, notification_id, {});
+    if (try self.notifications.fetchPut(self.alloc, notification_id, null)) |old| {
+        if (old.value) |token| self.alloc.free(token);
+    }
 }
 
 fn sendTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) !void {
@@ -1493,7 +1494,7 @@ fn handleNotificationActivationToken(self: *App, message: *c.DBusMessage) void {
     if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_UINT32) return;
     var notification_id: u32 = 0;
     c.dbus_message_iter_get_basic(&iter, &notification_id);
-    if (!self.notification_ids.contains(notification_id)) return;
+    const token_slot = self.notifications.getPtr(notification_id) orelse return;
     if (c.dbus_message_iter_next(&iter) == 0) return;
     if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return;
     var token_ptr: [*:0]const u8 = undefined;
@@ -1501,9 +1502,8 @@ fn handleNotificationActivationToken(self: *App, message: *c.DBusMessage) void {
 
     const token = std.mem.span(token_ptr);
     const owned = self.alloc.dupe(u8, token) catch return;
-    if (self.notification_tokens.fetchPut(self.alloc, notification_id, owned) catch null) |old| {
-        self.alloc.free(old.value);
-    }
+    if (token_slot.*) |old| self.alloc.free(old);
+    token_slot.* = owned;
 }
 
 fn handleNotificationActionInvoked(self: *App, message: *c.DBusMessage) void {
@@ -1512,18 +1512,18 @@ fn handleNotificationActionInvoked(self: *App, message: *c.DBusMessage) void {
     if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_UINT32) return;
     var notification_id: u32 = 0;
     c.dbus_message_iter_get_basic(&iter, &notification_id);
-    if (!self.notification_ids.remove(notification_id)) return;
+    const notification = self.notifications.fetchRemove(notification_id) orelse return;
+    defer if (notification.value) |token| self.alloc.free(token);
     if (c.dbus_message_iter_next(&iter) == 0) return;
     if (c.dbus_message_iter_get_arg_type(&iter) != c.DBUS_TYPE_STRING) return;
     var action_ptr: [*:0]const u8 = undefined;
     c.dbus_message_iter_get_basic(&iter, @ptrCast(&action_ptr));
     if (!std.mem.eql(u8, std.mem.span(action_ptr), "default")) return;
 
-    const kv = self.notification_tokens.fetchRemove(notification_id) orelse return;
-    defer self.alloc.free(kv.value);
-    if (kv.value.len == 0) return;
+    const token = notification.value orelse return;
+    if (token.len == 0) return;
 
-    const token_z = self.alloc.dupeZ(u8, kv.value) catch return;
+    const token_z = self.alloc.dupeZ(u8, token) catch return;
     defer self.alloc.free(token_z);
     self.window.activate(token_z);
 }
