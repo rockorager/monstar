@@ -2,7 +2,7 @@
 Type=Application
 Name=monstar
 Comment=Wayland terminal emulator
-Icon=utilities-terminal
+Icon=dev.rockorager.monstar
 Exec=monstar
 Terminal=false
 StartupNotify=true

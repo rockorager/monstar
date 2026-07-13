@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <title>Monstar</title>
+  <defs>
+    <linearGradient id="background" x1="64" y1="0" x2="64" y2="128" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#222631"/>
+      <stop offset=".55" stop-color="#1c1f26"/>
+      <stop offset="1" stop-color="#181a20"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="64" y1="0" x2="64" y2="128" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#43484e"/>
+      <stop offset=".55" stop-color="#363a3f"/>
+      <stop offset="1" stop-color="#2e3135"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="20" fill="url(#background)"/>
+  <rect x=".75" y=".75" width="126.5" height="126.5" rx="19.25" fill="none" stroke="url(#edge)" stroke-width="1.5"/>
+  <g fill="#f8fafc">
+    <path d="M27 86V39l20 18v9L34 54.3V86h-7ZM54 57l20-18v47h-7V54.3L54 66v-9Z"/>
+    <rect x="83" y="80.5" width="27" height="5.5" rx="2.75"/>
+  </g>
+</svg>

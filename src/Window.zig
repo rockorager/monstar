@@ -259,7 +259,7 @@ pub fn create(
 
     if (globals.toplevel_icon_manager) |manager| {
         if (manager.createIcon()) |icon| {
-            icon.setName("utilities-terminal");
+            icon.setName("dev.rockorager.monstar");
             manager.setIcon(toplevel, icon);
             icon.destroy();
         } else |_| {}
