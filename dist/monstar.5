@@ -27,11 +27,11 @@ the previous value or default remains in effect.
 .PP
 For example:
 .EX
+copy-highlight-duration = 200
 font-family = Iosevka
 font-size = 12.5
-window-padding-x = 4,8
 theme = light:Rose Pine Dawn,dark:Rose Pine
-copy-highlight-duration = 200
+window-padding-x = 4,8
 .EE
 .SH RELOADING
 Press
@@ -74,13 +74,6 @@ and then
 .B /bin/sh
 are used.
 .TP
-.BI pipe-command-output " = command"
-Set a shell command that receives the last OSC 133-delimited command output on
-standard input when
-.B Ctrl+Shift+G
-is pressed.
-The default is unset.
-.TP
 .BI linux-cgroup " = never|always"
 Choose whether each newly spawned child is moved into a separate transient
 systemd scope.
@@ -90,6 +83,13 @@ With
 .BR always ,
 Monstar falls back to its inherited cgroup if the session bus or systemd scope
 creation is unavailable.
+.TP
+.BI pipe-command-output " = command"
+Set a shell command that receives the last OSC 133-delimited command output on
+standard input when
+.B Ctrl+Shift+G
+is pressed.
+The default is unset.
 .SH FONT SETTINGS
 .TP
 .BI font-family " = family"
@@ -110,6 +110,12 @@ The default is
 equivalent to 16 logical pixels at 96 DPI.
 .SH WINDOW SETTINGS
 .TP
+.BI background-opacity " = opacity"
+Set the opacity of cells using the default terminal background.
+The value is between 0 and 1 inclusive; the default is 1.
+Explicit cell backgrounds, selections, cursors, text, and terminal graphics
+retain their own opacity.
+.TP
 .BI window-padding-x " = pixels[,pixels]"
 Set minimum left and right padding in logical pixels.
 One value applies to both sides; two values set left and right independently.
@@ -119,17 +125,12 @@ The default is zero.
 Set minimum top and bottom padding in logical pixels.
 One value applies to both sides; two values set top and bottom independently.
 The default is zero.
-.TP
-.BI background-opacity " = opacity"
-Set the opacity of cells using the default terminal background.
-The value is between 0 and 1 inclusive; the default is 1.
-Explicit cell backgrounds, selections, cursors, text, and terminal graphics
-retain their own opacity.
 .SH STORAGE AND INPUT SETTINGS
 .TP
-.BI scrollback-limit " = bytes"
-Set the terminal page-storage limit, including the active screen.
-The default is 50000000 bytes.
+.BI copy-highlight-duration " = milliseconds"
+Set how long copied selections flash.
+The default is 200 milliseconds.
+Zero disables the flash.
 .TP
 .BI image-storage-limit " = bytes"
 Set the kitty graphics image-data limit per terminal screen.
@@ -148,10 +149,9 @@ The defaults are
 and
 .BR discrete:3 .
 .TP
-.BI copy-highlight-duration " = milliseconds"
-Set how long copied selections flash.
-The default is 200 milliseconds.
-Zero disables the flash.
+.BI scrollback-limit " = bytes"
+Set the terminal page-storage limit, including the active screen.
+The default is 50000000 bytes.
 .SH THEME SELECTION
 .TP
 .BI theme " = name"
@@ -203,13 +203,17 @@ in light mode and
 .B #212225
 in dark mode.
 .TP
-.BI foreground " = color"
-Set the default terminal foreground.
-Built-in defaults are
+.BI copy-highlight " = color"
+Set the temporary background shown after a selection is copied.
+The built-in default is Radix Yellow 9,
+.BR #ffe629 ,
+in both color schemes.
+.TP
+.BI copy-highlight-foreground " = color"
+Set text shown during the post-copy flash.
+The built-in default is
 .B #1c2024
-in light mode and
-.B #edeeef
-in dark mode.
+in both color schemes.
 .TP
 .BI cursor-color " = color"
 Set the cursor color.
@@ -222,6 +226,24 @@ in dark mode.
 .BI cursor-text " = color"
 Set text beneath a focused block cursor.
 When unset, the terminal background is used.
+.TP
+.BI foreground " = color"
+Set the default terminal foreground.
+Built-in defaults are
+.B #1c2024
+in light mode and
+.B #edeeef
+in dark mode.
+.TP
+.BI palette " = index=color"
+Override one terminal palette entry.
+The index must be between 0 and 255 and may use decimal or a
+.BR 0b ,
+.BR 0o ,
+or
+.B 0x
+numeric prefix.
+Repeat the setting to override multiple entries.
 .TP
 .BI selection-background " = color"
 Set the selection background.
@@ -238,48 +260,26 @@ Built-in defaults are
 in light mode and
 .B #edeeef
 in dark mode.
-.TP
-.BI copy-highlight " = color"
-Set the temporary background shown after a selection is copied.
-The built-in default is Radix Yellow 9,
-.BR #ffe629 ,
-in both color schemes.
-.TP
-.BI copy-highlight-foreground " = color"
-Set text shown during the post-copy flash.
-The built-in default is
-.B #1c2024
-in both color schemes.
-.TP
-.BI palette " = index=color"
-Override one terminal palette entry.
-The index must be between 0 and 255 and may use decimal or a
-.BR 0b ,
-.BR 0o ,
-or
-.B 0x
-numeric prefix.
-Repeat the setting to override multiple entries.
 .SH THEME FILES
 Theme files use the same line syntax as the main configuration but accept only
 these color keys:
 .BR background ,
-.BR foreground ,
-.BR cursor-color ,
-.BR cursor-text ,
-.BR selection-background ,
-.BR selection-foreground ,
 .BR copy-highlight ,
 .BR copy-highlight-foreground ,
-and repeatable
-.BR palette .
+.BR cursor-color ,
+.BR cursor-text ,
+.BR foreground ,
+.BR palette ,
+.BR selection-background ,
+and
+.BR selection-foreground .
+The
+.B palette
+key may be repeated.
 .PP
 Main-configuration colors override theme-file colors.
 Palette entries not supplied by either use the built-in palette.
 .SH ENVIRONMENT
-.TP
-.B XDG_CONFIG_HOME
-Base directory for the default configuration and user themes.
 .TP
 .B HOME
 Fallback base directory when
@@ -293,18 +293,21 @@ Resource directory searched for installed themes.
 Default child command when
 .B command
 is unset.
-.SH FILES
 .TP
-.I $XDG_CONFIG_HOME/monstar/config
-Default configuration file.
+.B XDG_CONFIG_HOME
+Base directory for the default configuration and user themes.
+.SH FILES
 .TP
 .I $HOME/.config/monstar/config
 Fallback configuration file.
 .TP
-.I $XDG_CONFIG_HOME/monstar/themes/
-User theme directory.
-.TP
 .I $HOME/.config/monstar/themes/
 Fallback user theme directory.
+.TP
+.I $XDG_CONFIG_HOME/monstar/config
+Default configuration file.
+.TP
+.I $XDG_CONFIG_HOME/monstar/themes/
+User theme directory.
 .SH SEE ALSO
 .BR monstar (1)

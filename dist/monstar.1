@@ -39,41 +39,9 @@ Long options that take a value accept either
 or
 .BR "--option=value" .
 .TP
-.BR \-h , " " \-\-help
-Print usage information and exit.
-.TP
-.B \-\-version
-Print the version identifier and exit.
-.TP
-.BI \-\-title " title"
-Set the initial window title.
-The default is
-.BR monstar .
-.TP
 .BI \-\-app-id " app-id"
 Override the
 .B app-id
-configuration value for this invocation.
-.TP
-.BI \-\-working-directory " directory"
-Start the child in
-.IR directory .
-The directory must exist and be accessible.
-.TP
-.B \-\-hold
-Keep the window open after the child exits.
-.TP
-.BI \-\-window-size-chars " columns" x rows
-Set the initial terminal grid size in cells.
-Both dimensions must be positive and no greater than 65535.
-.TP
-.BI \-\-window-size-pixels " width" x height
-Set the initial window size in physical pixels.
-Both dimensions must be positive.
-.TP
-.BI \-\-font " family"
-Override the
-.B font-family
 configuration value for this invocation.
 .TP
 .BI \-\-config " path"
@@ -81,6 +49,21 @@ Load
 .I path
 instead of the default configuration file.
 A missing or unreadable file results in default configuration values.
+.TP
+.BI \-e " command" " [argument ...]"
+Execute the command directly without a shell.
+All remaining arguments belong to the command.
+.TP
+.BI \-\-font " family"
+Override the
+.B font-family
+configuration value for this invocation.
+.TP
+.BR \-h , " " \-\-help
+Print usage information and exit.
+.TP
+.B \-\-hold
+Keep the window open after the child exits.
 .TP
 .BI \-o " key=value"
 Override a configuration value after loading the configuration file.
@@ -91,9 +74,26 @@ See
 .BR monstar (5)
 for available keys.
 .TP
-.BI \-e " command" " [argument ...]"
-Execute the command directly without a shell.
-All remaining arguments belong to the command.
+.BI \-\-title " title"
+Set the initial window title.
+The default is
+.BR monstar .
+.TP
+.B \-\-version
+Print the version identifier and exit.
+.TP
+.BI \-\-window-size-chars " columns" x rows
+Set the initial terminal grid size in cells.
+Both dimensions must be positive and no greater than 65535.
+.TP
+.BI \-\-window-size-pixels " width" x height
+Set the initial window size in physical pixels.
+Both dimensions must be positive.
+.TP
+.BI \-\-working-directory " directory"
+Start the child in
+.IR directory .
+The directory must exist and be accessible.
 .TP
 .BI \-\- " command..."
 Join the remaining words with spaces and run the result through
@@ -138,6 +138,18 @@ Most visual and interaction settings update the running window;
 process-creation settings apply only when a child or window is created.
 .SH KEYBOARD SHORTCUTS
 .TP
+.BR Ctrl++ " or " Ctrl+=
+Increase the font size for this window.
+.TP
+.B Ctrl+-
+Decrease the font size for this window.
+.TP
+.B Ctrl+0
+Reset the runtime font-size override.
+.TP
+.B Ctrl+Shift+,
+Reload the configuration.
+.TP
 .B Ctrl+Shift+C
 Copy the current selection to the clipboard.
 .TP
@@ -156,18 +168,6 @@ Jump to the next OSC 133 prompt.
 .TP
 .B Ctrl+Shift+Z
 Jump to the previous OSC 133 prompt.
-.TP
-.B Ctrl+Shift+,
-Reload the configuration.
-.TP
-.BR Ctrl++ " or " Ctrl+=
-Increase the font size for this window.
-.TP
-.B Ctrl+-
-Decrease the font size for this window.
-.TP
-.B Ctrl+0
-Reset the runtime font-size override.
 .SH POINTER INPUT
 Drag with the left button to select text.
 Hold
@@ -197,37 +197,37 @@ keys; otherwise it scrolls the terminal scrollback.
 Reload the configuration file and reapply command-line overrides.
 .SH ENVIRONMENT
 .TP
-.B XDG_CONFIG_HOME
-Base directory for the configuration file and user themes.
-.TP
 .B HOME
 Used for configuration and user-theme paths when
 .B XDG_CONFIG_HOME
 is unset.
 .TP
-.B SHELL
-Default child command when no command is otherwise configured.
-.TP
 .B MONSTAR_RESOURCES_DIR
 Override the resource directory used to find installed themes.
+.TP
+.B SHELL
+Default child command when no command is otherwise configured.
 .TP
 .B TERM
 The inherited value is replaced with
 .B xterm-ghostty
 for the child.
-.SH FILES
 .TP
-.I $XDG_CONFIG_HOME/monstar/config
-Default configuration file.
+.B XDG_CONFIG_HOME
+Base directory for the configuration file and user themes.
+.SH FILES
 .TP
 .I $HOME/.config/monstar/config
 Fallback configuration file.
 .TP
-.I $XDG_CONFIG_HOME/monstar/themes/
-User theme directory.
-.TP
 .I $HOME/.config/monstar/themes/
 Fallback user theme directory.
+.TP
+.I $XDG_CONFIG_HOME/monstar/config
+Default configuration file.
+.TP
+.I $XDG_CONFIG_HOME/monstar/themes/
+User theme directory.
 .SH EXIT STATUS
 Command-line syntax and option-value errors exit with status 2.
 Startup or runtime failures exit nonzero.
