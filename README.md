@@ -156,8 +156,21 @@ cursor-color = #c0caf5
 cursor-text = #1a1b26
 selection-background = #33467c
 selection-foreground = #c0caf5
+copy-highlight = #ffe629
+copy-highlight-foreground = #1c2024
 palette = 1=#f7768e
 palette = 200=#123456
+```
+
+When selected text is copied with `Ctrl+Shift+C`, its background and text
+briefly flash `copy-highlight` and `copy-highlight-foreground`. The built-in
+defaults use Radix Yellow 9 with dark `#1c2024` text.
+
+`copy-highlight-duration` sets the flash duration in milliseconds and defaults
+to `200`; set it to `0` to disable the flash:
+
+```conf
+copy-highlight-duration = 200
 ```
 
 Make the default terminal background translucent with `background-opacity`,

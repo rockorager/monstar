@@ -173,6 +173,10 @@ selection_bg: vt.color.RGB,
 selection_fg: ?vt.color.RGB,
 selection_bg_override: ?vt.color.RGB,
 selection_fg_override: ?vt.color.RGB,
+/// Background used briefly after the current selection is copied.
+copy_highlight: vt.color.RGB,
+copy_highlight_fg: vt.color.RGB,
+copy_highlight_active: bool,
 /// Configured text color beneath a focused block cursor.
 cursor_text: ?vt.color.RGB,
 window: *Window,
@@ -224,6 +228,8 @@ last_scroll_time_ms: ?u32,
 sync_output_fd: posix.fd_t,
 /// Timer for ghostty-vt selection autoscroll while dragging past an edge.
 selection_autoscroll_fd: posix.fd_t,
+/// One-shot timer restoring the normal selection color after a copy.
+copy_highlight_fd: posix.fd_t,
 /// One-shot timer that clears stale OSC 9;4 taskbar progress.
 taskbar_progress_fd: posix.fd_t,
 /// Pointer position in logical surface coordinates.
@@ -770,6 +776,9 @@ pub fn init(
     const selection_autoscroll_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(selection_autoscroll_fd);
 
+    const copy_highlight_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(copy_highlight_fd);
+
     const taskbar_progress_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(taskbar_progress_fd);
 
@@ -838,6 +847,9 @@ pub fn init(
         .selection_fg = config.effectiveSelectionForeground(.dark),
         .selection_bg_override = null,
         .selection_fg_override = null,
+        .copy_highlight = config.effectiveCopyHighlight(.dark),
+        .copy_highlight_fg = config.effectiveCopyHighlightForeground(.dark),
+        .copy_highlight_active = false,
         .cursor_text = config.effectiveCursorText(.dark),
         .window = window,
         .keyboard = try .init(),
@@ -869,6 +881,7 @@ pub fn init(
         .last_scroll_time_ms = null,
         .sync_output_fd = sync_output_fd,
         .selection_autoscroll_fd = selection_autoscroll_fd,
+        .copy_highlight_fd = copy_highlight_fd,
         .taskbar_progress_fd = taskbar_progress_fd,
         .pointer_x = 0,
         .pointer_y = 0,
@@ -1587,6 +1600,7 @@ pub fn deinit(self: *App) void {
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
     _ = std.os.linux.close(self.taskbar_progress_fd);
+    _ = std.os.linux.close(self.copy_highlight_fd);
     _ = std.os.linux.close(self.selection_autoscroll_fd);
     _ = std.os.linux.close(self.sync_output_fd);
     _ = std.os.linux.close(self.fling_fd);
@@ -1626,6 +1640,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.signal_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.sync_output_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.selection_autoscroll_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.copy_highlight_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.taskbar_progress_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
@@ -1639,10 +1654,11 @@ pub fn run(self: *App) !void {
     const signal_fd = &fds[5];
     const sync_output_fd = &fds[6];
     const selection_autoscroll_fd = &fds[7];
-    const taskbar_progress_fd = &fds[8];
-    const dbus_fd = &fds[9];
-    const async_fd = &fds[10];
-    const fling_fd = &fds[11];
+    const copy_highlight_fd = &fds[8];
+    const taskbar_progress_fd = &fds[9];
+    const dbus_fd = &fds[10];
+    const async_fd = &fds[11];
+    const fling_fd = &fds[12];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
@@ -1719,6 +1735,10 @@ pub fn run(self: *App) !void {
 
         if (selection_autoscroll_fd.revents & posix.POLL.IN != 0) {
             self.fireSelectionAutoscroll();
+        }
+
+        if (copy_highlight_fd.revents & posix.POLL.IN != 0) {
+            self.fireCopyHighlightTimeout();
         }
 
         if (fling_fd.revents & posix.POLL.IN != 0) {
@@ -2306,7 +2326,17 @@ fn applyColorDefaultsForConfig(self: *App, config: Config) void {
         config.effectiveSelectionForeground(self.color_scheme),
         self.selection_fg_override,
     );
+    self.copy_highlight = config.effectiveCopyHighlight(self.color_scheme);
+    self.copy_highlight_fg = config.effectiveCopyHighlightForeground(self.color_scheme);
     self.cursor_text = config.effectiveCursorText(self.color_scheme);
+}
+
+fn selectionBackgroundForRender(self: *const App) vt.color.RGB {
+    return if (self.copy_highlight_active) self.copy_highlight else self.selection_bg;
+}
+
+fn selectionForegroundForRender(self: *const App) ?vt.color.RGB {
+    return if (self.copy_highlight_active) self.copy_highlight_fg else self.selection_fg;
 }
 
 fn colorWithRuntimeOverride(default: vt.color.RGB, runtime: ?vt.color.RGB) vt.color.RGB {
@@ -2532,7 +2562,7 @@ fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
     };
 
     switch (osc52Target(kind)) {
-        .clipboard => self.claimClipboardText(text),
+        .clipboard => _ = self.claimClipboardText(text),
         .primary => self.claimPrimaryText(text),
     }
 }
@@ -3903,27 +3933,27 @@ fn claimPrimaryText(self: *App, text: [:0]const u8) void {
 /// Claim the clipboard with the currently selected text.
 fn copyToClipboard(self: *App) void {
     const text = self.selectionText() orelse return;
-    self.claimClipboardText(text);
+    if (self.claimClipboardText(text)) self.flashCopyHighlight();
 }
 
-fn claimClipboardText(self: *App, text: [:0]const u8) void {
+fn claimClipboardText(self: *App, text: [:0]const u8) bool {
     const manager = self.window.data_manager orelse {
         self.alloc.free(text);
-        return;
+        return false;
     };
     const device = self.window.data_device orelse {
         self.alloc.free(text);
-        return;
+        return false;
     };
 
     const source = manager.createDataSource() catch {
         self.alloc.free(text);
-        return;
+        return false;
     };
     const ctx = self.alloc.create(SourceCtx) catch {
         source.destroy();
         self.alloc.free(text);
-        return;
+        return false;
     };
     ctx.* = .{ .app = self, .text = text, .source = .{ .clipboard = source } };
 
@@ -3934,6 +3964,27 @@ fn claimClipboardText(self: *App, text: [:0]const u8) void {
     if (self.clip_source) |old| old.destroy();
     self.clip_source = ctx;
     log.debug("claimed clipboard ({d} bytes)", .{text.len});
+    return true;
+}
+
+fn flashCopyHighlight(self: *App) void {
+    if (self.config.copy_highlight_duration == 0) return;
+    if (!setTimer(self.copy_highlight_fd, .{
+        .it_value = timespecFromNs(@as(u64, self.config.copy_highlight_duration) * std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    }, "copy highlight")) return;
+    if (self.copy_highlight_active) return;
+
+    self.copy_highlight_active = true;
+    self.requestFullAsyncRedraw();
+}
+
+fn fireCopyHighlightTimeout(self: *App) void {
+    _ = readTimer(self.copy_highlight_fd) orelse return;
+    if (!self.copy_highlight_active) return;
+
+    self.copy_highlight_active = false;
+    self.requestFullAsyncRedraw();
 }
 
 /// Ask the offer's owner to stream its contents into a pipe; the read
@@ -4506,17 +4557,19 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
 fn startAsyncRender(self: *App) !bool {
     var async_raster = &(self.async_raster orelse return false);
     if (async_raster.busy()) return false;
+    const selection_bg = self.selectionBackgroundForRender();
+    const selection_fg = self.selectionForegroundForRender();
     if (!async_raster.configuredFor(
         self.font.discovery(),
-        self.selection_bg,
-        self.selection_fg,
+        selection_bg,
+        selection_fg,
         self.cursor_text,
         self.config.background_opacity,
     )) {
         async_raster.reconfigure(
             self.font.discovery(),
-            self.selection_bg,
-            self.selection_fg,
+            selection_bg,
+            selection_fg,
             self.cursor_text,
             self.config.background_opacity,
         ) catch |err| {
@@ -4756,8 +4809,8 @@ fn startAsyncRasterLoad(self: *App) void {
 
     self.async_raster_loader = AsyncRaster.Loader.init(
         self.font.discovery(),
-        self.selection_bg,
-        self.selection_fg,
+        self.selectionBackgroundForRender(),
+        self.selectionForegroundForRender(),
         self.cursor_text,
         self.config.background_opacity,
         &self.render_state,
@@ -4786,8 +4839,8 @@ fn finishAsyncRasterLoad(self: *App) void {
             var raster = ready;
             if (!raster.configuredFor(
                 self.font.discovery(),
-                self.selection_bg,
-                self.selection_fg,
+                self.selectionBackgroundForRender(),
+                self.selectionForegroundForRender(),
                 self.cursor_text,
                 self.config.background_opacity,
             )) {

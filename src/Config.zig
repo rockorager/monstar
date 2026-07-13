@@ -65,6 +65,8 @@ const ThemeOverrides = struct {
     cursor_text: ?vt.color.RGB = null,
     selection_background: ?vt.color.RGB = null,
     selection_foreground: ?vt.color.RGB = null,
+    copy_highlight: ?vt.color.RGB = null,
+    copy_highlight_foreground: ?vt.color.RGB = null,
     palette: [256]?vt.color.RGB = @splat(null),
 };
 
@@ -74,6 +76,8 @@ pub const ThemeColors = struct {
     cursor_color: vt.color.RGB,
     selection_background: vt.color.RGB,
     selection_foreground: vt.color.RGB,
+    copy_highlight: vt.color.RGB,
+    copy_highlight_foreground: vt.color.RGB,
     palette: [16]vt.color.RGB,
 };
 
@@ -83,6 +87,8 @@ pub const light_theme: ThemeColors = .{
     .cursor_color = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
     .selection_background = .{ .r = 0xc2, .g = 0xe5, .b = 0xff },
     .selection_foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
+    .copy_highlight = .{ .r = 0xff, .g = 0xe6, .b = 0x29 },
+    .copy_highlight_foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
     .palette = .{
         .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
         .{ .r = 0xce, .g = 0x2c, .b = 0x31 },
@@ -109,6 +115,8 @@ pub const dark_theme: ThemeColors = .{
     .cursor_color = .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
     .selection_background = .{ .r = 0x10, .g = 0x4d, .b = 0x87 },
     .selection_foreground = .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
+    .copy_highlight = .{ .r = 0xff, .g = 0xe6, .b = 0x29 },
+    .copy_highlight_foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
     .palette = .{
         .{ .r = 0x18, .g = 0x19, .b = 0x1b },
         .{ .r = 0xff, .g = 0x95, .b = 0x92 },
@@ -155,6 +163,8 @@ scrollback_limit: usize = 50_000_000,
 /// rejected, so it must comfortably fit a fullscreen RGBA frame.
 image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
+/// Duration of the post-copy selection flash in milliseconds; 0 disables it.
+copy_highlight_duration: u32 = 200,
 /// Effective alpha of the default terminal background. Keeping this as an
 /// 8-bit value matches the wl_shm buffer and makes the opaque fast path exact.
 background_opacity: u8 = 255,
@@ -168,6 +178,8 @@ cursor_color: ?vt.color.RGB = null,
 cursor_text: ?vt.color.RGB = null,
 selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
+copy_highlight: ?vt.color.RGB = null,
+copy_highlight_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
 
 pub const LinuxCgroup = enum { never, always };
@@ -280,6 +292,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.image_storage_limit = limit;
     } else if (std.mem.eql(u8, key, "mouse-scroll-multiplier")) {
         self.mouse_scroll_multiplier = try parseMouseScrollMultiplier(self.mouse_scroll_multiplier, value);
+    } else if (std.mem.eql(u8, key, "copy-highlight-duration")) {
+        self.copy_highlight_duration = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background-opacity")) {
         self.background_opacity = try parseOpacity(value);
     } else if (std.mem.eql(u8, key, "theme")) {
@@ -296,6 +310,10 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.selection_background = try parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-foreground")) {
         self.selection_foreground = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "copy-highlight")) {
+        self.copy_highlight = try parseColor(value);
+    } else if (std.mem.eql(u8, key, "copy-highlight-foreground")) {
+        self.copy_highlight_foreground = try parseColor(value);
     } else if (std.mem.eql(u8, key, "palette")) {
         const entry = try parsePaletteEntry(value);
         self.palette[entry.index] = entry.color;
@@ -548,6 +566,16 @@ fn parseThemeOverrides(text: []const u8) ThemeOverrides {
                 warn("theme line {d}: invalid selection-foreground", .{line_no});
                 continue;
             };
+        } else if (std.mem.eql(u8, key, "copy-highlight")) {
+            result.copy_highlight = parseColor(value) catch {
+                warn("theme line {d}: invalid copy-highlight", .{line_no});
+                continue;
+            };
+        } else if (std.mem.eql(u8, key, "copy-highlight-foreground")) {
+            result.copy_highlight_foreground = parseColor(value) catch {
+                warn("theme line {d}: invalid copy-highlight-foreground", .{line_no});
+                continue;
+            };
         } else if (std.mem.eql(u8, key, "palette")) {
             const entry = parsePaletteEntry(value) catch {
                 warn("theme line {d}: invalid palette", .{line_no});
@@ -608,6 +636,14 @@ pub fn effectiveSelectionBackground(self: *const Config, color_scheme: vt.device
 
 pub fn effectiveSelectionForeground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
     return self.effectiveColor(color_scheme, "selection_foreground");
+}
+
+pub fn effectiveCopyHighlight(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
+    return self.effectiveColor(color_scheme, "copy_highlight");
+}
+
+pub fn effectiveCopyHighlightForeground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
+    return self.effectiveColor(color_scheme, "copy_highlight_foreground");
 }
 
 pub fn effectiveCursorText(self: *const Config, color_scheme: vt.device_status.ColorScheme) ?vt.color.RGB {
@@ -672,6 +708,7 @@ test "defaults" {
     try std.testing.expectEqual(@as(usize, 320_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
+    try std.testing.expectEqual(@as(u32, 200), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
     try std.testing.expectEqual(@as(?Theme, null), config.theme);
     try std.testing.expectEqual(@as(?ThemeOverrides, null), config.light_theme_overrides);
@@ -682,9 +719,13 @@ test "defaults" {
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.cursor_text);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.selection_background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.selection_foreground);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.copy_highlight);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.copy_highlight_foreground);
     for (config.palette) |entry| try std.testing.expectEqual(@as(?vt.color.RGB, null), entry);
     try std.testing.expectEqual(dark_theme.selection_background, config.effectiveSelectionBackground(.dark));
     try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.dark));
+    try std.testing.expectEqual(dark_theme.copy_highlight, config.effectiveCopyHighlight(.dark));
+    try std.testing.expectEqual(dark_theme.copy_highlight_foreground, config.effectiveCopyHighlightForeground(.dark));
 }
 
 test "parse config" {
@@ -705,6 +746,7 @@ test "parse config" {
         \\scrollback-limit = 50000000
         \\image-storage-limit = 50000000
         \\mouse-scroll-multiplier = precision:1.5,discrete:5
+        \\copy-highlight-duration = 250
         \\background-opacity = 0.8
         \\background = #1a1b26
         \\foreground = c0caf5
@@ -712,6 +754,8 @@ test "parse config" {
         \\cursor-text = #010203
         \\selection-background = #040506
         \\selection-foreground = #070809
+        \\copy-highlight = #0a0b0c
+        \\copy-highlight-foreground = #0d0e0f
         \\palette = 1=#f7768e
         \\palette = 200=#123456
         \\
@@ -732,6 +776,7 @@ test "parse config" {
     try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1.5), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 5), config.mouse_scroll_multiplier.discrete);
+    try std.testing.expectEqual(@as(u32, 250), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
@@ -739,6 +784,8 @@ test "parse config" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.cursor_text.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, config.selection_background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.selection_foreground.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 10, .g = 11, .b = 12 }, config.copy_highlight.?);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 13, .g = 14, .b = 15 }, config.copy_highlight_foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, config.palette[200].?);
@@ -790,6 +837,16 @@ test "mouse scroll multiplier forms and clamps" {
     try config.set(std.testing.allocator, "mouse-scroll-multiplier", "precision:0,discrete:20000");
     try std.testing.expectEqual(@as(f64, 0.01), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 10_000), config.mouse_scroll_multiplier.discrete);
+}
+
+test "copy highlight duration accepts milliseconds and zero" {
+    var config: Config = .{};
+    try config.set(std.testing.allocator, "copy-highlight-duration", "350");
+    try std.testing.expectEqual(@as(u32, 350), config.copy_highlight_duration);
+    try config.set(std.testing.allocator, "copy-highlight-duration", "0");
+    try std.testing.expectEqual(@as(u32, 0), config.copy_highlight_duration);
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "copy-highlight-duration", "-1"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "copy-highlight-duration", "1.5"));
 }
 
 test "background opacity accepts the closed unit interval" {
@@ -876,11 +933,15 @@ test "built-in colors follow color scheme" {
     try std.testing.expectEqual(light_theme.foreground, light_colors.foreground.get().?);
     try std.testing.expectEqual(light_theme.selection_background, config.effectiveSelectionBackground(.light));
     try std.testing.expectEqual(light_theme.selection_foreground, config.effectiveSelectionForeground(.light));
+    try std.testing.expectEqual(light_theme.copy_highlight, config.effectiveCopyHighlight(.light));
+    try std.testing.expectEqual(light_theme.copy_highlight_foreground, config.effectiveCopyHighlightForeground(.light));
 
     const dark_colors = config.terminalColors(.dark);
     try std.testing.expectEqual(dark_theme.background, dark_colors.background.get().?);
     try std.testing.expectEqual(dark_theme.foreground, dark_colors.foreground.get().?);
     try std.testing.expectEqual(dark_theme.cursor_color, dark_colors.cursor.get().?);
+    try std.testing.expectEqual(dark_theme.copy_highlight, config.effectiveCopyHighlight(.dark));
+    try std.testing.expectEqual(dark_theme.copy_highlight_foreground, config.effectiveCopyHighlightForeground(.dark));
     try std.testing.expectEqual(dark_theme.palette[1], dark_colors.palette.current[1]);
 }
 
@@ -893,6 +954,8 @@ test "built-in colors do not replace explicit color overrides" {
         \\background = #010203
         \\palette = 1=#040506
         \\selection-background = #070809
+        \\copy-highlight = #0a0b0c
+        \\copy-highlight-foreground = #0d0e0f
     );
 
     const colors = config.terminalColors(.dark);
@@ -901,6 +964,8 @@ test "built-in colors do not replace explicit color overrides" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, colors.palette.current[1]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveSelectionBackground(.dark));
     try std.testing.expectEqual(dark_theme.selection_foreground, config.effectiveSelectionForeground(.dark));
+    try std.testing.expectEqual(vt.color.RGB{ .r = 10, .g = 11, .b = 12 }, config.effectiveCopyHighlight(.dark));
+    try std.testing.expectEqual(vt.color.RGB{ .r = 13, .g = 14, .b = 15 }, config.effectiveCopyHighlightForeground(.dark));
 }
 
 test "named themes follow color scheme and remain below explicit colors" {
@@ -912,6 +977,8 @@ test "named themes follow color scheme and remain below explicit colors" {
         \\cursor-text = #fedcba
         \\selection-background = #dddddd
         \\selection-foreground = #333333
+        \\copy-highlight = #ffe629
+        \\copy-highlight-foreground = #1c2024
         \\palette = 1=#440000
         \\palette = 200=#abcdef
     );
@@ -932,6 +999,8 @@ test "named themes follow color scheme and remain below explicit colors" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, light.palette.current[1]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xab, .g = 0xcd, .b = 0xef }, light.palette.current[200]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xdd, .g = 0xdd, .b = 0xdd }, config.effectiveSelectionBackground(.light));
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0xff, .g = 0xe6, .b = 0x29 }, config.effectiveCopyHighlight(.light));
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0x1c, .g = 0x20, .b = 0x24 }, config.effectiveCopyHighlightForeground(.light));
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xfe, .g = 0xdc, .b = 0xba }, config.effectiveCursorText(.light).?);
 
     config.cursor_text = .{ .r = 7, .g = 8, .b = 9 };
