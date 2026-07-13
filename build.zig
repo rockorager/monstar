@@ -97,6 +97,8 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
     b.installFile("dist/dev.rockorager.monstar.desktop", "share/applications/dev.rockorager.monstar.desktop");
     b.installFile("dist/dev.rockorager.monstar.svg", "share/icons/hicolor/scalable/apps/dev.rockorager.monstar.svg");
+    b.installFile("dist/monstar.1", "share/man/man1/monstar.1");
+    b.installFile("dist/monstar.5", "share/man/man5/monstar.5");
     if (b.lazyDependency("iterm2_themes", .{})) |themes| {
         b.installDirectory(.{
             .source_dir = themes.path(""),
