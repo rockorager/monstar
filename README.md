@@ -233,6 +233,7 @@ pipe-command-output = cat > /tmp/monstar-output
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Shift+C` | Copy selection to clipboard |
+| `Ctrl+Shift+F` | Search scrollback |
 | `Ctrl+Shift+G` | Pipe last command output to `pipe-command-output` |
 | `Ctrl+Shift+N` | New window in current directory |
 | `Ctrl+Shift+V` | Paste from clipboard |
@@ -244,6 +245,11 @@ pipe-command-output = cat > /tmp/monstar-output
 | `Ctrl+0` | Reset font size for this window |
 | `Ctrl` + left click | Open OSC 8 hyperlink or detected URI (`Ctrl+Shift` when the application captures the mouse) |
 | `Ctrl` + drag | Rectangular text selection |
+
+Scrollback search remains live while terminal output continues. Type to update
+the query, use `Ctrl+N` and `Ctrl+P` to move between matches, and press `Enter`
+to accept the current match as the primary selection. `Escape`, `Ctrl+C`, or
+`Ctrl+G` cancels and restores the previous viewport; `Ctrl+U` clears the query.
 
 Detected URIs may use `http`, `https`, `ftp`, `mailto`, `file`, `ssh`, `git`,
 `tel`, `magnet`, `ipfs`, `ipns`, `gemini`, `gopher`, or `news`. Bare domains,

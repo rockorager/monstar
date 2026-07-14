@@ -163,6 +163,25 @@ Reload the configuration.
 .B Ctrl+Shift+C
 Copy the current selection to the clipboard.
 .TP
+.B Ctrl+Shift+F
+Open incremental scrollback search.
+Type to update the query and use
+.B Ctrl+N
+and
+.B Ctrl+P
+to move between matches.
+Press
+.B Enter
+to accept the match as the primary selection, or
+.BR Escape ,
+.BR Ctrl+C ,
+or
+.B Ctrl+G
+to cancel and restore the previous viewport.
+.B Ctrl+U
+clears the query.
+Search remains active while terminal output continues.
+.TP
 .B Ctrl+Shift+G
 Pipe the last OSC 133-delimited command output to the configured
 .BR pipe-command-output .

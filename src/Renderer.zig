@@ -39,6 +39,8 @@ focused: bool = true,
 hyperlink_hints: bool = false,
 /// Hovered automatically detected link, in viewport cell coordinates.
 link_range: ?LinkRange = null,
+/// Selected scrollback-search match, in viewport cell coordinates.
+search_range: ?LinkRange = null,
 /// Per-cell resolved foreground colors for the row being rendered.
 fg_scratch: std.ArrayList(vt.color.RGB),
 /// Per-cell font face indices for the row being rendered.
@@ -506,54 +508,120 @@ pub fn renderLinkHint(
     height: u31,
     uri: []const u8,
 ) !void {
-    if (uri.len == 0 or width == 0 or height < self.font.cell_height) return;
+    try self.renderTextOverlay(
+        pixels,
+        width,
+        height,
+        uri,
+        .bottom_left,
+        self.selection_bg,
+        self.selection_fg orelse state.colors.foreground,
+    );
+}
+
+pub fn renderSearch(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    text: []const u8,
+    no_match: bool,
+) !void {
+    try self.renderTextOverlay(
+        pixels,
+        width,
+        height,
+        text,
+        .top_right,
+        if (no_match) state.colors.palette[1] else self.selection_bg,
+        self.selection_fg orelse state.colors.foreground,
+    );
+}
+
+const OverlayPosition = enum { bottom_left, top_right };
+
+const OverlayText = struct {
+    start: usize,
+    width: u31,
+};
+
+fn overlayText(cps: []const u21, max_width: u31, suffix: bool) OverlayText {
+    var total: usize = 0;
+    var i: usize = 0;
+    while (i < cps.len) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        i += cluster.len;
+        total += cluster.width;
+    }
+
+    if (!suffix) {
+        var width_: usize = 0;
+        i = 0;
+        while (i < cps.len) {
+            const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+            if (cluster.len == 0 or width_ + cluster.width > max_width) break;
+            i += cluster.len;
+            width_ += cluster.width;
+        }
+        return .{ .start = 0, .width = @intCast(width_) };
+    }
+
+    i = 0;
+    while (i < cps.len and total > max_width) {
+        const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
+        if (cluster.len == 0) break;
+        i += cluster.len;
+        total -= cluster.width;
+    }
+    return .{ .start = i, .width = @intCast(total) };
+}
+
+fn renderTextOverlay(
+    self: *Renderer,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    text: []const u8,
+    position: OverlayPosition,
+    bg: vt.color.RGB,
+    fg: vt.color.RGB,
+) !void {
+    if (text.len == 0 or width == 0 or height < self.font.cell_height) return;
 
     const cols: u31 = @max(1, width / self.font.cell_width);
-    const text_start: u31 = @intFromBool(cols > 1);
-    const text_limit: u31 = if (cols > 2) cols - 1 else cols;
-    const y: u31 = height - self.font.cell_height;
+    const padding: u31 = @intFromBool(cols > 2);
+    const max_text_width = cols - padding * 2;
+    const cps = try self.overlayCodepoints(text);
+    const visible = overlayText(cps, max_text_width, position == .top_right);
+    const box_width = visible.width + padding * 2;
+    const box_x: u31 = if (position == .top_right) cols - box_width else 0;
+    const y: u31 = if (position == .top_right) 0 else height - self.font.cell_height;
     const baseline_y: i32 = @as(i32, @intCast(y)) + self.font.baseline;
-    const bg = self.selection_bg;
-    const fg = self.selection_fg orelse state.colors.foreground;
-    var x: u31 = text_start;
 
     fillRect(
         pixels,
         self.pixelStride(width),
         width,
         height,
-        0,
+        box_x * self.font.cell_width,
         y,
-        text_start * self.font.cell_width,
+        box_width * self.font.cell_width,
         self.font.cell_height,
         argb(bg),
     );
 
-    const cps = try self.overlayCodepoints(uri);
-
-    var i: usize = 0;
-    while (i < cps.len) {
+    var x = box_x + padding;
+    var i = visible.start;
+    const text_end = x + visible.width;
+    while (i < cps.len and x < text_end) {
         const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
         if (cluster.len == 0) break;
+        const cp = cps[i];
         i += cluster.len;
-
         const span: u31 = cluster.width;
         if (span == 0) continue;
-        if (x >= text_limit) break;
-        const clipped_span: u31 = @min(span, text_limit - x);
-        const cp = cps[i - cluster.len];
-
-        fillRect(
-            pixels,
-            self.pixelStride(width),
-            width,
-            height,
-            x * self.font.cell_width,
-            y,
-            clipped_span * self.font.cell_width,
-            self.font.cell_height,
-            argb(bg),
-        );
 
         const face_idx = self.font.faceForCodepoint(self.alloc, cp);
         const face = self.font.face(face_idx);
@@ -573,20 +641,6 @@ pub fn renderLinkHint(
             );
         }
         x += span;
-    }
-
-    if (x < cols) {
-        fillRect(
-            pixels,
-            self.pixelStride(width),
-            width,
-            height,
-            x * self.font.cell_width,
-            y,
-            self.font.cell_width,
-            self.font.cell_height,
-            argb(bg),
-        );
     }
 }
 
@@ -1352,7 +1406,8 @@ fn prepareRow(
         }
         // Selection overrides cell colors: fixed background, default
         // foreground, so selected text reads uniformly.
-        const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
+        const selected = (if (selection) |sel| x >= sel[0] and x <= sel[1] else false) or
+            (if (self.search_range) |range| range.contains(x, y) else false);
         if (selected) {
             bg = self.selection_bg;
             fg = self.selection_fg orelse colors.foreground;
@@ -3355,4 +3410,21 @@ test "dirty row render matches full render" {
     try renderer.renderDirty(&state, dirty_pixels, width, height);
     try renderer.render(&state, full_pixels, width, height);
     try std.testing.expectEqualSlices(u32, full_pixels, dirty_pixels);
+}
+
+test "top-right overlay keeps the newest complete grapheme clusters" {
+    const cps = [_]u21{ 'a', '界', 'b' };
+
+    try std.testing.expectEqual(
+        OverlayText{ .start = 0, .width = 3 },
+        overlayText(&cps, 3, false),
+    );
+    try std.testing.expectEqual(
+        OverlayText{ .start = 1, .width = 3 },
+        overlayText(&cps, 3, true),
+    );
+    try std.testing.expectEqual(
+        OverlayText{ .start = 2, .width = 1 },
+        overlayText(&cps, 2, true),
+    );
 }

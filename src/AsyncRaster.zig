@@ -36,11 +36,17 @@ pub const Job = struct {
     hyperlink_hints: bool,
     /// Hovered automatically detected link in viewport cell coordinates.
     link_range: ?Renderer.LinkRange,
+    /// Selected scrollback-search match in viewport cell coordinates.
+    search_range: ?Renderer.LinkRange,
     /// IME preedit overlay text. Owned by the submitter; must stay valid
     /// until the job's result is taken.
     preedit: ?[]const u8,
     /// Hovered-hyperlink URI overlay. Same ownership as `preedit`.
     link_hint: ?[]const u8,
+    /// Top-right scrollback-search overlay. Same ownership as `preedit`.
+    search: ?[]const u8,
+    /// Use the terminal's red palette entry for the search overlay.
+    search_no_match: bool,
     /// Visible kitty placements, resolved on the main thread with image
     /// data repointed at cache-pinned copies. Same ownership as
     /// `preedit`; empty when no graphics are visible.
@@ -58,7 +64,8 @@ pub const Job = struct {
     repair: Repair,
 
     fn hasOverlay(self: *const Job) bool {
-        return self.preedit != null or self.link_hint != null or self.kitty_items.len > 0;
+        return self.preedit != null or self.link_hint != null or
+            self.search != null or self.kitty_items.len > 0;
     }
 };
 
@@ -379,6 +386,7 @@ fn workerMain(self: *AsyncRaster) void {
         self.renderer.focused = job.focused;
         self.renderer.hyperlink_hints = job.hyperlink_hints;
         self.renderer.link_range = job.link_range;
+        self.renderer.search_range = job.search_range;
         self.renderer.buffer_stride = job.width;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
@@ -416,6 +424,16 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         }
         if (job.link_hint) |uri| {
             try self.renderer.renderLinkHint(self.state, grid_pixels, job.grid_width, job.grid_height, uri);
+        }
+        if (job.search) |text| {
+            try self.renderer.renderSearch(
+                self.state,
+                grid_pixels,
+                job.grid_width,
+                job.grid_height,
+                text,
+                job.search_no_match,
+            );
         }
         damage.* = .full;
         return;
@@ -562,8 +580,11 @@ test "repair previous frame" {
         .focused = true,
         .hyperlink_hints = false,
         .link_range = null,
+        .search_range = null,
         .preedit = null,
         .link_hint = null,
+        .search = null,
+        .search_no_match = false,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = null,
@@ -627,8 +648,11 @@ test "scroll previous frame in place and from distinct source" {
         .focused = true,
         .hyperlink_hints = false,
         .link_range = null,
+        .search_range = null,
         .preedit = null,
         .link_hint = null,
+        .search = null,
+        .search_no_match = false,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = 1,

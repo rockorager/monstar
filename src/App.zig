@@ -47,6 +47,84 @@ const LinkPress = struct {
     cell: vt.Coordinate,
 };
 
+const SearchState = struct {
+    query: std.ArrayList(u8) = .empty,
+    engine: ?vt.search.Screen = null,
+    engine_key: vt.ScreenSet.Key = .primary,
+    engine_generation: usize = 0,
+    complete: bool = true,
+    original_screen: *vt.Screen,
+    original_key: vt.ScreenSet.Key,
+    original_generation: usize,
+    original_viewport: vt.PageList.Viewport,
+    original_pin: ?*vt.Pin,
+
+    fn init(term: *vt.Terminal) !SearchState {
+        const key = term.screens.active_key;
+        const screen = term.screens.active;
+        const viewport = screen.pages.viewport;
+        return .{
+            .original_screen = screen,
+            .original_key = key,
+            .original_generation = term.screens.generation(key),
+            .original_viewport = viewport,
+            .original_pin = if (viewport == .pin)
+                try screen.pages.trackPin(screen.pages.getTopLeft(.viewport))
+            else
+                null,
+        };
+    }
+
+    fn screenValid(
+        term: *const vt.Terminal,
+        key: vt.ScreenSet.Key,
+        generation: usize,
+        screen: *const vt.Screen,
+    ) bool {
+        return term.screens.generation(key) == generation and
+            term.screens.get(key) == screen;
+    }
+
+    fn engineValid(self: *const SearchState, term: *const vt.Terminal) bool {
+        const engine = self.engine orelse return false;
+        return screenValid(term, self.engine_key, self.engine_generation, engine.screen);
+    }
+
+    fn deinitEngine(self: *SearchState, term: *vt.Terminal) void {
+        if (self.engine) |*engine| {
+            if (self.engineValid(term))
+                engine.deinit()
+            else
+                engine.deinitScreenInvalid();
+            self.engine = null;
+        }
+        self.complete = true;
+    }
+
+    fn restoreViewport(self: *SearchState, term: *vt.Terminal) void {
+        if (term.screens.active_key != self.original_key or
+            !screenValid(term, self.original_key, self.original_generation, self.original_screen))
+        {
+            return;
+        }
+        switch (self.original_viewport) {
+            .active => self.original_screen.pages.scroll(.active),
+            .top => self.original_screen.pages.scroll(.top),
+            .pin => self.original_screen.pages.scroll(.{ .pin = self.original_pin.?.* }),
+        }
+    }
+
+    fn deinit(self: *SearchState, alloc: std.mem.Allocator, term: *vt.Terminal) void {
+        self.deinitEngine(term);
+        if (self.original_pin) |pin| {
+            if (screenValid(term, self.original_key, self.original_generation, self.original_screen)) {
+                self.original_screen.pages.untrackPin(pin);
+            }
+        }
+        self.query.deinit(alloc);
+    }
+};
+
 alloc: std.mem.Allocator,
 io: std.Io,
 config_arena: std.heap.ArenaAllocator,
@@ -78,8 +156,12 @@ held_frame: ?*Window.Buffer,
 /// and freed on deinit.
 async_job_preedit: ?[]u8,
 async_job_link_hint: ?[]u8,
+async_job_search: ?[]u8,
+async_job_search_no_match: bool,
 /// Viewport cells for the automatic link submitted with the last async job.
 async_job_link_range: ?Renderer.LinkRange,
+/// Selected search match submitted with the last async job.
+async_job_search_range: ?Renderer.LinkRange,
 /// The hyperlink-hints flag submitted with the last async job, for
 /// detecting overlay changes between jobs.
 async_job_hyperlink_hints: bool,
@@ -139,6 +221,8 @@ ime_focused: bool,
 ime_preedit: ?[]u8,
 ime_pending_preedit: ?[]u8,
 ime_pending_commit: ?[]u8,
+/// Native incremental scrollback search, active even with an empty query.
+search: ?SearchState,
 /// Cached DEC mode 2048 state, to detect the application enabling
 /// in-band size reports.
 in_band_reports: bool,
@@ -182,6 +266,8 @@ selection_autoscroll_fd: posix.fd_t,
 copy_highlight_fd: posix.fd_t,
 /// One-shot timer that clears stale OSC 9;4 taskbar progress.
 taskbar_progress_fd: posix.fd_t,
+/// Drives bounded libghostty search work without blocking the event loop.
+search_fd: posix.fd_t,
 /// Pointer position in logical surface coordinates.
 pointer_x: f64,
 pointer_y: f64,
@@ -283,6 +369,9 @@ const sync_output_reset_ms = 1000;
 const taskbar_progress_timeout_seconds = 15;
 const selection_repeat_ms = 500;
 const selection_autoscroll_ms = 15;
+const search_tick_ms = 1;
+const search_ticks_per_wake = 8;
+const max_search_query_bytes = 64 * 1024;
 const disarmed_timer: std.os.linux.itimerspec = .{
     .it_value = .{ .sec = 0, .nsec = 0 },
     .it_interval = .{ .sec = 0, .nsec = 0 },
@@ -732,6 +821,9 @@ pub fn init(
     const taskbar_progress_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(taskbar_progress_fd);
 
+    const search_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(search_fd);
+
     // Scope confirmation ran concurrently with the window setup above,
     // so this rarely waits; the child stays gated until its migration
     // is confirmed (or abandoned).
@@ -765,7 +857,10 @@ pub fn init(
         .held_frame = null,
         .async_job_preedit = null,
         .async_job_link_hint = null,
+        .async_job_search = null,
+        .async_job_search_no_match = false,
         .async_job_link_range = null,
+        .async_job_search_range = null,
         .async_job_hyperlink_hints = false,
         .async_job_kitty = &.{},
         .kitty_cache = .empty,
@@ -809,6 +904,7 @@ pub fn init(
         .ime_preedit = null,
         .ime_pending_preedit = null,
         .ime_pending_commit = null,
+        .search = null,
         .in_band_reports = false,
         .sync_output = false,
         .write_queue = .empty,
@@ -833,6 +929,7 @@ pub fn init(
         .selection_autoscroll_fd = selection_autoscroll_fd,
         .copy_highlight_fd = copy_highlight_fd,
         .taskbar_progress_fd = taskbar_progress_fd,
+        .search_fd = search_fd,
         .pointer_x = 0,
         .pointer_y = 0,
         .pointer_inside = false,
@@ -1530,6 +1627,7 @@ pub fn deinit(self: *App) void {
     if (self.async_raster) |*async_raster| async_raster.deinit();
     if (self.async_job_preedit) |text| self.alloc.free(text);
     if (self.async_job_link_hint) |uri| self.alloc.free(uri);
+    if (self.async_job_search) |text| self.alloc.free(text);
     if (self.hovered_link) |link| self.alloc.free(link.uri);
     if (self.link_press) |press| self.alloc.free(press.uri);
     self.alloc.free(self.async_job_kitty);
@@ -1537,6 +1635,7 @@ pub fn deinit(self: *App) void {
     self.damage_spans.deinit(self.alloc);
     self.repair_spans.deinit(self.alloc);
     self.clearImeText();
+    if (self.search) |*search| search.deinit(self.alloc, &self.term);
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
     self.paste_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
@@ -1549,6 +1648,7 @@ pub fn deinit(self: *App) void {
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
+    _ = std.os.linux.close(self.search_fd);
     _ = std.os.linux.close(self.taskbar_progress_fd);
     _ = std.os.linux.close(self.copy_highlight_fd);
     _ = std.os.linux.close(self.selection_autoscroll_fd);
@@ -1595,6 +1695,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.dbus_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.fling_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.search_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1609,6 +1710,7 @@ pub fn run(self: *App) !void {
     const dbus_fd = &fds[10];
     const async_fd = &fds[11];
     const fling_fd = &fds[12];
+    const search_fd = &fds[13];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
@@ -1693,6 +1795,10 @@ pub fn run(self: *App) !void {
 
         if (fling_fd.revents & posix.POLL.IN != 0) {
             self.fireFling();
+        }
+
+        if (search_fd.revents & posix.POLL.IN != 0) {
+            self.fireSearch();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -2367,6 +2473,7 @@ fn drainPipeline(self: *App) !void {
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
     self.syncActiveScreen();
+    if (consumed) self.refreshSearch();
     if (consumed) self.syncHoveredLink(true);
 }
 
@@ -3204,10 +3311,26 @@ fn detectHoveredLink(self: *App) !?HoveredLink {
 
 fn linkRange(self: *App, selection: vt.Selection) ?Renderer.LinkRange {
     const screen = self.term.screens.active;
-    const tl = screen.pages.pointFromPin(.screen, selection.topLeft(screen)) orelse return null;
-    const br = screen.pages.pointFromPin(.screen, selection.bottomRight(screen)) orelse return null;
+    return highlightRange(
+        screen,
+        selection.topLeft(screen),
+        selection.bottomRight(screen),
+        self.term.rows,
+        self.term.cols,
+    );
+}
+
+fn highlightRange(
+    screen: *vt.Screen,
+    start: vt.Pin,
+    end: vt.Pin,
+    rows: u16,
+    cols: u16,
+) ?Renderer.LinkRange {
+    const tl = screen.pages.pointFromPin(.screen, start) orelse return null;
+    const br = screen.pages.pointFromPin(.screen, end) orelse return null;
     const viewport = screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)) orelse return null;
-    const last_y = viewport.screen.y + self.term.rows - 1;
+    const last_y = viewport.screen.y + rows - 1;
     if (br.screen.y < viewport.screen.y or tl.screen.y > last_y) return null;
 
     return .{
@@ -3216,7 +3339,7 @@ fn linkRange(self: *App, selection: vt.Selection) ?Renderer.LinkRange {
             .y = @max(tl.screen.y, viewport.screen.y) - viewport.screen.y,
         },
         .end = .{
-            .x = if (br.screen.y > last_y) self.term.cols - 1 else br.screen.x,
+            .x = if (br.screen.y > last_y) cols - 1 else br.screen.x,
             .y = @min(br.screen.y, last_y) - viewport.screen.y,
         },
     };
@@ -4276,6 +4399,12 @@ fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
 }
 
 fn applyPendingIme(self: *App) void {
+    if (self.search != null) {
+        if (self.ime_pending_commit) |commit| self.appendSearchText(commit);
+        self.setImePreedit(self.ime_pending_preedit);
+        self.resetPendingIme();
+        return;
+    }
     if (self.ime_pending_commit) |commit| {
         if (commit.len > 0) {
             self.writePty(commit);
@@ -4371,9 +4500,273 @@ fn fireRepeat(self: *App) void {
     for (0..@min(expirations, 8)) |_| self.onKey(keycode, .repeat);
 }
 
+fn startSearch(self: *App) void {
+    if (self.search != null) return;
+    self.search = SearchState.init(&self.term) catch |err| {
+        log.warn("failed to start scrollback search: {}", .{err});
+        return;
+    };
+    self.stopFling();
+    self.clearSelection();
+    self.requestFullAsyncRedraw();
+}
+
+fn finishSearch(self: *App, accept: bool) void {
+    var accepted: ?vt.Selection = null;
+    if (self.search) |*search| {
+        if (accept and search.engineValid(&self.term) and
+            search.engine_key == self.term.screens.active_key)
+        {
+            if (search.engine.?.selectedMatch()) |match| {
+                accepted = .init(match.startPin(), match.endPin(), false);
+            }
+        } else if (!accept) {
+            search.restoreViewport(&self.term);
+        }
+        search.deinit(self.alloc, &self.term);
+        self.search = null;
+    }
+    self.stopSearchTimer();
+    self.clearImeText();
+    if (accepted) |selection| {
+        self.term.screens.active.select(selection) catch |err| {
+            log.warn("failed to select accepted search match: {}", .{err});
+            self.requestFullAsyncRedraw();
+            return;
+        };
+        self.copyToPrimary();
+    }
+    self.syncHoveredLink(true);
+    self.requestFullAsyncRedraw();
+}
+
+fn rebuildSearch(self: *App) void {
+    const search = if (self.search) |*value| value else return;
+    search.deinitEngine(&self.term);
+    self.stopSearchTimer();
+    if (search.query.items.len == 0) {
+        search.restoreViewport(&self.term);
+        self.syncHoveredLink(true);
+        self.requestFullAsyncRedraw();
+        return;
+    }
+
+    const key = self.term.screens.active_key;
+    search.engine = vt.search.Screen.init(
+        self.alloc,
+        self.term.screens.active,
+        search.query.items,
+    ) catch |err| {
+        log.warn("failed to initialize scrollback search: {}", .{err});
+        self.requestFullAsyncRedraw();
+        return;
+    };
+    search.engine_key = key;
+    search.engine_generation = self.term.screens.generation(key);
+    search.complete = false;
+    self.ensureSearchSelection();
+    self.startSearchTimer();
+    self.requestFullAsyncRedraw();
+}
+
+/// Reconcile search with live terminal output. Screen generations make it
+/// safe to release an engine after an alternate screen was destroyed.
+fn refreshSearch(self: *App) void {
+    const search = if (self.search) |*value| value else return;
+    if (search.query.items.len == 0) return;
+    if (!search.engineValid(&self.term) or
+        search.engine_key != self.term.screens.active_key)
+    {
+        self.rebuildSearch();
+        return;
+    }
+
+    search.engine.?.reloadActive() catch |err| {
+        log.warn("failed to refresh scrollback search: {}", .{err});
+        return;
+    };
+    search.complete = false;
+    self.ensureSearchSelection();
+    self.startSearchTimer();
+    self.requestFullAsyncRedraw();
+}
+
+fn startSearchTimer(self: *App) void {
+    const interval = timespecFromNs(search_tick_ms * std.time.ns_per_ms);
+    _ = setTimer(self.search_fd, .{
+        .it_value = interval,
+        .it_interval = interval,
+    }, "scrollback search");
+}
+
+fn stopSearchTimer(self: *App) void {
+    _ = setTimer(self.search_fd, disarmed_timer, "scrollback search");
+}
+
+fn fireSearch(self: *App) void {
+    _ = readTimer(self.search_fd) orelse return;
+    var search = if (self.search) |*value| value else {
+        self.stopSearchTimer();
+        return;
+    };
+    if (search.query.items.len == 0) {
+        self.stopSearchTimer();
+        return;
+    }
+    if (!search.engineValid(&self.term)) {
+        self.rebuildSearch();
+        return;
+    }
+
+    const before_matches = search.engine.?.matchesLen();
+    const before_selected: ?usize = if (search.engine.?.selected) |selected| selected.idx else null;
+    const before_complete = search.complete;
+    for (0..search_ticks_per_wake) |_| {
+        search.engine.?.tick() catch |err| switch (err) {
+            error.FeedRequired => {
+                search.engine.?.feed() catch |feed_err| {
+                    log.warn("failed to feed scrollback search: {}", .{feed_err});
+                    search.complete = true;
+                    self.stopSearchTimer();
+                    break;
+                };
+                continue;
+            },
+            error.SearchComplete => {
+                search.complete = true;
+                self.stopSearchTimer();
+                break;
+            },
+            error.OutOfMemory => {
+                log.warn("failed to advance scrollback search: {}", .{err});
+                search.complete = true;
+                self.stopSearchTimer();
+                break;
+            },
+        };
+    }
+    self.ensureSearchSelection();
+
+    search = &self.search.?;
+    const after_selected: ?usize = if (search.engine.?.selected) |selected| selected.idx else null;
+    if (before_matches != search.engine.?.matchesLen() or
+        before_selected != after_selected or before_complete != search.complete)
+    {
+        self.requestFullAsyncRedraw();
+    }
+}
+
+fn ensureSearchSelection(self: *App) void {
+    const search = if (self.search) |*value| value else return;
+    if (!search.engineValid(&self.term) or
+        search.engine_key != self.term.screens.active_key) return;
+    const engine = &search.engine.?;
+    if (engine.selected == null and engine.matchesLen() > 0) {
+        _ = engine.select(.next) catch |err| {
+            log.warn("failed to select scrollback search result: {}", .{err});
+            return;
+        };
+        self.scrollToSearchSelection();
+    }
+}
+
+fn selectSearch(self: *App, direction: vt.search.Screen.Select) void {
+    const search = if (self.search) |*value| value else return;
+    if (!search.engineValid(&self.term) or
+        search.engine_key != self.term.screens.active_key) return;
+    _ = search.engine.?.select(direction) catch |err| {
+        log.warn("failed to move scrollback search selection: {}", .{err});
+        return;
+    };
+    self.scrollToSearchSelection();
+    self.requestFullAsyncRedraw();
+}
+
+fn scrollToSearchSelection(self: *App) void {
+    const search = if (self.search) |*value| value else return;
+    if (!search.engineValid(&self.term) or
+        search.engine_key != self.term.screens.active_key) return;
+    const match = search.engine.?.selectedMatch() orelse return;
+    const screen = search.engine.?.screen;
+    if (!searchMatchVisible(screen, match)) {
+        screen.pages.scroll(.{ .pin = match.startPin() });
+        self.syncHoveredLink(true);
+    }
+    self.needs_redraw = true;
+}
+
+fn searchMatchVisible(screen: *vt.Screen, match: vt.highlight.Flattened) bool {
+    var viewport = screen.pages.pageIterator(.right_down, .{ .viewport = .{} }, null);
+    const chunks = match.chunks.slice();
+    while (viewport.next()) |visible| {
+        for (0..chunks.len) |i| {
+            const chunk = chunks.get(i);
+            if (visible.overlaps(.{
+                .node = chunk.node,
+                .start = chunk.start,
+                .end = chunk.end,
+            })) return true;
+        }
+    }
+    return false;
+}
+
+fn appendSearchText(self: *App, text: []const u8) void {
+    if (text.len == 0) return;
+    const search = if (self.search) |*value| value else return;
+    if (search.query.items.len + text.len > max_search_query_bytes) return;
+    search.query.appendSlice(self.alloc, text) catch |err| {
+        log.warn("failed to edit scrollback search: {}", .{err});
+        return;
+    };
+    self.rebuildSearch();
+}
+
+fn backspaceSearch(self: *App) void {
+    const search = if (self.search) |*value| value else return;
+    if (!truncateLastUtf8(&search.query)) return;
+    self.rebuildSearch();
+}
+
+fn truncateLastUtf8(text: *std.ArrayList(u8)) bool {
+    if (text.items.len == 0) return false;
+    var start = text.items.len - 1;
+    while (start > 0 and text.items[start] & 0xc0 == 0x80) start -= 1;
+    text.shrinkRetainingCapacity(start);
+    return true;
+}
+
+fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
+    if (event.action == .release) return;
+    if (event.mods.ctrl) {
+        switch (event.key) {
+            .key_n => self.selectSearch(.next),
+            .key_p => self.selectSearch(.prev),
+            .key_c, .key_g => self.finishSearch(false),
+            .key_u => {
+                const search = if (self.search) |*value| value else return;
+                if (search.query.items.len == 0) return;
+                search.query.clearRetainingCapacity();
+                self.rebuildSearch();
+            },
+            else => {},
+        }
+        return;
+    }
+
+    switch (event.key) {
+        .escape => self.finishSearch(false),
+        .enter, .numpad_enter => self.finishSearch(true),
+        .backspace, .numpad_backspace => self.backspaceSearch(),
+        else => if (!event.mods.alt and !event.mods.super) self.appendSearchText(event.utf8),
+    }
+}
+
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
+
+    if (self.search != null) return self.handleSearchKey(event);
 
     if (action == .press and event.mods.ctrl) {
         switch (event.key) {
@@ -4388,6 +4781,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     if (action == .press and event.mods.ctrl and event.mods.shift) {
         switch (event.key) {
             .key_c => return self.copyToClipboard(),
+            .key_f => return self.startSearch(),
             .key_g => return self.pipeCommandOutput(),
             .key_n => return self.spawnNewWindow(),
             .key_v => return self.beginPaste(.clipboard),
@@ -4481,6 +4875,62 @@ fn queuePtyWrite(self: *App, bytes: []const u8) void {
     };
 }
 
+fn searchRangeForRender(self: *App) ?Renderer.LinkRange {
+    const search = if (self.search) |*value| value else return null;
+    if (!search.engineValid(&self.term) or
+        search.engine_key != self.term.screens.active_key)
+    {
+        return null;
+    }
+    const match = search.engine.?.selectedMatch() orelse return null;
+    return highlightRange(
+        search.engine.?.screen,
+        match.startPin(),
+        match.endPin(),
+        self.term.rows,
+        self.term.cols,
+    );
+}
+
+fn searchNoMatch(self: *App) bool {
+    const search = if (self.search) |*value| value else return false;
+    if (search.query.items.len == 0 or self.ime_preedit != null or
+        !search.complete or !search.engineValid(&self.term))
+    {
+        return false;
+    }
+    return search.engine.?.matchesLen() == 0;
+}
+
+fn searchOverlayText(self: *App) !?[]u8 {
+    const search = if (self.search) |*value| value else return null;
+    const preedit: []const u8 = self.ime_preedit orelse "";
+    if (!search.engineValid(&self.term)) {
+        return try std.fmt.allocPrint(self.alloc, "Search: {s}{s}", .{
+            search.query.items,
+            preedit,
+        });
+    }
+
+    const engine = &search.engine.?;
+    const total = engine.matchesLen();
+    const current: usize = if (engine.selected) |selected| selected.idx + 1 else 0;
+    if (search.complete) {
+        return try std.fmt.allocPrint(self.alloc, "Search ({d}/{d}): {s}{s}", .{
+            current,
+            total,
+            search.query.items,
+            preedit,
+        });
+    }
+    return try std.fmt.allocPrint(self.alloc, "Search ({d}/{d}+): {s}{s}", .{
+        current,
+        total,
+        search.query.items,
+        preedit,
+    });
+}
+
 fn startAsyncRender(self: *App) !bool {
     var async_raster = &(self.async_raster orelse return false);
     if (async_raster.busy()) return false;
@@ -4524,6 +4974,7 @@ fn startAsyncRender(self: *App) !bool {
             !hyperlink_hints and !self.async_job_hyperlink_hints and
             self.ime_preedit == null and self.async_job_preedit == null and
             self.async_job_link_hint == null and
+            self.search == null and self.async_job_search == null and
             !has_kitty_graphics and self.async_job_kitty.len == 0)
         {
             scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.term);
@@ -4543,17 +4994,28 @@ fn startAsyncRender(self: *App) !bool {
         const hovered = if (hyperlink_hints) self.hovered_link else null;
         const new_link: ?[]const u8 = if (hovered) |link| link.uri else null;
         const new_range: ?Renderer.LinkRange = if (hovered) |link| link.range else null;
+        const new_preedit: ?[]const u8 = if (self.search == null) self.ime_preedit else null;
+        const new_search = try self.searchOverlayText();
+        const new_search_no_match = self.searchNoMatch();
+        const new_search_range = self.searchRangeForRender();
         overlay_dirty = hyperlink_hints != self.async_job_hyperlink_hints or
-            !optionalStrEql(self.async_job_preedit, self.ime_preedit) or
+            !optionalStrEql(self.async_job_preedit, new_preedit) or
             !optionalStrEql(self.async_job_link_hint, new_link) or
-            !std.meta.eql(self.async_job_link_range, new_range);
+            !optionalStrEql(self.async_job_search, new_search) or
+            self.async_job_search_no_match != new_search_no_match or
+            !std.meta.eql(self.async_job_link_range, new_range) or
+            !std.meta.eql(self.async_job_search_range, new_search_range);
         if (self.async_job_preedit) |old| self.alloc.free(old);
         self.async_job_preedit = null;
         if (self.async_job_link_hint) |old| self.alloc.free(old);
         self.async_job_link_hint = null;
-        if (self.ime_preedit) |text| self.async_job_preedit = try self.alloc.dupe(u8, text);
+        if (self.async_job_search) |old| self.alloc.free(old);
+        self.async_job_search = new_search;
+        if (new_preedit) |text| self.async_job_preedit = try self.alloc.dupe(u8, text);
         if (new_link) |uri| self.async_job_link_hint = try self.alloc.dupe(u8, uri);
+        self.async_job_search_no_match = new_search_no_match;
         self.async_job_link_range = new_range;
+        self.async_job_search_range = new_search_range;
         self.async_job_hyperlink_hints = hyperlink_hints;
         const kitty_dirty = self.term.screens.active.kitty_images.dirty;
         var kitty_changed = kitty_dirty;
@@ -4610,8 +5072,11 @@ fn startAsyncRender(self: *App) !bool {
         .focused = self.focused,
         .hyperlink_hints = hyperlink_hints,
         .link_range = self.async_job_link_range,
+        .search_range = self.async_job_search_range,
         .preedit = self.async_job_preedit,
         .link_hint = self.async_job_link_hint,
+        .search = self.async_job_search,
+        .search_no_match = self.async_job_search_no_match,
         .kitty_items = self.async_job_kitty,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,
@@ -5134,6 +5599,7 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     if (cells_changed) {
         log.debug("resize to {d}x{d} cells", .{ cols, rows });
         try self.term.resize(self.alloc, cols, rows);
+        self.refreshSearch();
     }
     try self.pty.setWinsize(.{
         .row = rows,
@@ -5213,4 +5679,77 @@ test "semantic command output extracts most recent completed output" {
     const output = semanticCommandOutputText(alloc, term.screens.active).?;
     defer alloc.free(output);
     try std.testing.expectEqualStrings("one\ntwo", output);
+}
+
+test "search backspace removes one UTF-8 codepoint" {
+    const alloc = std.testing.allocator;
+    var query: std.ArrayList(u8) = .empty;
+    defer query.deinit(alloc);
+    try query.appendSlice(alloc, "abé🙂");
+
+    try std.testing.expect(truncateLastUtf8(&query));
+    try std.testing.expectEqualStrings("abé", query.items);
+    try std.testing.expect(truncateLastUtf8(&query));
+    try std.testing.expectEqualStrings("ab", query.items);
+    try std.testing.expect(truncateLastUtf8(&query));
+    try std.testing.expectEqualStrings("a", query.items);
+    try std.testing.expect(truncateLastUtf8(&query));
+    try std.testing.expect(!truncateLastUtf8(&query));
+}
+
+test "scrollback search scrolls a history match into the viewport" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{
+        .cols = 16,
+        .rows = 3,
+        .max_scrollback = 100,
+    });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("needle\r\n");
+    for (0..10) |i| {
+        var buf: [16]u8 = undefined;
+        stream.nextSlice(std.fmt.bufPrint(&buf, "line{d}\r\n", .{i}) catch unreachable);
+    }
+
+    const screen = term.screens.active;
+    var search: vt.search.Screen = try .init(alloc, screen, "needle");
+    defer search.deinit();
+    try search.searchAll();
+    try std.testing.expect(try search.select(.next));
+    const match = search.selectedMatch().?;
+    try std.testing.expect(!searchMatchVisible(screen, match));
+
+    screen.pages.scroll(.{ .pin = match.startPin() });
+    try std.testing.expect(searchMatchVisible(screen, match));
+    const range = highlightRange(
+        screen,
+        match.startPin(),
+        match.endPin(),
+        term.rows,
+        term.cols,
+    ).?;
+    try std.testing.expectEqual(@as(u32, 0), range.start.y);
+    try std.testing.expectEqual(@as(u16, 0), range.start.x);
+    try std.testing.expectEqual(@as(u16, 5), range.end.x);
+}
+
+test "search state releases an engine after its screen is removed" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer term.deinit(alloc);
+    _ = try term.switchScreen(.alternate);
+
+    var search: SearchState = try .init(&term);
+    defer search.deinit(alloc, &term);
+    try search.query.appendSlice(alloc, "needle");
+    search.engine = try .init(alloc, term.screens.active, search.query.items);
+    search.engine_key = .alternate;
+    search.engine_generation = term.screens.generation(.alternate);
+    search.complete = false;
+
+    _ = try term.switchScreen(.primary);
+    term.screens.remove(alloc, .alternate);
+    try std.testing.expect(!search.engineValid(&term));
 }
