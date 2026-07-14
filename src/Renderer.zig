@@ -26,6 +26,9 @@ hb_buf: *c.hb_buffer_t,
 /// Selection colors; a null foreground uses the default foreground.
 selection_bg: vt.color.RGB,
 selection_fg: ?vt.color.RGB,
+/// Highlight colors for the selected scrollback-search match.
+search_bg: vt.color.RGB,
+search_fg: vt.color.RGB,
 /// Explicit text color under a focused block cursor. Null preserves the
 /// terminal background fallback.
 cursor_text: ?vt.color.RGB,
@@ -159,6 +162,8 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .hb_buf = hb_buf,
         .selection_bg = opts.selection_background orelse Config.dark_theme.selection_background,
         .selection_fg = opts.selection_foreground,
+        .search_bg = Config.dark_theme.copy_highlight,
+        .search_fg = Config.dark_theme.copy_highlight_foreground,
         .cursor_text = opts.cursor_text,
         .background_alpha = opts.background_alpha,
         .fg_scratch = .empty,
@@ -1406,11 +1411,15 @@ fn prepareRow(
         }
         // Selection overrides cell colors: fixed background, default
         // foreground, so selected text reads uniformly.
-        const selected = (if (selection) |sel| x >= sel[0] and x <= sel[1] else false) or
-            (if (self.search_range) |range| range.contains(x, y) else false);
+        const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
+        const search_selected = if (self.search_range) |range| range.contains(x, y) else false;
         if (selected) {
             bg = self.selection_bg;
             fg = self.selection_fg orelse colors.foreground;
+            reverse_color_glyph = false;
+        } else if (search_selected) {
+            bg = self.search_bg;
+            fg = self.search_fg;
             reverse_color_glyph = false;
         }
         // Focused block cursor: swap in the cursor color, invert the
@@ -3427,4 +3436,42 @@ test "top-right overlay keeps the newest complete grapheme clusters" {
         OverlayText{ .start = 2, .width = 1 },
         overlayText(&cps, 2, true),
     );
+}
+
+test "search match uses its own highlight background" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("x");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    renderer.search_bg = .{ .r = 0xff, .g = 0xe6, .b = 0x29 };
+    renderer.search_fg = .{ .r = 0x1c, .g = 0x20, .b = 0x24 };
+    renderer.search_range = .{
+        .start = .{ .x = 0, .y = 0 },
+        .end = .{ .x = 0, .y = 0 },
+    };
+
+    const width = font.cell_width * 2;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    try renderer.render(&state, pixels, width, height);
+
+    var highlighted: usize = 0;
+    for (0..height) |y| {
+        for (0..font.cell_width) |x| {
+            if (pixels[y * width + x] == argb(renderer.search_bg)) highlighted += 1;
+        }
+    }
+    try std.testing.expect(highlighted > 0);
 }

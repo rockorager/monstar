@@ -4740,8 +4740,8 @@ fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
     if (event.action == .release) return;
     if (event.mods.ctrl) {
         switch (event.key) {
-            .key_n => self.selectSearch(.next),
-            .key_p => self.selectSearch(.prev),
+            .key_n => self.selectSearch(.prev),
+            .key_p => self.selectSearch(.next),
             .key_c, .key_g => self.finishSearch(false),
             .key_u => {
                 const search = if (self.search) |*value| value else return;
@@ -5073,6 +5073,8 @@ fn startAsyncRender(self: *App) !bool {
         .hyperlink_hints = hyperlink_hints,
         .link_range = self.async_job_link_range,
         .search_range = self.async_job_search_range,
+        .search_background = self.copy_highlight,
+        .search_foreground = self.copy_highlight_fg,
         .preedit = self.async_job_preedit,
         .link_hint = self.async_job_link_hint,
         .search = self.async_job_search,
