@@ -2303,6 +2303,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
         log.warn("config reload resize failed: {}", .{err});
     };
 
+    if (!new_config.inertial_scrolling) self.stopFling();
     self.requestFullAsyncRedraw();
 }
 
@@ -4159,6 +4160,7 @@ fn resetScrollVelocity(self: *App) void {
 }
 
 fn startFling(self: *App) void {
+    if (!self.config.inertial_scrolling) return;
     const velocity = std.math.clamp(self.scroll_velocity, -fling_max_velocity, fling_max_velocity);
     if (@abs(velocity) < fling_start_velocity) return;
 

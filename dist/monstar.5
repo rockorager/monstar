@@ -137,6 +137,12 @@ Set the kitty graphics image-data limit per terminal screen.
 The default is 320000000 bytes and the maximum is 4294967295.
 Zero disables the kitty graphics protocol.
 .TP
+.BI inertial-scrolling " = true|false"
+Choose whether precision-device scrolling continues with inertial motion after
+the fingers are lifted.
+The default is
+.BR true .
+.TP
 .BI mouse-scroll-multiplier " = multiplier"
 Apply one multiplier to both precision-device and discrete-wheel scrolling.
 Finite values are clamped to the range 0.01 through 10000.

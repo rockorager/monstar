@@ -129,6 +129,13 @@ Ghostty-compatible multiplier syntax. The defaults are `precision:1` and
 mouse-scroll-multiplier = precision:0.5,discrete:4
 ```
 
+Touchpad scrolling continues with inertial motion after the fingers are lifted
+by default. Disable it without affecting direct touchpad or wheel scrolling:
+
+```conf
+inertial-scrolling = false
+```
+
 Monstar installs Ghostty's iTerm2 theme collection and accepts the same theme
 names. A single name is used in both color schemes:
 
