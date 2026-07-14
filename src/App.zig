@@ -15,6 +15,7 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
+const terminfo = @import("ghostty-terminfo");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
@@ -30,61 +31,10 @@ const Window = @import("Window.zig");
 
 const log = std.log.scoped(.app);
 
-const xtgettcap_map = std.StaticStringMap([]const u8).initComptime(&.{
-    .{ hexEncodeComptime("TN"), "xterm-ghostty" },
-    .{ hexEncodeComptime("Co"), "256" },
-    .{ hexEncodeComptime("RGB"), "8" },
-    .{ hexEncodeComptime("am"), "" },
-    .{ hexEncodeComptime("bce"), "" },
-    .{ hexEncodeComptime("ccc"), "" },
-    .{ hexEncodeComptime("hs"), "" },
-    .{ hexEncodeComptime("km"), "" },
-    .{ hexEncodeComptime("mc5i"), "" },
-    .{ hexEncodeComptime("mir"), "" },
-    .{ hexEncodeComptime("msgr"), "" },
-    .{ hexEncodeComptime("npc"), "" },
-    .{ hexEncodeComptime("xenl"), "" },
-    .{ hexEncodeComptime("AX"), "" },
-    .{ hexEncodeComptime("Tc"), "" },
-    .{ hexEncodeComptime("Su"), "" },
-    .{ hexEncodeComptime("XT"), "" },
-    .{ hexEncodeComptime("fullkbd"), "" },
-    .{ hexEncodeComptime("colors"), "256" },
-    .{ hexEncodeComptime("cols"), "80" },
-    .{ hexEncodeComptime("it"), "8" },
-    .{ hexEncodeComptime("lines"), "24" },
-    .{ hexEncodeComptime("pairs"), "32767" },
-    .{ hexEncodeComptime("Smulx"), tcapString("\\E[4:%p1%dm") },
-    .{ hexEncodeComptime("Setulc"), tcapString("\\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m") },
-    .{ hexEncodeComptime("Ss"), tcapString("\\E[%p1%d q") },
-    .{ hexEncodeComptime("Se"), tcapString("\\E[0 q") },
-    .{ hexEncodeComptime("Ms"), tcapString("\\E]52;%p1%s;%p2%s\\007") },
-    .{ hexEncodeComptime("Sync"), tcapString("\\E[?2026%?%p1%{1}%-%tl%eh%;") },
-    .{ hexEncodeComptime("BD"), tcapString("\\E[?2004l") },
-    .{ hexEncodeComptime("BE"), tcapString("\\E[?2004h") },
-    .{ hexEncodeComptime("PS"), tcapString("\\E[200~") },
-    .{ hexEncodeComptime("PE"), tcapString("\\E[201~") },
-});
+const xtgettcap_map = terminfo.ghostty.xtgettcapMap();
 
 fn hexEncodeComptime(comptime input: []const u8) []const u8 {
     return comptime &(std.fmt.bytesToHex(input, .upper));
-}
-
-/// Prepare a terminfo string capability for an XTGETTCAP reply.
-/// Parameterized values (containing `%`) are sent in terminfo source
-/// form (kitty convention); plain strings get `\E` decoded to the
-/// escape byte (xterm convention). Mirrors ghostty's
-/// terminfo.Source.xtgettcapMap.
-fn tcapString(comptime v: []const u8) []const u8 {
-    comptime {
-        if (std.mem.indexOfScalar(u8, v, '%') != null) return v;
-        if (std.mem.indexOfScalar(u8, v, '^') != null)
-            @compileError("control-char escapes not handled: " ++ v);
-        var buf: [v.len]u8 = undefined;
-        const replacements = std.mem.replace(u8, v, "\\E", "\x1b", &buf);
-        const final = buf;
-        return final[0 .. v.len - replacements];
-    }
 }
 
 const HoveredLink = struct {
@@ -2641,22 +2591,9 @@ fn answerDcsCommand(self: *App, cmd: *vt.dcs.Command) void {
 
 fn answerXtgettcap(self: *App, gettcap: *vt.dcs.Command.XTGETTCAP) void {
     while (gettcap.next()) |key| {
-        const value = xtgettcap_map.get(key) orelse continue;
-        var response: [512]u8 = undefined;
-        const len = formatXtgettcapResponse(&response, key, value) catch return;
-        self.writePty(response[0..len]);
+        const response = xtgettcap_map.get(key) orelse continue;
+        self.writePty(response);
     }
-}
-
-fn formatXtgettcapResponse(response: []u8, key: []const u8, value: []const u8) !usize {
-    var writer: std.Io.Writer = .fixed(response);
-    try writer.print("\x1bP1+r{s}", .{key});
-    if (value.len > 0) {
-        try writer.writeByte('=');
-        for (value) |byte| try writer.print("{X:0>2}", .{byte});
-    }
-    try writer.writeAll("\x1b\\");
-    return writer.end;
 }
 
 fn answerDecrqss(self: *App, decrqss: vt.dcs.Command.DECRQSS) void {
@@ -2974,30 +2911,18 @@ test "portal color scheme values map to terminal reports" {
 }
 
 test "XTGETTCAP reports hex encoded capabilities" {
-    var buf: [512]u8 = undefined;
-
-    const bool_len = try formatXtgettcapResponse(&buf, hexEncodeComptime("Tc"), "");
-    try std.testing.expectEqualStrings("\x1bP1+r5463\x1b\\", buf[0..bool_len]);
-
-    const num_len = try formatXtgettcapResponse(&buf, hexEncodeComptime("RGB"), "8");
-    try std.testing.expectEqualStrings("\x1bP1+r524742=38\x1b\\", buf[0..num_len]);
-
-    const str_len = try formatXtgettcapResponse(&buf, hexEncodeComptime("Smulx"), "\\E[4:%p1%dm");
     try std.testing.expectEqualStrings(
-        "\x1bP1+r536D756C78=5C455B343A25703125646D\x1b\\",
-        buf[0..str_len],
+        "\x1bP1+r5463\x1b\\",
+        xtgettcap_map.get(hexEncodeComptime("Tc")).?,
     );
-}
-
-test "XTGETTCAP string values decode tcap escapes unless parameterized" {
-    // Parameterized: terminfo source form is preserved.
-    try std.testing.expectEqualStrings("\\E[4:%p1%dm", comptime tcapString("\\E[4:%p1%dm"));
-    // Plain: \E decodes to the escape byte before hex encoding.
-    try std.testing.expectEqualStrings("\x1b[0 q", comptime tcapString("\\E[0 q"));
-
-    var buf: [512]u8 = undefined;
-    const len = try formatXtgettcapResponse(&buf, hexEncodeComptime("Se"), comptime tcapString("\\E[0 q"));
-    try std.testing.expectEqualStrings("\x1bP1+r5365=1B5B302071\x1b\\", buf[0..len]);
+    try std.testing.expectEqualStrings(
+        "\x1bP1+r636C656172=1B5B481B5B324A\x1b\\",
+        xtgettcap_map.get(hexEncodeComptime("clear")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "\x1bP1+r62656C=07\x1b\\",
+        xtgettcap_map.get(hexEncodeComptime("bel")).?,
+    );
 }
 
 /// DEC mode 2048 (in-band size reports): the terminal must send a size

@@ -1,4 +1,4 @@
-.TH MONSTAR 1 "2026-07-13" "monstar" "User Commands"
+.TH MONSTAR 1 "2026-07-14" "monstar" "User Commands"
 .SH NAME
 monstar \- a small Wayland terminal emulator
 .SH SYNOPSIS
@@ -115,6 +115,16 @@ The child environment is inherited except that
 .B TERM
 is set to
 .BR xterm-ghostty .
+.SH TERMINAL COMPATIBILITY
+Monstar uses Ghostty's
+.B libghostty-vt
+terminal core and implements every terminal feature available from that
+library.
+It therefore uses the same
+.B xterm-ghostty
+terminfo entry and answers XTGETTCAP queries from Ghostty's terminfo definition.
+If Monstar's terminal behavior ever diverges, it will install and use its own
+terminfo entry.
 .SH CONFIGURATION
 The default configuration file is
 .I $XDG_CONFIG_HOME/monstar/config

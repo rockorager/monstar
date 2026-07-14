@@ -1,4 +1,4 @@
-.TH MONSTAR 5 "2026-07-13" "monstar" "File Formats Manual"
+.TH MONSTAR 5 "2026-07-14" "monstar" "File Formats Manual"
 .SH NAME
 monstar \- configuration and theme file format
 .SH DESCRIPTION
@@ -14,6 +14,16 @@ An alternate file may be selected with
 .B \-\-config
 option.
 A missing or unreadable file produces the default configuration.
+.SH TERMINAL COMPATIBILITY
+Monstar uses Ghostty's
+.B libghostty-vt
+terminal core and implements every terminal feature available from that
+library.
+It therefore uses the same
+.B xterm-ghostty
+terminfo entry and answers XTGETTCAP queries from Ghostty's terminfo definition.
+If Monstar's terminal behavior ever diverges, it will install and use its own
+terminfo entry.
 .SH SYNTAX
 The file contains one
 .I key = value

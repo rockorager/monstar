@@ -77,6 +77,17 @@ pub fn build(b: *std.Build) void {
     if (ghostty_dep) |dep| {
         const ghostty_vt = dep.module("ghostty-vt");
         root_module.addImport("ghostty-vt", ghostty_vt);
+        // ghostty-vt reaches these files indirectly, and Zig cannot assign one
+        // source file to two modules. Compile cache copies keep one upstream
+        // definition while making the terminfo package importable here.
+        const terminfo_files = b.addWriteFiles();
+        _ = terminfo_files.addCopyFile(dep.path("src/terminfo/Source.zig"), "Source.zig");
+        _ = terminfo_files.addCopyFile(dep.path("src/terminfo/ghostty.zig"), "ghostty.zig");
+        root_module.addImport("ghostty-terminfo", b.createModule(.{
+            .root_source_file = terminfo_files.addCopyFile(dep.path("src/terminfo/main.zig"), "main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
         root_module.addImport(
             "uucode",
             ghostty_vt.import_table.get("uucode") orelse
