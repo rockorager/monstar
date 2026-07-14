@@ -19,6 +19,15 @@ const KittyImage = vt.kitty.graphics.Image;
 const KittyPlacement = vt.kitty.graphics.ImageStorage.Placement;
 const KittyRenderPlacement = vt.kitty.graphics.RenderPlacement;
 const kitty_placeholder = vt.kitty.graphics.unicode.placeholder;
+const search_match_alpha = 128;
+
+pub const ScrollbarThumb = struct {
+    x: u31,
+    y: u31,
+    width: u31,
+    height: u31,
+    alpha: u8,
+};
 
 alloc: std.mem.Allocator,
 font: *Font,
@@ -44,6 +53,9 @@ hyperlink_hints: bool = false,
 link_range: ?LinkRange = null,
 /// Selected scrollback-search match, in viewport cell coordinates.
 search_range: ?LinkRange = null,
+/// Every visible scrollback-search match as a row-major cell mask. The
+/// selected match takes precedence over this dimmed highlight.
+search_matches: []const bool = &.{},
 /// Per-cell resolved foreground colors for the row being rendered.
 fg_scratch: std.ArrayList(vt.color.RGB),
 /// Per-cell font face indices for the row being rendered.
@@ -541,6 +553,27 @@ pub fn renderSearch(
         .top_right,
         if (no_match) state.colors.palette[1] else self.selection_bg,
         self.selection_fg orelse state.colors.foreground,
+    );
+}
+
+/// Draw a macOS-style overlay scrollbar: a narrow adaptive pill with no
+/// track. Geometry is in full-surface physical pixels rather than grid-local
+/// pixels, so the thumb stays against the window edge when padding is used.
+pub fn renderScrollbarThumb(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    thumb: ScrollbarThumb,
+) void {
+    blendCapsule(
+        pixels,
+        self.pixelStride(width),
+        width,
+        height,
+        thumb,
+        argb(state.colors.foreground),
     );
 }
 
@@ -1413,6 +1446,9 @@ fn prepareRow(
         // foreground, so selected text reads uniformly.
         const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
         const search_selected = if (self.search_range) |range| range.contains(x, y) else false;
+        const search_index = @as(usize, y) * state.cols + x;
+        const search_match = search_index < self.search_matches.len and self.search_matches[search_index];
+        var dim_search_bg = false;
         if (selected) {
             bg = self.selection_bg;
             fg = self.selection_fg orelse colors.foreground;
@@ -1421,6 +1457,8 @@ fn prepareRow(
             bg = self.search_bg;
             fg = self.search_fg;
             reverse_color_glyph = false;
+        } else if (search_match) {
+            dim_search_bg = true;
         }
         // Focused block cursor: swap in the cursor color, invert the
         // glyph. All other cursor shapes (and any unfocused cursor)
@@ -1431,11 +1469,18 @@ fn prepareRow(
             bg = colors.cursor orelse colors.foreground;
             fg = self.cursor_text orelse colors.background;
             reverse_color_glyph = false;
+            dim_search_bg = false;
         }
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
         if (backgrounds != .none) {
-            const color: ?u32 = if (bg) |bg_color|
+            const color: ?u32 = if (dim_search_bg) color: {
+                const mixed = blendRgb(self.search_bg, bg orelse colors.background, search_match_alpha);
+                break :color if (bg != null)
+                    argb(mixed)
+                else
+                    self.backgroundPixel(mixed);
+            } else if (bg) |bg_color|
                 argb(bg_color)
             else switch (backgrounds) {
                 .all => self.backgroundPixel(colors.background),
@@ -2082,6 +2127,16 @@ fn argb(rgb: vt.color.RGB) u32 {
         @as(u32, rgb.b);
 }
 
+fn blendRgb(fg: vt.color.RGB, bg: vt.color.RGB, alpha: u8) vt.color.RGB {
+    const a: u32 = alpha;
+    const na: u32 = 255 - a;
+    return .{
+        .r = @intCast((@as(u32, fg.r) * a + @as(u32, bg.r) * na) / 255),
+        .g = @intCast((@as(u32, fg.g) * a + @as(u32, bg.g) * na) / 255),
+        .b = @intCast((@as(u32, fg.b) * a + @as(u32, bg.b) * na) / 255),
+    };
+}
+
 /// Pack the default background in wl_shm's premultiplied ARGB8888 form.
 pub fn backgroundPixel(self: *const Renderer, rgb: vt.color.RGB) u32 {
     return premultipliedArgb(rgb, self.background_alpha);
@@ -2123,6 +2178,44 @@ fn fillSpan(dst: []u32, color: u32) void {
     var i: usize = 0;
     while (i + 8 <= dst.len) : (i += 8) dst[i..][0..8].* = splat;
     for (dst[i..]) |*px| px.* = color;
+}
+
+fn blendCapsule(
+    pixels: []u32,
+    stride: u31,
+    buf_width: u31,
+    buf_height: u31,
+    thumb: ScrollbarThumb,
+    color: u32,
+) void {
+    if (thumb.alpha == 0 or thumb.width == 0 or thumb.height == 0 or
+        thumb.x >= buf_width or thumb.y >= buf_height) return;
+    std.debug.assert(color >> 24 == 0xff);
+
+    const x_end = @min(thumb.x + thumb.width, buf_width);
+    const y_end = @min(thumb.y + thumb.height, buf_height);
+    const radius = @as(f64, @floatFromInt(@min(thumb.width, thumb.height))) / 2.0;
+    const center_x = @as(f64, @floatFromInt(thumb.x)) +
+        @as(f64, @floatFromInt(thumb.width)) / 2.0;
+    const cap_top = @as(f64, @floatFromInt(thumb.y)) + radius;
+    const cap_bottom = @as(f64, @floatFromInt(thumb.y + thumb.height)) - radius;
+
+    for (thumb.y..y_end) |y| {
+        const py = @as(f64, @floatFromInt(y)) + 0.5;
+        const nearest_y = std.math.clamp(py, cap_top, cap_bottom);
+        for (thumb.x..x_end) |x| {
+            const px = @as(f64, @floatFromInt(x)) + 0.5;
+            const dx = px - center_x;
+            const dy = py - nearest_y;
+            // One pixel of coverage around the mathematical edge gives the
+            // small pill smooth caps without involving the vector renderer.
+            const coverage = std.math.clamp(radius + 0.5 - @sqrt(dx * dx + dy * dy), 0, 1);
+            if (coverage == 0) continue;
+            const alpha: u8 = @intFromFloat(@round(@as(f64, @floatFromInt(thumb.alpha)) * coverage));
+            const pixel = &pixels[@as(usize, y) * stride + x];
+            pixel.* = blend(color, pixel.*, alpha);
+        }
+    }
 }
 
 test "fillRect clips to a view while honoring framebuffer stride" {
@@ -2610,6 +2703,25 @@ test "blend endpoints" {
         @as(u32, 0x801e140a),
         blendPremultipliedBgra(&.{ 10, 20, 30, 128 }, 0),
     );
+}
+
+test "scrollbar capsule has antialiased caps and a solid center" {
+    const background: u32 = 0xff000000;
+    var pixels = [_]u32{background} ** 48;
+    blendCapsule(&pixels, 8, 8, 6, .{
+        .x = 2,
+        .y = 0,
+        .width = 4,
+        .height = 6,
+        .alpha = 160,
+    }, 0xffffffff);
+
+    try std.testing.expectEqual(background, pixels[0]);
+    try std.testing.expect(pixels[2] != background);
+    try std.testing.expect(pixels[3] != background);
+    try std.testing.expect((pixels[3] & 0xff) > (pixels[2] & 0xff));
+    try std.testing.expect(pixels[2 * 8 + 3] != background);
+    try std.testing.expect((pixels[2 * 8 + 3] & 0xff) > (pixels[3] & 0xff));
 }
 
 test "default background pixels are premultiplied" {
@@ -3460,6 +3572,7 @@ test "search match uses its own highlight background" {
         .start = .{ .x = 0, .y = 0 },
         .end = .{ .x = 0, .y = 0 },
     };
+    renderer.search_matches = &.{ true, false };
 
     const width = font.cell_width * 2;
     const height = font.cell_height;
@@ -3474,4 +3587,44 @@ test "search match uses its own highlight background" {
         }
     }
     try std.testing.expect(highlighted > 0);
+}
+
+test "unselected search match tints its existing background" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("x");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    renderer.search_bg = .{ .r = 0xff, .g = 0xe6, .b = 0x29 };
+    renderer.search_matches = &.{ true, false };
+
+    const width = font.cell_width * 2;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    try renderer.render(&state, pixels, width, height);
+
+    const expected = renderer.backgroundPixel(blendRgb(
+        renderer.search_bg,
+        state.colors.background,
+        search_match_alpha,
+    ));
+    var highlighted: usize = 0;
+    for (0..height) |y| {
+        for (0..font.cell_width) |x| {
+            if (pixels[y * width + x] == expected) highlighted += 1;
+        }
+    }
+    try std.testing.expect(highlighted > 0);
+    try std.testing.expect(expected != argb(renderer.search_bg));
 }

@@ -162,6 +162,10 @@ async_job_search_no_match: bool,
 async_job_link_range: ?Renderer.LinkRange,
 /// Selected search match submitted with the last async job.
 async_job_search_range: ?Renderer.LinkRange,
+/// Every visible search match submitted with the last async job.
+async_job_search_matches: std.ArrayList(bool),
+/// Scrollbar geometry submitted with the last async job.
+async_job_scrollbar: ?Renderer.ScrollbarThumb,
 /// The hyperlink-hints flag submitted with the last async job, for
 /// detecting overlay changes between jobs.
 async_job_hyperlink_hints: bool,
@@ -268,6 +272,12 @@ copy_highlight_fd: posix.fd_t,
 taskbar_progress_fd: posix.fd_t,
 /// Drives bounded libghostty search work without blocking the event loop.
 search_fd: posix.fd_t,
+/// One-shot visibility delay followed by periodic scrollbar fade ticks.
+scrollbar_fd: posix.fd_t,
+scrollbar_alpha: u8,
+scrollbar_reveal_hovered: bool,
+scrollbar_hovered: bool,
+scrollbar_drag: ?ScrollbarDrag,
 /// Pointer position in logical surface coordinates.
 pointer_x: f64,
 pointer_y: f64,
@@ -372,6 +382,16 @@ const selection_autoscroll_ms = 15;
 const search_tick_ms = 1;
 const search_ticks_per_wake = 8;
 const max_search_query_bytes = 64 * 1024;
+const scrollbar_hold_ms = 700;
+const scrollbar_fade_interval_ms = 40;
+const scrollbar_default_alpha = 150;
+const scrollbar_hover_alpha = 220;
+const scrollbar_fade_step = 25;
+const scrollbar_width = 6;
+const scrollbar_inset = 3;
+const scrollbar_min_thumb = 24;
+const scrollbar_hit_width = 14;
+const scrollbar_reveal_width = 24;
 const disarmed_timer: std.os.linux.itimerspec = .{
     .it_value = .{ .sec = 0, .nsec = 0 },
     .it_interval = .{ .sec = 0, .nsec = 0 },
@@ -389,6 +409,18 @@ const velocity_smoothing = 0.75;
 
 /// Damage history length; shm buffers older than this get a full copy.
 const frame_damage_len = 8;
+
+const ScrollbarDrag = struct {
+    grab_offset: f64,
+    screen: vt.ScreenSet.Key,
+};
+
+const ScrollbarGeometry = struct {
+    thumb: Renderer.ScrollbarThumb,
+    track_y: u31,
+    travel: u31,
+    max_offset: usize,
+};
 
 pub const InitialSize = union(enum) {
     default,
@@ -824,6 +856,9 @@ pub fn init(
     const search_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(search_fd);
 
+    const scrollbar_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(scrollbar_fd);
+
     // Scope confirmation ran concurrently with the window setup above,
     // so this rarely waits; the child stays gated until its migration
     // is confirmed (or abandoned).
@@ -861,6 +896,8 @@ pub fn init(
         .async_job_search_no_match = false,
         .async_job_link_range = null,
         .async_job_search_range = null,
+        .async_job_search_matches = .empty,
+        .async_job_scrollbar = null,
         .async_job_hyperlink_hints = false,
         .async_job_kitty = &.{},
         .kitty_cache = .empty,
@@ -930,6 +967,11 @@ pub fn init(
         .copy_highlight_fd = copy_highlight_fd,
         .taskbar_progress_fd = taskbar_progress_fd,
         .search_fd = search_fd,
+        .scrollbar_fd = scrollbar_fd,
+        .scrollbar_alpha = 0,
+        .scrollbar_reveal_hovered = false,
+        .scrollbar_hovered = false,
+        .scrollbar_drag = null,
         .pointer_x = 0,
         .pointer_y = 0,
         .pointer_inside = false,
@@ -1628,6 +1670,7 @@ pub fn deinit(self: *App) void {
     if (self.async_job_preedit) |text| self.alloc.free(text);
     if (self.async_job_link_hint) |uri| self.alloc.free(uri);
     if (self.async_job_search) |text| self.alloc.free(text);
+    self.async_job_search_matches.deinit(self.alloc);
     if (self.hovered_link) |link| self.alloc.free(link.uri);
     if (self.link_press) |press| self.alloc.free(press.uri);
     self.alloc.free(self.async_job_kitty);
@@ -1648,6 +1691,7 @@ pub fn deinit(self: *App) void {
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
+    _ = std.os.linux.close(self.scrollbar_fd);
     _ = std.os.linux.close(self.search_fd);
     _ = std.os.linux.close(self.taskbar_progress_fd);
     _ = std.os.linux.close(self.copy_highlight_fd);
@@ -1696,6 +1740,7 @@ pub fn run(self: *App) !void {
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.fling_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.search_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1711,6 +1756,7 @@ pub fn run(self: *App) !void {
     const async_fd = &fds[11];
     const fling_fd = &fds[12];
     const search_fd = &fds[13];
+    const scrollbar_fd = &fds[14];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
@@ -1799,6 +1845,10 @@ pub fn run(self: *App) !void {
 
         if (search_fd.revents & posix.POLL.IN != 0) {
             self.fireSearch();
+        }
+
+        if (scrollbar_fd.revents & posix.POLL.IN != 0) {
+            self.fireScrollbarFade();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -2064,6 +2114,7 @@ fn jumpPrompt(self: *App, delta: isize) void {
     const screen = self.term.screens.active;
     if (!screen.semantic_prompt.seen) return;
     screen.pages.scroll(.{ .delta_prompt = delta });
+    self.revealScrollbar();
     self.clearSelection();
     self.needs_redraw = true;
     self.syncHoveredLink(true);
@@ -2473,6 +2524,7 @@ fn drainPipeline(self: *App) !void {
     self.syncInBandSizeReports();
     self.syncSynchronizedOutput();
     self.syncActiveScreen();
+    self.syncScrollbarHover();
     if (consumed) self.refreshSearch();
     if (consumed) self.syncHoveredLink(true);
 }
@@ -2846,6 +2898,7 @@ fn syncCursorShape(self: *App) void {
 }
 
 fn currentCursorShape(self: *App) Window.CursorShape {
+    if (self.scrollbar_hovered or self.scrollbar_drag != null or self.scrollbarThumbHit() != null) return .default;
     if (self.hoveredLinkUri() != null) return .pointer;
     if (self.mouse_shape_explicit) return cursorShapeFromMouseShape(self.term.mouse_shape);
     return if (self.term.flags.mouse_event != .none) .default else .text;
@@ -3110,12 +3163,18 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             self.pointer_x = enter.surface_x.toDouble();
             self.pointer_y = enter.surface_y.toDouble();
             self.pointer_inside = true;
+            self.syncScrollbarHoverFromPointer();
             self.syncHoveredLink(false);
             self.syncCursorShape();
         },
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
+            if (self.scrollbar_drag != null) {
+                self.dragScrollbar();
+                return;
+            }
+            self.syncScrollbarHoverFromPointer();
             self.syncHoveredLink(false);
             if (self.selecting) {
                 self.extendSelection();
@@ -3157,6 +3216,10 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .button => |button| {
             self.last_serial = button.serial;
             if (button.state == .pressed) self.stopFling();
+            if (button.button == 272) { // BTN_LEFT
+                if (button.state == .pressed and self.beginScrollbarDrag()) return;
+                if (button.state == .released and self.finishScrollbarDrag()) return;
+            }
             // Mouse reporting wins when the application asked for it,
             // except that shift bypasses it for terminal-side selection.
             const reporting = self.term.flags.mouse_event != .none and
@@ -3165,15 +3228,22 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
 
             if (button.button == 272) { // BTN_LEFT
                 if (button.state == .pressed) {
-                    if (self.armLinkPress()) return;
+                    if (self.armLinkPress()) {
+                        self.syncScrollbarHover();
+                        return;
+                    }
                     self.cancelLinkPress();
                 }
-                if (button.state == .released and self.finishLinkPress()) return;
+                if (button.state == .released and self.finishLinkPress()) {
+                    self.syncScrollbarHover();
+                    return;
+                }
                 switch (button.state) {
                     .pressed => if (reporting) {
                         self.forwardMouseButton(button, mouse_button.?);
                     } else {
                         self.startSelection(button.time);
+                        self.syncScrollbarHover();
                     },
                     // Routing may have changed since the press (shift
                     // released mid-drag, app toggled mouse mode): an
@@ -3181,6 +3251,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                     // saw get their release.
                     .released => if (self.selecting) {
                         self.finishSelection();
+                        self.syncScrollbarHover();
                     } else if (self.mouse_button == mouse_button) {
                         self.forwardMouseButton(button, mouse_button.?);
                     } else if (reporting) {
@@ -3209,9 +3280,128 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .axis_relative_direction => {},
         .leave => {
             self.pointer_inside = false;
+            self.syncScrollbarHover();
             self.syncHoveredLink(false);
         },
     }
+}
+
+fn pointerSurfacePhysical(self: *const App) struct { x: f64, y: f64 } {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    return .{
+        .x = @max(0, self.pointer_x * scale),
+        .y = @max(0, self.pointer_y * scale),
+    };
+}
+
+fn scrollbarPointerEligible(self: *App) bool {
+    if (!self.pointer_inside or self.term.screens.active_key != .primary or
+        self.scrollbar_drag != null or self.selecting or self.mouse_button != null or
+        self.link_press != null)
+    {
+        return false;
+    }
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    return scrollbar.total > scrollbar.len;
+}
+
+fn scrollbarRevealHovered(self: *App) bool {
+    if (!self.scrollbarPointerEligible()) return false;
+    const pos = self.pointerSurfacePhysical();
+    const reveal_width = Window.physicalDimension(scrollbar_reveal_width, self.window.scale120);
+    const reveal_left = self.layout.surface_width -| reveal_width;
+    return pos.x >= reveal_left and pos.x < self.layout.surface_width and
+        pos.y >= self.layout.grid_y and pos.y < self.layout.grid_y + self.layout.grid_height;
+}
+
+fn syncScrollbarHover(self: *App) void {
+    const reveal_hovered = self.scrollbarRevealHovered();
+    const hovered = reveal_hovered and self.scrollbarThumbUnderPointer() != null;
+    if (reveal_hovered == self.scrollbar_reveal_hovered and hovered == self.scrollbar_hovered) return;
+    self.scrollbar_reveal_hovered = reveal_hovered;
+    self.scrollbar_hovered = hovered;
+    if (reveal_hovered) {
+        self.revealScrollbar();
+    } else {
+        const scrollbar = self.term.screens.active.pages.scrollbar();
+        if (self.term.screens.active_key != .primary or scrollbar.total <= scrollbar.len) {
+            self.hideScrollbar();
+        } else if (self.scrollbar_alpha > 0) {
+            const changed = self.scrollbar_alpha != scrollbar_default_alpha;
+            self.scrollbar_alpha = scrollbar_default_alpha;
+            self.armScrollbarHold();
+            if (changed) self.requestFullAsyncRedraw();
+        }
+    }
+    self.syncCursorShape();
+}
+
+fn syncScrollbarHoverFromPointer(self: *App) void {
+    self.syncScrollbarHover();
+    if (self.scrollbar_reveal_hovered) self.revealScrollbar();
+}
+
+fn scrollbarThumbUnderPointer(self: *App) ?ScrollbarGeometry {
+    if (!self.scrollbarPointerEligible()) return null;
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const geometry = scrollbarGeometry(scrollbar, self.layout, self.window.scale120, scrollbar_default_alpha) orelse return null;
+    const pos = self.pointerSurfacePhysical();
+    const hit_width = @max(geometry.thumb.width, Window.physicalDimension(scrollbar_hit_width, self.window.scale120));
+    const hit_left = self.layout.surface_width -| hit_width;
+    const thumb_bottom = geometry.thumb.y + geometry.thumb.height;
+    if (pos.x < hit_left or pos.x >= self.layout.surface_width or
+        pos.y < geometry.thumb.y or pos.y >= thumb_bottom) return null;
+    return geometry;
+}
+
+fn scrollbarThumbHit(self: *App) ?ScrollbarGeometry {
+    if (self.scrollbar_alpha == 0) return null;
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    if (!scrollbarShouldRender(scrollbar, self.scrollbar_alpha)) return null;
+    return self.scrollbarThumbUnderPointer();
+}
+
+fn beginScrollbarDrag(self: *App) bool {
+    const geometry = self.scrollbarThumbHit() orelse return false;
+    const pos = self.pointerSurfacePhysical();
+    self.cancelDrag();
+    self.cancelLinkPress();
+    self.scrollbar_reveal_hovered = false;
+    self.scrollbar_hovered = false;
+    self.scrollbar_drag = .{
+        .grab_offset = std.math.clamp(
+            pos.y - @as(f64, @floatFromInt(geometry.thumb.y)),
+            0,
+            @as(f64, @floatFromInt(geometry.thumb.height)),
+        ),
+        .screen = self.term.screens.active_key,
+    };
+    self.revealScrollbar();
+    self.syncHoveredLink(true);
+    self.syncCursorShape();
+    return true;
+}
+
+fn dragScrollbar(self: *App) void {
+    const drag = self.scrollbar_drag orelse return;
+    if (drag.screen != self.term.screens.active_key) return;
+    const geometry = self.currentScrollbarGeometry(scrollbar_hover_alpha) orelse return;
+    const pos = self.pointerSurfacePhysical();
+    const row = scrollbarRowForThumbY(geometry, pos.y - drag.grab_offset);
+    self.term.screens.active.pages.scroll(.{ .row = row });
+    self.revealScrollbar();
+    self.needs_redraw = true;
+    self.syncHoveredLink(true);
+}
+
+fn finishScrollbarDrag(self: *App) bool {
+    if (self.scrollbar_drag == null) return false;
+    self.scrollbar_drag = null;
+    self.syncScrollbarHover();
+    self.revealScrollbar();
+    self.syncHoveredLink(true);
+    self.syncCursorShape();
+    return true;
 }
 
 /// The viewport cell under the pointer, clamped to the grid.
@@ -3241,6 +3431,7 @@ fn pinAtPointer(self: *App) ?vt.Pin {
 /// padding must not clamp to a clickable edge cell.
 fn linkCellAtPointer(self: *App) ?vt.Coordinate {
     if (!self.pointer_inside) return null;
+    if (self.scrollbar_hovered or self.scrollbar_drag != null or self.scrollbarThumbHit() != null) return null;
     const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
     const px = self.pointer_x * scale;
     const py = self.pointer_y * scale;
@@ -3530,6 +3721,7 @@ fn forwardMouseButton(self: *App, button: anytype, mouse_button: vt.input.MouseB
         .pos = self.pointerPosPhysical(),
     });
     if (button.state == .released and self.mouse_button == mouse_button) self.mouse_button = null;
+    self.syncScrollbarHover();
 }
 
 fn startSelection(self: *App, time_ms: u32) void {
@@ -3647,7 +3839,11 @@ fn syncActiveScreen(self: *App) void {
     const key = self.term.screens.active_key;
     if (key == self.active_screen) return;
     self.active_screen = key;
+    self.scrollbar_reveal_hovered = false;
+    self.scrollbar_hovered = false;
+    self.hideScrollbar();
     self.cancelDrag();
+    self.syncScrollbarHover();
 }
 
 const MimeMask = u32;
@@ -4237,6 +4433,147 @@ fn fireFling(self: *App) void {
     if (@abs(self.fling_velocity) < fling_min_velocity) self.stopFling();
 }
 
+fn scrollbarAtBottom(scrollbar: vt.PageList.Scrollbar) bool {
+    return scrollbar.total <= scrollbar.len or
+        scrollbar.offset >= scrollbar.total - scrollbar.len;
+}
+
+fn scrollbarShouldRender(
+    scrollbar: vt.PageList.Scrollbar,
+    alpha: u8,
+) bool {
+    return alpha > 0 and scrollbar.total > scrollbar.len;
+}
+
+fn scrollbarGeometry(
+    scrollbar: vt.PageList.Scrollbar,
+    layout: TerminalLayout,
+    scale120: u32,
+    alpha: u8,
+) ?ScrollbarGeometry {
+    if (scrollbar.total <= scrollbar.len or layout.surface_width == 0 or layout.grid_height == 0) return null;
+
+    const inset = @min(Window.physicalDimension(scrollbar_inset, scale120), layout.grid_height / 2);
+    const track_y = layout.grid_y + inset;
+    const track_height = layout.grid_height - inset * 2;
+    if (track_height == 0) return null;
+
+    const desired_width = @max(1, Window.physicalDimension(scrollbar_width, scale120));
+    const right = layout.surface_width -| inset;
+    if (right == 0) return null;
+    const width = @min(desired_width, right);
+    const min_height = @min(track_height, @max(1, Window.physicalDimension(scrollbar_min_thumb, scale120)));
+    const proportional: u31 = @intCast(
+        (@as(u128, track_height) * scrollbar.len) / scrollbar.total,
+    );
+    const thumb_height = @min(track_height, @max(min_height, @max(1, proportional)));
+    const travel = track_height - thumb_height;
+    const max_offset = scrollbar.total - scrollbar.len;
+    const offset = @min(scrollbar.offset, max_offset);
+    const thumb_offset: u31 = if (travel == 0)
+        0
+    else
+        @intCast((@as(u128, travel) * offset + max_offset / 2) / max_offset);
+
+    return .{
+        .thumb = .{
+            .x = right - width,
+            .y = track_y + thumb_offset,
+            .width = width,
+            .height = thumb_height,
+            .alpha = alpha,
+        },
+        .track_y = track_y,
+        .travel = travel,
+        .max_offset = max_offset,
+    };
+}
+
+fn scrollbarRowForThumbY(geometry: ScrollbarGeometry, thumb_y: f64) usize {
+    if (geometry.travel == 0) return 0;
+    const relative = std.math.clamp(
+        thumb_y - @as(f64, @floatFromInt(geometry.track_y)),
+        0,
+        @as(f64, @floatFromInt(geometry.travel)),
+    );
+    return @intFromFloat(@round(
+        relative / @as(f64, @floatFromInt(geometry.travel)) *
+            @as(f64, @floatFromInt(geometry.max_offset)),
+    ));
+}
+
+fn currentScrollbarGeometry(self: *App, alpha: u8) ?ScrollbarGeometry {
+    return scrollbarGeometry(
+        self.term.screens.active.pages.scrollbar(),
+        self.layout,
+        self.window.scale120,
+        alpha,
+    );
+}
+
+fn currentScrollbarThumb(self: *App) ?Renderer.ScrollbarThumb {
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    if (!scrollbarShouldRender(scrollbar, self.scrollbar_alpha)) return null;
+    const geometry = scrollbarGeometry(scrollbar, self.layout, self.window.scale120, self.scrollbar_alpha) orelse return null;
+    return geometry.thumb;
+}
+
+fn armScrollbarHold(self: *App) void {
+    _ = setTimer(self.scrollbar_fd, .{
+        .it_value = timespecFromNs(scrollbar_hold_ms * std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    }, "scrollbar");
+}
+
+fn hideScrollbar(self: *App) void {
+    _ = setTimer(self.scrollbar_fd, disarmed_timer, "scrollbar");
+    if (self.scrollbar_alpha == 0) return;
+    self.scrollbar_alpha = 0;
+    self.requestFullAsyncRedraw();
+}
+
+fn revealScrollbar(self: *App) void {
+    const scrollbar = self.term.screens.active.pages.scrollbar();
+    const at_bottom = scrollbarAtBottom(scrollbar);
+
+    const alpha: u8 = if (self.scrollbar_drag != null or self.scrollbar_hovered)
+        scrollbar_hover_alpha
+    else
+        scrollbar_default_alpha;
+    const changed = self.scrollbar_alpha != alpha;
+    self.scrollbar_alpha = alpha;
+    if (self.scrollbar_drag == null and !self.scrollbar_hovered and
+        (!self.scrollbar_reveal_hovered or at_bottom))
+        self.armScrollbarHold()
+    else
+        _ = setTimer(self.scrollbar_fd, disarmed_timer, "scrollbar");
+    if (changed) self.requestFullAsyncRedraw();
+}
+
+fn fireScrollbarFade(self: *App) void {
+    const expirations = readTimer(self.scrollbar_fd) orelse return;
+    const at_bottom = scrollbarAtBottom(self.term.screens.active.pages.scrollbar());
+    if (self.scrollbar_drag != null or self.scrollbar_hovered or self.scrollbar_alpha == 0 or
+        (self.scrollbar_reveal_hovered and !at_bottom)) return;
+
+    const ticks: u16 = @intCast(@min(expirations, 255));
+    const first_tick = self.scrollbar_alpha == scrollbar_default_alpha;
+    const decrement: u16 = if (first_tick)
+        scrollbar_fade_step
+    else
+        ticks * scrollbar_fade_step;
+    self.scrollbar_alpha -|= @intCast(@min(decrement, self.scrollbar_alpha));
+    const hidden = self.scrollbar_alpha == 0;
+    if (hidden) {
+        _ = setTimer(self.scrollbar_fd, disarmed_timer, "scrollbar");
+    } else if (first_tick) {
+        const interval = timespecFromNs(scrollbar_fade_interval_ms * std.time.ns_per_ms);
+        _ = setTimer(self.scrollbar_fd, .{ .it_value = interval, .it_interval = interval }, "scrollbar");
+    }
+    self.requestFullAsyncRedraw();
+    if (hidden) self.syncHoveredLink(true);
+}
+
 /// Route wheel scrolling (positive = towards newer content): mouse
 /// reports when the application asked for them, arrow keys on the
 /// alternate screen, otherwise the scrollback viewport.
@@ -4269,6 +4606,7 @@ fn scrollLines(self: *App, lines_down: i32) void {
     }
 
     self.term.screens.active.pages.scroll(.{ .delta_row = lines_down });
+    self.revealScrollbar();
     self.needs_redraw = true;
     self.syncHoveredLink(true);
 }
@@ -4411,6 +4749,7 @@ fn applyPendingIme(self: *App) void {
             self.clearSelection();
             if (self.term.screens.active.pages.viewport != .active) {
                 self.term.screens.active.pages.scroll(.active);
+                self.revealScrollbar();
                 self.syncHoveredLink(true);
             }
         }
@@ -4528,6 +4867,7 @@ fn finishSearch(self: *App, accept: bool) void {
     }
     self.stopSearchTimer();
     self.clearImeText();
+    self.revealScrollbar();
     if (accepted) |selection| {
         self.term.screens.active.select(selection) catch |err| {
             log.warn("failed to select accepted search match: {}", .{err});
@@ -4546,6 +4886,7 @@ fn rebuildSearch(self: *App) void {
     self.stopSearchTimer();
     if (search.query.items.len == 0) {
         search.restoreViewport(&self.term);
+        self.revealScrollbar();
         self.syncHoveredLink(true);
         self.requestFullAsyncRedraw();
         return;
@@ -4690,6 +5031,7 @@ fn scrollToSearchSelection(self: *App) void {
     const screen = search.engine.?.screen;
     if (!searchMatchVisible(screen, match)) {
         screen.pages.scroll(.{ .pin = match.startPin() });
+        self.revealScrollbar();
         self.syncHoveredLink(true);
     }
     self.needs_redraw = true;
@@ -4802,6 +5144,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
         self.clearSelection();
         if (self.term.screens.active.pages.viewport != .active) {
             self.term.screens.active.pages.scroll(.active);
+            self.revealScrollbar();
             self.needs_redraw = true;
             self.syncHoveredLink(true);
         }
@@ -4892,6 +5235,64 @@ fn searchRangeForRender(self: *App) ?Renderer.LinkRange {
     );
 }
 
+fn searchMatchesForRender(self: *App) !std.ArrayList(bool) {
+    const search = if (self.search) |*value| value else return .empty;
+    if (search.query.items.len == 0 or !search.engineValid(&self.term) or
+        search.engine_key != self.term.screens.active_key)
+    {
+        return .empty;
+    }
+    return searchMatchMask(
+        self.alloc,
+        search.engine.?.screen,
+        search.query.items,
+        self.term.rows,
+        self.term.cols,
+    );
+}
+
+fn searchMatchMask(
+    alloc: std.mem.Allocator,
+    screen: *vt.Screen,
+    query: []const u8,
+    rows: u16,
+    cols: u16,
+) !std.ArrayList(bool) {
+    std.debug.assert(rows > 0 and cols > 0);
+    var result: std.ArrayList(bool) = .empty;
+    errdefer result.deinit(alloc);
+
+    var viewport: vt.search.Viewport = try .init(alloc, query);
+    defer viewport.deinit();
+    _ = try viewport.update(&screen.pages);
+    while (viewport.next()) |match| {
+        const range = highlightRange(
+            screen,
+            match.startPin(),
+            match.endPin(),
+            rows,
+            cols,
+        ) orelse continue;
+        if (result.items.len == 0) {
+            try result.resize(alloc, @as(usize, rows) * cols);
+            @memset(result.items, false);
+        }
+        markSearchRange(result.items, cols, range);
+    }
+    return result;
+}
+
+fn markSearchRange(mask: []bool, cols: u16, range: Renderer.LinkRange) void {
+    const stride: usize = cols;
+    std.debug.assert(mask.len % stride == 0);
+    std.debug.assert(range.end.y < mask.len / stride);
+    for (range.start.y..range.end.y + 1) |y| {
+        const start_x: usize = if (y == range.start.y) range.start.x else 0;
+        const end_x: usize = if (y == range.end.y) range.end.x + 1 else stride;
+        @memset(mask[@as(usize, y) * stride + start_x .. @as(usize, y) * stride + end_x], true);
+    }
+}
+
 fn searchNoMatch(self: *App) bool {
     const search = if (self.search) |*value| value else return false;
     if (search.query.items.len == 0 or self.ime_preedit != null or
@@ -4967,6 +5368,7 @@ fn startAsyncRender(self: *App) !bool {
     var old_cursor: vt.RenderState.Cursor = self.render_state.cursor;
     if (!frozen) {
         const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
+        const new_scrollbar = self.currentScrollbarThumb();
         // Detection must precede update(). Both the previous and next frame
         // must be free of overlays because their pixels do not move with
         // terminal rows.
@@ -4975,6 +5377,7 @@ fn startAsyncRender(self: *App) !bool {
             self.ime_preedit == null and self.async_job_preedit == null and
             self.async_job_link_hint == null and
             self.search == null and self.async_job_search == null and
+            new_scrollbar == null and self.async_job_scrollbar == null and
             !has_kitty_graphics and self.async_job_kitty.len == 0)
         {
             scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.term);
@@ -4986,6 +5389,12 @@ fn startAsyncRender(self: *App) !bool {
         old_cursor = self.render_state.cursor;
         try self.render_state.update(self.alloc, &self.term);
         self.dirtyCursorRows(old_cursor);
+        // If terminal state (rather than the fade timer) removed the last
+        // overlay, redraw its old pixels instead of repairing from a buffer
+        // that still contains the thumb.
+        if (self.async_job_scrollbar != null and new_scrollbar == null) {
+            self.render_state.dirty = .full;
+        }
         if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) {
             self.render_state.dirty = .full;
         }
@@ -4995,6 +5404,8 @@ fn startAsyncRender(self: *App) !bool {
         const new_link: ?[]const u8 = if (hovered) |link| link.uri else null;
         const new_range: ?Renderer.LinkRange = if (hovered) |link| link.range else null;
         const new_preedit: ?[]const u8 = if (self.search == null) self.ime_preedit else null;
+        var new_search_matches = try self.searchMatchesForRender();
+        errdefer new_search_matches.deinit(self.alloc);
         const new_search = try self.searchOverlayText();
         const new_search_no_match = self.searchNoMatch();
         const new_search_range = self.searchRangeForRender();
@@ -5004,7 +5415,9 @@ fn startAsyncRender(self: *App) !bool {
             !optionalStrEql(self.async_job_search, new_search) or
             self.async_job_search_no_match != new_search_no_match or
             !std.meta.eql(self.async_job_link_range, new_range) or
-            !std.meta.eql(self.async_job_search_range, new_search_range);
+            !std.meta.eql(self.async_job_search_range, new_search_range) or
+            !std.mem.eql(bool, self.async_job_search_matches.items, new_search_matches.items) or
+            !std.meta.eql(self.async_job_scrollbar, new_scrollbar);
         if (self.async_job_preedit) |old| self.alloc.free(old);
         self.async_job_preedit = null;
         if (self.async_job_link_hint) |old| self.alloc.free(old);
@@ -5016,6 +5429,10 @@ fn startAsyncRender(self: *App) !bool {
         self.async_job_search_no_match = new_search_no_match;
         self.async_job_link_range = new_range;
         self.async_job_search_range = new_search_range;
+        self.async_job_search_matches.deinit(self.alloc);
+        self.async_job_search_matches = new_search_matches;
+        new_search_matches = .empty;
+        self.async_job_scrollbar = new_scrollbar;
         self.async_job_hyperlink_hints = hyperlink_hints;
         const kitty_dirty = self.term.screens.active.kitty_images.dirty;
         var kitty_changed = kitty_dirty;
@@ -5047,6 +5464,10 @@ fn startAsyncRender(self: *App) !bool {
     } else {
         // Keep link affordances consistent with the stale snapshot.
         hyperlink_hints = self.async_job_hyperlink_hints;
+        // Full-surface scrollbar coordinates belong to the old geometry.
+        // Remove the thumb while synchronized output holds the old terminal
+        // snapshot; the current geometry is picked up when the freeze ends.
+        if (self.async_job_scrollbar != null) self.render_state.dirty = .full;
     }
     std.debug.assert(self.held_frame == null);
     const target = self.window.acquireRenderTarget() catch return false;
@@ -5073,12 +5494,14 @@ fn startAsyncRender(self: *App) !bool {
         .hyperlink_hints = hyperlink_hints,
         .link_range = self.async_job_link_range,
         .search_range = self.async_job_search_range,
+        .search_matches = self.async_job_search_matches.items,
         .search_background = self.copy_highlight,
         .search_foreground = self.copy_highlight_fg,
         .preedit = self.async_job_preedit,
         .link_hint = self.async_job_link_hint,
         .search = self.async_job_search,
         .search_no_match = self.async_job_search_no_match,
+        .scrollbar = if (frozen) null else self.async_job_scrollbar,
         .kitty_items = self.async_job_kitty,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,
@@ -5612,6 +6035,7 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.geometry_redraw = true;
     self.needs_redraw = true;
+    self.syncScrollbarHover();
     self.syncHoveredLink(true);
 }
 
@@ -5654,6 +6078,30 @@ test "scroll detector finds viewport shifts and narrows dirty rows" {
     detector.prepare(&state, up, state.cursor);
     const dirty = state.row_data.items(.dirty);
     try std.testing.expectEqualSlices(bool, &.{ true, true, false, false }, dirty[0..4]);
+}
+
+test "scrollbar geometry maps viewport rows across the track" {
+    const layout = TerminalLayout.init(100, 100, 10, 10, .{});
+    const top = scrollbarGeometry(.{ .total = 100, .offset = 0, .len = 20 }, layout, 120, scrollbar_default_alpha).?;
+    const middle = scrollbarGeometry(.{ .total = 100, .offset = 40, .len = 20 }, layout, 120, scrollbar_default_alpha).?;
+    const bottom = scrollbarGeometry(.{ .total = 100, .offset = 80, .len = 20 }, layout, 120, scrollbar_default_alpha).?;
+
+    try std.testing.expectEqual(@as(u31, 91), top.thumb.x);
+    try std.testing.expectEqual(@as(u31, 6), top.thumb.width);
+    try std.testing.expectEqual(@as(u31, 24), top.thumb.height);
+    try std.testing.expectEqual(@as(u31, 3), top.thumb.y);
+    try std.testing.expectEqual(@as(u31, 38), middle.thumb.y);
+    try std.testing.expectEqual(@as(u31, 73), bottom.thumb.y);
+    try std.testing.expectEqual(@as(usize, 0), scrollbarRowForThumbY(top, 3));
+    try std.testing.expectEqual(@as(usize, 40), scrollbarRowForThumbY(top, 38));
+    try std.testing.expectEqual(@as(usize, 80), scrollbarRowForThumbY(top, 73));
+    try std.testing.expect(scrollbarAtBottom(.{ .total = 100, .offset = 80, .len = 20 }));
+    try std.testing.expect(!scrollbarAtBottom(.{ .total = 100, .offset = 79, .len = 20 }));
+    try std.testing.expect(scrollbarShouldRender(.{ .total = 100, .offset = 80, .len = 20 }, scrollbar_default_alpha));
+    try std.testing.expect(scrollbarShouldRender(.{ .total = 100, .offset = 80, .len = 20 }, scrollbar_hover_alpha));
+    try std.testing.expect(!scrollbarShouldRender(.{ .total = 20, .offset = 0, .len = 20 }, scrollbar_hover_alpha));
+    try std.testing.expect(!scrollbarShouldRender(.{ .total = 100, .offset = 40, .len = 20 }, 0));
+    try std.testing.expect(scrollbarGeometry(.{ .total = 20, .offset = 0, .len = 20 }, layout, 120, scrollbar_default_alpha) == null);
 }
 
 test "semantic command output extracts most recent completed output" {
@@ -5735,6 +6183,29 @@ test "scrollback search scrolls a history match into the viewport" {
     try std.testing.expectEqual(@as(u32, 0), range.start.y);
     try std.testing.expectEqual(@as(u16, 0), range.start.x);
     try std.testing.expectEqual(@as(u16, 5), range.end.x);
+}
+
+test "search match mask includes every visible result" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 2 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("hit hit");
+
+    var mask = try searchMatchMask(
+        alloc,
+        term.screens.active,
+        "hit",
+        term.rows,
+        term.cols,
+    );
+    defer mask.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 20), mask.items.len);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false, true, true, true, false, false, false }, mask.items[0..10]);
+    const no_matches = [_]bool{false} ** 10;
+    try std.testing.expectEqualSlices(bool, &no_matches, mask.items[10..20]);
 }
 
 test "search state releases an engine after its screen is removed" {

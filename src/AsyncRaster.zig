@@ -38,7 +38,9 @@ pub const Job = struct {
     link_range: ?Renderer.LinkRange,
     /// Selected scrollback-search match in viewport cell coordinates.
     search_range: ?Renderer.LinkRange,
-    /// Colors for the selected scrollback-search match.
+    /// Every visible scrollback-search match as a row-major cell mask.
+    search_matches: []const bool,
+    /// Colors shared by the full-strength selected match and dimmed matches.
     search_background: vt.color.RGB,
     search_foreground: vt.color.RGB,
     /// IME preedit overlay text. Owned by the submitter; must stay valid
@@ -50,6 +52,8 @@ pub const Job = struct {
     search: ?[]const u8,
     /// Use the terminal's red palette entry for the search overlay.
     search_no_match: bool,
+    /// Transient right-edge scrollback indicator in full-surface pixels.
+    scrollbar: ?Renderer.ScrollbarThumb,
     /// Visible kitty placements, resolved on the main thread with image
     /// data repointed at cache-pinned copies. Same ownership as
     /// `preedit`; empty when no graphics are visible.
@@ -68,7 +72,9 @@ pub const Job = struct {
 
     fn hasOverlay(self: *const Job) bool {
         return self.preedit != null or self.link_hint != null or
-            self.search != null or self.kitty_items.len > 0;
+            self.search != null or self.search_matches.len > 0 or
+            self.scrollbar != null or
+            self.kitty_items.len > 0;
     }
 };
 
@@ -390,6 +396,7 @@ fn workerMain(self: *AsyncRaster) void {
         self.renderer.hyperlink_hints = job.hyperlink_hints;
         self.renderer.link_range = job.link_range;
         self.renderer.search_range = job.search_range;
+        self.renderer.search_matches = job.search_matches;
         self.renderer.search_bg = job.search_background;
         self.renderer.search_fg = job.search_foreground;
         self.renderer.buffer_stride = job.width;
@@ -438,6 +445,15 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
                 job.grid_height,
                 text,
                 job.search_no_match,
+            );
+        }
+        if (job.scrollbar) |thumb| {
+            self.renderer.renderScrollbarThumb(
+                self.state,
+                job.pixels,
+                job.width,
+                job.height,
+                thumb,
             );
         }
         damage.* = .full;
@@ -586,12 +602,14 @@ test "repair previous frame" {
         .hyperlink_hints = false,
         .link_range = null,
         .search_range = null,
+        .search_matches = &.{},
         .search_background = .{ .r = 1, .g = 2, .b = 3 },
         .search_foreground = .{ .r = 4, .g = 5, .b = 6 },
         .preedit = null,
         .link_hint = null,
         .search = null,
         .search_no_match = false,
+        .scrollbar = null,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = null,
@@ -656,12 +674,14 @@ test "scroll previous frame in place and from distinct source" {
         .hyperlink_hints = false,
         .link_range = null,
         .search_range = null,
+        .search_matches = &.{},
         .search_background = .{ .r = 1, .g = 2, .b = 3 },
         .search_foreground = .{ .r = 4, .g = 5, .b = 6 },
         .preedit = null,
         .link_hint = null,
         .search = null,
         .search_no_match = false,
+        .scrollbar = null,
         .kitty_items = &.{},
         .overlay_dirty = false,
         .scroll_shift = 1,
