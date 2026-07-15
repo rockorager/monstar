@@ -1,6 +1,6 @@
 .{
     .name = .monstar,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x403203f070f777dc,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

@@ -3,6 +3,7 @@
 //! `monstar [options]` runs a shell in a Wayland terminal window.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const vt = @import("ghostty-vt");
 const App = @import("App.zig");
 const Config = @import("Config.zig");
@@ -234,7 +235,7 @@ fn printVersion(init: std.process.Init) !void {
     var buf: [128]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buf);
     defer writer.interface.flush() catch {};
-    try writer.interface.writeAll("monstar\n");
+    try writer.interface.writeAll("monstar " ++ build_options.version ++ "\n");
 }
 
 fn invalidCli(init: std.process.Init) noreturn {

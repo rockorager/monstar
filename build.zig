@@ -1,9 +1,12 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
 
+const release_version: std.SemanticVersion = .{ .major = 0, .minor = 1, .patch = 0 };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = versionString(b);
 
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
@@ -43,6 +46,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    root_module.addOptions("build_options", build_options);
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("wayland-cursor", .{});
@@ -98,6 +104,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "monstar",
         .root_module = root_module,
+        .version = std.SemanticVersion.parse(version) catch unreachable,
         // uucode's generated tables crash the x86_64 self-hosted backend on
         // Zig 0.16. Ghostty uses LLVM for the same reason.
         .use_llvm = true,
@@ -143,4 +150,76 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
+}
+
+fn versionString(b: *std.Build) []const u8 {
+    const release = b.fmt("{f}", .{release_version});
+    var code: u8 = undefined;
+    const raw = b.runAllowFail(&.{
+        "git",
+        "-C",
+        b.build_root.path orelse ".",
+        "describe",
+        "--tags",
+        "--long",
+        "--dirty",
+        "--always",
+        "--match",
+        "v[0-9]*",
+    }, &code, .ignore) catch return release;
+    const description = std.mem.trim(u8, raw, " \r\n");
+    if (description.len == 0) return release;
+
+    const dirty = std.mem.endsWith(u8, description, "-dirty");
+    const clean = if (dirty) description[0 .. description.len - "-dirty".len] else description;
+    if (!std.mem.startsWith(u8, clean, "v")) {
+        const count_raw = b.runAllowFail(&.{
+            "git",
+            "-C",
+            b.build_root.path orelse ".",
+            "rev-list",
+            "--count",
+            "HEAD",
+        }, &code, .ignore) catch return release;
+        const count = std.mem.trim(u8, count_raw, " \r\n");
+        _ = std.fmt.parseInt(usize, count, 10) catch return release;
+        return developmentVersion(b, release, count, clean, dirty);
+    }
+
+    const hash_sep = std.mem.lastIndexOfScalar(u8, clean, '-') orelse
+        std.process.fatal("unexpected git describe output: {s}", .{description});
+    const before_hash = clean[0..hash_sep];
+    const distance_sep = std.mem.lastIndexOfScalar(u8, before_hash, '-') orelse
+        std.process.fatal("unexpected git describe output: {s}", .{description});
+    const tag = before_hash[0..distance_sep];
+    const distance = before_hash[distance_sep + 1 ..];
+    const hash = clean[hash_sep + 1 ..];
+    if (hash.len < 2 or hash[0] != 'g')
+        std.process.fatal("unexpected git describe output: {s}", .{description});
+
+    const tagged_version = std.SemanticVersion.parse(tag[1..]) catch
+        std.process.fatal("version tag is not semantic: {s}", .{tag});
+    const commit_count = std.fmt.parseInt(usize, distance, 10) catch
+        std.process.fatal("unexpected git describe output: {s}", .{description});
+    if (commit_count == 0) {
+        if (release_version.order(tagged_version) != .eq)
+            std.process.fatal("release version {s} does not match tag {s}", .{ release, tag });
+        if (!dirty) return release;
+    } else if (release_version.order(tagged_version) != .gt) {
+        std.process.fatal("release version {s} must be newer than tag {s}", .{ release, tag });
+    }
+    return developmentVersion(b, release, distance, hash[1..], dirty);
+}
+
+fn developmentVersion(
+    b: *std.Build,
+    release: []const u8,
+    distance: []const u8,
+    hash: []const u8,
+    dirty: bool,
+) []const u8 {
+    return if (dirty)
+        b.fmt("{s}-dev.{s}+g{s}.dirty", .{ release, distance, hash })
+    else
+        b.fmt("{s}-dev.{s}+g{s}", .{ release, distance, hash });
 }

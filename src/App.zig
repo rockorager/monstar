@@ -10,6 +10,7 @@ const App = @This();
 
 const std = @import("std");
 const posix = std.posix;
+const build_options = @import("build_options");
 const c = @import("c");
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
@@ -1145,7 +1146,7 @@ fn sendColorSchemeReport(self: *App) void {
 }
 
 fn effectXtversion(_: *Handler) []const u8 {
-    return "monstar 0.0.0";
+    return "monstar " ++ build_options.version;
 }
 
 fn effectTitleChanged(handler: *Handler) void {
