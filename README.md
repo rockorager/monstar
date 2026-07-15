@@ -43,7 +43,7 @@ Launch-and-exit time over 100 fresh runs of `true`:
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./dist/benchmark-startup.svg">
   <source media="(prefers-color-scheme: light)" srcset="./dist/benchmark-startup-light.svg">
-  <img alt="Box plots of terminal startup times. Monstar has the lowest median at 14.0 milliseconds." src="./dist/benchmark-startup-light.svg">
+  <img alt="Box plots of terminal startup times. Monstar has the lowest median at 12.4 milliseconds." src="./dist/benchmark-startup-light.svg">
 </picture>
 
 ### PTY throughput

@@ -29,41 +29,39 @@
 <line x1="1079.57" y1="100" x2="1079.57" y2="365" class="grid"/>
 <text x="1079.57" y="391" class="axis" text-anchor="middle">400 ms</text>
 <text x="52" y="130" class="label" text-anchor="start">Monstar</text>
-<text x="218" y="130" class="small" text-anchor="end">14.0 ms</text>
-<line x1="276.02" y1="125" x2="441.44" y2="125" class="whisker"/>
-<line x1="276.02" y1="118" x2="276.02" y2="132" class="whisker"/>
-<line x1="441.44" y1="118" x2="441.44" y2="132" class="whisker"/>
-<rect x="294.8" y="114" width="75.21" height="22" rx="4" fill="#d783ed" fill-opacity="0.3" stroke="#d783ed" stroke-width="2"/>
-<line x1="355.26" y1="114" x2="355.26" y2="136" class="median"/>
+<text x="218" y="130" class="small" text-anchor="end">12.4 ms</text>
+<line x1="262" y1="125" x2="378.91" y2="125" class="whisker"/>
+<line x1="262" y1="118" x2="262" y2="132" class="whisker"/>
+<line x1="378.91" y1="118" x2="378.91" y2="132" class="whisker"/>
+<rect x="275.43" y="114" width="60.58" height="22" rx="4" fill="#d783ed" fill-opacity="0.3" stroke="#d783ed" stroke-width="2"/>
+<line x1="329.05" y1="114" x2="329.05" y2="136" class="median"/>
 <text x="52" y="182" class="label" text-anchor="start">foot</text>
-<text x="218" y="182" class="small" text-anchor="end">18.7 ms</text>
-<line x1="357.38" y1="177" x2="489.08" y2="177" class="whisker"/>
-<line x1="357.38" y1="170" x2="357.38" y2="184" class="whisker"/>
-<line x1="489.08" y1="170" x2="489.08" y2="184" class="whisker"/>
-<rect x="369.69" y="166" width="61.52" height="22" rx="4" fill="#56b4e9" fill-opacity="0.3" stroke="#56b4e9" stroke-width="2"/>
-<line x1="418.64" y1="166" x2="418.64" y2="188" class="median"/>
+<text x="218" y="182" class="small" text-anchor="end">18.1 ms</text>
+<line x1="353.18" y1="177" x2="481.52" y2="177" class="whisker"/>
+<line x1="353.18" y1="170" x2="353.18" y2="184" class="whisker"/>
+<line x1="481.52" y1="170" x2="481.52" y2="184" class="whisker"/>
+<rect x="368.82" y="166" width="61.96" height="22" rx="4" fill="#56b4e9" fill-opacity="0.3" stroke="#56b4e9" stroke-width="2"/>
+<line x1="411.83" y1="166" x2="411.83" y2="188" class="median"/>
+<path d="M507.8 173.8h0" fill="none" stroke="#56b4e9" stroke-width="4.4" stroke-linecap="round" stroke-opacity="0.85"/>
 <text x="52" y="234" class="label" text-anchor="start">Alacritty</text>
-<text x="218" y="234" class="small" text-anchor="end">66.7 ms</text>
-<line x1="642.37" y1="229" x2="744.44" y2="229" class="whisker"/>
-<line x1="642.37" y1="222" x2="642.37" y2="236" class="whisker"/>
-<line x1="744.44" y1="222" x2="744.44" y2="236" class="whisker"/>
-<rect x="680.24" y="218" width="29.65" height="22" rx="4" fill="#e06c75" fill-opacity="0.3" stroke="#e06c75" stroke-width="2"/>
-<line x1="693.01" y1="218" x2="693.01" y2="240" class="median"/>
-<path d="M754.2 225.8h0M759.4 227.4h0" fill="none" stroke="#e06c75" stroke-width="4.4" stroke-linecap="round" stroke-opacity="0.85"/>
+<text x="218" y="234" class="small" text-anchor="end">56.3 ms</text>
+<line x1="618.78" y1="229" x2="700.56" y2="229" class="whisker"/>
+<line x1="618.78" y1="222" x2="618.78" y2="236" class="whisker"/>
+<line x1="700.56" y1="222" x2="700.56" y2="236" class="whisker"/>
+<rect x="632.63" y="218" width="49.95" height="22" rx="4" fill="#e06c75" fill-opacity="0.3" stroke="#e06c75" stroke-width="2"/>
+<line x1="656.34" y1="218" x2="656.34" y2="240" class="median"/>
 <text x="52" y="286" class="label" text-anchor="start">kitty</text>
-<text x="218" y="286" class="small" text-anchor="end">154.6 ms</text>
-<line x1="832.15" y1="281" x2="984.05" y2="281" class="whisker"/>
-<line x1="832.15" y1="274" x2="832.15" y2="288" class="whisker"/>
-<line x1="984.05" y1="274" x2="984.05" y2="288" class="whisker"/>
-<rect x="850.75" y="270" width="72.57" height="22" rx="4" fill="#34c38f" fill-opacity="0.3" stroke="#34c38f" stroke-width="2"/>
-<line x1="874.41" y1="270" x2="874.41" y2="292" class="median"/>
-<path d="M1001.3 277.8h0" fill="none" stroke="#34c38f" stroke-width="4.4" stroke-linecap="round" stroke-opacity="0.85"/>
+<text x="218" y="286" class="small" text-anchor="end">132.2 ms</text>
+<line x1="828.57" y1="281" x2="867.63" y2="281" class="whisker"/>
+<line x1="828.57" y1="274" x2="828.57" y2="288" class="whisker"/>
+<line x1="867.63" y1="274" x2="867.63" y2="288" class="whisker"/>
+<rect x="836.56" y="270" width="17.62" height="22" rx="4" fill="#34c38f" fill-opacity="0.3" stroke="#34c38f" stroke-width="2"/>
+<line x1="840.52" y1="270" x2="840.52" y2="292" class="median"/>
 <text x="52" y="338" class="label" text-anchor="start">Ghostty</text>
-<text x="218" y="338" class="small" text-anchor="end">250.0 ms</text>
-<line x1="951.02" y1="333" x2="1012.3" y2="333" class="whisker"/>
-<line x1="951.02" y1="326" x2="951.02" y2="340" class="whisker"/>
-<line x1="1012.3" y1="326" x2="1012.3" y2="340" class="whisker"/>
-<rect x="968.61" y="322" width="19.5" height="22" rx="4" fill="#e69f00" fill-opacity="0.3" stroke="#e69f00" stroke-width="2"/>
-<line x1="978.13" y1="322" x2="978.13" y2="344" class="median"/>
-<path d="M929.0 329.8h0M1019.8 331.4h0M1026.1 333.0h0M1031.7 334.6h0M1031.9 336.2h0M1044.7 329.8h0M1065.5 331.4h0M1075.9 333.0h0" fill="none" stroke="#e69f00" stroke-width="4.4" stroke-linecap="round" stroke-opacity="0.85"/>
+<text x="218" y="338" class="small" text-anchor="end">208.7 ms</text>
+<line x1="916.74" y1="333" x2="961.42" y2="333" class="whisker"/>
+<line x1="916.74" y1="326" x2="916.74" y2="340" class="whisker"/>
+<line x1="961.42" y1="326" x2="961.42" y2="340" class="whisker"/>
+<rect x="933" y="322" width="12.76" height="22" rx="4" fill="#e69f00" fill-opacity="0.3" stroke="#e69f00" stroke-width="2"/>
+<line x1="939.15" y1="322" x2="939.15" y2="344" class="median"/>
 <text x="42" y="422" class="small" text-anchor="start">Box: middle 50% · center line: median · whiskers: 1.5× IQR · dots: sampled outliers</text></svg>
