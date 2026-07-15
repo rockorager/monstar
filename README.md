@@ -29,35 +29,35 @@ keeping the terminal focused, responsive, and configurable.
 
 ## Performance
 
-Reference results on an Intel Core Ultra 7 258V. Lower is better in both
-tables.
+Reference distributions recorded on an Intel Core Ultra 7 258V. Lower is
+better. The plots use logarithmic scales so both fast and slow results remain
+readable; boxes show the middle 50%, center lines show medians, and whiskers
+extend to 1.5× the interquartile range. Monstar is among the fastest terminals
+tested, with results that vary by workload rather than pointing to a single
+overall winner.
 
 ### Startup
 
-Median launch-and-exit time over 100 runs:
+Launch-and-exit time over 100 fresh runs of `true`:
 
-| Terminal | Run `true` |
-| --- | ---: |
-| **Monstar** | **9.6 ms** |
-| foot | 19.6 ms |
-| Ghostty | 215.2 ms |
-| kitty | 132.1 ms |
-| Alacritty | 53.9 ms |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./dist/benchmark-startup.svg">
+  <source media="(prefers-color-scheme: light)" srcset="./dist/benchmark-startup-light.svg">
+  <img alt="Box plots of terminal startup times. Monstar has the lowest median at 14.0 milliseconds." src="./dist/benchmark-startup-light.svg">
+</picture>
 
 ### PTY throughput
 
-Mean time per vtebench sample, in milliseconds:
+Sample-time distributions from eight vtebench workloads:
 
-| Workload | Monstar | foot | Ghostty | kitty | Alacritty |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Cursor motion | **3.3** | 8.5 | 4.8 | 27.5 | 5.2 |
-| Light cells | **3.2** | 7.3 | 4.6 | 8.9 | 7.6 |
-| Medium cells | **6.8** | 10.8 | 9.5 | 29.0 | 10.5 |
-| Dense cells | 23.8 | 22.2 | 30.3 | 48.2 | **21.7** |
-| Scrolling | **216.9** | 315.2 | 228.0 | 292.9 | 228.5 |
-| Fullscreen scrolling | 16.3 | **6.4** | 11.0 | 7.8 | 9.5 |
-| Synchronized medium cells | **6.8** | 10.2 | 8.9 | 34.8 | 9.2 |
-| Unicode | 8.7 | 10.6 | 11.0 | 179.4 | **7.9** |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./dist/benchmark-vtebench.svg">
+  <source media="(prefers-color-scheme: light)" srcset="./dist/benchmark-vtebench-light.svg">
+  <img alt="Grouped box plots comparing Monstar, foot, Ghostty, kitty, and Alacritty across eight vtebench workloads." src="./dist/benchmark-vtebench-light.svg">
+</picture>
+
+vtebench measures producer blocking and PTY read throughput—not frame
+presentation or input latency.
 
 <details>
 <summary>Benchmark methodology</summary>
