@@ -43,6 +43,16 @@ Launch-and-exit time over 100 fresh runs of `true`:
   <img alt="Box plots of terminal startup times. Monstar has the lowest median at 12.3 milliseconds." src="./dist/benchmark-startup-light.svg">
 </picture>
 
+### Keystroke latency
+
+Key event to echoed-frame commit over 200 injected keys:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./dist/benchmark-latency.svg">
+  <source media="(prefers-color-scheme: light)" srcset="./dist/benchmark-latency-light.svg">
+  <img alt="Box plots of terminal keystroke latency. Monstar has the lowest median at 0.26 milliseconds." src="./dist/benchmark-latency-light.svg">
+</picture>
+
 ### PTY throughput
 
 Sample-time distributions from eight vtebench workloads:
@@ -68,6 +78,13 @@ Startup was measured with hyperfine 1.20.0 after 10 warmups, using each
 terminal's command syntax: `monstar -e true`, `foot true`, `ghostty -e true`,
 `kitty true`, and `alacritty -e true`. It measures the complete process
 lifetime, not time to the first visible frame.
+
+Keystroke latency used `WAYLAND_DEBUG=client` around 200 `wtype` key presses at
+varied 50–100 ms intervals in each 120×40 terminal. A marked 20 ms raw-PTY echo
+delay separated output commits from toolkit-only redraws and was subtracted
+from every sample. It measures client-side key handling, the PTY round trip,
+rendering, and buffer commit under protocol logging—not physical input,
+compositor presentation, or display latency.
 
 The full default [vtebench](https://github.com/alacritty/vtebench) suite was run
 at 120×40 cells with its standard 1 MiB minimum samples and 10-second limit per
