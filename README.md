@@ -1,256 +1,201 @@
-# monstar
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./dist/dev.rockorager.monstar-wordmark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./dist/dev.rockorager.monstar-wordmark-light.svg">
+    <img alt="Monstar" src="./dist/dev.rockorager.monstar-wordmark-light.svg" width="360">
+  </picture>
+</h1>
 
-monstar is a small Wayland terminal emulator written in Zig, built on Ghostty's terminal core.
+Monstar is a Linux-native terminal built for Wayland. It integrates with the
+desktop session all the way down—from portals and D-Bus to systemd scopes—while
+keeping the terminal focused, responsive, and configurable.
 
-## Building
+## Highlights
 
-The generated bindings require the Wayland 1.25 core schema and
-wayland-protocols 1.49 (runtime support is negotiated and older compositors
-remain supported).
+- **At home on Linux.** Native notifications, taskbar progress, portal-driven
+  link opening and color schemes, and systemd process management.
+- **First-class Wayland.** Native windows, fractional scaling, IME, clipboard,
+  primary selection, activation, and system bell support.
+- **Live scrollback search.** Search and move between matches while terminal
+  output continues in the background.
+- **Modern terminal features.** Kitty graphics, OSC 8 hyperlinks, URI detection,
+  synchronized output, and rich color support are built in.
+- **Flexible appearance.** Use fontconfig fonts and bundled color schemes, follow
+  the desktop light/dark preference, and tune padding and background opacity.
+- **Comfortable input.** Smooth touchpad inertia, independent wheel tuning,
+  rectangular selection, and link opening work out of the box.
+- **Reloadable configuration.** Most appearance and interaction settings update
+  in the running window without a restart.
 
-```sh
-zig build
+## Performance
+
+Reference results from a `ReleaseFast` build on an Intel Core Ultra 7 258V,
+running under Sway:
+
+| Workload | Result |
+| --- | ---: |
+| Launch and exit (`monstar -e true`) | **17.6 ms** median |
+| ASCII PTY/parser throughput | **131.7 MB/s** |
+| CSI-heavy PTY/parser throughput | **56.8 MB/s** |
+
+Launch time is the complete process lifetime measured over 100 runs after 10
+warmups with an empty configuration. It is not a time-to-first-frame metric.
+Throughput was measured with
+`kitten __benchmark__ --repetitions 100 ascii csi`; the benchmark waits for a
+terminal response after each stream, with synchronized output suppressing
+rendering. Results vary by hardware and system load.
+
+## Linux-native by design
+
+Desktop integration is part of Monstar's core rather than an add-on:
+
+- **XDG desktop portals** open links, local files, and directories with the
+  user's preferred applications. Wayland activation tokens make the focus
+  handoff clean, and portal settings keep light/dark themes in sync with the
+  desktop.
+- **D-Bus session services** let terminal applications publish desktop
+  notifications and launcher/taskbar progress where supported. Notification
+  actions can bring the terminal back into focus without fighting the
+  compositor.
+- **systemd user services** collect new Monstar windows launched with
+  `Ctrl+Shift+N`. Optional per-shell transient scopes keep process accounting
+  and memory-pressure handling attached to the shell's process tree instead of
+  the terminal itself.
+- **Native Wayland protocols** provide fractional scaling, text-input-v3 IME,
+  cursor shapes, clipboard and primary selection, server-side decorations,
+  named app icons, activation, and the compositor's system bell.
+
+Enable a transient systemd scope for each newly spawned shell with:
+
+```conf
+linux-cgroup = always
 ```
 
-## Installing
+If the session bus or systemd scope is unavailable, Monstar leaves the shell in
+its inherited cgroup. Portal link opening falls back to `xdg-open` when the
+desktop portal is not available, and optional Wayland protocols have sensible
+fallbacks for older compositors.
+
+## Install
+
+Arch Linux users can install the current development version from the
+[`monstar-git` AUR package](https://aur.archlinux.org/packages/monstar-git)
+with an AUR helper, for example:
 
 ```sh
-zig build -Doptimize=ReleaseFast install --prefix $HOME/.local
+yay -S monstar-git
 ```
 
-## Running
+To build and install Monstar from source into `~/.local`:
 
 ```sh
-zig build run
+zig build -Doptimize=ReleaseFast install --prefix "$HOME/.local"
 ```
 
-Run a command directly in a new terminal window:
+This installs the executable, desktop entry, app icon, manual pages, and bundled
+themes. Ensure `$HOME/.local/bin` is on your `PATH`, then launch a shell:
 
 ```sh
-monstar -e ls -la
+monstar
 ```
 
-Use `--` to run a command through `/bin/sh -c`:
+See [Development](#development) for build requirements.
+
+## Start using Monstar
+
+With no arguments, Monstar starts `$SHELL`, falling back to `/bin/sh`. Use `-e`
+to run a command directly:
 
 ```sh
-monstar -- 'echo "$SHELL"'
+monstar -e fish --login
 ```
 
-Set the child's working directory:
+Use `--` to run a shell expression:
 
 ```sh
-monstar --working-directory /tmp -e env A=B
+monstar -- 'git log --oneline | less'
 ```
 
-Keep the window open after a command exits:
+Launcher-friendly options can set the working directory, initial size, title,
+app ID, font, and one-off configuration overrides:
 
 ```sh
-monstar --hold -e make test
+monstar --working-directory ~/src \
+  --title scratch \
+  --window-size-chars 100x32 \
+  --font Iosevka \
+  -o background-opacity=0.95
 ```
 
-Useful launcher/scripting options include:
+Run `monstar --help`, `man monstar`, or `man 5 monstar` for the complete command
+and configuration reference.
 
-```sh
-monstar --title scratch --app-id com.example.scratchpad --hold \
-  --window-size-chars 100x32 --font "Iosevka" \
-  -o scrollback-limit=100000000 -e fish
-```
+## Configuration
 
-Run `monstar --help` for the full option list.
-
-Configuration is read from `$XDG_CONFIG_HOME/monstar/config` or `~/.config/monstar/config`.
-Send `SIGUSR1` to reload the config for a running process:
-
-```sh
-pkill -USR1 monstar
-```
-
-Visual and interaction settings apply to the running window. `command`,
-`linux-cgroup`, and `scrollback-limit` configure resources created at startup,
-so changes to those settings apply to new windows.
-
-Set the font family with `font-family`; the default asks fontconfig for
-`monospace`:
+Monstar reads `$XDG_CONFIG_HOME/monstar/config`, falling back to
+`~/.config/monstar/config`. A useful starting point looks like this:
 
 ```conf
 font-family = Iosevka
-```
-
-`font-size` accepts bare values or an explicit `pt` suffix for typographic
-points, and a `px` suffix for logical pixels. Fractional values are supported.
-Pixel values map directly to logical pixels before Wayland output scaling;
-they do not use the DPI conversion applied to point values.
-The default is 12 points, equivalent to 16 logical pixels at the standard Linux
-96 DPI baseline:
-
-```conf
 font-size = 12.5
-# font-size = 12.5pt
-# font-size = 16px
+theme = light:Rose Pine Dawn,dark:Rose Pine
+background-opacity = 0.95
+window-padding-x = 8
+window-padding-y = 6
+mouse-scroll-multiplier = precision:1,discrete:3
 ```
 
-Set `app-id` to customize the Wayland app-id and desktop-entry hint used by
-compositor/window-manager rules:
+Without an explicit theme, the built-in colors follow the desktop portal.
+Monstar includes a large collection of iTerm2 color schemes and loads custom
+themes from `$XDG_CONFIG_HOME/monstar/themes` or `~/.config/monstar/themes`.
 
-```conf
-app-id = com.example.scratchpad
-```
-
-Set the command launched by default with Ghostty-compatible `command` syntax.
-Commands use `/bin/sh -c` unless prefixed with `direct:`:
+Set the default command for new windows. Commands run through `/bin/sh -c`
+unless prefixed with `direct:`:
 
 ```conf
 command = fish --login
 # command = direct:fish --no-config
 ```
 
-When `command` is unset, Monstar uses `$SHELL`, then `/bin/sh`.
+Press `Ctrl+Shift+,` or send `SIGUSR1` to reload the configuration:
 
-`scrollback-limit` is the maximum terminal page storage in bytes, including
-the active screen. It defaults to 50,000,000 bytes:
-
-```conf
-scrollback-limit = 100000000
+```sh
+pkill -USR1 monstar
 ```
 
-`image-storage-limit` caps kitty graphics image data per terminal screen. It
-defaults to 320,000,000 bytes, may not exceed 4,294,967,295 bytes, and can be
-set to `0` to disable the image protocol:
+Visual and interaction settings apply immediately. Settings that control newly
+created processes or storage take effect for new windows.
 
-```conf
-image-storage-limit = 320000000
-```
-
-Control precision-device and discrete-wheel scrolling independently with
-Ghostty-compatible multiplier syntax. The defaults are `precision:1` and
-`discrete:3`:
-
-```conf
-mouse-scroll-multiplier = precision:0.5,discrete:4
-```
-
-Touchpad scrolling continues with inertial motion after the fingers are lifted
-by default. Disable it without affecting direct touchpad or wheel scrolling:
-
-```conf
-inertial-scrolling = false
-```
-
-Monstar installs Ghostty's iTerm2 theme collection and accepts the same theme
-names. A single name is used in both color schemes:
-
-```conf
-theme = TokyoNight
-```
-
-Use Ghostty's light/dark syntax to follow the desktop portal while selecting a
-different named theme for each scheme. Both sides are required:
-
-```conf
-theme = light:Rose Pine Dawn,dark:Rose Pine
-```
-
-Custom themes can be placed in `$XDG_CONFIG_HOME/monstar/themes` or
-`~/.config/monstar/themes`; a theme file uses the same color keys shown below.
-Without a `theme` setting, Monstar's built-in colors follow the desktop portal.
-Individual colors override the selected theme, and all 256 palette entries use
-the repeatable Ghostty syntax:
-
-```conf
-background = #1a1b26
-foreground = #c0caf5
-cursor-color = #c0caf5
-cursor-text = #1a1b26
-selection-background = #33467c
-selection-foreground = #c0caf5
-copy-highlight = #ffe629
-copy-highlight-foreground = #1c2024
-palette = 1=#f7768e
-palette = 200=#123456
-```
-
-When selected text is copied with `Ctrl+Shift+C`, its background and text
-briefly flash `copy-highlight` and `copy-highlight-foreground`. The built-in
-defaults use Radix Yellow 9 with dark `#1c2024` text.
-
-`copy-highlight-duration` sets the flash duration in milliseconds and defaults
-to `200`; set it to `0` to disable the flash:
-
-```conf
-copy-highlight-duration = 200
-```
-
-Make the default terminal background translucent with `background-opacity`,
-from `0` (fully transparent) to `1` (fully opaque, the default). Explicit cell
-backgrounds, selections, cursors, and text remain opaque; terminal graphics
-retain their own alpha:
-
-```conf
-background-opacity = 0.85
-```
-
-Add minimum padding around the terminal grid with Ghostty-style X/Y options:
-
-```conf
-window-padding-x = 4
-window-padding-y = 4
-```
-
-One value applies to both sides of an axis. Two comma-separated values set
-left/right or top/bottom independently:
-
-```conf
-window-padding-x = 4,8
-window-padding-y = 6,10
-```
-
-Padding is measured in logical pixels and follows the output scale. Any space
-left after fitting whole cells remains on the right and bottom. The default is
-zero padding.
-
-By default, child processes inherit Monstar's cgroup. To move each newly
-spawned child into a separate transient systemd scope, enable Linux cgroup
-isolation:
-
-```conf
-linux-cgroup = always
-```
-
-Valid values are `never` (the default) and `always`. The setting is applied
-when a child starts; reloading the config does not move an existing child.
-When enabled, Monstar falls back to the inherited cgroup if the session bus
-or systemd scope creation is unavailable.
-
-To pipe the last OSC 133-delimited command output with `Ctrl+Shift+G`, set a
-shell command that receives the output on stdin:
-
-```conf
-pipe-command-output = cat > /tmp/monstar-output
-```
-
-## Keyboard shortcuts
+## Keybindings
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+Shift+C` | Copy selection to clipboard |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy / paste |
 | `Ctrl+Shift+F` | Search scrollback |
-| `Ctrl+Shift+G` | Pipe last command output to `pipe-command-output` |
-| `Ctrl+Shift+N` | New window in current directory |
-| `Ctrl+Shift+V` | Paste from clipboard |
-| `Ctrl+Shift+X` | Jump to next OSC 133 prompt |
-| `Ctrl+Shift+Z` | Jump to previous OSC 133 prompt |
-| `Ctrl+Shift+,` | Reload config |
-| `Ctrl++` / `Ctrl+=` | Increase font size for this window |
-| `Ctrl+-` | Decrease font size for this window |
-| `Ctrl+0` | Reset font size for this window |
-| `Ctrl` + left click | Open OSC 8 hyperlink or detected URI (`Ctrl+Shift` when the application captures the mouse) |
-| `Ctrl` + drag | Rectangular text selection |
+| `Ctrl+Shift+N` | Open a new window in the current directory |
+| `Ctrl+Shift+,` | Reload configuration |
+| `Ctrl++` / `Ctrl+=` / `Ctrl+-` | Adjust the font size |
+| `Ctrl+0` | Reset the font size |
+| `Ctrl` + left click | Open a hyperlink or detected URI |
+| `Ctrl` + drag | Make a rectangular selection |
 
-Scrollback search remains live while terminal output continues. Type to update
-the query, use `Ctrl+N` and `Ctrl+P` to move between matches, and press `Enter`
-to accept the current match as the primary selection. `Escape`, `Ctrl+C`, or
-`Ctrl+G` cancels and restores the previous viewport; `Ctrl+U` clears the query.
+Scrollback search updates as you type. Use `Ctrl+N` and `Ctrl+P` to move between
+matches, `Enter` to accept one as the primary selection, and `Escape` to return
+to the previous viewport.
 
-Detected URIs may use `http`, `https`, `ftp`, `mailto`, `file`, `ssh`, `git`,
-`tel`, `magnet`, `ipfs`, `ipns`, `gemini`, `gopher`, or `news`. Bare domains,
-email addresses, and filesystem paths are not detected.
+Hold `Shift` while dragging to select text when an application has captured the
+mouse. Use `Ctrl+Shift` instead of `Ctrl` to open a link in the same situation.
+Middle-click pastes the primary selection.
+
+## Development
+
+Building requires Zig 0.16, the Wayland 1.25 core schema,
+wayland-protocols 1.49, and development libraries for Wayland, fontconfig,
+FreeType, HarfBuzz, xkbcommon, and D-Bus. Runtime protocol versions are
+negotiated with the compositor, so older compositors remain supported.
+
+```sh
+zig build
+zig build test
+zig build fmt
+```
