@@ -29,21 +29,58 @@ keeping the terminal focused, responsive, and configurable.
 
 ## Performance
 
-Reference results from a `ReleaseFast` build on an Intel Core Ultra 7 258V,
-running under Sway:
+Reference results on an Intel Core Ultra 7 258V. Lower is better in both
+tables.
 
-| Workload | Result |
+### Startup
+
+Median launch-and-exit time over 100 runs:
+
+| Terminal | Run `true` |
 | --- | ---: |
-| Launch and exit (`monstar -e true`) | **17.6 ms** median |
-| ASCII PTY/parser throughput | **131.7 MB/s** |
-| CSI-heavy PTY/parser throughput | **56.8 MB/s** |
+| **Monstar** | **9.6 ms** |
+| foot | 19.6 ms |
+| Ghostty | 215.2 ms |
+| kitty | 132.1 ms |
+| Alacritty | 53.9 ms |
 
-Launch time is the complete process lifetime measured over 100 runs after 10
-warmups with an empty configuration. It is not a time-to-first-frame metric.
-Throughput was measured with
-`kitten __benchmark__ --repetitions 100 ascii csi`; the benchmark waits for a
-terminal response after each stream, with synchronized output suppressing
-rendering. Results vary by hardware and system load.
+### PTY throughput
+
+Mean time per vtebench sample, in milliseconds:
+
+| Workload | Monstar | foot | Ghostty | kitty | Alacritty |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cursor motion | **3.3** | 8.5 | 4.8 | 27.5 | 5.2 |
+| Light cells | **3.2** | 7.3 | 4.6 | 8.9 | 7.6 |
+| Medium cells | **6.8** | 10.8 | 9.5 | 29.0 | 10.5 |
+| Dense cells | 23.8 | 22.2 | 30.3 | 48.2 | **21.7** |
+| Scrolling | **216.9** | 315.2 | 228.0 | 292.9 | 228.5 |
+| Fullscreen scrolling | 16.3 | **6.4** | 11.0 | 7.8 | 9.5 |
+| Synchronized medium cells | **6.8** | 10.2 | 8.9 | 34.8 | 9.2 |
+| Unicode | 8.7 | 10.6 | 11.0 | 179.4 | **7.9** |
+
+<details>
+<summary>Benchmark methodology</summary>
+
+Results were recorded on July 15, 2026 using a hardware-accelerated, headless
+Sway 1.12 session at 2560×1440. The compositor used its GLES2 renderer on the
+Intel GPU through `/dev/dri/renderD128`. Every terminal used an empty
+configuration and a fresh process.
+
+Startup was measured with hyperfine 1.20.0 after 10 warmups, using each
+terminal's command syntax: `monstar -e true`, `foot true`, `ghostty -e true`,
+`kitty true`, and `alacritty -e true`. It measures the complete process
+lifetime, not time to the first visible frame.
+
+The full default [vtebench](https://github.com/alacritty/vtebench) suite was run
+at 120×40 cells with its standard 1 MiB minimum samples and 10-second limit per
+workload. vtebench measures PTY read performance; it does not measure frame
+rate, display latency, or time until the final frame is presented.
+
+Versions: Monstar 0.1.0 (`5b350e2`, `ReleaseFast`), foot 1.27.0, Ghostty 1.3.2
+tip (`157ef1e`), kitty 0.47.4, and Alacritty 0.17.0.
+
+</details>
 
 ## Linux-native by design
 
