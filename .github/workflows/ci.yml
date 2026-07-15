@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            curl \
+            fonts-noto-cjk \
+            fonts-noto-color-emoji \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libharfbuzz-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config \
+            xz-utils
+
+      - name: Install Wayland protocol schemas
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          wayland_version=1.25.0
+          wayland_sha256=c065f040afdff3177680600f249727e41a1afc22fccf27222f15f5306faa1f03
+          protocols_version=1.49
+          protocols_sha256=ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14
+
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/wayland.tar.xz" \
+            "https://gitlab.freedesktop.org/wayland/wayland/-/releases/$wayland_version/downloads/wayland-$wayland_version.tar.xz"
+          echo "$wayland_sha256  $RUNNER_TEMP/wayland.tar.xz" | sha256sum --check
+          tar --directory "$RUNNER_TEMP" --extract --file "$RUNNER_TEMP/wayland.tar.xz"
+
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/wayland-protocols.tar.xz" \
+            "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/$protocols_version/downloads/wayland-protocols-$protocols_version.tar.xz"
+          echo "$protocols_sha256  $RUNNER_TEMP/wayland-protocols.tar.xz" | sha256sum --check
+          tar --directory "$RUNNER_TEMP" --extract --file "$RUNNER_TEMP/wayland-protocols.tar.xz"
+
+          mkdir --parents "$RUNNER_TEMP/pkgconfig"
+          cat > "$RUNNER_TEMP/pkgconfig/wayland-scanner.pc" <<EOF
+          prefix=$RUNNER_TEMP/wayland-$wayland_version
+          pkgdatadir=\${prefix}/protocol
+
+          Name: Wayland Scanner Data
+          Description: Wayland core protocol files
+          Version: $wayland_version
+          EOF
+          cat > "$RUNNER_TEMP/pkgconfig/wayland-protocols.pc" <<EOF
+          prefix=$RUNNER_TEMP/wayland-protocols-$protocols_version
+          pkgdatadir=\${prefix}
+
+          Name: Wayland Protocols
+          Description: Wayland protocol files
+          Version: $protocols_version
+          EOF
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig build fmt
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build executable
+        run: zig build --summary all
