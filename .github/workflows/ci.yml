@@ -80,11 +80,11 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Check formatting
-        run: zig build fmt
-
       - name: Run tests
         run: zig build test --summary all
 
       - name: Build executable
         run: zig build --summary all
+
+      - name: Check formatting
+        run: zig build fmt
