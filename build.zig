@@ -1,7 +1,7 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
 
-const release_version: std.SemanticVersion = .{ .major = 0, .minor = 1, .patch = 0 };
+const release_version: std.SemanticVersion = .{ .major = 0, .minor = 2, .patch = 0 };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
