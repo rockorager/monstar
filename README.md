@@ -30,11 +30,8 @@ keeping the terminal focused, responsive, and configurable.
 ## Performance
 
 Reference distributions recorded on an Intel Core Ultra 7 258V. Lower is
-better. The plots use logarithmic scales so both fast and slow results remain
-readable; boxes show the middle 50%, center lines show medians, and whiskers
-extend to 1.5× the interquartile range. Monstar is among the fastest terminals
-tested, with results that vary by workload rather than pointing to a single
-overall winner.
+better. Monstar is among the fastest terminals tested, with results that vary
+by workload rather than pointing to a single overall winner.
 
 ### Startup
 
