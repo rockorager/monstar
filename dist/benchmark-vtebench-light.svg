@@ -47,80 +47,80 @@
 <line x1="112" y1="160" x2="1160" y2="160" class="grid"/>
 <text x="100" y="164" class="axis" text-anchor="end">1000</text>
 <text x="0" y="0" class="small" text-anchor="middle" transform="translate(43 365) rotate(-90)">sample time (ms)</text>
-<line x1="141.5" y1="517.41" x2="141.5" y2="474.76" class="whisker"/>
-<line x1="137.5" y1="517.41" x2="145.5" y2="517.41" class="whisker"/>
-<line x1="137.5" y1="474.76" x2="145.5" y2="474.76" class="whisker"/>
-<rect x="134.5" y="499.71" width="14" height="17.7" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
+<line x1="141.5" y1="542.35" x2="141.5" y2="485.98" class="whisker"/>
+<line x1="137.5" y1="542.35" x2="145.5" y2="542.35" class="whisker"/>
+<line x1="137.5" y1="485.98" x2="145.5" y2="485.98" class="whisker"/>
+<rect x="134.5" y="499.71" width="14" height="2" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
 <line x1="134.5" y1="499.71" x2="148.5" y2="499.71" class="median"/>
-<line x1="159.5" y1="517.41" x2="159.5" y2="485.98" class="whisker"/>
+<line x1="159.5" y1="517.41" x2="159.5" y2="465.28" class="whisker"/>
 <line x1="155.5" y1="517.41" x2="163.5" y2="517.41" class="whisker"/>
-<line x1="155.5" y1="485.98" x2="163.5" y2="485.98" class="whisker"/>
-<rect x="152.5" y="499.71" width="14" height="17.7" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
+<line x1="155.5" y1="465.28" x2="163.5" y2="465.28" class="whisker"/>
+<rect x="152.5" y="485.98" width="14" height="13.73" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
 <line x1="152.5" y1="499.71" x2="166.5" y2="499.71" class="median"/>
-<line x1="177.5" y1="499.71" x2="177.5" y2="457.06" class="whisker"/>
-<line x1="173.5" y1="499.71" x2="181.5" y2="499.71" class="whisker"/>
-<line x1="173.5" y1="457.06" x2="181.5" y2="457.06" class="whisker"/>
-<rect x="170.5" y="474.76" width="14" height="11.22" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="170.5" y1="485.98" x2="184.5" y2="485.98" class="median"/>
-<line x1="195.5" y1="392.09" x2="195.5" y2="352.18" class="whisker"/>
+<line x1="177.5" y1="517.41" x2="177.5" y2="465.28" class="whisker"/>
+<line x1="173.5" y1="517.41" x2="181.5" y2="517.41" class="whisker"/>
+<line x1="173.5" y1="465.28" x2="181.5" y2="465.28" class="whisker"/>
+<rect x="170.5" y="485.98" width="14" height="13.73" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="170.5" y1="499.71" x2="184.5" y2="499.71" class="median"/>
+<line x1="195.5" y1="392.09" x2="195.5" y2="352.39" class="whisker"/>
 <line x1="191.5" y1="392.09" x2="199.5" y2="392.09" class="whisker"/>
-<line x1="191.5" y1="352.18" x2="199.5" y2="352.18" class="whisker"/>
-<rect x="188.5" y="379.99" width="14" height="6.97" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
-<line x1="188.5" y1="382.22" x2="202.5" y2="382.22" class="median"/>
-<line x1="213.5" y1="485.98" x2="213.5" y2="465.28" class="whisker"/>
-<line x1="209.5" y1="485.98" x2="217.5" y2="485.98" class="whisker"/>
+<line x1="191.5" y1="352.39" x2="199.5" y2="352.39" class="whisker"/>
+<rect x="188.5" y="377.83" width="14" height="7.31" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
+<line x1="188.5" y1="379.99" x2="202.5" y2="379.99" class="median"/>
+<line x1="213.5" y1="499.71" x2="213.5" y2="465.28" class="whisker"/>
+<line x1="209.5" y1="499.71" x2="217.5" y2="499.71" class="whisker"/>
 <line x1="209.5" y1="465.28" x2="217.5" y2="465.28" class="whisker"/>
-<rect x="206.5" y="465.28" width="14" height="9.48" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
+<rect x="206.5" y="474.76" width="14" height="11.22" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
 <line x1="206.5" y1="474.76" x2="220.5" y2="474.76" class="median"/>
 <text x="177.5" y="616" class="axis" text-anchor="middle">Cursor</text>
 <text x="177.5" y="634" class="axis" text-anchor="middle">motion</text>
-<line x1="272.5" y1="542.35" x2="272.5" y2="485.98" class="whisker"/>
+<line x1="272.5" y1="542.35" x2="272.5" y2="499.71" class="whisker"/>
 <line x1="268.5" y1="542.35" x2="276.5" y2="542.35" class="whisker"/>
-<line x1="268.5" y1="485.98" x2="276.5" y2="485.98" class="whisker"/>
+<line x1="268.5" y1="499.71" x2="276.5" y2="499.71" class="whisker"/>
 <rect x="265.5" y="517.41" width="14" height="24.95" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
-<line x1="265.5" y1="517.41" x2="279.5" y2="517.41" class="median"/>
-<line x1="290.5" y1="485.98" x2="290.5" y2="457.06" class="whisker"/>
-<line x1="286.5" y1="485.98" x2="294.5" y2="485.98" class="whisker"/>
-<line x1="286.5" y1="457.06" x2="294.5" y2="457.06" class="whisker"/>
-<rect x="283.5" y="465.28" width="14" height="20.7" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
-<line x1="283.5" y1="474.76" x2="297.5" y2="474.76" class="median"/>
-<line x1="308.5" y1="499.71" x2="308.5" y2="437.47" class="whisker"/>
-<line x1="304.5" y1="499.71" x2="312.5" y2="499.71" class="whisker"/>
-<line x1="304.5" y1="437.47" x2="312.5" y2="437.47" class="whisker"/>
-<rect x="301.5" y="457.06" width="14" height="28.92" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="301.5" y1="474.76" x2="315.5" y2="474.76" class="median"/>
+<line x1="265.5" y1="542.35" x2="279.5" y2="542.35" class="median"/>
+<line x1="290.5" y1="499.71" x2="290.5" y2="465.28" class="whisker"/>
+<line x1="286.5" y1="499.71" x2="294.5" y2="499.71" class="whisker"/>
+<line x1="286.5" y1="465.28" x2="294.5" y2="465.28" class="whisker"/>
+<rect x="283.5" y="474.76" width="14" height="11.22" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
+<line x1="283.5" y1="485.98" x2="297.5" y2="485.98" class="median"/>
+<line x1="308.5" y1="542.35" x2="308.5" y2="485.98" class="whisker"/>
+<line x1="304.5" y1="542.35" x2="312.5" y2="542.35" class="whisker"/>
+<line x1="304.5" y1="485.98" x2="312.5" y2="485.98" class="whisker"/>
+<rect x="301.5" y="499.71" width="14" height="17.7" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="301.5" y1="517.41" x2="315.5" y2="517.41" class="median"/>
 <line x1="326.5" y1="474.76" x2="326.5" y2="437.47" class="whisker"/>
 <line x1="322.5" y1="474.76" x2="330.5" y2="474.76" class="whisker"/>
 <line x1="322.5" y1="437.47" x2="330.5" y2="437.47" class="whisker"/>
-<rect x="319.5" y="457.06" width="14" height="8.22" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
+<rect x="319.5" y="465.28" width="14" height="2" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
 <line x1="319.5" y1="465.28" x2="333.5" y2="465.28" class="median"/>
 <line x1="344.5" y1="474.76" x2="344.5" y2="457.06" class="whisker"/>
 <line x1="340.5" y1="474.76" x2="348.5" y2="474.76" class="whisker"/>
 <line x1="340.5" y1="457.06" x2="348.5" y2="457.06" class="whisker"/>
 <rect x="337.5" y="465.28" width="14" height="9.48" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
-<line x1="337.5" y1="465.28" x2="351.5" y2="465.28" class="median"/>
+<line x1="337.5" y1="474.76" x2="351.5" y2="474.76" class="median"/>
 <text x="308.5" y="616" class="axis" text-anchor="middle">Light</text>
 <text x="308.5" y="634" class="axis" text-anchor="middle">cells</text>
-<line x1="403.5" y1="474.76" x2="403.5" y2="457.06" class="whisker"/>
+<line x1="403.5" y1="474.76" x2="403.5" y2="465.28" class="whisker"/>
 <line x1="399.5" y1="474.76" x2="407.5" y2="474.76" class="whisker"/>
-<line x1="399.5" y1="457.06" x2="407.5" y2="457.06" class="whisker"/>
-<rect x="396.5" y="465.28" width="14" height="2" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
-<line x1="396.5" y1="465.28" x2="410.5" y2="465.28" class="median"/>
-<line x1="421.5" y1="465.28" x2="421.5" y2="400.69" class="whisker"/>
-<line x1="417.5" y1="465.28" x2="425.5" y2="465.28" class="whisker"/>
-<line x1="417.5" y1="400.69" x2="425.5" y2="400.69" class="whisker"/>
-<rect x="414.5" y="418.39" width="14" height="38.68" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
-<line x1="414.5" y1="449.82" x2="428.5" y2="449.82" class="median"/>
-<line x1="439.5" y1="465.28" x2="439.5" y2="409.26" class="whisker"/>
-<line x1="435.5" y1="465.28" x2="443.5" y2="465.28" class="whisker"/>
-<line x1="435.5" y1="409.26" x2="443.5" y2="409.26" class="whisker"/>
-<rect x="432.5" y="432.12" width="14" height="24.95" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="432.5" y1="443.33" x2="446.5" y2="443.33" class="median"/>
-<line x1="457.5" y1="394.82" x2="457.5" y2="382.22" class="whisker"/>
-<line x1="453.5" y1="394.82" x2="461.5" y2="394.82" class="whisker"/>
-<line x1="453.5" y1="382.22" x2="461.5" y2="382.22" class="whisker"/>
+<line x1="399.5" y1="465.28" x2="407.5" y2="465.28" class="whisker"/>
+<rect x="396.5" y="474.76" width="14" height="2" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
+<line x1="396.5" y1="474.76" x2="410.5" y2="474.76" class="median"/>
+<line x1="421.5" y1="485.98" x2="421.5" y2="410.69" class="whisker"/>
+<line x1="417.5" y1="485.98" x2="425.5" y2="485.98" class="whisker"/>
+<line x1="417.5" y1="410.69" x2="425.5" y2="410.69" class="whisker"/>
+<rect x="414.5" y="432.12" width="14" height="33.16" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
+<line x1="414.5" y1="465.28" x2="428.5" y2="465.28" class="median"/>
+<line x1="439.5" y1="485.98" x2="439.5" y2="457.06" class="whisker"/>
+<line x1="435.5" y1="485.98" x2="443.5" y2="485.98" class="whisker"/>
+<line x1="435.5" y1="457.06" x2="443.5" y2="457.06" class="whisker"/>
+<rect x="432.5" y="465.28" width="14" height="9.48" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="432.5" y1="465.28" x2="446.5" y2="465.28" class="median"/>
+<line x1="457.5" y1="397.69" x2="457.5" y2="386.96" class="whisker"/>
+<line x1="453.5" y1="397.69" x2="461.5" y2="397.69" class="whisker"/>
+<line x1="453.5" y1="386.96" x2="461.5" y2="386.96" class="whisker"/>
 <rect x="450.5" y="392.09" width="14" height="2.73" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
-<line x1="450.5" y1="392.09" x2="464.5" y2="392.09" class="median"/>
+<line x1="450.5" y1="394.82" x2="464.5" y2="394.82" class="median"/>
 <line x1="475.5" y1="457.06" x2="475.5" y2="443.33" class="whisker"/>
 <line x1="471.5" y1="457.06" x2="479.5" y2="457.06" class="whisker"/>
 <line x1="471.5" y1="443.33" x2="479.5" y2="443.33" class="whisker"/>
@@ -128,111 +128,111 @@
 <line x1="468.5" y1="449.82" x2="482.5" y2="449.82" class="median"/>
 <text x="439.5" y="616" class="axis" text-anchor="middle">Medium</text>
 <text x="439.5" y="634" class="axis" text-anchor="middle">cells</text>
-<line x1="534.5" y1="392.09" x2="534.5" y2="379.99" class="whisker"/>
-<line x1="530.5" y1="392.09" x2="538.5" y2="392.09" class="whisker"/>
-<line x1="530.5" y1="379.99" x2="538.5" y2="379.99" class="whisker"/>
-<rect x="527.5" y="386.96" width="14" height="2.51" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
-<line x1="527.5" y1="389.47" x2="541.5" y2="389.47" class="median"/>
-<line x1="552.5" y1="422.63" x2="552.5" y2="392.09" class="whisker"/>
+<line x1="534.5" y1="394.82" x2="534.5" y2="386.96" class="whisker"/>
+<line x1="530.5" y1="394.82" x2="538.5" y2="394.82" class="whisker"/>
+<line x1="530.5" y1="386.96" x2="538.5" y2="386.96" class="whisker"/>
+<rect x="527.5" y="389.47" width="14" height="2.62" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
+<line x1="527.5" y1="392.09" x2="541.5" y2="392.09" class="median"/>
+<line x1="552.5" y1="422.63" x2="552.5" y2="397.69" class="whisker"/>
 <line x1="548.5" y1="422.63" x2="556.5" y2="422.63" class="whisker"/>
-<line x1="548.5" y1="392.09" x2="556.5" y2="392.09" class="whisker"/>
-<rect x="545.5" y="400.69" width="14" height="10" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
-<line x1="545.5" y1="403.84" x2="559.5" y2="403.84" class="median"/>
-<line x1="570.5" y1="379.99" x2="570.5" y2="333.1" class="whisker"/>
-<line x1="566.5" y1="379.99" x2="574.5" y2="379.99" class="whisker"/>
-<line x1="566.5" y1="333.1" x2="574.5" y2="333.1" class="whisker"/>
-<rect x="563.5" y="355.04" width="14" height="13" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="563.5" y1="362.84" x2="577.5" y2="362.84" class="median"/>
-<line x1="588.5" y1="356.6" x2="588.5" y2="339.58" class="whisker"/>
-<line x1="584.5" y1="356.6" x2="592.5" y2="356.6" class="whisker"/>
-<line x1="584.5" y1="339.58" x2="592.5" y2="339.58" class="whisker"/>
-<rect x="581.5" y="346.5" width="14" height="10.02" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
-<line x1="581.5" y1="355.04" x2="595.5" y2="355.04" class="median"/>
-<line x1="606.5" y1="407.17" x2="606.5" y2="387.21" class="whisker"/>
+<line x1="548.5" y1="397.69" x2="556.5" y2="397.69" class="whisker"/>
+<rect x="545.5" y="403.84" width="14" height="6.84" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
+<line x1="545.5" y1="407.17" x2="559.5" y2="407.17" class="median"/>
+<line x1="570.5" y1="389.47" x2="570.5" y2="377.83" class="whisker"/>
+<line x1="566.5" y1="389.47" x2="574.5" y2="389.47" class="whisker"/>
+<line x1="566.5" y1="377.83" x2="574.5" y2="377.83" class="whisker"/>
+<rect x="563.5" y="382.22" width="14" height="4.74" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="563.5" y1="384.55" x2="577.5" y2="384.55" class="median"/>
+<line x1="588.5" y1="358.04" x2="588.5" y2="327.23" class="whisker"/>
+<line x1="584.5" y1="358.04" x2="592.5" y2="358.04" class="whisker"/>
+<line x1="584.5" y1="327.23" x2="592.5" y2="327.23" class="whisker"/>
+<rect x="581.5" y="343.09" width="14" height="13.43" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
+<line x1="581.5" y1="353.59" x2="595.5" y2="353.59" class="median"/>
+<line x1="606.5" y1="407.17" x2="606.5" y2="392.09" class="whisker"/>
 <line x1="602.5" y1="407.17" x2="610.5" y2="407.17" class="whisker"/>
-<line x1="602.5" y1="387.21" x2="610.5" y2="387.21" class="whisker"/>
-<rect x="599.5" y="394.82" width="14" height="5.86" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
+<line x1="602.5" y1="392.09" x2="610.5" y2="392.09" class="whisker"/>
+<rect x="599.5" y="397.69" width="14" height="3" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
 <line x1="599.5" y1="397.69" x2="613.5" y2="397.69" class="median"/>
 <text x="570.5" y="616" class="axis" text-anchor="middle">Dense</text>
 <text x="570.5" y="634" class="axis" text-anchor="middle">cells</text>
-<line x1="665.5" y1="264.82" x2="665.5" y2="241.99" class="whisker"/>
-<line x1="661.5" y1="264.82" x2="669.5" y2="264.82" class="whisker"/>
-<line x1="661.5" y1="241.99" x2="669.5" y2="241.99" class="whisker"/>
-<rect x="658.5" y="245.29" width="14" height="13.42" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
-<line x1="658.5" y1="249.1" x2="672.5" y2="249.1" class="median"/>
-<line x1="683.5" y1="252.99" x2="683.5" y2="235.04" class="whisker"/>
-<line x1="679.5" y1="252.99" x2="687.5" y2="252.99" class="whisker"/>
-<line x1="679.5" y1="235.04" x2="687.5" y2="235.04" class="whisker"/>
-<rect x="676.5" y="241.07" width="14" height="8.03" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
-<line x1="676.5" y1="245.29" x2="690.5" y2="245.29" class="median"/>
-<line x1="701.5" y1="255.78" x2="701.5" y2="231.7" class="whisker"/>
-<line x1="697.5" y1="255.78" x2="705.5" y2="255.78" class="whisker"/>
-<line x1="697.5" y1="231.7" x2="705.5" y2="231.7" class="whisker"/>
-<rect x="694.5" y="239.65" width="14" height="8.67" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="694.5" y1="243.35" x2="708.5" y2="243.35" class="median"/>
-<line x1="719.5" y1="252.7" x2="719.5" y2="232.05" class="whisker"/>
-<line x1="715.5" y1="252.7" x2="723.5" y2="252.7" class="whisker"/>
-<line x1="715.5" y1="232.05" x2="723.5" y2="232.05" class="whisker"/>
-<rect x="712.5" y="241.3" width="14" height="8.26" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
-<line x1="712.5" y1="245.79" x2="726.5" y2="245.79" class="median"/>
-<line x1="737.5" y1="262.42" x2="737.5" y2="243.04" class="whisker"/>
-<line x1="733.5" y1="262.42" x2="741.5" y2="262.42" class="whisker"/>
-<line x1="733.5" y1="243.04" x2="741.5" y2="243.04" class="whisker"/>
-<rect x="730.5" y="248.38" width="14" height="9.65" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
-<line x1="730.5" y1="252.32" x2="744.5" y2="252.32" class="median"/>
+<line x1="665.5" y1="272.81" x2="665.5" y2="245.75" class="whisker"/>
+<line x1="661.5" y1="272.81" x2="669.5" y2="272.81" class="whisker"/>
+<line x1="661.5" y1="245.75" x2="669.5" y2="245.75" class="whisker"/>
+<rect x="658.5" y="248.45" width="14" height="18.09" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
+<line x1="658.5" y1="257.95" x2="672.5" y2="257.95" class="median"/>
+<line x1="683.5" y1="256.46" x2="683.5" y2="240.03" class="whisker"/>
+<line x1="679.5" y1="256.46" x2="687.5" y2="256.46" class="whisker"/>
+<line x1="679.5" y1="240.03" x2="687.5" y2="240.03" class="whisker"/>
+<rect x="676.5" y="243.47" width="14" height="6.55" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
+<line x1="676.5" y1="245.79" x2="690.5" y2="245.79" class="median"/>
+<line x1="701.5" y1="273.5" x2="701.5" y2="250.42" class="whisker"/>
+<line x1="697.5" y1="273.5" x2="705.5" y2="273.5" class="whisker"/>
+<line x1="697.5" y1="250.42" x2="705.5" y2="250.42" class="whisker"/>
+<rect x="694.5" y="256.39" width="14" height="8.35" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="694.5" y1="259.33" x2="708.5" y2="259.33" class="median"/>
+<line x1="719.5" y1="244.44" x2="719.5" y2="232.96" class="whisker"/>
+<line x1="715.5" y1="244.44" x2="723.5" y2="244.44" class="whisker"/>
+<line x1="715.5" y1="232.96" x2="723.5" y2="232.96" class="whisker"/>
+<rect x="712.5" y="236.8" width="14" height="4.79" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
+<line x1="712.5" y1="238.54" x2="726.5" y2="238.54" class="median"/>
+<line x1="737.5" y1="268" x2="737.5" y2="245.53" class="whisker"/>
+<line x1="733.5" y1="268" x2="741.5" y2="268" class="whisker"/>
+<line x1="733.5" y1="245.53" x2="741.5" y2="245.53" class="whisker"/>
+<rect x="730.5" y="251.84" width="14" height="10.74" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
+<line x1="730.5" y1="256.31" x2="744.5" y2="256.31" class="median"/>
 <text x="701.5" y="616" class="axis" text-anchor="middle">Scrolling</text>
-<line x1="796.5" y1="455.92" x2="796.5" y2="386.96" class="whisker"/>
-<line x1="792.5" y1="455.92" x2="800.5" y2="455.92" class="whisker"/>
-<line x1="792.5" y1="386.96" x2="800.5" y2="386.96" class="whisker"/>
-<rect x="789.5" y="403.84" width="14" height="23.35" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
+<line x1="796.5" y1="449.82" x2="796.5" y2="389.47" class="whisker"/>
+<line x1="792.5" y1="449.82" x2="800.5" y2="449.82" class="whisker"/>
+<line x1="792.5" y1="389.47" x2="800.5" y2="389.47" class="whisker"/>
+<rect x="789.5" y="400.69" width="14" height="31.43" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
 <line x1="789.5" y1="414.42" x2="803.5" y2="414.42" class="median"/>
 <line x1="814.5" y1="485.98" x2="814.5" y2="457.06" class="whisker"/>
 <line x1="810.5" y1="485.98" x2="818.5" y2="485.98" class="whisker"/>
 <line x1="810.5" y1="457.06" x2="818.5" y2="457.06" class="whisker"/>
 <rect x="807.5" y="465.28" width="14" height="9.48" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
 <line x1="807.5" y1="474.76" x2="821.5" y2="474.76" class="median"/>
-<line x1="832.5" y1="457.06" x2="832.5" y2="408.03" class="whisker"/>
-<line x1="828.5" y1="457.06" x2="836.5" y2="457.06" class="whisker"/>
-<line x1="828.5" y1="408.03" x2="836.5" y2="408.03" class="whisker"/>
-<rect x="825.5" y="422.63" width="14" height="27.18" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="825.5" y1="437.47" x2="839.5" y2="437.47" class="median"/>
-<line x1="850.5" y1="485.98" x2="850.5" y2="443.33" class="whisker"/>
+<line x1="832.5" y1="485.98" x2="832.5" y2="407.17" class="whisker"/>
+<line x1="828.5" y1="485.98" x2="836.5" y2="485.98" class="whisker"/>
+<line x1="828.5" y1="407.17" x2="836.5" y2="407.17" class="whisker"/>
+<rect x="825.5" y="427.19" width="14" height="38.09" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="825.5" y1="443.33" x2="839.5" y2="443.33" class="median"/>
+<line x1="850.5" y1="485.98" x2="850.5" y2="413.65" class="whisker"/>
 <line x1="846.5" y1="485.98" x2="854.5" y2="485.98" class="whisker"/>
-<line x1="846.5" y1="443.33" x2="854.5" y2="443.33" class="whisker"/>
-<rect x="843.5" y="465.28" width="14" height="20.7" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
-<line x1="843.5" y1="474.76" x2="857.5" y2="474.76" class="median"/>
-<line x1="868.5" y1="465.28" x2="868.5" y2="438.88" class="whisker"/>
+<line x1="846.5" y1="413.65" x2="854.5" y2="413.65" class="whisker"/>
+<rect x="843.5" y="449.82" width="14" height="24.95" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
+<line x1="843.5" y1="465.28" x2="857.5" y2="465.28" class="median"/>
+<line x1="868.5" y1="465.28" x2="868.5" y2="437.47" class="whisker"/>
 <line x1="864.5" y1="465.28" x2="872.5" y2="465.28" class="whisker"/>
-<line x1="864.5" y1="438.88" x2="872.5" y2="438.88" class="whisker"/>
+<line x1="864.5" y1="437.47" x2="872.5" y2="437.47" class="whisker"/>
 <rect x="861.5" y="449.82" width="14" height="7.25" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
 <line x1="861.5" y1="457.06" x2="875.5" y2="457.06" class="median"/>
 <text x="832.5" y="616" class="axis" text-anchor="middle">Fullscreen</text>
 <text x="832.5" y="634" class="axis" text-anchor="middle">scroll</text>
-<line x1="927.5" y1="465.28" x2="927.5" y2="457.06" class="whisker"/>
-<line x1="923.5" y1="465.28" x2="931.5" y2="465.28" class="whisker"/>
-<line x1="923.5" y1="457.06" x2="931.5" y2="457.06" class="whisker"/>
-<rect x="920.5" y="465.28" width="14" height="2" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
+<line x1="927.5" y1="474.76" x2="927.5" y2="432.12" class="whisker"/>
+<line x1="923.5" y1="474.76" x2="931.5" y2="474.76" class="whisker"/>
+<line x1="923.5" y1="432.12" x2="931.5" y2="432.12" class="whisker"/>
+<rect x="920.5" y="465.28" width="14" height="9.48" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
 <line x1="920.5" y1="465.28" x2="934.5" y2="465.28" class="median"/>
-<line x1="945.5" y1="457.06" x2="945.5" y2="403.84" class="whisker"/>
+<line x1="945.5" y1="457.06" x2="945.5" y2="402.4" class="whisker"/>
 <line x1="941.5" y1="457.06" x2="949.5" y2="457.06" class="whisker"/>
-<line x1="941.5" y1="403.84" x2="949.5" y2="403.84" class="whisker"/>
-<rect x="938.5" y="443.33" width="14" height="13.73" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
+<line x1="941.5" y1="402.4" x2="949.5" y2="402.4" class="whisker"/>
+<rect x="938.5" y="443.33" width="14" height="6.48" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
 <line x1="938.5" y1="449.82" x2="952.5" y2="449.82" class="median"/>
-<line x1="963.5" y1="457.06" x2="963.5" y2="427.19" class="whisker"/>
-<line x1="959.5" y1="457.06" x2="967.5" y2="457.06" class="whisker"/>
-<line x1="959.5" y1="427.19" x2="967.5" y2="427.19" class="whisker"/>
-<rect x="956.5" y="443.33" width="14" height="13.73" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="956.5" y1="449.82" x2="970.5" y2="449.82" class="median"/>
-<line x1="981.5" y1="373.72" x2="981.5" y2="333.1" class="whisker"/>
-<line x1="977.5" y1="373.72" x2="985.5" y2="373.72" class="whisker"/>
-<line x1="977.5" y1="333.1" x2="985.5" y2="333.1" class="whisker"/>
-<rect x="974.5" y="368.04" width="14" height="3.73" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
-<line x1="974.5" y1="369.88" x2="988.5" y2="369.88" class="median"/>
-<line x1="999.5" y1="449.82" x2="999.5" y2="414.42" class="whisker"/>
-<line x1="995.5" y1="449.82" x2="1003.5" y2="449.82" class="whisker"/>
-<line x1="995.5" y1="414.42" x2="1003.5" y2="414.42" class="whisker"/>
-<rect x="992.5" y="427.19" width="14" height="16.14" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
-<line x1="992.5" y1="437.47" x2="1006.5" y2="437.47" class="median"/>
+<line x1="963.5" y1="465.28" x2="963.5" y2="449.82" class="whisker"/>
+<line x1="959.5" y1="465.28" x2="967.5" y2="465.28" class="whisker"/>
+<line x1="959.5" y1="449.82" x2="967.5" y2="449.82" class="whisker"/>
+<rect x="956.5" y="457.06" width="14" height="8.22" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="956.5" y1="465.28" x2="970.5" y2="465.28" class="median"/>
+<line x1="981.5" y1="375.74" x2="981.5" y2="335.18" class="whisker"/>
+<line x1="977.5" y1="375.74" x2="985.5" y2="375.74" class="whisker"/>
+<line x1="977.5" y1="335.18" x2="985.5" y2="335.18" class="whisker"/>
+<rect x="974.5" y="369.88" width="14" height="3.85" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
+<line x1="974.5" y1="371.77" x2="988.5" y2="371.77" class="median"/>
+<line x1="999.5" y1="457.06" x2="999.5" y2="437.47" class="whisker"/>
+<line x1="995.5" y1="457.06" x2="1003.5" y2="457.06" class="whisker"/>
+<line x1="995.5" y1="437.47" x2="1003.5" y2="437.47" class="whisker"/>
+<rect x="992.5" y="443.33" width="14" height="6.48" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
+<line x1="992.5" y1="449.82" x2="1006.5" y2="449.82" class="median"/>
 <text x="963.5" y="616" class="axis" text-anchor="middle">Sync</text>
 <text x="963.5" y="634" class="axis" text-anchor="middle">medium</text>
 <line x1="1058.5" y1="449.82" x2="1058.5" y2="437.47" class="whisker"/>
@@ -240,25 +240,25 @@
 <line x1="1054.5" y1="437.47" x2="1062.5" y2="437.47" class="whisker"/>
 <rect x="1051.5" y="443.33" width="14" height="2" rx="2" fill="#d783ed" fill-opacity="0.34" stroke="#d783ed" stroke-width="1.7"/>
 <line x1="1051.5" y1="443.33" x2="1065.5" y2="443.33" class="median"/>
-<line x1="1076.5" y1="449.82" x2="1076.5" y2="417.17" class="whisker"/>
+<line x1="1076.5" y1="449.82" x2="1076.5" y2="432.12" class="whisker"/>
 <line x1="1072.5" y1="449.82" x2="1080.5" y2="449.82" class="whisker"/>
-<line x1="1072.5" y1="417.17" x2="1080.5" y2="417.17" class="whisker"/>
-<rect x="1069.5" y="437.47" width="14" height="5.86" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
+<line x1="1072.5" y1="432.12" x2="1080.5" y2="432.12" class="whisker"/>
+<rect x="1069.5" y="443.33" width="14" height="6.48" rx="2" fill="#56b4e9" fill-opacity="0.34" stroke="#56b4e9" stroke-width="1.7"/>
 <line x1="1069.5" y1="443.33" x2="1083.5" y2="443.33" class="median"/>
-<line x1="1094.5" y1="443.33" x2="1094.5" y2="418.8" class="whisker"/>
+<line x1="1094.5" y1="457.06" x2="1094.5" y2="443.33" class="whisker"/>
+<line x1="1090.5" y1="457.06" x2="1098.5" y2="457.06" class="whisker"/>
 <line x1="1090.5" y1="443.33" x2="1098.5" y2="443.33" class="whisker"/>
-<line x1="1090.5" y1="418.8" x2="1098.5" y2="418.8" class="whisker"/>
-<rect x="1087.5" y="432.12" width="14" height="11.22" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
-<line x1="1087.5" y1="437.47" x2="1101.5" y2="437.47" class="median"/>
-<line x1="1112.5" y1="474.76" x2="1112.5" y2="183.48" class="whisker"/>
-<line x1="1108.5" y1="474.76" x2="1116.5" y2="474.76" class="whisker"/>
-<line x1="1108.5" y1="183.48" x2="1116.5" y2="183.48" class="whisker"/>
-<rect x="1105.5" y="432.12" width="14" height="33.16" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
+<rect x="1087.5" y="449.82" width="14" height="7.25" rx="2" fill="#e69f00" fill-opacity="0.34" stroke="#e69f00" stroke-width="1.7"/>
+<line x1="1087.5" y1="449.82" x2="1101.5" y2="449.82" class="median"/>
+<line x1="1112.5" y1="465.72" x2="1112.5" y2="183.92" class="whisker"/>
+<line x1="1108.5" y1="465.72" x2="1116.5" y2="465.72" class="whisker"/>
+<line x1="1108.5" y1="183.92" x2="1116.5" y2="183.92" class="whisker"/>
+<rect x="1105.5" y="284.35" width="14" height="180.93" rx="2" fill="#34c38f" fill-opacity="0.34" stroke="#34c38f" stroke-width="1.7"/>
 <line x1="1105.5" y1="457.06" x2="1119.5" y2="457.06" class="median"/>
-<line x1="1130.5" y1="443.33" x2="1130.5" y2="410.69" class="whisker"/>
-<line x1="1126.5" y1="443.33" x2="1134.5" y2="443.33" class="whisker"/>
-<line x1="1126.5" y1="410.69" x2="1134.5" y2="410.69" class="whisker"/>
-<rect x="1123.5" y="427.19" width="14" height="10.28" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
-<line x1="1123.5" y1="432.12" x2="1137.5" y2="432.12" class="median"/>
+<line x1="1130.5" y1="465.28" x2="1130.5" y2="457.06" class="whisker"/>
+<line x1="1126.5" y1="465.28" x2="1134.5" y2="465.28" class="whisker"/>
+<line x1="1126.5" y1="457.06" x2="1134.5" y2="457.06" class="whisker"/>
+<rect x="1123.5" y="465.28" width="14" height="2" rx="2" fill="#e06c75" fill-opacity="0.34" stroke="#e06c75" stroke-width="1.7"/>
+<line x1="1123.5" y1="465.28" x2="1137.5" y2="465.28" class="median"/>
 <text x="1094.5" y="616" class="axis" text-anchor="middle">Unicode</text>
 <text x="42" y="688" class="small" text-anchor="start">Box: middle 50% · center line: median · whiskers: 5th–95th percentiles</text></svg>

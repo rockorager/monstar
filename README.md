@@ -40,7 +40,7 @@ Launch-and-exit time over 100 fresh runs of `true`:
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./dist/benchmark-startup.svg">
   <source media="(prefers-color-scheme: light)" srcset="./dist/benchmark-startup-light.svg">
-  <img alt="Box plots of terminal startup times. Monstar has the lowest median at 12.4 milliseconds." src="./dist/benchmark-startup-light.svg">
+  <img alt="Box plots of terminal startup times. Monstar has the lowest median at 12.3 milliseconds." src="./dist/benchmark-startup-light.svg">
 </picture>
 
 ### PTY throughput
@@ -75,7 +75,7 @@ workload. vtebench measures PTY read performance; it does not measure frame
 rate, display latency, or time until the final frame is presented.
 
 Versions: Monstar 0.1.0 (`5b350e2`, `ReleaseFast`), foot 1.27.0, Ghostty 1.3.2
-tip (`157ef1e`), kitty 0.47.4, and Alacritty 0.17.0.
+tip (`c5a21ed`), kitty 0.47.4, and Alacritty 0.17.0.
 
 </details>
 
