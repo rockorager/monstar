@@ -231,7 +231,7 @@ pub fn drawE0B3(
     metrics: font.Metrics,
 ) !void {
     try drawE0B1(cp, canvas, width, height, metrics);
-    try canvas.flipHorizontal();
+    canvas.flipHorizontal();
 }
 
 /// 
@@ -330,7 +330,7 @@ pub fn drawE0B6(
     metrics: font.Metrics,
 ) !void {
     try drawE0B4(cp, canvas, width, height, metrics);
-    try canvas.flipHorizontal();
+    canvas.flipHorizontal();
 }
 
 /// 
@@ -342,7 +342,7 @@ pub fn drawE0B7(
     metrics: font.Metrics,
 ) !void {
     try drawE0B5(cp, canvas, width, height, metrics);
-    try canvas.flipHorizontal();
+    canvas.flipHorizontal();
 }
 
 /// 
@@ -393,5 +393,5 @@ pub fn drawE0D4(
     metrics: font.Metrics,
 ) !void {
     try drawE0D2(cp, canvas, width, height, metrics);
-    try canvas.flipHorizontal();
+    canvas.flipHorizontal();
 }

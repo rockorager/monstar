@@ -39,20 +39,6 @@ const schemes = [_]Scheme{
     .{ .prefix = "news:", .kind = .opaque_uri },
 };
 
-/// Return the automatic link containing `byte_index`, if any. Matches are
-/// byte ranges so callers can use ghostty-vt's byte-to-cell maps directly.
-pub fn matchAt(text: []const u8, byte_index: usize) ?Match {
-    if (byte_index >= text.len) return null;
-
-    var offset: usize = 0;
-    while (find(text, offset)) |match| {
-        if (byte_index < match.start) return null;
-        if (byte_index < match.end) return match;
-        offset = match.end;
-    }
-    return null;
-}
-
 /// Find the first automatic link at or after `offset`.
 pub fn find(text: []const u8, offset: usize) ?Match {
     var start = offset;
@@ -144,18 +130,37 @@ fn isUriByte(byte: u8) bool {
 }
 
 fn trimEnd(text: []const u8, payload_start: usize, end_: usize) usize {
+    var open_parens: usize = 0;
+    var close_parens: usize = 0;
+    var open_brackets: usize = 0;
+    var close_brackets: usize = 0;
+    var open_braces: usize = 0;
+    var close_braces: usize = 0;
+    for (text[payload_start..end_]) |byte| switch (byte) {
+        '(' => open_parens += 1,
+        ')' => close_parens += 1,
+        '[' => open_brackets += 1,
+        ']' => close_brackets += 1,
+        '{' => open_braces += 1,
+        '}' => close_braces += 1,
+        else => {},
+    };
+
     var end = end_;
     while (end > payload_start) {
         switch (text[end - 1]) {
             '.', ',' => end -= 1,
-            ')' => if (count(text[payload_start..end], ')') > count(text[payload_start..end], '(')) {
+            ')' => if (close_parens > open_parens) {
                 end -= 1;
+                close_parens -= 1;
             } else return end,
-            ']' => if (count(text[payload_start..end], ']') > count(text[payload_start..end], '[')) {
+            ']' => if (close_brackets > open_brackets) {
                 end -= 1;
+                close_brackets -= 1;
             } else return end,
-            '}' => if (count(text[payload_start..end], '}') > count(text[payload_start..end], '{')) {
+            '}' => if (close_braces > open_braces) {
                 end -= 1;
+                close_braces -= 1;
             } else return end,
             else => return end,
         }
@@ -163,15 +168,10 @@ fn trimEnd(text: []const u8, payload_start: usize, end_: usize) usize {
     return end;
 }
 
-fn count(text: []const u8, needle: u8) usize {
-    var result: usize = 0;
-    for (text) |byte| result += @intFromBool(byte == needle);
-    return result;
-}
-
 fn expectMatch(input: []const u8, expected: []const u8) !void {
     const start = std.mem.indexOf(u8, input, expected) orelse return error.InvalidTest;
-    const match = matchAt(input, start + expected.len / 2) orelse return error.TestExpectedEqual;
+    const match = find(input, 0) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(start, match.start);
     try std.testing.expectEqualStrings(expected, input[match.start..match.end]);
 }
 
@@ -208,22 +208,27 @@ test "automatic links trim prose punctuation and unmatched brackets" {
 }
 
 test "automatic links respect boundaries and delimiters" {
-    try std.testing.expectEqual(null, matchAt("prefixhttps://example.com", 12));
-    try std.testing.expectEqual(null, matchAt("www.example.com", 4));
-    try std.testing.expectEqual(null, matchAt("user@example.com", 6));
-    try std.testing.expectEqual(null, matchAt("/tmp/example", 6));
-    try std.testing.expectEqual(null, matchAt("https://", 2));
-    try std.testing.expectEqual(null, matchAt("https:///path", 9));
+    try std.testing.expectEqual(null, find("prefixhttps://example.com", 0));
+    try std.testing.expectEqual(null, find("www.example.com", 0));
+    try std.testing.expectEqual(null, find("user@example.com", 0));
+    try std.testing.expectEqual(null, find("/tmp/example", 0));
+    try std.testing.expectEqual(null, find("https://", 0));
+    try std.testing.expectEqual(null, find("https:///path", 0));
     try expectMatch("<https://example.com/path>", "https://example.com/path");
     try expectMatch("'mailto:user@example.com'", "mailto:user@example.com");
 }
 
-test "automatic link match contains only its cells" {
-    const text = "before https://example.com after";
-    try std.testing.expectEqual(null, matchAt(text, 2));
-    const match = matchAt(text, 15).?;
-    try std.testing.expectEqualStrings("https://example.com", text[match.start..match.end]);
-    try std.testing.expectEqual(null, matchAt(text, match.end));
+test "automatic link ranges and next link" {
+    const text = "before https://example.com then mailto:user@example.com after";
+    const first = find(text, 0).?;
+    try std.testing.expectEqualStrings("https://example.com", text[first.start..first.end]);
+    try std.testing.expectEqual(@as(usize, 7), first.start);
+    try std.testing.expectEqual(@as(usize, 26), first.end);
+
+    const second = find(text, first.end).?;
+    try std.testing.expectEqualStrings("mailto:user@example.com", text[second.start..second.end]);
+    try std.testing.expectEqual(null, find(text, second.end));
+    try std.testing.expectEqual(null, find(text, text.len));
 }
 
 test "automatic links accept UTF-8 and valid percent escapes" {

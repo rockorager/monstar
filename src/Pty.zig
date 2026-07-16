@@ -114,11 +114,11 @@ pub fn spawn(
         // start with a clean signal mask (shells need SIGCHLD).
         const empty_mask = posix.sigemptyset();
         posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
-        _ = linux.setsid();
-        _ = linux.ioctl(self.slave, linux.T.IOCSCTTY, 0);
-        _ = linux.dup2(self.slave, 0);
-        _ = linux.dup2(self.slave, 1);
-        _ = linux.dup2(self.slave, 2);
+        if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.ioctl(self.slave, linux.T.IOCSCTTY, 0)) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.dup2(self.slave, 0)) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.dup2(self.slave, 1)) != .SUCCESS) linux.exit(126);
+        if (linux.errno(linux.dup2(self.slave, 2)) != .SUCCESS) linux.exit(126);
         _ = linux.close(self.master);
         if (self.slave > 2) _ = linux.close(self.slave);
         if (options.cwd) |cwd| {

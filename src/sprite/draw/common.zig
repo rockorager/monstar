@@ -111,8 +111,6 @@ pub const Alignment = struct {
 
     pub const top = upper;
     pub const bottom = lower;
-    pub const center_top = top;
-    pub const center_bottom = bottom;
 
     pub const top_left = upper_left;
     pub const top_right = upper_right;
@@ -187,21 +185,6 @@ pub const Fraction = enum {
         .one_quarter,
         .two_quarters,
         .three_quarters,
-        .one,
-    };
-
-    /// This can be indexed to get the fraction for `i/3`.
-    pub const thirds: [4]Fraction = .{
-        .zero,
-        .one_third,
-        .two_thirds,
-        .one,
-    };
-
-    /// This can be indexed to get the fraction for `i/2`.
-    pub const halves: [3]Fraction = .{
-        .zero,
-        .one_half,
         .one,
     };
 

@@ -272,17 +272,6 @@ pub const Canvas = struct {
         }).rect(), color);
     }
 
-    /// Draw and fill a quad.
-    pub fn quad(self: *Canvas, q: Quad(f64), color: Color) !void {
-        var path = self.staticPath(6); // nodes.len = 0
-        path.moveTo(q.p0.x, q.p0.y); // +1, nodes.len = 1
-        path.lineTo(q.p1.x, q.p1.y); // +1, nodes.len = 2
-        path.lineTo(q.p2.x, q.p2.y); // +1, nodes.len = 3
-        path.lineTo(q.p3.x, q.p3.y); // +1, nodes.len = 4
-        path.close(); // +2, nodes.len = 6
-        try self.fillPath(path.wrapped_path, .{}, color);
-    }
-
     /// Draw and fill a triangle.
     pub fn triangle(self: *Canvas, t: Triangle(f64), color: Color) !void {
         var path = self.staticPath(5); // nodes.len = 0
@@ -451,15 +440,14 @@ pub const Canvas = struct {
     }
 
     /// Mirror the canvas horizontally.
-    pub fn flipHorizontal(self: *Canvas) Allocator.Error!void {
+    pub fn flipHorizontal(self: *Canvas) void {
         const buf = std.mem.sliceAsBytes(self.sfc.image_surface_alpha8.buf);
-        const clone = try self.alloc.dupe(u8, buf);
-        defer self.alloc.free(clone);
         const width: usize = @intCast(self.sfc.getWidth());
         const height: usize = @intCast(self.sfc.getHeight());
         for (0..height) |y| {
-            for (0..width) |x| {
-                buf[y * width + x] = clone[y * width + width - x - 1];
+            const row = buf[y * width ..][0..width];
+            for (0..width / 2) |x| {
+                std.mem.swap(u8, &row[x], &row[width - x - 1]);
             }
         }
         std.mem.swap(u32, &self.clip_left, &self.clip_right);

@@ -184,7 +184,7 @@ pub const Loader = struct {
 };
 
 alloc: std.mem.Allocator,
-font: Font,
+font: *Font,
 renderer: Renderer,
 thread: ?std.Thread,
 mutex: std.atomic.Mutex = .unlocked,
@@ -206,9 +206,11 @@ pub fn init(
     state: *vt.RenderState,
 ) !AsyncRaster {
     const alloc = std.heap.smp_allocator;
-    var font: Font = try .initWithDiscovery(alloc, discovery);
+    const font = try alloc.create(Font);
+    errdefer alloc.destroy(font);
+    font.* = try .initWithDiscovery(alloc, discovery);
     errdefer font.deinit(alloc);
-    var renderer: Renderer = try .init(alloc, &font, .{
+    var renderer: Renderer = try .init(alloc, font, .{
         .selection_background = selection_background,
         .selection_foreground = selection_foreground,
         .cursor_text = cursor_text,
@@ -235,9 +237,6 @@ pub fn init(
 
 pub fn start(self: *AsyncRaster) !void {
     std.debug.assert(self.thread == null);
-    // init returns this structure by value, so repair the renderer's pointer
-    // after it reaches its stable address and before the worker can use it.
-    self.renderer.font = &self.font;
     self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
 }
 
@@ -253,6 +252,7 @@ pub fn deinit(self: *AsyncRaster) void {
     _ = linux.close(self.complete_fd);
     self.renderer.deinit();
     self.font.deinit(self.alloc);
+    self.alloc.destroy(self.font);
     self.* = undefined;
 }
 
@@ -267,9 +267,11 @@ pub fn reconfigure(
     self.lock();
     defer self.mutex.unlock();
     if (self.has_job or self.working or self.result != null) return error.Busy;
-    var font: Font = try .initWithDiscovery(self.alloc, discovery);
+    const font = try self.alloc.create(Font);
+    errdefer self.alloc.destroy(font);
+    font.* = try .initWithDiscovery(self.alloc, discovery);
     errdefer font.deinit(self.alloc);
-    var renderer: Renderer = try .init(self.alloc, &font, .{
+    var renderer: Renderer = try .init(self.alloc, font, .{
         .selection_background = selection_background,
         .selection_foreground = selection_foreground,
         .cursor_text = cursor_text,
@@ -278,9 +280,9 @@ pub fn reconfigure(
     errdefer renderer.deinit();
     self.renderer.deinit();
     self.font.deinit(self.alloc);
+    self.alloc.destroy(self.font);
     self.font = font;
     self.renderer = renderer;
-    self.renderer.font = &self.font;
 }
 
 pub fn busy(self: *AsyncRaster) bool {

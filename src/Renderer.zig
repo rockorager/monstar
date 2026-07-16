@@ -219,7 +219,7 @@ fn clearKittyScaleCache(self: *Renderer) void {
 
 /// Drop all cached shaping results. Must be called when the font (and
 /// with it the face set and metrics) changes.
-pub fn clearShapeCache(self: *Renderer) void {
+fn clearShapeCache(self: *Renderer) void {
     var it = self.shape_cache.iterator();
     while (it.next()) |entry| {
         self.alloc.free(entry.key_ptr.*);
@@ -294,19 +294,6 @@ pub fn render(
             self.backgroundPixel(state.colors.background),
         );
     }
-}
-
-pub fn renderWithKittyGraphics(
-    self: *Renderer,
-    state: *const vt.RenderState,
-    terminal: *const vt.Terminal,
-    pixels: []u32,
-    width: u31,
-    height: u31,
-) !void {
-    const items = try collectKittyPlacements(self.font, self.alloc, terminal);
-    defer self.alloc.free(items);
-    try self.renderWithKittyItems(state, items, pixels, width, height);
 }
 
 /// Full render interleaving kitty placements with the grid by z layer.
@@ -3448,7 +3435,9 @@ test "render kitty image placement" {
     const pixels = try alloc.alloc(u32, @as(usize, width) * height);
     defer alloc.free(pixels);
 
-    try renderer.renderWithKittyGraphics(&state, &term, pixels, width, height);
+    const items = try collectKittyPlacements(&font, alloc, &term);
+    defer alloc.free(items);
+    try renderer.renderWithKittyItems(&state, items, pixels, width, height);
 
     var white_pixels: usize = 0;
     for (pixels) |px| {
@@ -3486,7 +3475,9 @@ test "render kitty unicode placeholder placement" {
     const pixels = try alloc.alloc(u32, @as(usize, width) * height);
     defer alloc.free(pixels);
 
-    try renderer.renderWithKittyGraphics(&state, &term, pixels, width, height);
+    const items = try collectKittyPlacements(&font, alloc, &term);
+    defer alloc.free(items);
+    try renderer.renderWithKittyItems(&state, items, pixels, width, height);
 
     var white_pixels: usize = 0;
     for (pixels) |px| {

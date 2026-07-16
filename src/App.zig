@@ -126,6 +126,82 @@ const SearchState = struct {
     }
 };
 
+const AsyncJobSnapshot = struct {
+    preedit: ?[]u8 = null,
+    link_hint: ?[]u8 = null,
+    search: ?[]u8 = null,
+    search_no_match: bool = false,
+    link_range: ?Renderer.LinkRange = null,
+    search_range: ?Renderer.LinkRange = null,
+    search_matches: std.ArrayList(bool) = .empty,
+    scrollbar: ?Renderer.ScrollbarThumb = null,
+    hyperlink_hints: bool = false,
+    kitty: []Renderer.KittyRenderItem = &.{},
+
+    fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
+        if (self.preedit) |value| alloc.free(value);
+        if (self.link_hint) |value| alloc.free(value);
+        if (self.search) |value| alloc.free(value);
+        self.search_matches.deinit(alloc);
+        self.releaseKitty(alloc, cache);
+    }
+
+    fn replaceOverlays(
+        self: *AsyncJobSnapshot,
+        alloc: std.mem.Allocator,
+        preedit: ?[]const u8,
+        link_hint: ?[]const u8,
+        search: ?[]u8,
+        search_no_match: bool,
+        link_range: ?Renderer.LinkRange,
+        search_range: ?Renderer.LinkRange,
+        search_matches: std.ArrayList(bool),
+        scrollbar: ?Renderer.ScrollbarThumb,
+        hyperlink_hints: bool,
+    ) !void {
+        var new_preedit: ?[]u8 = null;
+        errdefer if (new_preedit) |value| alloc.free(value);
+        var new_link_hint: ?[]u8 = null;
+        errdefer if (new_link_hint) |value| alloc.free(value);
+        errdefer if (search) |value| alloc.free(value);
+        const matches = search_matches;
+        if (preedit) |value| new_preedit = try alloc.dupe(u8, value);
+        if (link_hint) |value| new_link_hint = try alloc.dupe(u8, value);
+
+        if (self.preedit) |value| alloc.free(value);
+        if (self.link_hint) |value| alloc.free(value);
+        if (self.search) |value| alloc.free(value);
+        self.search_matches.deinit(alloc);
+        self.preedit = new_preedit;
+        self.link_hint = new_link_hint;
+        self.search = search;
+        self.search_no_match = search_no_match;
+        self.link_range = link_range;
+        self.search_range = search_range;
+        self.search_matches = matches;
+        self.scrollbar = scrollbar;
+        self.hyperlink_hints = hyperlink_hints;
+    }
+
+    fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
+        for (self.kitty) |item| cache.release(item.image.id, item.image.generation);
+        alloc.free(self.kitty);
+        self.kitty = &.{};
+    }
+
+    fn replaceKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache, items: []Renderer.KittyRenderItem) !void {
+        errdefer alloc.free(items);
+        var acquired: usize = 0;
+        errdefer for (items[0..acquired]) |item| cache.release(item.image.id, item.image.generation);
+        for (items) |*item| {
+            item.image.data = try cache.acquire(alloc, item.image);
+            acquired += 1;
+        }
+        self.releaseKitty(alloc, cache);
+        self.kitty = items;
+    }
+};
+
 alloc: std.mem.Allocator,
 io: std.Io,
 config_arena: std.heap.ArenaAllocator,
@@ -152,28 +228,8 @@ async_force_full: bool,
 /// outstanding frame callback before it can be committed. While held,
 /// `window.rendering_pending` stays true so no new render can start.
 held_frame: ?*Window.Buffer,
-/// Owned copies of overlay strings for the in-flight async job. At most
-/// one job exists at a time; these are replaced on the next submission
-/// and freed on deinit.
-async_job_preedit: ?[]u8,
-async_job_link_hint: ?[]u8,
-async_job_search: ?[]u8,
-async_job_search_no_match: bool,
-/// Viewport cells for the automatic link submitted with the last async job.
-async_job_link_range: ?Renderer.LinkRange,
-/// Selected search match submitted with the last async job.
-async_job_search_range: ?Renderer.LinkRange,
-/// Every visible search match submitted with the last async job.
-async_job_search_matches: std.ArrayList(bool),
-/// Scrollbar geometry submitted with the last async job.
-async_job_scrollbar: ?Renderer.ScrollbarThumb,
-/// The hyperlink-hints flag submitted with the last async job, for
-/// detecting overlay changes between jobs.
-async_job_hyperlink_hints: bool,
-/// Kitty render items for the in-flight async job, with image data
-/// repointed at cache-pinned copies. Same lifetime as the overlay
-/// copies above.
-async_job_kitty: []Renderer.KittyRenderItem,
+/// Owned overlay and Kitty inputs for the in-flight async job.
+async_job: AsyncJobSnapshot,
 /// Pinned copies of kitty image data shared between consecutive async
 /// jobs, so the worker never reads terminal-owned image bytes.
 kitty_cache: KittyImageCache,
@@ -891,16 +947,7 @@ pub fn init(
         .async_generation = 1,
         .async_force_full = true,
         .held_frame = null,
-        .async_job_preedit = null,
-        .async_job_link_hint = null,
-        .async_job_search = null,
-        .async_job_search_no_match = false,
-        .async_job_link_range = null,
-        .async_job_search_range = null,
-        .async_job_search_matches = .empty,
-        .async_job_scrollbar = null,
-        .async_job_hyperlink_hints = false,
-        .async_job_kitty = &.{},
+        .async_job = .{},
         .kitty_cache = .empty,
         .geometry_redraw = false,
         .frame_damage = @splat(.{
@@ -1668,13 +1715,9 @@ pub fn deinit(self: *App) void {
     for (&self.frame_damage) |*damage| damage.rows.deinit(self.alloc);
     if (self.async_raster_loader) |*loader| loader.deinit();
     if (self.async_raster) |*async_raster| async_raster.deinit();
-    if (self.async_job_preedit) |text| self.alloc.free(text);
-    if (self.async_job_link_hint) |uri| self.alloc.free(uri);
-    if (self.async_job_search) |text| self.alloc.free(text);
-    self.async_job_search_matches.deinit(self.alloc);
+    self.async_job.deinit(self.alloc, &self.kitty_cache);
     if (self.hovered_link) |link| self.alloc.free(link.uri);
     if (self.link_press) |press| self.alloc.free(press.uri);
-    self.alloc.free(self.async_job_kitty);
     self.kitty_cache.deinit(self.alloc);
     self.damage_spans.deinit(self.alloc);
     self.repair_spans.deinit(self.alloc);
@@ -5333,9 +5376,11 @@ fn searchOverlayText(self: *App) !?[]u8 {
     });
 }
 
-fn startAsyncRender(self: *App) !bool {
-    var async_raster = &(self.async_raster orelse return false);
-    if (async_raster.busy()) return false;
+const AsyncRenderStart = enum { submitted, no_work, deferred };
+
+fn startAsyncRender(self: *App) !AsyncRenderStart {
+    var async_raster = &(self.async_raster orelse return .deferred);
+    if (async_raster.busy()) return .deferred;
     const selection_bg = self.selectionBackgroundForRender();
     const selection_fg = self.selectionForegroundForRender();
     if (!async_raster.configuredFor(
@@ -5353,7 +5398,7 @@ fn startAsyncRender(self: *App) !bool {
             self.config.background_opacity,
         ) catch |err| {
             self.rasterFatal(err);
-            return false;
+            return .deferred;
         };
     }
     // DEC 2026: the terminal is mid-update, so the previous snapshot
@@ -5374,12 +5419,12 @@ fn startAsyncRender(self: *App) !bool {
         // must be free of overlays because their pixels do not move with
         // terminal rows.
         if (!self.async_force_full and
-            !hyperlink_hints and !self.async_job_hyperlink_hints and
-            self.ime_preedit == null and self.async_job_preedit == null and
-            self.async_job_link_hint == null and
-            self.search == null and self.async_job_search == null and
-            new_scrollbar == null and self.async_job_scrollbar == null and
-            !has_kitty_graphics and self.async_job_kitty.len == 0)
+            !hyperlink_hints and !self.async_job.hyperlink_hints and
+            self.ime_preedit == null and self.async_job.preedit == null and
+            self.async_job.link_hint == null and
+            self.search == null and self.async_job.search == null and
+            new_scrollbar == null and self.async_job.scrollbar == null and
+            !has_kitty_graphics and self.async_job.kitty.len == 0)
         {
             scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.term);
         }
@@ -5393,7 +5438,7 @@ fn startAsyncRender(self: *App) !bool {
         // If terminal state (rather than the fade timer) removed the last
         // overlay, redraw its old pixels instead of repairing from a buffer
         // that still contains the thumb.
-        if (self.async_job_scrollbar != null and new_scrollbar == null) {
+        if (self.async_job.scrollbar != null and new_scrollbar == null) {
             self.render_state.dirty = .full;
         }
         if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) {
@@ -5410,44 +5455,28 @@ fn startAsyncRender(self: *App) !bool {
         const new_search = try self.searchOverlayText();
         const new_search_no_match = self.searchNoMatch();
         const new_search_range = self.searchRangeForRender();
-        overlay_dirty = hyperlink_hints != self.async_job_hyperlink_hints or
-            !optionalStrEql(self.async_job_preedit, new_preedit) or
-            !optionalStrEql(self.async_job_link_hint, new_link) or
-            !optionalStrEql(self.async_job_search, new_search) or
-            self.async_job_search_no_match != new_search_no_match or
-            !std.meta.eql(self.async_job_link_range, new_range) or
-            !std.meta.eql(self.async_job_search_range, new_search_range) or
-            !std.mem.eql(bool, self.async_job_search_matches.items, new_search_matches.items) or
-            !std.meta.eql(self.async_job_scrollbar, new_scrollbar);
-        if (self.async_job_preedit) |old| self.alloc.free(old);
-        self.async_job_preedit = null;
-        if (self.async_job_link_hint) |old| self.alloc.free(old);
-        self.async_job_link_hint = null;
-        if (self.async_job_search) |old| self.alloc.free(old);
-        self.async_job_search = new_search;
-        if (new_preedit) |text| self.async_job_preedit = try self.alloc.dupe(u8, text);
-        if (new_link) |uri| self.async_job_link_hint = try self.alloc.dupe(u8, uri);
-        self.async_job_search_no_match = new_search_no_match;
-        self.async_job_link_range = new_range;
-        self.async_job_search_range = new_search_range;
-        self.async_job_search_matches.deinit(self.alloc);
-        self.async_job_search_matches = new_search_matches;
+        overlay_dirty = hyperlink_hints != self.async_job.hyperlink_hints or
+            !optionalStrEql(self.async_job.preedit, new_preedit) or
+            !optionalStrEql(self.async_job.link_hint, new_link) or
+            !optionalStrEql(self.async_job.search, new_search) or
+            self.async_job.search_no_match != new_search_no_match or
+            !std.meta.eql(self.async_job.link_range, new_range) or
+            !std.meta.eql(self.async_job.search_range, new_search_range) or
+            !std.mem.eql(bool, self.async_job.search_matches.items, new_search_matches.items) or
+            !std.meta.eql(self.async_job.scrollbar, new_scrollbar);
+        try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_search, new_search_no_match, new_range, new_search_range, new_search_matches, new_scrollbar, hyperlink_hints);
         new_search_matches = .empty;
-        self.async_job_scrollbar = new_scrollbar;
-        self.async_job_hyperlink_hints = hyperlink_hints;
         const kitty_dirty = self.term.screens.active.kitty_images.dirty;
         var kitty_changed = kitty_dirty;
         if (has_kitty_graphics) {
             const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
-            if (!Renderer.kittyItemsEqual(self.async_job_kitty, items)) kitty_changed = true;
-            self.releaseKittyJob();
-            try self.pinKittyJob(items);
+            if (!Renderer.kittyItemsEqual(self.async_job.kitty, items)) kitty_changed = true;
+            try self.async_job.replaceKitty(self.alloc, &self.kitty_cache, items);
         } else {
-            if (self.async_job_kitty.len > 0) kitty_changed = true;
-            self.releaseKittyJob();
+            if (self.async_job.kitty.len > 0) kitty_changed = true;
+            self.async_job.releaseKitty(self.alloc, &self.kitty_cache);
         }
         self.kitty_cache.sweep(self.alloc);
-        if (kitty_dirty) self.term.screens.active.kitty_images.dirty = false;
         // Kitty placements are not tracked per row, so any change to
         // the graphics — or any content change underneath them — is a
         // full render.
@@ -5461,17 +5490,27 @@ fn startAsyncRender(self: *App) !bool {
         // kitty payload bytes land here; submitting would burn a job
         // round-trip (and often a buffer repair copy) on a frame
         // identical to the last one.
-        if (self.render_state.dirty == .false and !overlay_dirty) return false;
+        if (self.render_state.dirty == .false and !overlay_dirty and !self.geometry_redraw) return .no_work;
     } else {
         // Keep link affordances consistent with the stale snapshot.
-        hyperlink_hints = self.async_job_hyperlink_hints;
+        hyperlink_hints = self.async_job.hyperlink_hints;
         // Full-surface scrollbar coordinates belong to the old geometry.
         // Remove the thumb while synchronized output holds the old terminal
         // snapshot; the current geometry is picked up when the freeze ends.
-        if (self.async_job_scrollbar != null) self.render_state.dirty = .full;
+        if (self.async_job.scrollbar != null) self.render_state.dirty = .full;
     }
     std.debug.assert(self.held_frame == null);
-    const target = self.window.acquireRenderTarget() catch return false;
+    const target = self.window.acquireRenderTarget() catch |err| {
+        // Overlay snapshots above now describe the pending frame rather than
+        // the last submitted one. Ensure the retry cannot mistake them for
+        // unchanged inputs and skip the frame.
+        self.async_force_full = true;
+        // NotReady is transient window state. Every other failure means the
+        // only renderer cannot obtain a buffer, so retrying in the pre-poll
+        // redraw path would spin indefinitely.
+        if (err != error.NotReady) self.rasterFatal(err);
+        return .deferred;
+    };
     errdefer self.window.cancelRender(target.buffer);
     if (scroll != null and target.age != 1 and target.source_pixels == null) scroll = null;
     if (scroll) |value| self.scroll_detector.prepare(&self.render_state, value, old_cursor);
@@ -5493,61 +5532,34 @@ fn startAsyncRender(self: *App) !bool {
         .generation = self.async_generation,
         .focused = self.focused,
         .hyperlink_hints = hyperlink_hints,
-        .link_range = self.async_job_link_range,
-        .search_range = self.async_job_search_range,
-        .search_matches = self.async_job_search_matches.items,
+        .link_range = self.async_job.link_range,
+        .search_range = self.async_job.search_range,
+        .search_matches = self.async_job.search_matches.items,
         .search_background = self.copy_highlight,
         .search_foreground = self.copy_highlight_fg,
-        .preedit = self.async_job_preedit,
-        .link_hint = self.async_job_link_hint,
-        .search = self.async_job_search,
-        .search_no_match = self.async_job_search_no_match,
-        .scrollbar = if (frozen) null else self.async_job_scrollbar,
-        .kitty_items = self.async_job_kitty,
+        .preedit = self.async_job.preedit,
+        .link_hint = self.async_job.link_hint,
+        .search = self.async_job.search,
+        .search_no_match = self.async_job.search_no_match,
+        .scrollbar = if (frozen) null else self.async_job.scrollbar,
+        .kitty_items = self.async_job.kitty,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,
         .repair = repair,
     }) catch |err| {
         self.window.cancelRender(target.buffer);
-        self.releaseKittyJob();
         self.kitty_cache.sweep(self.alloc);
         self.rasterFatal(err);
-        return false;
+        return .deferred;
     };
+    if (!frozen) self.term.screens.active.kitty_images.dirty = false;
     if (!frozen) self.async_force_full = false;
-    return true;
-}
-
-/// Pin the collected kitty placements for an async job, repointing
-/// their image data at cache-pinned copies. Takes ownership of `items`,
-/// also on error.
-fn pinKittyJob(self: *App, items: []Renderer.KittyRenderItem) !void {
-    std.debug.assert(self.async_job_kitty.len == 0);
-    errdefer self.alloc.free(items);
-    var acquired: usize = 0;
-    errdefer for (items[0..acquired]) |item|
-        self.kitty_cache.release(item.image.id, item.image.generation);
-    for (items) |*item| {
-        item.image.data = try self.kitty_cache.acquire(self.alloc, item.image);
-        acquired += 1;
-    }
-    self.async_job_kitty = items;
+    return .submitted;
 }
 
 fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
-}
-
-/// Drop the last job's kitty pins. Only safe while no worker job
-/// references the items, i.e. the worker is idle or its result was
-/// already taken.
-fn releaseKittyJob(self: *App) void {
-    for (self.async_job_kitty) |item| {
-        self.kitty_cache.release(item.image.id, item.image.generation);
-    }
-    self.alloc.free(self.async_job_kitty);
-    self.async_job_kitty = &.{};
 }
 
 /// A finished frame is waiting and the compositor is ready for it.
@@ -5581,9 +5593,13 @@ fn hasReadyRedraw(self: *App) bool {
 fn redrawIfNeeded(self: *App) !void {
     if (self.canCommitHeldFrame()) self.commitHeldFrame();
     if (!self.hasContentRedraw()) return;
-    self.needs_redraw = false;
-    self.geometry_redraw = false;
-    _ = try self.startAsyncRender();
+    switch (try self.startAsyncRender()) {
+        .submitted, .no_work => {
+            self.needs_redraw = false;
+            self.geometry_redraw = false;
+        },
+        .deferred => {},
+    }
 }
 
 /// Commit a finished frame that was held for the frame callback, unless
@@ -5699,7 +5715,7 @@ fn finishAsyncRender(self: *App) void {
     };
     if (result.err) |err| {
         self.window.cancelRender(buffer);
-        self.releaseKittyJob();
+        self.async_job.releaseKitty(self.alloc, &self.kitty_cache);
         self.kitty_cache.sweep(self.alloc);
         // A deterministic raster error would retry forever; with no other
         // renderer to fall back to, stop.
