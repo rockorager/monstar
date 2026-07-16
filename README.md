@@ -6,32 +6,28 @@
   </picture>
 </h1>
 
-Monstar is a Linux-native terminal built for Wayland. It integrates with the
-desktop session all the way down—from portals and D-Bus to systemd scopes—while
-keeping the terminal focused, responsive, and configurable.
+Monstar is a terminal emulator for Linux and Wayland.
 
-## Highlights
+## Features
 
-- **At home on Linux.** Native notifications, taskbar progress, portal-driven
-  link opening and color schemes, and systemd process management.
-- **First-class Wayland.** Native windows, fractional scaling, IME, clipboard,
-  primary selection, activation, and system bell support.
-- **Live scrollback search.** Search and move between matches while terminal
-  output continues in the background.
-- **Modern terminal features.** Kitty graphics, OSC 8 hyperlinks, URI detection,
-  synchronized output, and rich color support are built in.
-- **Flexible appearance.** Use fontconfig fonts and bundled color schemes, follow
-  the desktop light/dark preference, and tune padding and background opacity.
-- **Comfortable input.** Smooth touchpad inertia, independent wheel tuning,
-  rectangular selection, and link opening work out of the box.
-- **Reloadable configuration.** Most appearance and interaction settings update
-  in the running window without a restart.
+- Wayland windows, fractional scaling, text input (IME), clipboard, primary
+  selection, activation, and system bell support.
+- Desktop notifications and launcher progress over D-Bus.
+- Link and file opening through XDG desktop portals.
+- Optional systemd scopes for shell processes.
+- Kitty graphics, OSC 8 hyperlinks, URI detection, synchronized output, and
+  terminal color support.
+- Scrollback search while terminal output continues.
+- Fontconfig fonts, bundled color schemes, desktop light/dark preference,
+  padding, and background opacity settings.
+- Touchpad scrolling, separate precision and discrete wheel settings,
+  rectangular selection, and link opening.
+- Configuration reloads for most appearance and interaction settings.
 
 ## Performance
 
 Reference distributions recorded on an Intel Core Ultra 7 258V. Lower is
-better. Monstar is among the fastest terminals tested, with results that vary
-by workload rather than pointing to a single overall winner.
+better. Results vary by workload.
 
 ### Startup
 
@@ -63,58 +59,50 @@ Sample-time distributions from eight vtebench workloads:
   <img alt="Grouped box plots comparing Monstar, foot, Ghostty, kitty, and Alacritty across eight vtebench workloads." src="./dist/benchmark-vtebench-light.svg">
 </picture>
 
-vtebench measures producer blocking and PTY read throughput—not frame
+vtebench measures producer blocking and PTY read throughput, not frame
 presentation or input latency.
 
 <details>
 <summary>Benchmark methodology</summary>
 
-Results were recorded on July 15, 2026 using a hardware-accelerated, headless
-Sway 1.12 session at 2560×1440. The compositor used its GLES2 renderer on the
-Intel GPU through `/dev/dri/renderD128`. Every terminal used an empty
-configuration and a fresh process.
-
-Startup was measured with hyperfine 1.20.0 after 10 warmups, using each
-terminal's command syntax: `monstar -e true`, `foot true`, `ghostty -e true`,
-`kitty true`, and `alacritty -e true`. It measures the complete process
-lifetime, not time to the first visible frame.
-
-Keystroke latency used `WAYLAND_DEBUG=client` around 200 `wtype` key presses at
-varied 50–100 ms intervals in each 120×40 terminal. A marked 20 ms raw-PTY echo
-delay separated output commits from toolkit-only redraws and was subtracted
-from every sample. It measures client-side key handling, the PTY round trip,
-rendering, and buffer commit under protocol logging—not physical input,
-compositor presentation, or display latency.
-
-The full default [vtebench](https://github.com/alacritty/vtebench) suite was run
-at 120×40 cells with its standard 1 MiB minimum samples and 10-second limit per
-workload. vtebench measures PTY read performance; it does not measure frame
-rate, display latency, or time until the final frame is presented.
-
-Versions: Monstar 0.1.0 (`5b350e2`, `ReleaseFast`), foot 1.27.0, Ghostty 1.3.2
-tip (`c5a21ed`), kitty 0.47.4, and Alacritty 0.17.0.
+- Date: July 15, 2026.
+- Session: hardware-accelerated, headless Sway 1.12 at 2560×1440.
+- Renderer: GLES2 on the Intel GPU through `/dev/dri/renderD128`.
+- Process setup: empty configuration and a fresh process for each terminal.
+- Startup: measured with hyperfine 1.20.0 after 10 warmups. Commands were
+  `monstar -e true`, `foot true`, `ghostty -e true`, `kitty true`, and
+  `alacritty -e true`. The result covers the complete process lifetime, not
+  time to the first visible frame.
+- Keystroke latency: measured in 120×40 terminals under
+  `WAYLAND_DEBUG=client`. The test injected 200 keys with `wtype` at intervals
+  from 50 to 100 ms. A marked 20 ms raw-PTY echo delay was subtracted from each
+  sample to separate output commits from toolkit-only redraws. The result
+  includes client key handling, the PTY round trip, rendering, and buffer
+  commit. It excludes physical input, compositor presentation, and display
+  latency.
+- PTY throughput: measured with the default
+  [vtebench](https://github.com/alacritty/vtebench) suite at 120×40 cells. The
+  test used the standard 1 MiB minimum sample size and 10-second workload
+  limit. The result covers PTY reads, not frame rate, display latency, or
+  final-frame presentation.
+- Versions: Monstar 0.1.0 (`5b350e2`, `ReleaseFast`), foot 1.27.0,
+  Ghostty 1.3.2 tip (`c5a21ed`), kitty 0.47.4, and Alacritty 0.17.0.
 
 </details>
 
-## Linux-native by design
+## Linux integration
 
-Desktop integration is part of Monstar's core rather than an add-on:
-
-- **XDG desktop portals** open links, local files, and directories with the
-  user's preferred applications. Wayland activation tokens make the focus
-  handoff clean, and portal settings keep light/dark themes in sync with the
-  desktop.
-- **D-Bus session services** let terminal applications publish desktop
-  notifications and launcher/taskbar progress where supported. Notification
-  actions can bring the terminal back into focus without fighting the
-  compositor.
-- **systemd user services** collect new Monstar windows launched with
-  `Ctrl+Shift+N`. Optional per-shell transient scopes keep process accounting
-  and memory-pressure handling attached to the shell's process tree instead of
-  the terminal itself.
-- **Native Wayland protocols** provide fractional scaling, text-input-v3 IME,
-  cursor shapes, clipboard and primary selection, server-side decorations,
-  named app icons, activation, and the compositor's system bell.
+- XDG desktop portals open links, local files, and directories. Portal
+  settings provide the desktop light/dark preference. Link opening uses
+  Wayland activation tokens.
+- D-Bus session services provide desktop notifications and launcher progress.
+  Notification actions can activate the terminal window.
+- Monstar launches new windows opened with `Ctrl+Shift+N` through the systemd
+  user manager. Optional transient scopes place each shell process tree in a
+  separate scope.
+- Wayland protocols provide fractional scaling, text-input-v3 IME, cursor
+  shapes, clipboard and primary selection, server-side decorations, named app
+  icons, activation, and system bell support.
 
 Enable a transient systemd scope for each newly spawned shell with:
 
@@ -122,29 +110,28 @@ Enable a transient systemd scope for each newly spawned shell with:
 linux-cgroup = always
 ```
 
-If the session bus or systemd scope is unavailable, Monstar leaves the shell in
-its inherited cgroup. Portal link opening falls back to `xdg-open` when the
-desktop portal is not available, and optional Wayland protocols have sensible
-fallbacks for older compositors.
+If the session bus or systemd scope is unavailable, Monstar leaves the shell
+in its inherited cgroup. Link opening falls back to `xdg-open` when the portal
+is unavailable. Monstar disables optional Wayland protocols when the
+compositor does not support them.
 
 ## Install
 
-Arch Linux users can install the current development version from the
-[`monstar-git` AUR package](https://aur.archlinux.org/packages/monstar-git)
-with an AUR helper, for example:
+Install the current development version on Arch Linux from the
+[`monstar-git` AUR package](https://aur.archlinux.org/packages/monstar-git):
 
 ```sh
 yay -S monstar-git
 ```
 
-To build and install Monstar from source into `~/.local`:
+Build and install Monstar from source into `~/.local`:
 
 ```sh
 zig build -Doptimize=ReleaseFast install --prefix "$HOME/.local"
 ```
 
-This installs the executable, desktop entry, app icon, manual pages, and bundled
-themes. Ensure `$HOME/.local/bin` is on your `PATH`, then launch a shell:
+The command installs the executable, desktop entry, app icon, manual pages,
+and bundled themes. Add `$HOME/.local/bin` to `PATH`, then launch Monstar:
 
 ```sh
 monstar
@@ -152,23 +139,23 @@ monstar
 
 See [Development](#development) for build requirements.
 
-## Start using Monstar
+## Usage
 
-With no arguments, Monstar starts `$SHELL`, falling back to `/bin/sh`. Use `-e`
-to run a command directly:
+Run Monstar without arguments to start `$SHELL`. Monstar falls back to
+`/bin/sh` when `SHELL` is unset. Pass `-e` to run a command directly:
 
 ```sh
 monstar -e fish --login
 ```
 
-Use `--` to run a shell expression:
+Pass `--` to run a shell expression:
 
 ```sh
 monstar -- 'git log --oneline | less'
 ```
 
-Launcher-friendly options can set the working directory, initial size, title,
-app ID, font, and one-off configuration overrides:
+Set the working directory, initial size, title, app ID, font, and one-off
+configuration overrides with command-line options:
 
 ```sh
 monstar --working-directory ~/src \
@@ -178,13 +165,13 @@ monstar --working-directory ~/src \
   -o background-opacity=0.95
 ```
 
-Run `monstar --help`, `man monstar`, or `man 5 monstar` for the complete command
-and configuration reference.
+Run `monstar --help`, `man monstar`, or `man 5 monstar` for the complete
+command and configuration reference.
 
 ## Configuration
 
-Monstar reads `$XDG_CONFIG_HOME/monstar/config`, falling back to
-`~/.config/monstar/config`. A useful starting point looks like this:
+Write configuration to `$XDG_CONFIG_HOME/monstar/config`. Use
+`~/.config/monstar/config` when `XDG_CONFIG_HOME` is unset. Start with:
 
 ```conf
 font-family = Iosevka
@@ -196,9 +183,9 @@ window-padding-y = 6
 mouse-scroll-multiplier = precision:1,discrete:3
 ```
 
-Without an explicit theme, the built-in colors follow the desktop portal.
-Monstar includes a large collection of iTerm2 color schemes and loads custom
-themes from `$XDG_CONFIG_HOME/monstar/themes` or `~/.config/monstar/themes`.
+Leave `theme` unset to follow the desktop light/dark preference. Load bundled
+iTerm2 color schemes by name. Put custom themes in
+`$XDG_CONFIG_HOME/monstar/themes` or `~/.config/monstar/themes`.
 
 Set the default command for new windows. Commands run through `/bin/sh -c`
 unless prefixed with `direct:`:
@@ -214,8 +201,8 @@ Press `Ctrl+Shift+,` or send `SIGUSR1` to reload the configuration:
 pkill -USR1 monstar
 ```
 
-Visual and interaction settings apply immediately. Settings that control newly
-created processes or storage take effect for new windows.
+Visual and interaction settings apply immediately. Process and storage
+settings apply to new windows.
 
 ## Keybindings
 
@@ -230,20 +217,20 @@ created processes or storage take effect for new windows.
 | `Ctrl` + left click | Open a hyperlink or detected URI |
 | `Ctrl` + drag | Make a rectangular selection |
 
-Scrollback search updates as you type. Use `Ctrl+N` and `Ctrl+P` to move between
-matches, `Enter` to accept one as the primary selection, and `Escape` to return
-to the previous viewport.
+Scrollback search updates as you type. Press `Ctrl+N` and `Ctrl+P` to move
+between matches. Press `Enter` to copy a match to the primary selection. Press
+`Escape` to restore the previous viewport.
 
-Hold `Shift` while dragging to select text when an application has captured the
-mouse. Use `Ctrl+Shift` instead of `Ctrl` to open a link in the same situation.
-Middle-click pastes the primary selection.
+Hold `Shift` while dragging to select text after an application captures the
+mouse. Hold `Ctrl+Shift` instead of `Ctrl` to open a link in this state.
+Middle-click to paste the primary selection.
 
 ## Development
 
 Building requires Zig 0.16, the Wayland 1.25 core schema,
-wayland-protocols 1.49, and development libraries for Wayland, fontconfig,
-FreeType, HarfBuzz, xkbcommon, and D-Bus. Runtime protocol versions are
-negotiated with the compositor, so older compositors remain supported.
+wayland-protocols 1.49, and development libraries for Wayland, Fontconfig,
+FreeType, HarfBuzz, xkbcommon, and D-Bus. Monstar negotiates protocol versions
+at runtime to support older compositors.
 
 ```sh
 zig build
