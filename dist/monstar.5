@@ -126,6 +126,13 @@ The value is between 0 and 1 inclusive; the default is 1.
 By default, explicit cell backgrounds, selections, cursors, text, and terminal
 graphics retain their own opacity.
 .TP
+.BI background-blur " = boolean"
+Request compositor-provided blur behind a translucent terminal background.
+The default is true.
+Blur is requested only when
+.B background-opacity
+is less than 1 and the compositor supports the background effect protocol.
+.TP
 .BI background-opacity-cells " = boolean"
 Apply
 .B background-opacity

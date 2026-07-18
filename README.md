@@ -102,7 +102,7 @@ presentation or input latency.
   separate scope.
 - Wayland protocols provide fractional scaling, text-input-v3 IME, cursor
   shapes, clipboard and primary selection, server-side decorations, named app
-  icons, activation, and system bell support.
+  icons, activation, system bell, and translucent background blur support.
 
 Enable a transient systemd scope for each newly spawned shell with:
 
@@ -185,7 +185,8 @@ mouse-scroll-multiplier = precision:1,discrete:3
 
 By default, `background-opacity` affects only the default terminal background
 and padding. Set `background-opacity-cells = true` to apply it to explicit cell
-background colors too.
+background colors too. Monstar requests compositor-provided blur whenever the
+background is translucent; set `background-blur = false` to keep it clear.
 
 Leave `theme` unset to follow the desktop light/dark preference. Load bundled
 iTerm2 color schemes by name. Put custom themes in

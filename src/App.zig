@@ -887,6 +887,7 @@ pub fn init(
     const window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
     errdefer window.destroy();
     window.setBufferAlpha(config.background_opacity < 255);
+    window.setBackgroundBlur(config.background_blur and config.background_opacity < 255);
 
     // Timerfds must be nonblocking: disarming a timerfd clears its
     // pending expirations, so a reader acting on stale poll revents
@@ -2430,6 +2431,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
     self.applyColorDefaultsForConfig(new_config);
     self.window.setBufferAlpha(new_config.background_opacity < 255);
+    self.window.setBackgroundBlur(new_config.background_blur and new_config.background_opacity < 255);
     self.window.toplevel.setAppId(new_config.app_id);
 
     if (new_config.image_storage_limit != self.config.image_storage_limit) {

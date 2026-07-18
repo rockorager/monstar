@@ -170,6 +170,8 @@ copy_highlight_duration: u32 = 200,
 /// Effective alpha of the default terminal background. Keeping this as an
 /// 8-bit value matches the wl_shm buffer and makes the opaque fast path exact.
 background_opacity: u8 = 255,
+/// Request compositor-provided blur whenever the background is translucent.
+background_blur: bool = true,
 /// Whether background opacity also applies to explicit cell backgrounds.
 background_opacity_cells: bool = false,
 
@@ -307,6 +309,13 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.copy_highlight_duration = std.fmt.parseInt(u32, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background-opacity")) {
         self.background_opacity = try parseOpacity(value);
+    } else if (std.mem.eql(u8, key, "background-blur")) {
+        self.background_blur = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background-opacity-cells")) {
         self.background_opacity_cells = if (std.mem.eql(u8, value, "true"))
             true
@@ -729,6 +738,7 @@ test "defaults" {
     try std.testing.expect(config.inertial_scrolling);
     try std.testing.expectEqual(@as(u32, 200), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
+    try std.testing.expect(config.background_blur);
     try std.testing.expect(!config.background_opacity_cells);
     try std.testing.expectEqual(@as(?Theme, null), config.theme);
     try std.testing.expectEqual(@as(?ThemeOverrides, null), config.light_theme_overrides);
@@ -769,6 +779,7 @@ test "parse config" {
         \\inertial-scrolling = false
         \\copy-highlight-duration = 250
         \\background-opacity = 0.8
+        \\background-blur = false
         \\background-opacity-cells = true
         \\background = #1a1b26
         \\foreground = c0caf5
@@ -801,6 +812,7 @@ test "parse config" {
     try std.testing.expect(!config.inertial_scrolling);
     try std.testing.expectEqual(@as(u32, 250), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
+    try std.testing.expect(!config.background_blur);
     try std.testing.expect(config.background_opacity_cells);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
@@ -895,6 +907,15 @@ test "background opacity accepts the closed unit interval" {
     try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "background-opacity", "-0.1"));
     try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "background-opacity", "1.1"));
     try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "background-opacity", "nan"));
+}
+
+test "background blur accepts booleans" {
+    var config: Config = .{};
+    try config.set(std.testing.allocator, "background-blur", "false");
+    try std.testing.expect(!config.background_blur);
+    try config.set(std.testing.allocator, "background-blur", "true");
+    try std.testing.expect(config.background_blur);
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "background-blur", "yes"));
 }
 
 test "background opacity cells accepts booleans" {

@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
     scanner.addSystemProtocol("staging/xdg-system-bell/xdg-system-bell-v1.xml");
     scanner.addSystemProtocol("staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml");
+    scanner.addSystemProtocol("staging/ext-background-effect/ext-background-effect-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/primary-selection/primary-selection-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/text-input/text-input-unstable-v3.xml");
@@ -34,6 +35,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wp_cursor_shape_manager_v1", 2);
     scanner.generate("xdg_system_bell_v1", 1);
     scanner.generate("xdg_toplevel_icon_manager_v1", 1);
+    scanner.generate("ext_background_effect_manager_v1", 1);
     scanner.generate("zxdg_decoration_manager_v1", 2);
     scanner.generate("wl_data_device_manager", 4);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);

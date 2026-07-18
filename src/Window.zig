@@ -7,6 +7,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const wayland = @import("wayland");
+const ext = wayland.client.ext;
 const wl = wayland.client.wl;
 const wp = wayland.client.wp;
 const xdg = wayland.client.xdg;
@@ -30,6 +31,8 @@ activation_token: ?*xdg.ActivationTokenV1,
 activation_token_purpose: ?ActivationTokenPurpose,
 system_bell: ?*xdg.SystemBellV1,
 toplevel_icon_manager: ?*xdg.ToplevelIconManagerV1,
+background_effect_manager: ?*ext.BackgroundEffectManagerV1,
+background_effect: ?*ext.BackgroundEffectSurfaceV1,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
@@ -198,6 +201,7 @@ const Globals = struct {
     activation: ?*xdg.ActivationV1 = null,
     system_bell: ?*xdg.SystemBellV1 = null,
     toplevel_icon_manager: ?*xdg.ToplevelIconManagerV1 = null,
+    background_effect_manager: ?*ext.BackgroundEffectManagerV1 = null,
     seat: ?*wl.Seat = null,
     seat_name: ?u32 = null,
     viewporter: ?*wp.Viewporter = null,
@@ -256,6 +260,14 @@ pub fn create(
     const toplevel = try xdg_surface.getToplevel();
     toplevel.setAppId(app_id);
     toplevel.setTitle(title);
+
+    const background_effect: ?*ext.BackgroundEffectSurfaceV1 = effect: {
+        const manager = globals.background_effect_manager orelse break :effect null;
+        break :effect manager.getBackgroundEffect(surface) catch |err| {
+            log.warn("background effect setup failed: {}", .{err});
+            break :effect null;
+        };
+    };
 
     if (globals.toplevel_icon_manager) |manager| {
         if (manager.createIcon()) |icon| {
@@ -346,6 +358,8 @@ pub fn create(
         .activation_token_purpose = null,
         .system_bell = globals.system_bell,
         .toplevel_icon_manager = globals.toplevel_icon_manager,
+        .background_effect_manager = globals.background_effect_manager,
+        .background_effect = background_effect,
         .seat = globals.seat,
         .keyboard = null,
         .pointer = null,
@@ -453,9 +467,11 @@ pub fn destroy(self: *Window) void {
     if (self.activation) |activation| activation.destroy();
     if (self.system_bell) |bell| bell.destroy();
     if (self.toplevel_icon_manager) |manager| manager.destroy();
+    if (self.background_effect) |effect| effect.destroy();
     self.toplevel.destroy();
     self.xdg_surface.destroy();
     self.surface.destroy();
+    if (self.background_effect_manager) |manager| manager.destroy();
     self.wm_base.destroy();
     if (self.shm.getVersion() >= wl.Shm.release_since_version)
         self.shm.release()
@@ -545,6 +561,24 @@ pub fn setBufferAlpha(self: *Window, enabled: bool) void {
     if (self.newest_buffer) |newest| {
         if (newest.format != format) self.newest_buffer = null;
     }
+}
+
+/// Request compositor blur for the whole surface. The effect state is
+/// double-buffered and takes effect with the application's next surface commit.
+pub fn setBackgroundBlur(self: *Window, enabled: bool) void {
+    const effect = self.background_effect orelse return;
+    if (!enabled) {
+        effect.setBlurRegion(null);
+        return;
+    }
+
+    const region = self.compositor.createRegion() catch |err| {
+        log.warn("background blur region creation failed: {}", .{err});
+        return;
+    };
+    defer region.destroy();
+    region.add(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
+    effect.setBlurRegion(region);
 }
 
 pub fn ringBell(self: *Window) void {
@@ -882,6 +916,12 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
             } else if (std.mem.orderZ(u8, global.interface, xdg.ToplevelIconManagerV1.interface.name) == .eq) {
                 if (globals.toplevel_icon_manager == null)
                     globals.toplevel_icon_manager = registry.bind(global.name, xdg.ToplevelIconManagerV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, ext.BackgroundEffectManagerV1.interface.name) == .eq) {
+                if (globals.background_effect_manager == null) {
+                    const manager = registry.bind(global.name, ext.BackgroundEffectManagerV1, 1) catch return;
+                    globals.background_effect_manager = manager;
+                    manager.setListener(*Globals, backgroundEffectManagerListener, globals);
+                }
             } else if (std.mem.orderZ(u8, global.interface, wl.Seat.interface.name) == .eq) {
                 if (globals.seat == null) {
                     const seat = registry.bind(global.name, wl.Seat, @min(global.version, wl.Seat.generated_version)) catch return;
@@ -923,6 +963,16 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.seat_name = null;
             }
         },
+    }
+}
+
+fn backgroundEffectManagerListener(
+    _: *ext.BackgroundEffectManagerV1,
+    event: ext.BackgroundEffectManagerV1.Event,
+    _: *Globals,
+) void {
+    switch (event) {
+        .capabilities => |capabilities| log.debug("background blur capability: {}", .{capabilities.flags.blur}),
     }
 }
 
