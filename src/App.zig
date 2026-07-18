@@ -4737,7 +4737,10 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             self.cancelRepeat();
             self.setFocus(false);
         },
-        .enter => self.setFocus(true),
+        .enter => |enter| {
+            self.last_serial = enter.serial;
+            self.setFocus(true);
+        },
     }
 }
 
