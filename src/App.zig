@@ -5392,6 +5392,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         selection_fg,
         self.cursor_text,
         self.config.background_opacity,
+        self.config.background_opacity_cells,
     )) {
         async_raster.reconfigure(
             self.font.discovery(),
@@ -5399,6 +5400,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             selection_fg,
             self.cursor_text,
             self.config.background_opacity,
+            self.config.background_opacity_cells,
         ) catch |err| {
             self.rasterFatal(err);
             return .deferred;
@@ -5650,6 +5652,7 @@ fn startAsyncRasterLoad(self: *App) void {
         self.selectionForegroundForRender(),
         self.cursor_text,
         self.config.background_opacity,
+        self.config.background_opacity_cells,
         &self.render_state,
     ) catch |err| {
         self.rasterFatal(err);
@@ -5680,6 +5683,7 @@ fn finishAsyncRasterLoad(self: *App) void {
                 self.selectionForegroundForRender(),
                 self.cursor_text,
                 self.config.background_opacity,
+                self.config.background_opacity_cells,
             )) {
                 // Config changed while loading; rebuild with the new one.
                 raster.deinit();

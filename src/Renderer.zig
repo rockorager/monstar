@@ -41,9 +41,11 @@ search_fg: vt.color.RGB,
 /// Explicit text color under a focused block cursor. Null preserves the
 /// terminal background fallback.
 cursor_text: ?vt.color.RGB,
-/// Alpha applied only to the default terminal background and window padding.
-/// Explicit cell backgrounds, selections, cursors, and foregrounds stay opaque.
+/// Alpha applied to the default terminal background and window padding.
 background_alpha: u8,
+/// Whether background alpha also applies to explicit terminal cell
+/// backgrounds. Selections, cursors, and renderer overlays stay opaque.
+background_alpha_cells: bool,
 /// Keyboard focus: unfocused windows draw the cursor as a hollow
 /// rectangle regardless of the requested style. Set by the caller.
 focused: bool = true,
@@ -141,6 +143,7 @@ pub const InitOptions = struct {
     selection_foreground: ?vt.color.RGB = null,
     cursor_text: ?vt.color.RGB = null,
     background_alpha: u8 = 255,
+    background_alpha_cells: bool = false,
 };
 
 pub const ShapeStats = struct {
@@ -178,6 +181,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .search_fg = Config.dark_theme.copy_highlight_foreground,
         .cursor_text = opts.cursor_text,
         .background_alpha = opts.background_alpha,
+        .background_alpha_cells = opts.background_alpha_cells,
         .fg_scratch = .empty,
         .face_scratch = .empty,
         .reverse_scratch = .empty,
@@ -1429,6 +1433,7 @@ fn prepareRow(
             fg = bg orelse colors.background;
             bg = old_fg;
         }
+        var background_uses_alpha = self.background_alpha_cells and bg != null;
         // Selection overrides cell colors: fixed background, default
         // foreground, so selected text reads uniformly.
         const selected = if (selection) |sel| x >= sel[0] and x <= sel[1] else false;
@@ -1440,10 +1445,12 @@ fn prepareRow(
             bg = self.selection_bg;
             fg = self.selection_fg orelse colors.foreground;
             reverse_color_glyph = false;
+            background_uses_alpha = false;
         } else if (search_selected) {
             bg = self.search_bg;
             fg = self.search_fg;
             reverse_color_glyph = false;
+            background_uses_alpha = false;
         } else if (search_match) {
             dim_search_bg = true;
         }
@@ -1457,18 +1464,19 @@ fn prepareRow(
             fg = self.cursor_text orelse colors.background;
             reverse_color_glyph = false;
             dim_search_bg = false;
+            background_uses_alpha = false;
         }
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
         if (backgrounds != .none) {
             const color: ?u32 = if (dim_search_bg) color: {
                 const mixed = blendRgb(self.search_bg, bg orelse colors.background, search_match_alpha);
-                break :color if (bg != null)
-                    argb(mixed)
+                break :color if (bg == null or background_uses_alpha)
+                    self.backgroundPixel(mixed)
                 else
-                    self.backgroundPixel(mixed);
+                    argb(mixed);
             } else if (bg) |bg_color|
-                argb(bg_color)
+                if (background_uses_alpha) self.backgroundPixel(bg_color) else argb(bg_color)
             else switch (backgrounds) {
                 .all => self.backgroundPixel(colors.background),
                 else => null,
@@ -2124,7 +2132,7 @@ fn blendRgb(fg: vt.color.RGB, bg: vt.color.RGB, alpha: u8) vt.color.RGB {
     };
 }
 
-/// Pack the default background in wl_shm's premultiplied ARGB8888 form.
+/// Pack a background color in wl_shm's premultiplied ARGB8888 form.
 pub fn backgroundPixel(self: *const Renderer, rgb: vt.color.RGB) u32 {
     return premultipliedArgb(rgb, self.background_alpha);
 }
@@ -3319,7 +3327,7 @@ test "render a simple grid" {
     try std.testing.expect(non_bg > 0);
 }
 
-test "background opacity does not fade explicit cell backgrounds" {
+test "background opacity cells controls explicit cell backgrounds" {
     const alloc = std.testing.allocator;
 
     var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
@@ -3346,8 +3354,13 @@ test "background opacity does not fade explicit cell backgrounds" {
     const y = font.cell_height / 2;
     const explicit_bg = pixels[@as(usize, y) * width + font.cell_width / 2];
     const default_bg = pixels[@as(usize, y) * width + font.cell_width + font.cell_width / 2];
-    try std.testing.expectEqual(@as(u32, 0xff), explicit_bg >> 24);
+    try std.testing.expectEqual(argb(state.colors.palette[1]), explicit_bg);
     try std.testing.expectEqual(renderer.backgroundPixel(state.colors.background), default_bg);
+
+    renderer.background_alpha_cells = true;
+    try renderer.render(&state, pixels, width, height);
+    const faded_explicit_bg = pixels[@as(usize, y) * width + font.cell_width / 2];
+    try std.testing.expectEqual(renderer.backgroundPixel(state.colors.palette[1]), faded_explicit_bg);
 }
 
 test "render rectangular selection spans" {
@@ -3382,7 +3395,11 @@ test "render rectangular selection spans" {
     try std.testing.expectEqualSlices(vt.size.CellCountInt, &.{ 2, 4 }, &selections[3].?);
     try std.testing.expectEqual(null, selections[4]);
 
-    var renderer: Renderer = try .init(alloc, &font, .{ .selection_background = selection_bg });
+    var renderer: Renderer = try .init(alloc, &font, .{
+        .selection_background = selection_bg,
+        .background_alpha = 128,
+        .background_alpha_cells = true,
+    });
     defer renderer.deinit();
 
     const width: u31 = font.cell_width * 8;
@@ -3393,7 +3410,7 @@ test "render rectangular selection spans" {
     try renderer.render(&state, pixels, width, height);
 
     const selected = argb(selection_bg);
-    const background = argb(state.colors.background);
+    const background = renderer.backgroundPixel(state.colors.background);
     for (0..5) |y| {
         for (0..8) |x| {
             const px = (y * font.cell_height + font.cell_height / 2) * width +

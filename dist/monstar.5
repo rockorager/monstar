@@ -123,8 +123,15 @@ equivalent to 16 logical pixels at 96 DPI.
 .BI background-opacity " = opacity"
 Set the opacity of cells using the default terminal background.
 The value is between 0 and 1 inclusive; the default is 1.
-Explicit cell backgrounds, selections, cursors, text, and terminal graphics
-retain their own opacity.
+By default, explicit cell backgrounds, selections, cursors, text, and terminal
+graphics retain their own opacity.
+.TP
+.BI background-opacity-cells " = boolean"
+Apply
+.B background-opacity
+to explicit cell background colors too.
+The default is false.
+Selections, cursors, text, and terminal graphics retain their own opacity.
 .TP
 .BI window-padding-x " = pixels[,pixels]"
 Set minimum left and right padding in logical pixels.

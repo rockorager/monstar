@@ -183,6 +183,10 @@ window-padding-y = 6
 mouse-scroll-multiplier = precision:1,discrete:3
 ```
 
+By default, `background-opacity` affects only the default terminal background
+and padding. Set `background-opacity-cells = true` to apply it to explicit cell
+background colors too.
+
 Leave `theme` unset to follow the desktop light/dark preference. Load bundled
 iTerm2 color schemes by name. Put custom themes in
 `$XDG_CONFIG_HOME/monstar/themes` or `~/.config/monstar/themes`.

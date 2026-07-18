@@ -99,6 +99,7 @@ pub const Loader = struct {
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
     background_alpha: u8,
+    background_alpha_cells: bool,
     state: *vt.RenderState,
     thread: ?std.Thread = null,
     mutex: std.atomic.Mutex = .unlocked,
@@ -111,6 +112,7 @@ pub const Loader = struct {
         selection_foreground: ?vt.color.RGB,
         cursor_text: ?vt.color.RGB,
         background_alpha: u8,
+        background_alpha_cells: bool,
         state: *vt.RenderState,
     ) !Loader {
         const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -122,6 +124,7 @@ pub const Loader = struct {
             .selection_foreground = selection_foreground,
             .cursor_text = cursor_text,
             .background_alpha = background_alpha,
+            .background_alpha_cells = background_alpha_cells,
             .state = state,
             .complete_fd = @intCast(rc),
         };
@@ -164,6 +167,7 @@ pub const Loader = struct {
             self.selection_foreground,
             self.cursor_text,
             self.background_alpha,
+            self.background_alpha_cells,
             self.state,
         )) |raster|
             .{ .ready = raster }
@@ -203,6 +207,7 @@ pub fn init(
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
     background_alpha: u8,
+    background_alpha_cells: bool,
     state: *vt.RenderState,
 ) !AsyncRaster {
     const alloc = std.heap.smp_allocator;
@@ -215,6 +220,7 @@ pub fn init(
         .selection_foreground = selection_foreground,
         .cursor_text = cursor_text,
         .background_alpha = background_alpha,
+        .background_alpha_cells = background_alpha_cells,
     });
     errdefer renderer.deinit();
     const rc = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -263,6 +269,7 @@ pub fn reconfigure(
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
     background_alpha: u8,
+    background_alpha_cells: bool,
 ) !void {
     self.lock();
     defer self.mutex.unlock();
@@ -276,6 +283,7 @@ pub fn reconfigure(
         .selection_foreground = selection_foreground,
         .cursor_text = cursor_text,
         .background_alpha = background_alpha,
+        .background_alpha_cells = background_alpha_cells,
     });
     errdefer renderer.deinit();
     self.renderer.deinit();
@@ -298,6 +306,7 @@ pub fn configuredFor(
     selection_foreground: ?vt.color.RGB,
     cursor_text: ?vt.color.RGB,
     background_alpha: u8,
+    background_alpha_cells: bool,
 ) bool {
     self.lock();
     defer self.mutex.unlock();
@@ -305,7 +314,8 @@ pub fn configuredFor(
         self.renderer.selection_bg.eql(selection_background) and
         optionalRgbEql(self.renderer.selection_fg, selection_foreground) and
         optionalRgbEql(self.renderer.cursor_text, cursor_text) and
-        self.renderer.background_alpha == background_alpha;
+        self.renderer.background_alpha == background_alpha and
+        self.renderer.background_alpha_cells == background_alpha_cells;
 }
 
 pub fn submit(self: *AsyncRaster, job: Job) !void {
