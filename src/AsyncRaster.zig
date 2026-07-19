@@ -1,4 +1,11 @@
 //! Asynchronous CPU raster worker.
+//!
+//! A single controlling thread owns each `Loader` and `AsyncRaster` and calls
+//! its public methods; their internal threads only perform loading or raster
+//! work. Once started, either object must remain at a stable address until its
+//! thread is joined by `takeResult` or `deinit`. The supplied `RenderState` is
+//! borrowed for the lifetime of the resulting `AsyncRaster` and must not be
+//! accessed by the controlling thread while a raster job is busy.
 
 const AsyncRaster = @This();
 
@@ -17,6 +24,12 @@ pub const Repair = union(enum) {
     rects: []const RepairRect,
 };
 
+/// A borrowed render snapshot. On successful submission, every slice and any
+/// memory reachable through its elements must remain valid until the matching
+/// result is taken, or until `AsyncRaster.deinit` returns. The worker has
+/// exclusive access to mutate `pixels` during that interval; all other slices
+/// are read-only. A returned `Result.job` preserves these borrows and does not
+/// transfer ownership of their backing storage.
 pub const Job = struct {
     pixels: []u32,
     source_pixels: ?[]const u32,
@@ -40,20 +53,19 @@ pub const Job = struct {
     /// Colors shared by the full-strength selected match and dimmed matches.
     search_background: vt.color.RGB,
     search_foreground: vt.color.RGB,
-    /// IME preedit overlay text. Owned by the submitter; must stay valid
-    /// until the job's result is taken.
+    /// IME preedit overlay text.
     preedit: ?[]const u8,
-    /// Hovered-hyperlink URI overlay. Same ownership as `preedit`.
+    /// Hovered-hyperlink URI overlay.
     link_hint: ?[]const u8,
-    /// Top-right scrollback-search overlay. Same ownership as `preedit`.
+    /// Top-right scrollback-search overlay.
     search: ?[]const u8,
     /// Use the terminal's red palette entry for the search overlay.
     search_no_match: bool,
     /// Transient right-edge scrollback indicator in full-surface pixels.
     scrollbar: ?Renderer.ScrollbarThumb,
     /// Visible kitty placements, resolved on the main thread with image
-    /// data repointed at cache-pinned copies. Same ownership as
-    /// `preedit`; empty when no graphics are visible.
+    /// data repointed at cache-pinned copies; empty when no graphics are
+    /// visible.
     kitty_items: []const Renderer.KittyRenderItem,
     /// Any overlay input (kitty snapshot, preedit, link hint, hint
     /// flag) differs from the previously submitted job. Unchanged
@@ -63,8 +75,7 @@ pub const Job = struct {
     /// shifts content up; negative shifts it down.
     scroll_shift: ?isize,
     /// Work needed to bring a stale target up to the previous committed
-    /// frame. Span storage belongs to the submitter and remains valid until
-    /// the result is taken.
+    /// frame.
     repair: Repair,
 
     fn hasOverlay(self: *const Job) bool {
@@ -89,7 +100,9 @@ pub const LoadResult = union(enum) {
 };
 
 /// Builds the worker's independent FreeType and renderer state after the
-/// first frame without repeating the main Font's immutable discovery.
+/// first frame without repeating the main Font's immutable discovery. The
+/// controlling thread owns the loader and must eventually call `deinit`, even
+/// after taking its result.
 pub const Loader = struct {
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
@@ -103,6 +116,9 @@ pub const Loader = struct {
     result: ?LoadResult = null,
     complete_fd: posix.fd_t,
 
+    /// Retains `discovery` and borrows `state`. The borrow is transferred to a
+    /// successful `.ready` raster; otherwise it ends when the loader is
+    /// deinitialized.
     pub fn init(
         discovery: *Font.Discovery,
         selection_background: vt.color.RGB,
@@ -127,11 +143,16 @@ pub const Loader = struct {
         };
     }
 
+    /// Starts the load thread. Requires no thread to have been started for
+    /// this loader; `self` must not move until that thread is joined.
     pub fn start(self: *Loader) !void {
         std.debug.assert(self.thread == null);
         self.thread = try std.Thread.spawn(.{}, loadMain, .{self});
     }
 
+    /// Returns null while loading is incomplete. A non-null return joins the
+    /// load thread; `.ready` transfers an `AsyncRaster` that the caller must
+    /// deinitialize, while `.failed` produces no raster.
     pub fn takeResult(self: *Loader) ?LoadResult {
         drainEventFd(self.complete_fd);
         self.lock();
@@ -146,6 +167,9 @@ pub const Loader = struct {
         return result;
     }
 
+    /// Joins an outstanding load, destroys any result not taken by the caller,
+    /// releases the retained discovery, and invalidates the loader. This may
+    /// block until loading completes.
     pub fn deinit(self: *Loader) void {
         if (self.thread) |thread| thread.join();
         if (self.result) |*result| switch (result.*) {
@@ -198,6 +222,9 @@ job: Job = undefined,
 result: ?Result = null,
 state: *vt.RenderState,
 
+/// Creates an idle raster worker but does not start its thread. The returned
+/// value owns its renderer, font, and event descriptors and borrows `state`
+/// until `deinit`.
 pub fn init(
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
@@ -238,11 +265,16 @@ pub fn init(
     return self;
 }
 
+/// Starts the raster thread. Requires no thread to have been started for this
+/// instance; `self` must not move until that thread is joined.
 pub fn start(self: *AsyncRaster) !void {
     std.debug.assert(self.thread == null);
     self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
 }
 
+/// Stops and joins the raster thread, releases owned resources, and invalidates
+/// the instance. This may block for an in-progress job; that job's borrowed
+/// storage must remain valid until this function returns.
 pub fn deinit(self: *AsyncRaster) void {
     if (self.thread) |thread| {
         self.lock();
@@ -259,6 +291,9 @@ pub fn deinit(self: *AsyncRaster) void {
     self.* = undefined;
 }
 
+/// Replaces the worker's font and renderer configuration while idle. Returns
+/// `error.Busy` if a job is queued, running, or awaiting collection. Other
+/// errors leave the existing configuration intact.
 pub fn reconfigure(
     self: *AsyncRaster,
     discovery: *Font.Discovery,
@@ -290,12 +325,15 @@ pub fn reconfigure(
     self.renderer = renderer;
 }
 
+/// Reports whether a job is queued, running, or has an uncollected result.
 pub fn busy(self: *AsyncRaster) bool {
     self.lock();
     defer self.mutex.unlock();
     return self.has_job or self.working or self.result != null;
 }
 
+/// Compares the current renderer settings, including discovery identity. This
+/// query is synchronized with the worker and does not require an idle raster.
 pub fn configuredFor(
     self: *AsyncRaster,
     discovery: *Font.Discovery,
@@ -315,6 +353,9 @@ pub fn configuredFor(
         self.renderer.background_alpha_cells == background_alpha_cells;
 }
 
+/// Queues one job and wakes the worker. Returns `error.Busy` unless the raster
+/// is idle. On success the worker borrows the job's storage as documented by
+/// `Job`; on notification failure no job is retained.
 pub fn submit(self: *AsyncRaster, job: Job) !void {
     self.lock();
     defer self.mutex.unlock();
@@ -327,6 +368,9 @@ pub fn submit(self: *AsyncRaster, job: Job) !void {
     };
 }
 
+/// Returns null until a job completes. Taking a result makes the raster idle
+/// and ends the worker's borrow of the job storage; the returned `Job` still
+/// contains caller-owned slices and performs no cleanup.
 pub fn takeResult(self: *AsyncRaster) ?Result {
     self.drainEventfd();
     self.lock();
@@ -336,6 +380,10 @@ pub fn takeResult(self: *AsyncRaster) ?Result {
     return result;
 }
 
+/// Copies the most recently rendered rectangles into caller-owned `dest`,
+/// clearing its previous contents while retaining capacity. Requires an idle
+/// raster, normally immediately after `takeResult`; `alloc` is used only if
+/// `dest` must grow.
 pub fn copyRenderedRects(self: *AsyncRaster, alloc: std.mem.Allocator, dest: *std.ArrayList(Renderer.PixelRect)) !void {
     self.lock();
     defer self.mutex.unlock();
