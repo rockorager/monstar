@@ -100,12 +100,58 @@ const output = try writer.toOwnedSlice();
 - lower-case `snake_case` for variables, parameters, and constants
 - `PascalCase` for types, structs, and enums
 - prefer `const foo: Type = .{ .field = value };` over `const foo = Type{ .field = value };`
-- preferred file order: `//!` module doc comment, `const Self = @This();`, imports, `const log = std.log.scoped(...)`
 - pass allocators explicitly; use `errdefer` for cleanup on error
 - keep tests inline with the code they cover; register them in `src/main.zig`
+
+### Files and Types
+
+- Treat every `.zig` file as a namespace. Make the file itself a type only when
+  its root represents one primary stateful abstraction with fields and methods.
+- Name a file-backed type `PascalCase.zig`, import it directly with
+  `const Widget = @import("Widget.zig");`, and begin it with an optional `//!`
+  container doc followed by `const Widget = @This();`. Prefer the concrete type
+  name over `Self` so signatures remain clear out of context.
+- Use lower-case `snake_case.zig` for namespace modules: related free functions,
+  constants, multiple peer types, or package facades. Export named types from
+  these modules and import them as `@import("widget.zig").Widget`.
+- Do not put a sole `pub const Widget = struct { ... };` inside `Widget.zig`;
+  the file root already provides that container. Conversely, do not create a
+  file-backed type merely to enforce one-type-per-file organization.
+- Preferred file start: `//!` container docs when needed, the file-backed type
+  alias when applicable, imports and local aliases, then a scoped logger.
+
+### Comments and Documentation
+
+- Use `//!` at the start of a nontrivial file to document the root namespace or
+  file-backed type: its purpose, conceptual model, and major invariants. Omit it
+  for trivial facades whose exports make the purpose obvious.
+- Use `///` for declaration-level contracts. Document public APIs when the name
+  and signature do not fully convey ownership and lifetime, allocation,
+  mutation or pointer invalidation, errors or nullability, units and ranges,
+  thread safety, side effects, or asserted preconditions. Simple re-exports and
+  self-explanatory declarations do not need filler documentation.
+- Use `//` for implementation rationale, state invariants, workarounds, and
+  signposts for non-obvious algorithm phases. Do not narrate syntax or restate
+  the code. Doc comments must not contain notes intended only for maintainers.
+- Keep comments accurate when behavior changes. Prefer deleting a stale or
+  redundant comment over expanding it.
+
+### File Size
+
+- Cohesion, not line count, decides when to split a file. As review triggers,
+  prefer hand-written files below roughly 1,000 lines, actively look for a
+  cohesive extraction once a file crosses that size, and treat files above
+  roughly 2,000 lines as exceptional. These are not hard limits.
+- Split when a file contains independently nameable responsibilities, disjoint
+  subsystems, or helpers with their own invariants. Extract a real subordinate
+  type, parser, formatter, platform backend, or pure algorithm rather than an
+  arbitrary range of methods.
+- Keep a large file intact when its declarations jointly implement one cohesive
+  type and splitting would add forwarding APIs or make invariants harder to
+  follow. Generated code, data tables, and version-specific compatibility
+  snapshots are exempt from the size guidance.
 
 ## Safety
 
 - Add assertions at API boundaries and state transitions; avoid trivial assertions.
 - Keep functions small and push pure computation into helpers.
-- Comments should explain why, not what.
