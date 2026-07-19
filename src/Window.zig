@@ -106,15 +106,20 @@ redraw_ready_fn: ?RedrawReadyFn,
 activation_token_fn: ?ActivationTokenFn,
 clipboard_devices_fn: ?ClipboardDevicesFn,
 
-/// A full-width horizontal band of pixels, in buffer coordinates.
-pub const RowSpan = struct { y: u31, height: u31 };
+/// A changed rectangle in physical buffer coordinates.
+pub const DamageRect = struct {
+    x: u31,
+    y: u31,
+    width: u31,
+    height: u31,
+};
 
 /// The buffer region a render changed relative to the previous frame.
 pub const Damage = union(enum) {
     full,
-    /// Changed full-width bands; an empty slice means nothing changed.
+    /// Changed rectangles; an empty slice means nothing changed.
     /// The slice must remain valid until the next render callback.
-    spans: []const RowSpan,
+    rects: []const DamageRect,
 };
 
 /// Called when the window size changed, before the next draw.
@@ -815,15 +820,15 @@ pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
     if (self.surface.getVersion() >= wl.Surface.damage_buffer_since_version) {
         switch (damage) {
             .full => self.surface.damageBuffer(0, 0, phys_width, phys_height),
-            .spans => |spans| for (spans) |span| {
-                self.surface.damageBuffer(0, span.y, phys_width, span.height);
+            .rects => |rects| for (rects) |rect| {
+                self.surface.damageBuffer(rect.x, rect.y, rect.width, rect.height);
             },
         }
     } else switch (damage) {
         // Older surfaces only accept surface-local damage. Full damage is
-        // conservative and avoids lossy conversion of fractional row spans.
+        // conservative and avoids lossy fractional rectangle conversion.
         .full => self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32)),
-        .spans => |spans| if (spans.len > 0)
+        .rects => |rects| if (rects.len > 0)
             self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32)),
     }
     self.surface.commit();

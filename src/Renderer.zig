@@ -73,9 +73,23 @@ reverse_scratch: std.ArrayList(bool),
 row_overhang: std.DynamicBitSetUnmanaged,
 /// Whether the row currently being rendered blitted above its strip.
 overhang_scratch: bool = false,
-/// The rows the last renderDirty call actually repainted, for the
-/// caller's damage bookkeeping.
-repainted: std.DynamicBitSetUnmanaged,
+/// Horizontal framebuffer interval glyph blits may modify while a
+/// partial row is being painted. Shaping still sees complete runs.
+glyph_clip_x: ?PixelRange = null,
+/// Grid-local pixel rectangles modified by the last renderDirty call.
+rendered_rects: std.ArrayList(PixelRect),
+/// Fingerprints of the last fully rendered visual cell state. The
+/// cell-damage path compares only dirty rows against these.
+cell_fingerprints: std.ArrayList(CellFingerprint),
+cell_fingerprint_scratch: std.ArrayList(CellFingerprint),
+cell_fingerprint_valid: std.DynamicBitSetUnmanaged,
+cell_damage: std.ArrayList(?CellRange),
+cell_fingerprint_rows: usize = 0,
+cell_fingerprint_cols: usize = 0,
+cell_colors: ?@FieldType(vt.RenderState, "colors") = null,
+cell_damage_stats: CellDamageStats = .{},
+track_cell_damage: bool,
+partial_cell_raster: bool,
 /// Shaped-run cache: HarfBuzz output keyed by face and run content
 /// (codepoints with run-relative clusters), so repeated text shapes
 /// once no matter where it appears on screen. Cleared wholesale when
@@ -144,6 +158,9 @@ pub const InitOptions = struct {
     cursor_text: ?vt.color.RGB = null,
     background_alpha: u8 = 255,
     background_alpha_cells: bool = false,
+    /// Benchmark escape hatch for comparing the superseded row path.
+    track_cell_damage: bool = true,
+    partial_cell_raster: bool = true,
 };
 
 pub const ShapeStats = struct {
@@ -151,6 +168,43 @@ pub const ShapeStats = struct {
     cache_misses: usize = 0,
     shaped_cells: usize = 0,
     cache_clears: usize = 0,
+};
+
+pub const CellDamageStats = struct {
+    dirty_rows: usize = 0,
+    unchanged_dirty_rows: usize = 0,
+    scanned_cells: usize = 0,
+    changed_cells: usize = 0,
+    /// Cells covered by one first-through-last changed interval per row.
+    spanned_cells: usize = 0,
+};
+
+pub const PixelRect = struct {
+    x: u31,
+    y: u31,
+    width: u31,
+    height: u31,
+};
+
+const CellFingerprint = struct {
+    raw: vt.Cell,
+    style: vt.Style,
+    grapheme: u64,
+    visual: u8,
+    cursor_style: u8,
+
+    fn eql(self: CellFingerprint, other: CellFingerprint) bool {
+        return @as(u64, @bitCast(self.raw)) == @as(u64, @bitCast(other.raw)) and
+            (self.raw.style_id == 0 or self.style.eql(other.style)) and
+            self.grapheme == other.grapheme and
+            self.visual == other.visual and
+            self.cursor_style == other.cursor_style;
+    }
+};
+
+const CellRange = struct {
+    start: usize,
+    end: usize,
 };
 
 pub const LinkRange = struct {
@@ -169,6 +223,7 @@ pub const LinkRange = struct {
 };
 
 pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer {
+    std.debug.assert(!opts.partial_cell_raster or opts.track_cell_damage);
     const hb_buf = c.hb_buffer_create() orelse return error.OutOfMemory;
     if (c.hb_buffer_allocation_successful(hb_buf) == 0) return error.OutOfMemory;
     return .{
@@ -186,7 +241,13 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .face_scratch = .empty,
         .reverse_scratch = .empty,
         .row_overhang = .{},
-        .repainted = .{},
+        .rendered_rects = .empty,
+        .cell_fingerprints = .empty,
+        .cell_fingerprint_scratch = .empty,
+        .cell_fingerprint_valid = .{},
+        .cell_damage = .empty,
+        .track_cell_damage = opts.track_cell_damage,
+        .partial_cell_raster = opts.partial_cell_raster,
         .shape_cache = .empty,
         .shape_key = .empty,
         .codepoint_scratch = .empty,
@@ -203,7 +264,11 @@ pub fn deinit(self: *Renderer) void {
     self.face_scratch.deinit(self.alloc);
     self.reverse_scratch.deinit(self.alloc);
     self.row_overhang.deinit(self.alloc);
-    self.repainted.deinit(self.alloc);
+    self.rendered_rects.deinit(self.alloc);
+    self.cell_fingerprints.deinit(self.alloc);
+    self.cell_fingerprint_scratch.deinit(self.alloc);
+    self.cell_fingerprint_valid.deinit(self.alloc);
+    self.cell_damage.deinit(self.alloc);
     self.clearShapeCache();
     self.shape_cache.deinit(self.alloc);
     self.shape_key.deinit(self.alloc);
@@ -240,6 +305,14 @@ pub fn shapeStats(self: *const Renderer) ShapeStats {
     return self.shape_stats;
 }
 
+pub fn resetCellDamageStats(self: *Renderer) void {
+    self.cell_damage_stats = .{};
+}
+
+pub fn cellDamageStats(self: *const Renderer) CellDamageStats {
+    return self.cell_damage_stats;
+}
+
 fn pixelStride(self: *const Renderer, width: u31) u31 {
     const stride = if (self.buffer_stride == 0) width else self.buffer_stride;
     std.debug.assert(stride >= width);
@@ -263,6 +336,7 @@ pub fn render(
 
     if (state.rows == 0 or state.cols == 0) {
         fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
+        if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
         return;
     }
     try self.row_overhang.resize(self.alloc, state.rows, false);
@@ -298,6 +372,7 @@ pub fn render(
             self.backgroundPixel(state.colors.background),
         );
     }
+    if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
 }
 
 /// Full render interleaving kitty placements with the grid by z layer.
@@ -323,12 +398,16 @@ pub fn renderWithKittyItems(
             rect.x0 <= 0 and rect.y0 <= 0 and rect.x1 >= width and rect.y1 >= height)
         {
             try self.renderKittyPlacement(pixels, width, height, final.image, final.viewport);
+            if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
             return;
         }
     }
 
     fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
-    if (state.rows == 0 or state.cols == 0) return;
+    if (state.rows == 0 or state.cols == 0) {
+        if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
+        return;
+    }
 
     try self.renderKittyItems(items, pixels, width, height, .below_bg);
 
@@ -372,14 +451,15 @@ pub fn renderWithKittyItems(
     }
 
     try self.renderKittyItems(items, pixels, width, height, .above_text);
+    if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
 }
 
 /// Draw only rows marked dirty in `state`, preserving other pixels.
 /// A dirty row's neighbors are repainted only when the row_overhang
 /// bits demand it: the row above when the dirty row's previous
 /// content inked into it, the row below when its ink reaches into the
-/// dirty row's freshly cleared strip. The rows actually repainted are
-/// recorded in `repainted` for the caller's damage bookkeeping.
+/// dirty row's freshly cleared strip. Modified grid-pixel rectangles
+/// are recorded in `rendered_rects` for repair and surface damage.
 pub fn renderDirty(
     self: *Renderer,
     state: *vt.RenderState,
@@ -388,10 +468,10 @@ pub fn renderDirty(
     height: u31,
 ) !void {
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
+    self.rendered_rects.clearRetainingCapacity();
     if (state.rows == 0 or state.cols == 0) return;
+    if (self.track_cell_damage) try self.measureCellDamage(state);
     try self.row_overhang.resize(self.alloc, state.rows, false);
-    try self.repainted.resize(self.alloc, state.rows, false);
-    self.repainted.unsetAll();
 
     const rows = state.row_data.slice();
     const all_cells = rows.items(.cells);
@@ -400,31 +480,288 @@ pub fn renderDirty(
     var rendered_until: usize = 0;
     for (all_dirty[0..state.rows], 0..) |dirty, y| {
         if (!dirty) continue;
+        if (self.partial_cell_raster and self.cell_damage.items[y] == null) continue;
         const expand_up = y > 0 and self.row_overhang.isSet(y);
         const expand_down = y + 1 < state.rows and self.row_overhang.isSet(y + 1);
         const start = y - @intFromBool(expand_up);
         const end = y + 1 + @intFromBool(expand_down);
         var row = @max(start, rendered_until);
         while (row < end) : (row += 1) {
-            self.repainted.set(row);
-            try self.renderRow(
-                state,
-                all_cells[row].slice(),
-                all_selections[row],
-                @intCast(row),
-                pixels,
-                width,
-                height,
-            );
+            const cell_damage = if (self.partial_cell_raster and
+                row == y and start == y and end == y + 1)
+                self.cell_damage.items[y]
+            else
+                null;
+            if (cell_damage) |cell_range| {
+                try self.renderRowCells(
+                    state,
+                    all_cells[row].slice(),
+                    all_selections[row],
+                    cell_range,
+                    @intCast(row),
+                    pixels,
+                    width,
+                    height,
+                );
+                try self.recordRenderedRect(cell_range, row, state.cols, width, height);
+            } else {
+                try self.renderRow(
+                    state,
+                    all_cells[row].slice(),
+                    all_selections[row],
+                    @intCast(row),
+                    pixels,
+                    width,
+                    height,
+                );
+                try self.recordRenderedRect(.{ .start = 0, .end = state.cols }, row, state.cols, width, height);
+            }
         }
         rendered_until = @max(rendered_until, end);
     }
 }
 
-/// The overhang bits describe rendered row content, so move them with a
-/// scroll blit. Newly exposed rows are conservatively marked until their
-/// first repaint determines their actual overhang.
-pub fn shiftRowOverhang(self: *Renderer, rows: usize, shift_rows: isize) !void {
+fn recordRenderedRect(
+    self: *Renderer,
+    cell_range: CellRange,
+    row: usize,
+    cols: usize,
+    width: u31,
+    height: u31,
+) !void {
+    const cell_width: u64 = self.font.cell_width;
+    const cell_height: u64 = self.font.cell_height;
+    const x_start: u31 = @intCast(@min(@as(u64, cell_range.start) * cell_width, width));
+    const x_end: u31 = if (cell_range.end == cols)
+        width
+    else
+        @intCast(@min(@as(u64, cell_range.end) * cell_width, width));
+    var y_start: u31 = @intCast(@min(@as(u64, row) * cell_height, height));
+    const y_end: u31 = @intCast(@min(@as(u64, row + 1) * cell_height, height));
+    if (self.overhang_scratch) y_start -|= self.font.cell_height;
+    if (x_end <= x_start or y_end <= y_start) return;
+    try self.rendered_rects.append(self.alloc, .{
+        .x = @intCast(x_start),
+        .y = @intCast(y_start),
+        .width = @intCast(x_end - x_start),
+        .height = @intCast(y_end - y_start),
+    });
+}
+
+fn snapshotCellFingerprints(self: *Renderer, state: *const vt.RenderState) !void {
+    const rows: usize = state.rows;
+    const cols: usize = state.cols;
+    const len = try std.math.mul(usize, rows, cols);
+    try self.cell_fingerprints.resize(self.alloc, len);
+    try self.cell_fingerprint_valid.resize(self.alloc, rows, false);
+    self.cell_fingerprint_rows = rows;
+    self.cell_fingerprint_cols = cols;
+    self.cell_colors = state.colors;
+
+    const row_data = state.row_data.slice();
+    const all_cells = row_data.items(.cells);
+    const all_selections = row_data.items(.selection);
+    for (0..rows) |y| {
+        const cells = all_cells[y].slice();
+        for (0..cols) |x| {
+            self.cell_fingerprints.items[y * cols + x] = self.cellFingerprint(
+                state,
+                cells,
+                all_selections[y],
+                x,
+                @intCast(y),
+            );
+        }
+    }
+    if (rows > 0) self.cell_fingerprint_valid.setRangeValue(.{ .start = 0, .end = rows }, true);
+}
+
+fn measureCellDamage(self: *Renderer, state: *const vt.RenderState) !void {
+    const rows: usize = state.rows;
+    const cols: usize = state.cols;
+    const len = try std.math.mul(usize, rows, cols);
+    try self.cell_damage.resize(self.alloc, rows);
+    @memset(self.cell_damage.items, null);
+    if (self.cell_fingerprint_rows != rows or
+        self.cell_fingerprint_cols != cols or
+        self.cell_fingerprints.items.len != len or
+        self.cell_fingerprint_valid.bit_length != rows or
+        self.cell_colors == null or
+        !std.meta.eql(self.cell_colors.?, state.colors))
+    {
+        try self.snapshotCellFingerprints(state);
+        const dirty = state.row_data.items(.dirty);
+        for (dirty[0..rows], self.cell_damage.items) |is_dirty, *damage| {
+            if (is_dirty) damage.* = .{ .start = 0, .end = cols };
+        }
+        return;
+    }
+    try self.cell_fingerprint_scratch.resize(self.alloc, cols);
+
+    const row_data = state.row_data.slice();
+    const all_cells = row_data.items(.cells);
+    const all_selections = row_data.items(.selection);
+    const all_dirty = row_data.items(.dirty);
+    for (all_dirty[0..rows], 0..) |dirty, y| {
+        if (!dirty) continue;
+        self.cell_damage_stats.dirty_rows += 1;
+        self.cell_damage_stats.scanned_cells += cols;
+        var first = cols;
+        var end: usize = 0;
+        const cells = all_cells[y].slice();
+        for (0..cols) |x| {
+            const fingerprint = self.cellFingerprint(
+                state,
+                cells,
+                all_selections[y],
+                x,
+                @intCast(y),
+            );
+            self.cell_fingerprint_scratch.items[x] = fingerprint;
+            if (!self.cell_fingerprint_valid.isSet(y) or
+                !self.cell_fingerprints.items[y * cols + x].eql(fingerprint))
+            {
+                first = @min(first, x);
+                end = x + 1;
+                self.cell_damage_stats.changed_cells += 1;
+            }
+        }
+        if (first == cols) {
+            self.cell_damage_stats.unchanged_dirty_rows += 1;
+        } else {
+            const damage = self.expandCellDamage(state, cells, y, .{ .start = first, .end = end });
+            self.cell_damage.items[y] = damage;
+            self.cell_damage_stats.spanned_cells += damage.end - damage.start;
+        }
+        @memcpy(
+            self.cell_fingerprints.items[y * cols ..][0..cols],
+            self.cell_fingerprint_scratch.items,
+        );
+        self.cell_fingerprint_valid.set(y);
+    }
+}
+
+fn expandCellDamage(
+    self: *const Renderer,
+    state: *const vt.RenderState,
+    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    y: usize,
+    initial: CellRange,
+) CellRange {
+    const cols: usize = state.cols;
+    var result = initial;
+    const previous = self.cell_fingerprints.items[y * cols ..][0..cols];
+    const current = cells.items(.raw);
+
+    result.start = @min(
+        textRunStart(previous, result.start),
+        textRunStartRaw(current, result.start),
+    );
+    result.end = @max(
+        textRunEnd(previous, result.end, cols),
+        textRunEndRaw(current, result.end, cols),
+    );
+
+    // Covers horizontal glyph bearings and the symbol constraint heuristic,
+    // which can consume the empty cell immediately after a glyph.
+    result.start -|= 1;
+    result.end = @min(cols, result.end + 1);
+
+    // Keep wide heads and spacer tails in the same repaint interval.
+    if (result.start > 0 and
+        (previous[result.start].raw.wide == .spacer_tail or current[result.start].wide == .spacer_tail))
+    {
+        result.start -= 1;
+    }
+    if (result.end < cols and
+        (previous[result.end - 1].raw.wide == .wide or current[result.end - 1].wide == .wide))
+    {
+        result.end += 1;
+    }
+    return result;
+}
+
+fn textRunStart(cells: []const CellFingerprint, x: usize) usize {
+    if (x >= cells.len or !cellHasText(cells[x].raw)) return x;
+    var start = x;
+    while (start > 0 and cellHasText(cells[start - 1].raw)) start -= 1;
+    return start;
+}
+
+fn textRunStartRaw(cells: []const vt.Cell, x: usize) usize {
+    if (x >= cells.len or !cellHasText(cells[x])) return x;
+    var start = x;
+    while (start > 0 and cellHasText(cells[start - 1])) start -= 1;
+    return start;
+}
+
+fn textRunEnd(cells: []const CellFingerprint, end: usize, cols: usize) usize {
+    if (end == 0 or !cellHasText(cells[end - 1].raw)) return end;
+    var result = end;
+    while (result < cols and cellHasText(cells[result].raw)) result += 1;
+    return result;
+}
+
+fn textRunEndRaw(cells: []const vt.Cell, end: usize, cols: usize) usize {
+    if (end == 0 or !cellHasText(cells[end - 1])) return end;
+    var result = end;
+    while (result < cols and cellHasText(cells[result])) result += 1;
+    return result;
+}
+
+fn cellHasText(cell: vt.Cell) bool {
+    return switch (cell.content_tag) {
+        .codepoint => cell.content.codepoint.data != 0 and
+            cell.content.codepoint.data != ' ' and
+            cell.content.codepoint.data != kitty_placeholder,
+        .codepoint_grapheme => cell.content.codepoint.data != 0 and
+            cell.content.codepoint.data != kitty_placeholder,
+        else => false,
+    };
+}
+
+fn cellFingerprint(
+    self: *const Renderer,
+    state: *const vt.RenderState,
+    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    selection: ?[2]vt.size.CellCountInt,
+    x: usize,
+    y: u31,
+) CellFingerprint {
+    const raw = cells.items(.raw)[x];
+    const selected = if (selection) |range| x >= range[0] and x <= range[1] else false;
+    const cursor_here = cursor: {
+        if (!state.cursor.visible) break :cursor false;
+        const viewport = state.cursor.viewport orelse break :cursor false;
+        if (viewport.y != y) break :cursor false;
+        break :cursor x == viewport.x -| @intFromBool(viewport.wide_tail);
+    };
+    const hyperlink = (self.hyperlink_hints and raw.hyperlink) or
+        if (self.link_range) |range| range.contains(x, y) else false;
+    const search_selected = if (self.search_range) |range| range.contains(x, y) else false;
+    const search_index = @as(usize, y) * state.cols + x;
+    const search_match = search_index < self.search_matches.len and self.search_matches[search_index];
+    const visual = @as(u8, @intFromBool(selected)) |
+        @as(u8, @intFromBool(cursor_here)) << 1 |
+        @as(u8, @intFromBool(cursor_here and self.focused)) << 2 |
+        @as(u8, @intFromBool(hyperlink)) << 3 |
+        @as(u8, @intFromBool(search_selected)) << 4 |
+        @as(u8, @intFromBool(search_match)) << 5;
+    return .{
+        .raw = raw,
+        .style = if (raw.style_id == 0) .{} else cells.items(.style)[x],
+        .grapheme = if (raw.content_tag == .codepoint_grapheme)
+            std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(cells.items(.grapheme)[x]))
+        else
+            0,
+        .visual = visual,
+        .cursor_style = if (cursor_here) @intCast(@intFromEnum(state.cursor.visual_style)) else 0,
+    };
+}
+
+/// Move renderer-owned row state with a framebuffer scroll. Fingerprints
+/// for newly exposed rows are invalid until renderDirty repaints them.
+pub fn shiftCellState(self: *Renderer, rows: usize, cols: usize, shift_rows: isize) !void {
     const shift: usize = @abs(shift_rows);
     std.debug.assert(shift > 0 and shift < rows);
     if (self.row_overhang.bit_length != rows) {
@@ -442,6 +779,40 @@ pub fn shiftRowOverhang(self: *Renderer, rows: usize, shift_rows: isize) !void {
             self.row_overhang.setValue(y, self.row_overhang.isSet(y - shift));
         }
         self.row_overhang.setRangeValue(.{ .start = 0, .end = shift }, true);
+    }
+
+    if (!self.track_cell_damage) return;
+    if (self.cell_fingerprint_rows != rows or
+        self.cell_fingerprint_cols != cols or
+        self.cell_fingerprints.items.len != rows * cols or
+        self.cell_fingerprint_valid.bit_length != rows)
+    {
+        try self.cell_fingerprint_valid.resize(self.alloc, rows, false);
+        self.cell_fingerprint_valid.unsetAll();
+        return;
+    }
+    if (shift_rows > 0) {
+        for (0..rows - shift) |dst| {
+            const src = dst + shift;
+            @memcpy(
+                self.cell_fingerprints.items[dst * cols ..][0..cols],
+                self.cell_fingerprints.items[src * cols ..][0..cols],
+            );
+            self.cell_fingerprint_valid.setValue(dst, self.cell_fingerprint_valid.isSet(src));
+        }
+        self.cell_fingerprint_valid.setRangeValue(.{ .start = rows - shift, .end = rows }, false);
+    } else {
+        var dst = rows;
+        while (dst > shift) {
+            dst -= 1;
+            const src = dst - shift;
+            @memcpy(
+                self.cell_fingerprints.items[dst * cols ..][0..cols],
+                self.cell_fingerprints.items[src * cols ..][0..cols],
+            );
+            self.cell_fingerprint_valid.setValue(dst, self.cell_fingerprint_valid.isSet(src));
+        }
+        self.cell_fingerprint_valid.setRangeValue(.{ .start = 0, .end = shift }, false);
     }
 }
 
@@ -501,6 +872,7 @@ pub fn renderPreedit(
                 baseline_y - g.bearing_y,
                 argb(state.colors.foreground),
                 false,
+                self.glyph_clip_x,
             );
         }
         try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), pixels, width, height);
@@ -667,6 +1039,7 @@ fn renderTextOverlay(
                 baseline_y - g.bearing_y,
                 argb(fg),
                 false,
+                self.glyph_clip_x,
             );
         }
         x += span;
@@ -1365,6 +1738,27 @@ fn renderRow(
     try self.renderRowForeground(state, cells, y, pixels, width, height);
 }
 
+fn renderRowCells(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    selection: ?[2]vt.size.CellCountInt,
+    cell_range: CellRange,
+    y: u31,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
+    std.debug.assert(self.glyph_clip_x == null);
+    self.glyph_clip_x = .{
+        .start = @intCast(cell_range.start * self.font.cell_width),
+        .end = @intCast(cell_range.end * self.font.cell_width),
+    };
+    defer self.glyph_clip_x = null;
+    try self.prepareRowCells(state, cells, selection, cell_range, y, pixels, width, height, .all);
+    try self.renderRowForegroundCells(state, cells, cell_range, y, pixels, width, height);
+}
+
 /// Which cell backgrounds prepareRow paints. `.all` covers the entire
 /// row rect (unstyled cells and the right margin get the default
 /// background), so callers need no separate clear pass. `.styled`
@@ -1383,11 +1777,37 @@ fn prepareRow(
     height: u31,
     backgrounds: Backgrounds,
 ) !void {
+    return self.prepareRowCells(
+        state,
+        cells,
+        selection,
+        .{ .start = 0, .end = @min(@as(usize, state.cols), cells.len) },
+        y,
+        pixels,
+        width,
+        height,
+        backgrounds,
+    );
+}
+
+fn prepareRowCells(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    selection: ?[2]vt.size.CellCountInt,
+    cell_range: CellRange,
+    y: u31,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    backgrounds: Backgrounds,
+) !void {
     const font = self.font;
     const colors = &state.colors;
     const raws = cells.items(.raw);
     const styles = cells.items(.style);
     const cols: u31 = @min(state.cols, cells.len);
+    std.debug.assert(cell_range.start <= cell_range.end and cell_range.end <= cols);
 
     const cursor_x: ?u31 = cursor: {
         if (!state.cursor.visible) break :cursor null;
@@ -1468,7 +1888,7 @@ fn prepareRow(
         }
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
-        if (backgrounds != .none) {
+        if (backgrounds != .none and x >= cell_range.start and x < cell_range.end) {
             const color: ?u32 = if (dim_search_bg) color: {
                 const mixed = blendRgb(self.search_bg, bg orelse colors.background, search_match_alpha);
                 break :color if (bg == null or background_uses_alpha)
@@ -1499,7 +1919,7 @@ fn prepareRow(
     }
     // In .all mode the row rect must be fully covered: extend to the
     // buffer's right edge past the last column.
-    if (backgrounds == .all) {
+    if (backgrounds == .all and cell_range.end == cols) {
         const margin_start: u31 = cols * font.cell_width;
         if (margin_start < width) {
             const color = self.backgroundPixel(colors.background);
@@ -1537,11 +1957,35 @@ fn renderRowForeground(
     width: u31,
     height: u31,
 ) !void {
+    return self.renderRowForegroundCells(
+        state,
+        cells,
+        .{ .start = 0, .end = @min(@as(usize, state.cols), cells.len) },
+        y,
+        pixels,
+        width,
+        height,
+    );
+}
+
+fn renderRowForegroundCells(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
+    cell_range: CellRange,
+    y: u31,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
     const colors = &state.colors;
     const raws = cells.items(.raw);
     const styles = cells.items(.style);
     const graphemes = cells.items(.grapheme);
     const cols: u31 = @min(state.cols, cells.len);
+    std.debug.assert(cell_range.start <= cell_range.end and cell_range.end <= cols);
+    const range_start: u31 = @intCast(cell_range.start);
+    const range_end: u31 = @intCast(cell_range.end);
     self.overhang_scratch = false;
     defer if (y < self.row_overhang.bit_length) {
         self.row_overhang.setValue(y, self.overhang_scratch);
@@ -1572,16 +2016,20 @@ fn renderRowForeground(
             raws[x].style_id != raws[run_start].style_id or
             faces[x] != faces[run_start];
         if (breaks_run) {
-            try self.drawRun(raws, styles, graphemes, run_start, x, cols, y, pixels, width, height);
+            if (run_start <= range_end and x >= range_start) {
+                try self.drawRun(raws, styles, graphemes, run_start, x, cols, y, pixels, width, height);
+            }
             run_start = if (has_text) x else x + 1;
         }
     }
-    try self.drawRun(raws, styles, graphemes, run_start, cols, cols, y, pixels, width, height);
+    if (run_start <= range_end and cols >= range_start) {
+        try self.drawRun(raws, styles, graphemes, run_start, cols, cols, y, pixels, width, height);
+    }
 
     // Decoration pass: underlines, strikethrough, overline, and hyperlink
     // hints overlay the glyphs, in the style's underline color (or the
     // resolved fg).
-    for (0..cols) |dx| {
+    for (cell_range.start..cell_range.end) |dx| {
         const show_hyperlink = (self.hyperlink_hints and raws[dx].hyperlink) or
             if (self.link_range) |range| range.contains(dx, y) else false;
         if (raws[dx].style_id == 0 and !show_hyperlink) continue;
@@ -1622,7 +2070,8 @@ fn renderRowForeground(
     // Non-block cursor shapes (DECSCUSR bar/underline, hollow block)
     // overlay the cell rather than recoloring it. Without keyboard
     // focus the cursor is always a hollow rectangle.
-    if (cursor_x) |cx| {
+    if (cursor_x) |cx| cursor: {
+        if (cx < range_start or cx >= range_end) break :cursor;
         const kind: ?@import("sprite.zig").Decoration = if (!self.focused)
             .cursor_hollow_rect
         else switch (state.cursor.visual_style) {
@@ -1669,6 +2118,7 @@ fn blitDecoration(
         baseline_y - g.bearing_y,
         color,
         false,
+        self.glyph_clip_x,
     );
 }
 
@@ -1712,6 +2162,7 @@ fn drawRun(
                 baseline_y - g.bearing_y,
                 argb(self.fg_scratch.items[x]),
                 false,
+                self.glyph_clip_x,
             );
         }
         return;
@@ -1789,6 +2240,7 @@ fn drawRun(
             baseline_y - sg.y_offset - g.bearing_y,
             argb(self.fg_scratch.items[cluster]),
             self.reverse_scratch.items[cluster],
+            self.glyph_clip_x,
         );
         pen_x += sg.x_advance;
     }
@@ -2237,16 +2689,17 @@ fn blitGlyph(
     y0: i32,
     color: u32,
     reverse_color_glyph: bool,
+    clip_x: ?PixelRange,
 ) void {
     switch (g.format) {
         .alpha => if (g.fully_opaque)
-            blitOpaqueGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color)
+            blitOpaqueGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x)
         else
-            blitAlphaGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color),
+            blitAlphaGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x),
         .bgra => if (reverse_color_glyph)
-            blitBgraGlyphAsAlpha(pixels, stride, buf_width, buf_height, g, x0, y0, color)
+            blitBgraGlyphAsAlpha(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x)
         else
-            blitBgraGlyph(pixels, stride, buf_width, buf_height, g, x0, y0),
+            blitBgraGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, clip_x),
     }
 }
 
@@ -2259,10 +2712,24 @@ const GlyphClip = struct {
     gy_end: usize,
 };
 
-fn clipGlyph(g: *const Font.Glyph, x0: i32, y0: i32, buf_width: u31, buf_height: u31) ?GlyphClip {
-    const gx_start: i64 = @max(0, -@as(i64, x0));
+const PixelRange = struct {
+    start: i32,
+    end: i32,
+};
+
+fn clipGlyph(
+    g: *const Font.Glyph,
+    x0: i32,
+    y0: i32,
+    buf_width: u31,
+    buf_height: u31,
+    clip_x: ?PixelRange,
+) ?GlyphClip {
+    const x_start: i64 = if (clip_x) |clip| clip.start else 0;
+    const x_end: i64 = if (clip_x) |clip| clip.end else buf_width;
+    const gx_start: i64 = @max(0, x_start - x0);
     const gy_start: i64 = @max(0, -@as(i64, y0));
-    const gx_end: i64 = @min(@as(i64, g.width), @as(i64, buf_width) - x0);
+    const gx_end: i64 = @min(@as(i64, g.width), @min(@as(i64, buf_width), x_end) - x0);
     const gy_end: i64 = @min(@as(i64, g.height), @as(i64, buf_height) - y0);
     if (gx_end <= gx_start or gy_end <= gy_start) return null;
     return .{
@@ -2282,8 +2749,9 @@ fn blitOpaqueGlyph(
     x0: i32,
     y0: i32,
     color: u32,
+    clip_x: ?PixelRange,
 ) void {
-    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
     const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
     const span_len = clip.gx_end - clip.gx_start;
     for (clip.gy_start..clip.gy_end) |gy| {
@@ -2301,8 +2769,9 @@ fn blitAlphaGlyph(
     x0: i32,
     y0: i32,
     color: u32,
+    clip_x: ?PixelRange,
 ) void {
-    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
     const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
     for (clip.gy_start..clip.gy_end) |gy| {
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
@@ -2354,8 +2823,9 @@ fn blitBgraGlyph(
     g: *const Font.Glyph,
     x0: i32,
     y0: i32,
+    clip_x: ?PixelRange,
 ) void {
-    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
     const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
     for (clip.gy_start..clip.gy_end) |gy| {
         const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
@@ -2431,8 +2901,9 @@ fn blitBgraGlyphAsAlpha(
     x0: i32,
     y0: i32,
     color: u32,
+    clip_x: ?PixelRange,
 ) void {
-    const clip = clipGlyph(g, x0, y0, buf_width, buf_height) orelse return;
+    const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
     const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
     for (clip.gy_start..clip.gy_end) |gy| {
         const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
@@ -2771,8 +3242,8 @@ test "opaque glyph fast path matches alpha blending with clipping" {
 
     var alpha_pixels: [5 * 4]u32 = @splat(0xff123456);
     var opaque_pixels = alpha_pixels;
-    blitGlyph(&alpha_pixels, 5, 5, 4, &alpha_glyph, -1, 2, 0xffabcdef, false);
-    blitGlyph(&opaque_pixels, 5, 5, 4, &opaque_glyph, -1, 2, 0xffabcdef, false);
+    blitGlyph(&alpha_pixels, 5, 5, 4, &alpha_glyph, -1, 2, 0xffabcdef, false, null);
+    blitGlyph(&opaque_pixels, 5, 5, 4, &opaque_glyph, -1, 2, 0xffabcdef, false, null);
     try std.testing.expectEqualSlices(u32, &alpha_pixels, &opaque_pixels);
 }
 
@@ -3539,6 +4010,307 @@ test "dirty row render matches full render" {
     try renderer.renderDirty(&state, dirty_pixels, width, height);
     try renderer.render(&state, full_pixels, width, height);
     try std.testing.expectEqualSlices(u32, full_pixels, dirty_pixels);
+}
+
+test "cell damage render matches full render for sparse row churn" {
+    const alloc = std.testing.allocator;
+    const cols = 48;
+    const rows = 6;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = cols, .rows = rows });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var partial: Renderer = try .init(alloc, &font, .{
+        .track_cell_damage = true,
+        .partial_cell_raster = true,
+    });
+    defer partial.deinit();
+    var reference: Renderer = try .init(alloc, &font, .{});
+    defer reference.deinit();
+
+    const width: u31 = font.cell_width * cols;
+    const height: u31 = font.cell_height * rows;
+    const partial_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(partial_pixels);
+    const full_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(full_pixels);
+
+    for (0..20) |frame| {
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        defer output.deinit();
+        try output.writer.writeAll("\x1b[H");
+        for (0..rows) |y| {
+            if (y > 0) try output.writer.writeAll("\r\n");
+            try output.writer.print("{d:0>6} stable row {d:0>2}   ", .{ frame, y });
+        }
+        stream.nextSlice(output.writer.buffered());
+        try state.update(alloc, &term);
+
+        if (frame == 0) {
+            try partial.render(&state, partial_pixels, width, height);
+        } else {
+            try partial.renderDirty(&state, partial_pixels, width, height);
+        }
+        try reference.render(&state, full_pixels, width, height);
+        try std.testing.expectEqualSlices(u32, full_pixels, partial_pixels);
+
+        for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+        state.dirty = .false;
+    }
+}
+
+test "cell damage repairs rotating stale buffers" {
+    const alloc = std.testing.allocator;
+    const cols = 24;
+    const rows = 3;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = cols, .rows = rows });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var partial: Renderer = try .init(alloc, &font, .{});
+    defer partial.deinit();
+    var reference: Renderer = try .init(alloc, &font, .{});
+    defer reference.deinit();
+
+    const width: u31 = font.cell_width * cols;
+    const height: u31 = font.cell_height * rows;
+    const frame_len = @as(usize, width) * height;
+    const buffers = try alloc.alloc(u32, frame_len * 3);
+    defer alloc.free(buffers);
+    const full_pixels = try alloc.alloc(u32, frame_len);
+    defer alloc.free(full_pixels);
+    var history: [2]std.ArrayList(PixelRect) = .{ .empty, .empty };
+    defer for (&history) |*rects| rects.deinit(alloc);
+
+    stream.nextSlice("\x1b[?25l\x1b[H0000 stable row 0\r\n0000 stable row 1\r\n0000 stable row 2");
+    try state.update(alloc, &term);
+    try partial.render(&state, buffers[0..frame_len], width, height);
+    @memcpy(buffers[frame_len .. frame_len * 2], buffers[0..frame_len]);
+    @memcpy(buffers[frame_len * 2 .. frame_len * 3], buffers[0..frame_len]);
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+    state.dirty = .false;
+
+    for (0..12) |frame| {
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        defer output.deinit();
+        try output.writer.print(
+            "\x1b[H{d:0>4} stable row 0\r\n{d:0>4} stable row 1\r\n{d:0>4} stable row 2",
+            .{ frame + 1, frame + 1, frame + 1 },
+        );
+        stream.nextSlice(output.writer.buffered());
+        try state.update(alloc, &term);
+
+        const target_index = (frame + 1) % 3;
+        const newest_index = frame % 3;
+        const target = buffers[target_index * frame_len ..][0..frame_len];
+        const newest = buffers[newest_index * frame_len ..][0..frame_len];
+        for (history[0..@min(frame, history.len)]) |rects| {
+            for (rects.items) |rect| {
+                for (rect.y..rect.y + rect.height) |y| {
+                    const offset = @as(usize, y) * width + rect.x;
+                    @memcpy(target[offset..][0..rect.width], newest[offset..][0..rect.width]);
+                }
+            }
+        }
+
+        try partial.renderDirty(&state, target, width, height);
+        try reference.render(&state, full_pixels, width, height);
+        try std.testing.expectEqualSlices(u32, full_pixels, target);
+
+        history[1].clearRetainingCapacity();
+        try history[1].appendSlice(alloc, history[0].items);
+        history[0].clearRetainingCapacity();
+        try history[0].appendSlice(alloc, partial.rendered_rects.items);
+        for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+        state.dirty = .false;
+    }
+}
+
+test "cell damage clips an adjacent text run to the cleared interval" {
+    const alloc = std.testing.allocator;
+    const cols = 12;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = cols, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l aaaaaaaaaaa");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var partial: Renderer = try .init(alloc, &font, .{
+        .track_cell_damage = true,
+        .partial_cell_raster = true,
+    });
+    defer partial.deinit();
+    var reference: Renderer = try .init(alloc, &font, .{});
+    defer reference.deinit();
+
+    const width: u31 = font.cell_width * cols;
+    const height: u31 = font.cell_height;
+    const partial_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(partial_pixels);
+    const full_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(full_pixels);
+
+    try partial.render(&state, partial_pixels, width, height);
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+    state.dirty = .false;
+
+    // Changing this non-text cell pads damage one cell into the adjacent
+    // shaping run. The whole run must be shaped, but only the cleared two
+    // cells may be blended into the existing framebuffer.
+    stream.nextSlice("\x1b[H\x1b[41m \x1b[0m");
+    try state.update(alloc, &term);
+    try partial.renderDirty(&state, partial_pixels, width, height);
+    try std.testing.expectEqual(CellRange{ .start = 0, .end = 2 }, partial.cell_damage.items[0].?);
+
+    try reference.render(&state, full_pixels, width, height);
+    try std.testing.expectEqualSlices(u32, full_pixels, partial_pixels);
+}
+
+test "cell damage redraws symbol ink spilling into the interval" {
+    const alloc = std.testing.allocator;
+    const cols = 10;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = cols, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l      x");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    try std.testing.expectEqual(
+        @as(u2, 2),
+        constraintWidth(state.row_data.get(0).cells.items(.raw), 5, cols),
+    );
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var partial: Renderer = try .init(alloc, &font, .{});
+    defer partial.deinit();
+    var reference: Renderer = try .init(alloc, &font, .{});
+    defer reference.deinit();
+
+    const width: u31 = font.cell_width * cols;
+    const height: u31 = font.cell_height;
+    const partial_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(partial_pixels);
+    const full_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(full_pixels);
+    try partial.render(&state, partial_pixels, width, height);
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+    state.dirty = .false;
+
+    // The symbol at cell 5 renders across the space at cell 6. Damage for
+    // cell 7 clears cell 6 as bearing slack, so the adjacent symbol run
+    // must be redrawn even though its cells do not overlap the interval.
+    stream.nextSlice("\x1b[1;8Hy");
+    try state.update(alloc, &term);
+    try partial.renderDirty(&state, partial_pixels, width, height);
+    try std.testing.expectEqual(CellRange{ .start = 6, .end = 9 }, partial.cell_damage.items[0].?);
+
+    try reference.render(&state, full_pixels, width, height);
+    try std.testing.expectEqualSlices(u32, full_pixels, partial_pixels);
+}
+
+test "scroll invalidates newly exposed cell fingerprints" {
+    const alloc = std.testing.allocator;
+    const cols = 4;
+    const rows = 3;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = cols, .rows = rows });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25l");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    var reference: Renderer = try .init(alloc, &font, .{});
+    defer reference.deinit();
+
+    const width: u31 = font.cell_width * cols;
+    const height: u31 = font.cell_height * rows;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const full_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(full_pixels);
+    try renderer.render(&state, pixels, width, height);
+
+    try renderer.shiftCellState(rows, cols, 1);
+    try std.testing.expect(renderer.cell_fingerprint_valid.isSet(0));
+    try std.testing.expect(renderer.cell_fingerprint_valid.isSet(1));
+    try std.testing.expect(!renderer.cell_fingerprint_valid.isSet(2));
+
+    const bottom_start = @as(usize, 2 * font.cell_height) * width;
+    @memset(pixels[bottom_start..], 0xffabcdef);
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+    state.row_data.items(.dirty)[2] = true;
+    state.dirty = .partial;
+    try renderer.renderDirty(&state, pixels, width, height);
+    try std.testing.expectEqual(CellRange{ .start = 0, .end = cols }, renderer.cell_damage.items[2].?);
+
+    try reference.render(&state, full_pixels, width, height);
+    try std.testing.expectEqualSlices(u32, full_pixels, pixels);
+}
+
+test "cell damage repaints dirty rows after terminal colors change" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25labcd");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    var reference: Renderer = try .init(alloc, &font, .{});
+    defer reference.deinit();
+
+    const width: u31 = font.cell_width * 4;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const full_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(full_pixels);
+    try renderer.render(&state, pixels, width, height);
+
+    state.colors.background = .{ .r = 12, .g = 34, .b = 56 };
+    state.row_data.items(.dirty)[0] = true;
+    state.dirty = .partial;
+    try renderer.renderDirty(&state, pixels, width, height);
+    try std.testing.expectEqual(CellRange{ .start = 0, .end = 4 }, renderer.cell_damage.items[0].?);
+
+    try reference.render(&state, full_pixels, width, height);
+    try std.testing.expectEqualSlices(u32, full_pixels, pixels);
 }
 
 test "top-right overlay keeps the newest complete grapheme clusters" {

@@ -237,16 +237,16 @@ kitty_cache: KittyImageCache,
 /// happen even while synchronized output has content frames frozen.
 geometry_redraw: bool,
 /// Ring of per-frame damage records: what changed in each of the last
-/// N frames. Stale shm buffers use this to copy missed rows from the
-/// newest rendered shm buffer before this frame's dirty rows are drawn.
+/// N frames. Stale shm buffers use this to copy missed rectangles from the
+/// newest rendered shm buffer before this frame's dirty cells are drawn.
 frame_damage: [frame_damage_len]FrameDamage,
 /// Ring index of the current frame's entry.
 frame_damage_index: usize,
-/// Scratch for the damage spans reported to the window each frame.
-damage_spans: std.ArrayList(Window.RowSpan),
-/// Repair spans owned by the main thread and borrowed by the in-flight
+/// Scratch for the damage rectangles reported to the window each frame.
+damage_rects: std.ArrayList(Window.DamageRect),
+/// Repair rectangles owned by the main thread and borrowed by the in-flight
 /// raster job. Kept separate from surface-damage scratch used at commit.
-repair_spans: std.ArrayList(AsyncRaster.RepairSpan),
+repair_rects: std.ArrayList(AsyncRaster.RepairRect),
 pty: Pty,
 /// Gather-thread pipeline draining the pty master; the main loop
 /// consumes parsed batches via its ready_fd in the poll set.
@@ -540,15 +540,10 @@ fn dimensionForCells(cells: u16, cell_size: u31, before: u31, after: u31) u31 {
 /// What one frame changed, recorded so stale shm buffers can be brought
 /// current from the newest rendered shm buffer without copying everything.
 const FrameDamage = struct {
-    /// Everything changed (or rendering failed partway); ignore `rows`.
+    /// Everything changed (or rendering failed partway); ignore `rects`.
     full: bool,
-    /// The rows Renderer.renderDirty repainted: dirty rows plus the
-    /// neighbors its overhang tracking chose to include.
-    rows: std.DynamicBitSetUnmanaged,
-    /// The bottom link-hint strip was drawn this frame. It straddles
-    /// cell rows (it hugs the window's bottom edge), so it is tracked
-    /// separately from `rows`.
-    bottom_strip: bool,
+    /// Physical buffer rectangles changed by Renderer.renderDirty.
+    rects: std.ArrayList(Renderer.PixelRect),
     /// Pixel geometry this entry was recorded at.
     width: u31,
     height: u31,
@@ -953,8 +948,7 @@ pub fn init(
         .geometry_redraw = false,
         .frame_damage = @splat(.{
             .full = true,
-            .rows = .{},
-            .bottom_strip = false,
+            .rects = .empty,
             .width = 0,
             .height = 0,
             .grid_x = 0,
@@ -965,8 +959,8 @@ pub fn init(
             .cell_height = 0,
         }),
         .frame_damage_index = 0,
-        .damage_spans = .empty,
-        .repair_spans = .empty,
+        .damage_rects = .empty,
+        .repair_rects = .empty,
         .pty = pty,
         .pipeline = try .init(pty.master),
         .child_pid = child_pid,
@@ -1713,15 +1707,15 @@ pub fn deinit(self: *App) void {
     self.pty.deinit();
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
-    for (&self.frame_damage) |*damage| damage.rows.deinit(self.alloc);
+    for (&self.frame_damage) |*damage| damage.rects.deinit(self.alloc);
     if (self.async_raster_loader) |*loader| loader.deinit();
     if (self.async_raster) |*async_raster| async_raster.deinit();
     self.async_job.deinit(self.alloc, &self.kitty_cache);
     if (self.hovered_link) |link| self.alloc.free(link.uri);
     if (self.link_press) |press| self.alloc.free(press.uri);
     self.kitty_cache.deinit(self.alloc);
-    self.damage_spans.deinit(self.alloc);
-    self.repair_spans.deinit(self.alloc);
+    self.damage_rects.deinit(self.alloc);
+    self.repair_rects.deinit(self.alloc);
     self.clearImeText();
     if (self.search) |*search| search.deinit(self.alloc, &self.term);
     if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
@@ -5741,7 +5735,7 @@ fn finishAsyncRender(self: *App) void {
         self.needs_redraw = true;
         return;
     }
-    const damage = self.beginFrameDamage(result.job.width, result.job.height);
+    const damage = self.beginFrameDamage(&result.job);
     self.recordAsyncFrameDamage(damage, async_raster, result.damage) catch |err| {
         log.err("async damage bookkeeping failed: {}", .{err});
         self.window.cancelRender(buffer);
@@ -5776,17 +5770,17 @@ fn findRenderingBuffer(self: *App, pixels: []u32) ?*Window.Buffer {
 }
 
 /// Advance the damage ring and reset the new current entry to full.
-fn beginFrameDamage(self: *App, width: u31, height: u31) *FrameDamage {
+fn beginFrameDamage(self: *App, job: *const AsyncRaster.Job) *FrameDamage {
     self.frame_damage_index = (self.frame_damage_index + 1) % frame_damage_len;
     const damage = &self.frame_damage[self.frame_damage_index];
     damage.full = true;
-    damage.bottom_strip = false;
-    damage.width = width;
-    damage.height = height;
-    damage.grid_x = self.layout.grid_x;
-    damage.grid_y = self.layout.grid_y;
-    damage.grid_width = self.layout.grid_width;
-    damage.grid_height = self.layout.grid_height;
+    damage.rects.clearRetainingCapacity();
+    damage.width = job.width;
+    damage.height = job.height;
+    damage.grid_x = job.grid_x;
+    damage.grid_y = job.grid_y;
+    damage.grid_width = job.grid_width;
+    damage.grid_height = job.grid_height;
     damage.cell_width = self.font.cell_width;
     damage.cell_height = self.font.cell_height;
     return damage;
@@ -5797,13 +5791,33 @@ fn recordAsyncFrameDamage(self: *App, damage: *FrameDamage, async_raster: *Async
     damage.full = false;
     switch (rendered) {
         .full => unreachable,
-        .partial => try async_raster.copyRepaintedRows(self.alloc, &damage.rows),
-        .none => {
-            try damage.rows.resize(self.alloc, self.render_state.rows, false);
-            damage.rows.unsetAll();
+        .partial => {
+            try async_raster.copyRenderedRects(self.alloc, &damage.rects);
+            for (damage.rects.items) |*rect| {
+                rect.x += damage.grid_x;
+                rect.y += damage.grid_y;
+            }
+            coalesceDamageRects(&damage.rects);
         },
+        .none => {},
     }
-    std.debug.assert(damage.rows.bit_length == self.render_state.rows);
+}
+
+fn coalesceDamageRects(rects: *std.ArrayList(Renderer.PixelRect)) void {
+    var kept: usize = 0;
+    for (rects.items) |rect| {
+        if (kept > 0) {
+            const previous = &rects.items[kept - 1];
+            const previous_end = previous.y + previous.height;
+            if (previous.x == rect.x and previous.width == rect.width and rect.y <= previous_end) {
+                previous.height = @max(previous_end, rect.y + rect.height) - previous.y;
+                continue;
+            }
+        }
+        rects.items[kept] = rect;
+        kept += 1;
+    }
+    rects.items.len = kept;
 }
 
 /// The damage entry recorded `back` frames ago (0 = current frame).
@@ -5812,72 +5826,41 @@ fn frameDamageBack(self: *const App, back: usize) *const FrameDamage {
     return &self.frame_damage[(self.frame_damage_index + frame_damage_len - back) % frame_damage_len];
 }
 
-/// Describe the rows a stale target missed since it last represented a
-/// committed frame. The worker applies these before painting current dirt.
+/// Describe the rectangles a stale target missed since it last represented
+/// a committed frame. Current cell damage is not known until the render
+/// worker scans dirty rows, so repair every missed rectangle first.
 fn planFrameRepair(self: *App, age: usize, width: u31, height: u31) !AsyncRaster.Repair {
-    self.repair_spans.clearRetainingCapacity();
+    self.repair_rects.clearRetainingCapacity();
     if (self.render_state.dirty == .full or age == 1) return .none;
     if (age == 0 or age > frame_damage_len + 1) return .full;
 
     const missed_frames = age - 1;
-    const rows: usize = self.render_state.rows;
+    const frame_area = @as(u64, width) * height;
+    var repair_area: u64 = 0;
     for (0..missed_frames) |back| {
         const entry = self.frameDamageBack(back);
         if (entry.full or
             entry.width != width or entry.height != height or
             entry.grid_x != self.layout.grid_x or entry.grid_y != self.layout.grid_y or
             entry.grid_width != self.layout.grid_width or entry.grid_height != self.layout.grid_height or
-            entry.cell_width != self.font.cell_width or entry.cell_height != self.font.cell_height or
-            entry.rows.bit_length != rows)
+            entry.cell_width != self.font.cell_width or entry.cell_height != self.font.cell_height)
         {
             return .full;
         }
-    }
-
-    const cell_height: usize = self.font.cell_height;
-    const grid_y: usize = self.layout.grid_y;
-    const current_dirty = self.render_state.row_data.items(.dirty);
-    var y: usize = 0;
-    while (y < rows) {
-        // renderDirty fully repaints current dirty rows, so repairing their
-        // stale pixels would only copy bytes that the worker overwrites.
-        if (current_dirty[y] or !self.rowDamagedSince(y, missed_frames)) {
-            y += 1;
-            continue;
+        for (entry.rects.items) |rect| {
+            if (rect.x > width or rect.width > width - rect.x or
+                rect.y > height or rect.height > height - rect.y)
+            {
+                return .full;
+            }
+            try self.repair_rects.append(self.alloc, rect);
+            repair_area += @as(u64, rect.width) * rect.height;
+            // Many small strided copies or enough overlapping area cost more
+            // than one linear full-frame copy.
+            if (self.repair_rects.items.len > 512 or repair_area * 2 >= frame_area) return .full;
         }
-        const start = y;
-        while (y < rows and !current_dirty[y] and self.rowDamagedSince(y, missed_frames)) y += 1;
-        const px_start = @min(grid_y + start * cell_height, height);
-        const px_end = @min(grid_y + y * cell_height, height);
-        if (px_end > px_start) try self.repair_spans.append(self.alloc, .{
-            .y = @intCast(px_start),
-            .height = @intCast(px_end - px_start),
-        });
     }
-    if (height >= self.font.cell_height and self.bottomStripDamagedSince(missed_frames)) {
-        try self.repair_spans.append(self.alloc, .{
-            .y = @intCast(@min(
-                height - self.font.cell_height,
-                self.layout.grid_y + self.layout.grid_height -| self.font.cell_height,
-            )),
-            .height = self.font.cell_height,
-        });
-    }
-    return .{ .spans = self.repair_spans.items };
-}
-
-fn rowDamagedSince(self: *const App, row: usize, frames: usize) bool {
-    for (0..frames) |back| {
-        if (self.frameDamageBack(back).rows.isSet(row)) return true;
-    }
-    return false;
-}
-
-fn bottomStripDamagedSince(self: *const App, frames: usize) bool {
-    for (0..frames) |back| {
-        if (self.frameDamageBack(back).bottom_strip) return true;
-    }
-    return false;
+    return .{ .rects = self.repair_rects.items };
 }
 
 fn invalidateFrameDamageHistory(self: *App) void {
@@ -5897,37 +5880,21 @@ fn allStateRowsDirty(state: *const vt.RenderState) bool {
     return true;
 }
 
-/// Surface damage of the current frame only, as pixel-row spans.
+/// Surface damage of the current frame only, in physical buffer pixels.
 fn currentFrameDamage(self: *App, height: u31) !Window.Damage {
     const entry = self.frameDamageBack(0);
     if (entry.full) return .full;
-    const cell_height: usize = entry.cell_height;
-    self.damage_spans.clearRetainingCapacity();
-    var y: usize = 0;
-    while (y < entry.rows.bit_length) {
-        if (!entry.rows.isSet(y)) {
-            y += 1;
-            continue;
-        }
-        const start = y;
-        while (y < entry.rows.bit_length and entry.rows.isSet(y)) y += 1;
-        const px_start = @min(@as(usize, entry.grid_y) + start * cell_height, height);
-        const px_end = @min(@as(usize, entry.grid_y) + y * cell_height, height);
-        if (px_end > px_start) try self.damage_spans.append(self.alloc, .{
-            .y = @intCast(px_start),
-            .height = @intCast(px_end - px_start),
+    std.debug.assert(entry.height == height);
+    self.damage_rects.clearRetainingCapacity();
+    for (entry.rects.items) |rect| {
+        try self.damage_rects.append(self.alloc, .{
+            .x = rect.x,
+            .y = rect.y,
+            .width = rect.width,
+            .height = rect.height,
         });
     }
-    if (entry.bottom_strip and height >= cell_height) {
-        try self.damage_spans.append(self.alloc, .{
-            .y = @intCast(@min(
-                height - cell_height,
-                entry.grid_y + entry.grid_height -| @as(u31, @intCast(cell_height)),
-            )),
-            .height = @intCast(cell_height),
-        });
-    }
-    return .{ .spans = self.damage_spans.items };
+    return .{ .rects = self.damage_rects.items };
 }
 
 fn syncTextInputCursorRect(self: *App, state: *const vt.RenderState) void {
@@ -6104,6 +6071,23 @@ test "scroll detector finds viewport shifts and narrows dirty rows" {
     detector.prepare(&state, up, state.cursor);
     const dirty = state.row_data.items(.dirty);
     try std.testing.expectEqualSlices(bool, &.{ true, true, false, false }, dirty[0..4]);
+}
+
+test "damage rectangles coalesce vertically when columns match" {
+    const alloc = std.testing.allocator;
+    var rects: std.ArrayList(Renderer.PixelRect) = .empty;
+    defer rects.deinit(alloc);
+    try rects.appendSlice(alloc, &.{
+        .{ .x = 9, .y = 18, .width = 27, .height = 18 },
+        .{ .x = 9, .y = 36, .width = 27, .height = 18 },
+        .{ .x = 18, .y = 54, .width = 18, .height = 18 },
+    });
+
+    coalesceDamageRects(&rects);
+    try std.testing.expectEqualSlices(Renderer.PixelRect, &.{
+        .{ .x = 9, .y = 18, .width = 27, .height = 36 },
+        .{ .x = 18, .y = 54, .width = 18, .height = 18 },
+    }, rects.items);
 }
 
 test "scrollbar geometry maps viewport rows across the track" {

@@ -9,15 +9,12 @@ const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
 const Renderer = @import("Renderer.zig");
 
-pub const RepairSpan = struct {
-    y: u31,
-    height: u31,
-};
+pub const RepairRect = Renderer.PixelRect;
 
 pub const Repair = union(enum) {
     none,
     full,
-    spans: []const RepairSpan,
+    rects: []const RepairRect,
 };
 
 pub const Job = struct {
@@ -339,14 +336,12 @@ pub fn takeResult(self: *AsyncRaster) ?Result {
     return result;
 }
 
-pub fn copyRepaintedRows(self: *AsyncRaster, alloc: std.mem.Allocator, dest: *std.DynamicBitSetUnmanaged) !void {
+pub fn copyRenderedRects(self: *AsyncRaster, alloc: std.mem.Allocator, dest: *std.ArrayList(Renderer.PixelRect)) !void {
     self.lock();
     defer self.mutex.unlock();
     std.debug.assert(!self.has_job and !self.working and self.result == null);
-    try dest.resize(alloc, self.renderer.repainted.bit_length, false);
-    dest.unsetAll();
-    var it = self.renderer.repainted.iterator(.{});
-    while (it.next()) |row| dest.set(row);
+    dest.clearRetainingCapacity();
+    try dest.appendSlice(alloc, self.renderer.rendered_rects.items);
 }
 
 fn lock(self: *AsyncRaster) void {
@@ -474,7 +469,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     if (job.scroll_shift) |shift| {
         clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
         if (scrollFromPreviousFrame(job, shift, self.font.cell_height)) {
-            try self.renderer.shiftRowOverhang(self.state.rows, shift);
+            try self.renderer.shiftCellState(self.state.rows, self.state.cols, shift);
             try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
             // Rasterization touched only dirty rows, but every retained row
             // moved to a different surface location.
@@ -543,15 +538,23 @@ fn repairToPreviousFrame(job: Job) bool {
             if (source.ptr != job.pixels.ptr) Renderer.copyPixels(job.pixels, source);
             break :repair true;
         },
-        .spans => |spans| repair: {
+        .rects => |rects| repair: {
             const source = job.source_pixels orelse break :repair false;
             if (source.len != job.pixels.len) break :repair false;
             if (source.ptr == job.pixels.ptr) break :repair true;
-            for (spans) |span| {
-                if (span.y > job.height or span.height > job.height - span.y) break :repair false;
-                const offset = @as(usize, span.y) * job.width;
-                const len = @as(usize, span.height) * job.width;
-                Renderer.copyPixels(job.pixels[offset..][0..len], source[offset..][0..len]);
+            for (rects) |rect| {
+                if (rect.x > job.width or rect.width > job.width - rect.x or
+                    rect.y > job.height or rect.height > job.height - rect.y)
+                {
+                    break :repair false;
+                }
+                for (rect.y..rect.y + rect.height) |y| {
+                    const offset = @as(usize, y) * job.width + rect.x;
+                    Renderer.copyPixels(
+                        job.pixels[offset..][0..rect.width],
+                        source[offset..][0..rect.width],
+                    );
+                }
             }
             break :repair true;
         },
@@ -639,22 +642,22 @@ test "repair previous frame" {
     try std.testing.expect(repairToPreviousFrame(current));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, &target);
 
-    const spans = [_]RepairSpan{.{ .y = 1, .height = 1 }};
+    const rects = [_]RepairRect{.{ .x = 1, .y = 1, .width = 1, .height = 1 }};
     current = base;
-    current.repair = .{ .spans = &spans };
+    current.repair = .{ .rects = &rects };
     try std.testing.expect(repairToPreviousFrame(current));
-    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 7, 8 }, &target);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 8 }, &target);
 
     target = .{ 1, 2, 3, 4 };
-    current.repair = .{ .spans = &.{} };
+    current.repair = .{ .rects = &.{} };
     try std.testing.expect(repairToPreviousFrame(current));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, &target);
 
-    const invalid_spans = [_]RepairSpan{
-        .{ .y = 0, .height = 1 },
-        .{ .y = 2, .height = 1 },
+    const invalid_rects = [_]RepairRect{
+        .{ .x = 0, .y = 0, .width = 2, .height = 1 },
+        .{ .x = 0, .y = 2, .width = 2, .height = 1 },
     };
-    current.repair = .{ .spans = &invalid_spans };
+    current.repair = .{ .rects = &invalid_rects };
     try std.testing.expect(!repairToPreviousFrame(current));
 
     current.source_pixels = null;

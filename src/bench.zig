@@ -176,8 +176,18 @@ pub fn run(init: std.process.Init) !void {
     }
 
     try w.writeAll("\n4K-ish stress cases\n");
-    try benchFullGrid(init.io, alloc, config, &renderer, w, 384, 112, "full render 384x112");
-    try benchShapePrefixChurn(init.io, alloc, config, &renderer, w, 384, 112);
+    var row_renderer: Renderer = try .init(alloc, &font, .{
+        .track_cell_damage = false,
+        .partial_cell_raster = false,
+    });
+    defer row_renderer.deinit();
+    try benchFullGrid(init.io, alloc, config, &row_renderer, w, 384, 112, "full render rows 384x112");
+    try benchShapePrefixChurn(init.io, alloc, config, &row_renderer, w, 384, 112, "prefix-churn rows 384x112", false);
+    try benchFullGrid(init.io, alloc, config, &renderer, w, 384, 112, "full render+cell snapshot 384x112");
+    try benchShapePrefixChurn(init.io, alloc, config, &renderer, w, 384, 112, "prefix-churn cells 384x112", false);
+    var pipeline_renderer: Renderer = try .init(alloc, &font, .{});
+    defer pipeline_renderer.deinit();
+    try benchShapePrefixChurn(init.io, alloc, config, &pipeline_renderer, w, 384, 112, "prefix-churn cells+repair 384x112", true);
     try benchCopies(init.io, alloc, w, 3840, 2160, "copy 3840x2160");
 }
 
@@ -295,6 +305,8 @@ fn benchShapePrefixChurn(
     w: *std.Io.Writer,
     comptime bench_cols: u16,
     comptime bench_rows: u16,
+    name: []const u8,
+    repair_stale_buffers: bool,
 ) !void {
     const width: u31 = renderer.font.cell_width * bench_cols;
     const height: u31 = renderer.font.cell_height * bench_rows;
@@ -313,25 +325,78 @@ fn benchShapePrefixChurn(
     var render_state: vt.RenderState = .empty;
     defer render_state.deinit(alloc);
 
-    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
-    defer alloc.free(pixels);
+    const frame_len = @as(usize, width) * height;
+    const buffer_count: usize = if (repair_stale_buffers) 3 else 1;
+    const buffers = try alloc.alloc(u32, frame_len * buffer_count);
+    defer alloc.free(buffers);
+    var damage_history: [2]std.ArrayList(Renderer.PixelRect) = .{ .empty, .empty };
+    defer for (&damage_history) |*rects| rects.deinit(alloc);
 
     try fillPrefixChurnFrame(alloc, &stream, bench_cols, bench_rows, 0);
     try render_state.update(alloc, &term);
-    try renderer.render(&render_state, pixels, width, height);
+    try renderer.render(&render_state, buffers[0..frame_len], width, height);
+    for (1..buffer_count) |i| {
+        @memcpy(buffers[i * frame_len ..][0..frame_len], buffers[0..frame_len]);
+    }
     clearDirty(&render_state);
 
     renderer.resetShapeStats();
+    renderer.resetCellDamageStats();
     const iters = 30;
     const start = nowNs(io);
     for (0..iters) |frame| {
+        const target_index = if (repair_stale_buffers) (frame + 1) % buffer_count else 0;
+        const newest_index = if (repair_stale_buffers) frame % buffer_count else 0;
+        const target = buffers[target_index * frame_len ..][0..frame_len];
+        const newest = buffers[newest_index * frame_len ..][0..frame_len];
+        if (repair_stale_buffers) {
+            const history_len = @min(frame, damage_history.len);
+            for (damage_history[0..history_len]) |rects| {
+                copyDamageRects(target, newest, width, rects.items);
+            }
+        }
         try fillPrefixChurnFrame(alloc, &stream, bench_cols, bench_rows, frame + 1);
         try render_state.update(alloc, &term);
-        try renderer.renderDirty(&render_state, pixels, width, height);
+        try renderer.renderDirty(&render_state, target, width, height);
+        if (repair_stale_buffers) {
+            damage_history[1].clearRetainingCapacity();
+            try damage_history[1].appendSlice(alloc, damage_history[0].items);
+            try replaceCoalescedDamage(alloc, &damage_history[0], renderer.rendered_rects.items);
+        }
         clearDirty(&render_state);
     }
-    try report(w, "prefix-churn frame 384x112", nowNs(io) - start, iters, null);
+    try report(w, name, nowNs(io) - start, iters, null);
     try reportShapeStats(w, renderer.shapeStats());
+    const damage_stats = renderer.cellDamageStats();
+    if (damage_stats.scanned_cells > 0) try reportCellDamageStats(w, damage_stats);
+}
+
+fn replaceCoalescedDamage(
+    alloc: std.mem.Allocator,
+    dest: *std.ArrayList(Renderer.PixelRect),
+    source: []const Renderer.PixelRect,
+) !void {
+    dest.clearRetainingCapacity();
+    for (source) |rect| {
+        if (dest.items.len > 0) {
+            const previous = &dest.items[dest.items.len - 1];
+            const previous_end = previous.y + previous.height;
+            if (previous.x == rect.x and previous.width == rect.width and rect.y <= previous_end) {
+                previous.height = @max(previous_end, rect.y + rect.height) - previous.y;
+                continue;
+            }
+        }
+        try dest.append(alloc, rect);
+    }
+}
+
+fn copyDamageRects(dest: []u32, source: []const u32, stride: u31, rects: []const Renderer.PixelRect) void {
+    for (rects) |rect| {
+        for (rect.y..rect.y + rect.height) |y| {
+            const offset = @as(usize, y) * stride + rect.x;
+            @memcpy(dest[offset..][0..rect.width], source[offset..][0..rect.width]);
+        }
+    }
 }
 
 /// Fill every grid row with colored words and park the cursor at the
@@ -454,5 +519,30 @@ fn reportShapeStats(w: *std.Io.Writer, stats: Renderer.ShapeStats) !void {
     try w.print(
         "  shape cache: {d} hits, {d} misses ({d:.1}% hit), {d:.1} cells/miss, {d} clears\n",
         .{ stats.cache_hits, stats.cache_misses, hit_rate, cells_per_miss, stats.cache_clears },
+    );
+}
+
+fn reportCellDamageStats(w: *std.Io.Writer, stats: Renderer.CellDamageStats) !void {
+    const changed_rate: f64 = if (stats.scanned_cells == 0)
+        0
+    else
+        @as(f64, @floatFromInt(stats.changed_cells)) * 100 /
+            @as(f64, @floatFromInt(stats.scanned_cells));
+    const span_rate: f64 = if (stats.scanned_cells == 0)
+        0
+    else
+        @as(f64, @floatFromInt(stats.spanned_cells)) * 100 /
+            @as(f64, @floatFromInt(stats.scanned_cells));
+    try w.print(
+        "  cell damage: {d} dirty rows ({d} unchanged), {d}/{d} cells changed ({d:.2}%), {d} spanned ({d:.2}%)\n",
+        .{
+            stats.dirty_rows,
+            stats.unchanged_dirty_rows,
+            stats.changed_cells,
+            stats.scanned_cells,
+            changed_rate,
+            stats.spanned_cells,
+            span_rate,
+        },
     );
 }
