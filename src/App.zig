@@ -26,6 +26,7 @@ const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
 const AsyncRaster = @import("AsyncRaster.zig");
 const KittyImageCache = @import("KittyImageCache.zig");
+const ScrollbackSearch = @import("ScrollbackSearch.zig");
 const TerminalLayout = @import("TerminalLayout.zig");
 const cgroup = @import("cgroup.zig");
 const Window = @import("Window.zig");
@@ -46,84 +47,6 @@ const HoveredLink = struct {
 const LinkPress = struct {
     uri: []u8,
     cell: vt.Coordinate,
-};
-
-const SearchState = struct {
-    query: std.ArrayList(u8) = .empty,
-    engine: ?vt.search.Screen = null,
-    engine_key: vt.ScreenSet.Key = .primary,
-    engine_generation: usize = 0,
-    complete: bool = true,
-    original_screen: *vt.Screen,
-    original_key: vt.ScreenSet.Key,
-    original_generation: usize,
-    original_viewport: vt.PageList.Viewport,
-    original_pin: ?*vt.Pin,
-
-    fn init(term: *vt.Terminal) !SearchState {
-        const key = term.screens.active_key;
-        const screen = term.screens.active;
-        const viewport = screen.pages.viewport;
-        return .{
-            .original_screen = screen,
-            .original_key = key,
-            .original_generation = term.screens.generation(key),
-            .original_viewport = viewport,
-            .original_pin = if (viewport == .pin)
-                try screen.pages.trackPin(screen.pages.getTopLeft(.viewport))
-            else
-                null,
-        };
-    }
-
-    fn screenValid(
-        term: *const vt.Terminal,
-        key: vt.ScreenSet.Key,
-        generation: usize,
-        screen: *const vt.Screen,
-    ) bool {
-        return term.screens.generation(key) == generation and
-            term.screens.get(key) == screen;
-    }
-
-    fn engineValid(self: *const SearchState, term: *const vt.Terminal) bool {
-        const engine = self.engine orelse return false;
-        return screenValid(term, self.engine_key, self.engine_generation, engine.screen);
-    }
-
-    fn deinitEngine(self: *SearchState, term: *vt.Terminal) void {
-        if (self.engine) |*engine| {
-            if (self.engineValid(term))
-                engine.deinit()
-            else
-                engine.deinitScreenInvalid();
-            self.engine = null;
-        }
-        self.complete = true;
-    }
-
-    fn restoreViewport(self: *SearchState, term: *vt.Terminal) void {
-        if (term.screens.active_key != self.original_key or
-            !screenValid(term, self.original_key, self.original_generation, self.original_screen))
-        {
-            return;
-        }
-        switch (self.original_viewport) {
-            .active => self.original_screen.pages.scroll(.active),
-            .top => self.original_screen.pages.scroll(.top),
-            .pin => self.original_screen.pages.scroll(.{ .pin = self.original_pin.?.* }),
-        }
-    }
-
-    fn deinit(self: *SearchState, alloc: std.mem.Allocator, term: *vt.Terminal) void {
-        self.deinitEngine(term);
-        if (self.original_pin) |pin| {
-            if (screenValid(term, self.original_key, self.original_generation, self.original_screen)) {
-                self.original_screen.pages.untrackPin(pin);
-            }
-        }
-        self.query.deinit(alloc);
-    }
 };
 
 const AsyncJobSnapshot = struct {
@@ -283,7 +206,7 @@ ime_preedit: ?[]u8,
 ime_pending_preedit: ?[]u8,
 ime_pending_commit: ?[]u8,
 /// Native incremental scrollback search, active even with an empty query.
-search: ?SearchState,
+search: ?ScrollbackSearch,
 /// Cached DEC mode 2048 state, to detect the application enabling
 /// in-band size reports.
 in_band_reports: bool,
@@ -4884,7 +4807,7 @@ fn fireRepeat(self: *App) void {
 
 fn startSearch(self: *App) void {
     if (self.search != null) return;
-    self.search = SearchState.init(&self.term) catch |err| {
+    self.search = ScrollbackSearch.init(&self.term) catch |err| {
         log.warn("failed to start scrollback search: {}", .{err});
         return;
     };
@@ -6216,23 +6139,4 @@ test "search match mask includes every visible result" {
     try std.testing.expectEqualSlices(bool, &.{ true, true, true, false, true, true, true, false, false, false }, mask.items[0..10]);
     const no_matches = [_]bool{false} ** 10;
     try std.testing.expectEqualSlices(bool, &no_matches, mask.items[10..20]);
-}
-
-test "search state releases an engine after its screen is removed" {
-    const alloc = std.testing.allocator;
-    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
-    defer term.deinit(alloc);
-    _ = try term.switchScreen(.alternate);
-
-    var search: SearchState = try .init(&term);
-    defer search.deinit(alloc, &term);
-    try search.query.appendSlice(alloc, "needle");
-    search.engine = try .init(alloc, term.screens.active, search.query.items);
-    search.engine_key = .alternate;
-    search.engine_generation = term.screens.generation(.alternate);
-    search.complete = false;
-
-    _ = try term.switchScreen(.primary);
-    term.screens.remove(alloc, .alternate);
-    try std.testing.expect(!search.engineValid(&term));
 }
