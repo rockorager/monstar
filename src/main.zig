@@ -362,6 +362,7 @@ test {
     _ = @import("glyph_constraints.zig");
     _ = @import("Keyboard.zig");
     _ = @import("KittyImageCache.zig");
+    _ = @import("kitty_graphics.zig");
     _ = Link;
     _ = Pty;
     _ = @import("ReadPipeline.zig");
