@@ -367,6 +367,7 @@ test {
     _ = @import("ReadPipeline.zig");
     _ = Renderer;
     _ = @import("pixel_copy.zig");
+    _ = @import("pixel_raster.zig");
     _ = @import("sprite.zig");
     _ = @import("sprite/canvas.zig");
     _ = @import("sprite/draw/box.zig");
