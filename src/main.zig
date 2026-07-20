@@ -358,6 +358,7 @@ test {
     _ = @import("AsyncJobSnapshot.zig");
     _ = @import("AsyncRaster.zig");
     _ = @import("CellDamageTracker.zig");
+    _ = @import("Clipboard.zig");
     _ = @import("FrameDamageTracker.zig");
     _ = Config;
     _ = Font;

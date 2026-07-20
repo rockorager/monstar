@@ -17,6 +17,7 @@ const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
 const terminfo = @import("ghostty-terminfo");
+const Clipboard = @import("Clipboard.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
@@ -212,38 +213,7 @@ mouse_shape_explicit: bool,
 active_screen: vt.ScreenSet.Key,
 /// Serial of the most recent input event, required to claim selections.
 last_serial: u32,
-/// Current clipboard/primary offers from other clients (paste sources).
-clip_offer: ?*ClipboardOffer,
-clip_pending_offer: ?*ClipboardOffer,
-primary_offer: ?*PrimaryOffer,
-primary_pending_offer: ?*PrimaryOffer,
-/// Active drag-and-drop offer, valid between wl_data_device.enter/leave.
-dnd_offer: ?*ClipboardOffer,
-/// Our own outgoing selection sources, so exit can reclaim them if the
-/// compositor never cancels them (nobody else took the selection).
-clip_source: ?*SourceCtx,
-primary_source: ?*SourceCtx,
-/// An in-flight paste: pipe read end (-1 when idle) and received bytes.
-paste_fd: posix.fd_t,
-paste_buf: std.ArrayList(u8),
-paste_action: PasteAction,
-
-const PasteAction = union(enum) {
-    terminal,
-    osc52_read: u8,
-    dnd: *ClipboardOffer,
-};
-const TransferOffer = union(enum) {
-    clipboard: *ClipboardOffer,
-    primary: *PrimaryOffer,
-
-    fn receive(self: TransferOffer, mime: [*:0]const u8, fd: posix.fd_t) void {
-        switch (self) {
-            .clipboard => |offer| offer.offer.receive(mime, fd),
-            .primary => |offer| offer.offer.receive(mime, fd),
-        }
-    }
-};
+clipboard: Clipboard,
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
     '│',
@@ -711,16 +681,7 @@ pub fn init(
         .mouse_shape_explicit = false,
         .active_screen = .primary,
         .last_serial = 0,
-        .clip_offer = null,
-        .clip_pending_offer = null,
-        .primary_offer = null,
-        .primary_pending_offer = null,
-        .dnd_offer = null,
-        .clip_source = null,
-        .primary_source = null,
-        .paste_fd = -1,
-        .paste_buf = .empty,
-        .paste_action = .terminal,
+        .clipboard = .init(alloc, window.data_manager, window.primary_manager),
     };
     self.stream = .initAlloc(alloc, .{
         .app = self,
@@ -1387,15 +1348,7 @@ pub fn deinit(self: *App) void {
     self.kitty_cache.deinit(self.alloc);
     self.clearImeText();
     if (self.search) |*search| search.deinit(self.alloc, &self.term);
-    if (self.paste_fd >= 0) _ = std.os.linux.close(self.paste_fd);
-    self.paste_buf.deinit(self.alloc);
-    if (self.clip_offer) |offer| offer.destroy();
-    if (self.clip_pending_offer) |offer| offer.destroy();
-    if (self.primary_offer) |offer| offer.destroy();
-    if (self.primary_pending_offer) |offer| offer.destroy();
-    if (self.dnd_offer) |offer| offer.destroy();
-    if (self.clip_source) |source| source.destroy();
-    if (self.primary_source) |source| source.destroy();
+    self.clipboard.deinit();
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
@@ -1504,7 +1457,7 @@ pub fn run(self: *App) !void {
         // Only poll the master while a write backlog exists, otherwise
         // POLLOUT would make every poll return immediately.
         pty_write_fd.fd = if (self.write_queue.items.len > 0) self.pty.master else -1;
-        paste_fd.fd = self.paste_fd;
+        paste_fd.fd = self.clipboard.transferFd();
 
         const ready = posix.poll(&fds, -1) catch {
             display.cancelRead();
@@ -1574,8 +1527,8 @@ pub fn run(self: *App) !void {
                 self.finishAsyncRender();
         }
 
-        if (self.paste_fd >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
-            self.readPaste();
+        if (self.clipboard.transferFd() >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+            self.readClipboardTransfer();
         }
 
         try self.redrawIfNeeded();
@@ -2287,27 +2240,19 @@ fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
     };
 
     switch (osc52Target(kind)) {
-        .clipboard => _ = self.claimClipboardText(text),
-        .primary => self.claimPrimaryText(text),
+        .clipboard => _ = self.clipboard.claim(.clipboard, text, self.last_serial),
+        .primary => _ = self.clipboard.claim(.primary, text, self.last_serial),
     }
 }
 
 fn beginOsc52Read(self: *App, kind: u8) void {
-    if (self.paste_fd >= 0) return;
-
-    switch (osc52Target(kind)) {
-        .clipboard => {
-            const offer = self.clip_offer orelse return self.writeOsc52ClipboardReport(kind, "");
-            self.beginClipboardTransfer(offer.bestMime() orelse return self.writeOsc52ClipboardReport(kind, ""), .{ .clipboard = offer }, .{ .osc52_read = kind }) catch {
-                self.writeOsc52ClipboardReport(kind, "");
-            };
-        },
-        .primary => {
-            const offer = self.primary_offer orelse return self.writeOsc52ClipboardReport(kind, "");
-            self.beginClipboardTransfer(offer.bestMime() orelse return self.writeOsc52ClipboardReport(kind, ""), .{ .primary = offer }, .{ .osc52_read = kind }) catch {
-                self.writeOsc52ClipboardReport(kind, "");
-            };
-        },
+    const target: Clipboard.Target = switch (osc52Target(kind)) {
+        .clipboard => .clipboard,
+        .primary => .primary,
+    };
+    switch (self.clipboard.request(target, .{ .osc52_read = kind })) {
+        .started, .busy => {},
+        .unavailable => self.writeOsc52ClipboardReport(kind, ""),
     }
 }
 
@@ -3461,268 +3406,13 @@ fn syncActiveScreen(self: *App) void {
     self.syncScrollbarHover();
 }
 
-const ClipboardOffer = struct {
-    app: *App,
-    offer: *wl.DataOffer,
-    mimes: clipboard_format.MimeMask = 0,
-    dnd_mimes: clipboard_format.MimeMask = 0,
-    dnd_action: wl.DataDeviceManager.DndAction = .{},
-
-    fn noteMime(self: *ClipboardOffer, mime_type: [*:0]const u8) void {
-        if (clipboard_format.mimeBit(&clipboard_format.paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
-        if (clipboard_format.mimeBit(&clipboard_format.dnd_mime_preference, mime_type)) |bit| self.dnd_mimes |= bit;
-    }
-
-    fn bestMime(self: *const ClipboardOffer) ?[*:0]const u8 {
-        return clipboard_format.preferredMime(&clipboard_format.paste_mime_preference, self.mimes);
-    }
-
-    fn bestDndMime(self: *const ClipboardOffer) ?[*:0]const u8 {
-        return clipboard_format.preferredMime(&clipboard_format.dnd_mime_preference, self.dnd_mimes);
-    }
-
-    fn destroy(self: *ClipboardOffer) void {
-        const app = self.app;
-        if (app.clip_offer == self) app.clip_offer = null;
-        if (app.clip_pending_offer == self) app.clip_pending_offer = null;
-        if (app.dnd_offer == self) app.dnd_offer = null;
-        self.offer.destroy();
-        app.alloc.destroy(self);
-    }
-};
-
-const PrimaryOffer = struct {
-    app: *App,
-    offer: *zwp.PrimarySelectionOfferV1,
-    mimes: clipboard_format.MimeMask = 0,
-
-    fn noteMime(self: *PrimaryOffer, mime_type: [*:0]const u8) void {
-        if (clipboard_format.mimeBit(&clipboard_format.paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
-    }
-
-    fn bestMime(self: *const PrimaryOffer) ?[*:0]const u8 {
-        return clipboard_format.preferredMime(&clipboard_format.paste_mime_preference, self.mimes);
-    }
-
-    fn destroy(self: *PrimaryOffer) void {
-        const app = self.app;
-        if (app.primary_offer == self) app.primary_offer = null;
-        if (app.primary_pending_offer == self) app.primary_pending_offer = null;
-        self.offer.destroy();
-        app.alloc.destroy(self);
-    }
-};
-
-/// Heap context for an outgoing selection source: owns the text and the
-/// source proxy. Destroyed when the compositor cancels the source
-/// (someone else took the selection), when we replace it with a new
-/// source, or at exit — whichever comes first.
-const SourceCtx = struct {
-    app: *App,
-    text: [:0]const u8,
-    source: union(enum) {
-        clipboard: *wl.DataSource,
-        primary: *zwp.PrimarySelectionSourceV1,
-    },
-
-    /// Destroy the proxy, release ownership, and detach from the app's
-    /// tracking slot (if it still points here).
-    fn destroy(self: *SourceCtx) void {
-        const app = self.app;
-        switch (self.source) {
-            .clipboard => |source| {
-                if (app.clip_source == self) app.clip_source = null;
-                source.destroy();
-            },
-            .primary => |source| {
-                if (app.primary_source == self) app.primary_source = null;
-                source.destroy();
-            },
-        }
-        app.alloc.free(self.text);
-        app.alloc.destroy(self);
-    }
-
-    /// Stream the text to the requesting client and close the fd.
-    /// Writes are blocking; selections are small enough in practice.
-    fn send(self: *SourceCtx, fd: i32) void {
-        const linux = std.os.linux;
-        defer _ = linux.close(fd);
-        var offset: usize = 0;
-        while (offset < self.text.len) {
-            const rc = linux.write(fd, self.text.ptr + offset, self.text.len - offset);
-            switch (linux.errno(rc)) {
-                .SUCCESS => offset += rc,
-                .INTR => continue,
-                else => return,
-            }
-        }
-    }
-};
-
-fn dataSourceListener(_: *wl.DataSource, event: wl.DataSource.Event, ctx: *SourceCtx) void {
-    switch (event) {
-        .send => |send| ctx.send(send.fd),
-        .cancelled => ctx.destroy(),
-        else => {},
-    }
-}
-
-fn primarySourceListener(
-    _: *zwp.PrimarySelectionSourceV1,
-    event: zwp.PrimarySelectionSourceV1.Event,
-    ctx: *SourceCtx,
-) void {
-    switch (event) {
-        .send => |send| ctx.send(send.fd),
-        .cancelled => ctx.destroy(),
-    }
-}
-
-fn dataOfferListener(_: *wl.DataOffer, event: wl.DataOffer.Event, offer: *ClipboardOffer) void {
-    switch (event) {
-        .offer => |ev| offer.noteMime(ev.mime_type),
-        .action => |ev| offer.dnd_action = ev.dnd_action,
-        else => {},
-    }
-}
-
-fn primaryOfferListener(
-    _: *zwp.PrimarySelectionOfferV1,
-    event: zwp.PrimarySelectionOfferV1.Event,
-    offer: *PrimaryOffer,
-) void {
-    switch (event) {
-        .offer => |ev| offer.noteMime(ev.mime_type),
-    }
-}
-
-fn createClipboardOffer(self: *App, proxy: *wl.DataOffer) ?*ClipboardOffer {
-    if (self.clip_pending_offer) |old| old.destroy();
-    const offer = self.alloc.create(ClipboardOffer) catch {
-        proxy.destroy();
-        return null;
-    };
-    offer.* = .{ .app = self, .offer = proxy };
-    proxy.setListener(*ClipboardOffer, dataOfferListener, offer);
-    self.clip_pending_offer = offer;
-    return offer;
-}
-
-fn takeClipboardOffer(self: *App, proxy: *wl.DataOffer) ?*ClipboardOffer {
-    const offer = self.clip_pending_offer orelse return null;
-    if (offer.offer != proxy) return null;
-    self.clip_pending_offer = null;
-    return offer;
-}
-
-fn createPrimaryOffer(self: *App, proxy: *zwp.PrimarySelectionOfferV1) ?*PrimaryOffer {
-    if (self.primary_pending_offer) |old| old.destroy();
-    const offer = self.alloc.create(PrimaryOffer) catch {
-        proxy.destroy();
-        return null;
-    };
-    offer.* = .{ .app = self, .offer = proxy };
-    proxy.setListener(*PrimaryOffer, primaryOfferListener, offer);
-    self.primary_pending_offer = offer;
-    return offer;
-}
-
-fn takePrimaryOffer(self: *App, proxy: *zwp.PrimarySelectionOfferV1) ?*PrimaryOffer {
-    const offer = self.primary_pending_offer orelse return null;
-    if (offer.offer != proxy) return null;
-    self.primary_pending_offer = null;
-    return offer;
-}
-
-fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *App) void {
-    switch (event) {
-        .data_offer => |data_offer| {
-            _ = self.createClipboardOffer(data_offer.id);
-        },
-        .selection => |selection| {
-            const offer = if (selection.id) |id| offer: {
-                break :offer self.takeClipboardOffer(id) orelse {
-                    id.destroy();
-                    break :offer null;
-                };
-            } else null;
-            if (self.clip_offer) |old| old.destroy();
-            self.clip_offer = offer;
-        },
-        .enter => |enter| {
-            const id = enter.id orelse return;
-            const offer = self.takeClipboardOffer(id) orelse {
-                id.destroy();
-                return;
-            };
-            if (offer.bestDndMime()) |mime| {
-                offer.offer.accept(enter.serial, mime);
-                offer.offer.setActions(.{ .copy = true }, .{ .copy = true });
-                if (self.dnd_offer) |old| old.destroy();
-                self.dnd_offer = offer;
-            } else {
-                offer.offer.accept(enter.serial, null);
-                offer.destroy();
-            }
-        },
-        .leave => {
-            if (self.dnd_offer) |offer| offer.destroy();
-        },
-        .drop => self.beginDropPaste(),
-        .motion => {},
-    }
-}
-
-fn beginDropPaste(self: *App) void {
-    const offer = self.dnd_offer orelse return;
-    // The compositor sends leave right after drop; hand ownership to
-    // the in-flight paste action now so that leave cannot destroy the
-    // offer under it (finishPaste destroys it when the transfer ends).
-    self.dnd_offer = null;
-    if (self.paste_fd >= 0) {
-        offer.destroy();
-        return;
-    }
-    const mime = offer.bestDndMime() orelse {
-        offer.destroy();
-        return;
-    };
-    self.beginClipboardTransfer(mime, .{ .clipboard = offer }, .{ .dnd = offer }) catch {
-        offer.destroy();
-    };
-}
-
-fn primaryDeviceListener(
-    _: *zwp.PrimarySelectionDeviceV1,
-    event: zwp.PrimarySelectionDeviceV1.Event,
-    self: *App,
-) void {
-    switch (event) {
-        .data_offer => |data_offer| {
-            _ = self.createPrimaryOffer(data_offer.offer);
-        },
-        .selection => |selection| {
-            const offer = if (selection.id) |id| offer: {
-                break :offer self.takePrimaryOffer(id) orelse {
-                    id.destroy();
-                    break :offer null;
-                };
-            } else null;
-            if (self.primary_offer) |old| old.destroy();
-            self.primary_offer = offer;
-        },
-    }
-}
-
 fn clipboardDevicesChanged(
     ctx: *anyopaque,
     data_device: ?*wl.DataDevice,
     primary_device: ?*zwp.PrimarySelectionDeviceV1,
 ) void {
     const self: *App = @ptrCast(@alignCast(ctx));
-    if (data_device) |device| device.setListener(*App, dataDeviceListener, self);
-    if (primary_device) |device| device.setListener(*App, primaryDeviceListener, self);
+    self.clipboard.setDevices(data_device, primary_device);
 }
 
 /// The current selection's text, allocated, or null if nothing selected.
@@ -3735,77 +3425,13 @@ fn selectionText(self: *App) ?[:0]const u8 {
 /// Claim the primary selection with the currently selected text.
 fn copyToPrimary(self: *App) void {
     const text = self.selectionText() orelse return;
-    self.claimPrimaryText(text);
-}
-
-fn claimPrimaryText(self: *App, text: [:0]const u8) void {
-    const manager = self.window.primary_manager orelse {
-        self.alloc.free(text);
-        return;
-    };
-    const device = self.window.primary_device orelse {
-        self.alloc.free(text);
-        return;
-    };
-
-    const source = manager.createSource() catch {
-        self.alloc.free(text);
-        return;
-    };
-    const ctx = self.alloc.create(SourceCtx) catch {
-        source.destroy();
-        self.alloc.free(text);
-        return;
-    };
-    ctx.* = .{ .app = self, .text = text, .source = .{ .primary = source } };
-
-    inline for (clipboard_format.paste_mime_preference) |mime| source.offer(mime.ptr);
-    source.setListener(*SourceCtx, primarySourceListener, ctx);
-    device.setSelection(source, self.last_serial);
-
-    // Replace any previous source of ours eagerly; the compositor's
-    // cancelled event for it would hit a destroyed proxy, which
-    // libwayland drops safely.
-    if (self.primary_source) |old| old.destroy();
-    self.primary_source = ctx;
-    log.debug("claimed primary selection ({d} bytes)", .{text.len});
+    _ = self.clipboard.claim(.primary, text, self.last_serial);
 }
 
 /// Claim the clipboard with the currently selected text.
 fn copyToClipboard(self: *App) void {
     const text = self.selectionText() orelse return;
-    if (self.claimClipboardText(text)) self.flashCopyHighlight();
-}
-
-fn claimClipboardText(self: *App, text: [:0]const u8) bool {
-    const manager = self.window.data_manager orelse {
-        self.alloc.free(text);
-        return false;
-    };
-    const device = self.window.data_device orelse {
-        self.alloc.free(text);
-        return false;
-    };
-
-    const source = manager.createDataSource() catch {
-        self.alloc.free(text);
-        return false;
-    };
-    const ctx = self.alloc.create(SourceCtx) catch {
-        source.destroy();
-        self.alloc.free(text);
-        return false;
-    };
-    ctx.* = .{ .app = self, .text = text, .source = .{ .clipboard = source } };
-
-    inline for (clipboard_format.paste_mime_preference) |mime| source.offer(mime.ptr);
-    source.setListener(*SourceCtx, dataSourceListener, ctx);
-    device.setSelection(source, self.last_serial);
-
-    if (self.clip_source) |old| old.destroy();
-    self.clip_source = ctx;
-    log.debug("claimed clipboard ({d} bytes)", .{text.len});
-    return true;
+    if (self.clipboard.claim(.clipboard, text, self.last_serial)) self.flashCopyHighlight();
 }
 
 fn flashCopyHighlight(self: *App) void {
@@ -3830,79 +3456,18 @@ fn fireCopyHighlightTimeout(self: *App) void {
 
 /// Ask the offer's owner to stream its contents into a pipe; the read
 /// end joins the poll loop and the paste completes on EOF.
-fn beginPaste(self: *App, comptime which: enum { clipboard, primary }) void {
-    if (self.paste_fd >= 0) return; // one paste at a time
-
-    switch (which) {
-        .clipboard => {
-            const offer = self.clip_offer orelse {
-                return;
-            };
-            const mime = offer.bestMime() orelse {
-                return;
-            };
-            self.beginClipboardTransfer(mime, .{ .clipboard = offer }, .terminal) catch return;
-        },
-        .primary => {
-            const offer = self.primary_offer orelse {
-                return;
-            };
-            const mime = offer.bestMime() orelse {
-                return;
-            };
-            self.beginClipboardTransfer(mime, .{ .primary = offer }, .terminal) catch return;
-        },
-    }
+fn beginPaste(self: *App, target: Clipboard.Target) void {
+    _ = self.clipboard.request(target, .terminal);
 }
 
-fn beginClipboardTransfer(
-    self: *App,
-    mime: [*:0]const u8,
-    offer: TransferOffer,
-    action: PasteAction,
-) !void {
-    var fds: [2]posix.fd_t = undefined;
-    if (std.os.linux.errno(std.os.linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
-    errdefer _ = std.os.linux.close(fds[0]);
-    errdefer _ = std.os.linux.close(fds[1]);
-
-    offer.receive(mime, fds[1]);
-    _ = std.os.linux.close(fds[1]);
-    setNonblocking(fds[0]);
-    self.paste_fd = fds[0];
-    self.paste_buf.clearRetainingCapacity();
-    self.paste_action = action;
-}
-
-/// Drain the paste pipe; on EOF encode and write the paste to the PTY.
-fn readPaste(self: *App) void {
-    var buf: [16 * 1024]u8 = undefined;
-    while (true) {
-        const n = posix.read(self.paste_fd, &buf) catch |err| switch (err) {
-            error.WouldBlock => return,
-            else => break,
-        };
-        if (n == 0) break; // EOF: sender is done
-        self.paste_buf.appendSlice(self.alloc, buf[0..n]) catch break;
-    }
-    self.finishPaste();
-}
-
-fn finishPaste(self: *App) void {
-    _ = std.os.linux.close(self.paste_fd);
-    self.paste_fd = -1;
-    defer {
-        self.paste_buf.clearRetainingCapacity();
-        self.paste_action = .terminal;
-    }
-
-    switch (self.paste_action) {
-        .terminal => self.writeTerminalPaste(self.paste_buf.items),
-        .osc52_read => |kind| self.writeOsc52ClipboardReport(kind, self.paste_buf.items),
-        .dnd => |offer| {
-            defer offer.destroy();
-            defer if (offer.dnd_action.copy or offer.dnd_action.move) offer.offer.finish();
-            const text = self.formatDropPaste(offer, self.paste_buf.items) catch return;
+fn readClipboardTransfer(self: *App) void {
+    const event = self.clipboard.readTransfer() orelse return;
+    defer self.clipboard.finishEvent();
+    switch (event) {
+        .terminal => |data| self.writeTerminalPaste(data),
+        .osc52_read => |read| self.writeOsc52ClipboardReport(read.kind, read.data),
+        .dnd => |drop| {
+            const text = self.formatDropPaste(drop.mime, drop.data) catch return;
             defer self.alloc.free(text);
             self.writeTerminalPaste(text);
         },
@@ -3921,8 +3486,7 @@ fn writeTerminalPaste(self: *App, data: []u8) void {
     for (parts) |part| self.writePty(part);
 }
 
-fn formatDropPaste(self: *App, offer: *const ClipboardOffer, data: []const u8) ![]u8 {
-    const mime = std.mem.span(offer.bestDndMime() orelse return self.alloc.dupe(u8, data));
+fn formatDropPaste(self: *App, mime: []const u8, data: []const u8) ![]u8 {
     if (!std.mem.eql(u8, mime, clipboard_format.uri_list_mime)) return self.alloc.dupe(u8, data);
     return try clipboard_format.formatUriListDrop(self.alloc, data);
 }
