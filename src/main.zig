@@ -359,6 +359,7 @@ test {
     _ = Config;
     _ = Font;
     _ = @import("cgroup.zig");
+    _ = @import("config_theme.zig");
     _ = @import("glyph_constraints.zig");
     _ = @import("Keyboard.zig");
     _ = @import("KittyImageCache.zig");

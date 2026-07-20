@@ -8,6 +8,7 @@ const Config = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
+const config_theme = @import("config_theme.zig");
 
 const log = std.log.scoped(.config);
 const baseline_dpi = 96.0;
@@ -34,10 +35,11 @@ pub const MouseScrollMultiplier = struct {
     discrete: f64 = 3,
 };
 
-pub const Theme = struct {
-    light: [:0]const u8,
-    dark: [:0]const u8,
-};
+pub const Theme = config_theme.Theme;
+pub const ThemeColors = config_theme.ThemeColors;
+pub const light_theme = config_theme.light_theme;
+pub const dark_theme = config_theme.dark_theme;
+const ThemeOverrides = config_theme.ThemeOverrides;
 
 pub const FontSize = union(enum) {
     points: f32,
@@ -56,85 +58,6 @@ pub const FontSize = union(enum) {
             .pixels => "px",
         };
     }
-};
-
-const ThemeOverrides = struct {
-    background: ?vt.color.RGB = null,
-    foreground: ?vt.color.RGB = null,
-    cursor_color: ?vt.color.RGB = null,
-    cursor_text: ?vt.color.RGB = null,
-    selection_background: ?vt.color.RGB = null,
-    selection_foreground: ?vt.color.RGB = null,
-    copy_highlight: ?vt.color.RGB = null,
-    copy_highlight_foreground: ?vt.color.RGB = null,
-    palette: [256]?vt.color.RGB = @splat(null),
-};
-
-pub const ThemeColors = struct {
-    background: vt.color.RGB,
-    foreground: vt.color.RGB,
-    cursor_color: vt.color.RGB,
-    selection_background: vt.color.RGB,
-    selection_foreground: vt.color.RGB,
-    copy_highlight: vt.color.RGB,
-    copy_highlight_foreground: vt.color.RGB,
-    palette: [16]vt.color.RGB,
-};
-
-pub const light_theme: ThemeColors = .{
-    .background = .{ .r = 0xf0, .g = 0xf0, .b = 0xf3 },
-    .foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
-    .cursor_color = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
-    .selection_background = .{ .r = 0xc2, .g = 0xe5, .b = 0xff },
-    .selection_foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
-    .copy_highlight = .{ .r = 0xff, .g = 0xe6, .b = 0x29 },
-    .copy_highlight_foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
-    .palette = .{
-        .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
-        .{ .r = 0xce, .g = 0x2c, .b = 0x31 },
-        .{ .r = 0x21, .g = 0x83, .b = 0x58 },
-        .{ .r = 0xab, .g = 0x64, .b = 0x00 },
-        .{ .r = 0x0d, .g = 0x74, .b = 0xce },
-        .{ .r = 0x81, .g = 0x45, .b = 0xb5 },
-        .{ .r = 0x10, .g = 0x7d, .b = 0x98 },
-        .{ .r = 0x60, .g = 0x64, .b = 0x6c },
-        .{ .r = 0x8b, .g = 0x8d, .b = 0x98 },
-        .{ .r = 0xe5, .g = 0x48, .b = 0x4d },
-        .{ .r = 0x30, .g = 0xa4, .b = 0x6c },
-        .{ .r = 0xff, .g = 0xc5, .b = 0x3d },
-        .{ .r = 0x00, .g = 0x90, .b = 0xff },
-        .{ .r = 0x8e, .g = 0x4e, .b = 0xc6 },
-        .{ .r = 0x00, .g = 0xa2, .b = 0xc7 },
-        .{ .r = 0xfc, .g = 0xfc, .b = 0xfd },
-    },
-};
-
-pub const dark_theme: ThemeColors = .{
-    .background = .{ .r = 0x21, .g = 0x22, .b = 0x25 },
-    .foreground = .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
-    .cursor_color = .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
-    .selection_background = .{ .r = 0x10, .g = 0x4d, .b = 0x87 },
-    .selection_foreground = .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
-    .copy_highlight = .{ .r = 0xff, .g = 0xe6, .b = 0x29 },
-    .copy_highlight_foreground = .{ .r = 0x1c, .g = 0x20, .b = 0x24 },
-    .palette = .{
-        .{ .r = 0x18, .g = 0x19, .b = 0x1b },
-        .{ .r = 0xff, .g = 0x95, .b = 0x92 },
-        .{ .r = 0x3d, .g = 0xd6, .b = 0x8c },
-        .{ .r = 0xff, .g = 0xca, .b = 0x16 },
-        .{ .r = 0x70, .g = 0xb8, .b = 0xff },
-        .{ .r = 0xd1, .g = 0x9d, .b = 0xff },
-        .{ .r = 0x4c, .g = 0xcc, .b = 0xe6 },
-        .{ .r = 0xb0, .g = 0xb4, .b = 0xba },
-        .{ .r = 0x69, .g = 0x6e, .b = 0x77 },
-        .{ .r = 0xff, .g = 0xd1, .b = 0xd9 },
-        .{ .r = 0xb1, .g = 0xf1, .b = 0xcb },
-        .{ .r = 0xff, .g = 0xe7, .b = 0xb3 },
-        .{ .r = 0xc2, .g = 0xe6, .b = 0xff },
-        .{ .r = 0xec, .g = 0xd9, .b = 0xfa },
-        .{ .r = 0xb6, .g = 0xec, .b = 0xf7 },
-        .{ .r = 0xed, .g = 0xee, .b = 0xf0 },
-    },
 };
 
 /// Wayland app-id and desktop-entry hint for desktop integration.
@@ -254,11 +177,11 @@ pub fn resolveThemes(
     self.dark_theme_overrides = null;
     const theme = self.theme orelse return;
 
-    self.light_theme_overrides = try loadThemeOverrides(io, arena, environ, theme.light);
+    self.light_theme_overrides = try config_theme.loadOverrides(io, arena, environ, theme.light);
     if (std.mem.eql(u8, theme.light, theme.dark)) {
         self.dark_theme_overrides = self.light_theme_overrides;
     } else {
-        self.dark_theme_overrides = try loadThemeOverrides(io, arena, environ, theme.dark);
+        self.dark_theme_overrides = try config_theme.loadOverrides(io, arena, environ, theme.dark);
     }
 }
 
@@ -324,25 +247,25 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         else
             return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "theme")) {
-        self.theme = try parseTheme(arena, value);
+        self.theme = try config_theme.parse(arena, value);
     } else if (std.mem.eql(u8, key, "background")) {
-        self.background = try parseColor(value);
+        self.background = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "foreground")) {
-        self.foreground = try parseColor(value);
+        self.foreground = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "cursor-color")) {
-        self.cursor_color = try parseColor(value);
+        self.cursor_color = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "cursor-text")) {
-        self.cursor_text = try parseColor(value);
+        self.cursor_text = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-background")) {
-        self.selection_background = try parseColor(value);
+        self.selection_background = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-foreground")) {
-        self.selection_foreground = try parseColor(value);
+        self.selection_foreground = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "copy-highlight")) {
-        self.copy_highlight = try parseColor(value);
+        self.copy_highlight = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "copy-highlight-foreground")) {
-        self.copy_highlight_foreground = try parseColor(value);
+        self.copy_highlight_foreground = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "palette")) {
-        const entry = try parsePaletteEntry(value);
+        const entry = try config_theme.parsePaletteEntry(value);
         self.palette[entry.index] = entry.color;
     } else {
         return error.UnknownKey;
@@ -365,41 +288,6 @@ fn parseFontSize(value: []const u8) error{InvalidValue}!FontSize {
     return switch (unit) {
         .points => .{ .points = size },
         .pixels => .{ .pixels = size },
-    };
-}
-
-fn parseTheme(arena: std.mem.Allocator, value: []const u8) SetError!Theme {
-    const trimmed = std.mem.trim(u8, value, " \t");
-    if (trimmed.len == 0) return error.InvalidValue;
-
-    if (std.mem.indexOfAny(u8, trimmed, ",:=") == null) {
-        const name = try arena.dupeZ(u8, trimmed);
-        return .{ .light = name, .dark = name };
-    }
-
-    var light: ?[:0]const u8 = null;
-    var dark: ?[:0]const u8 = null;
-    var entries = std.mem.splitScalar(u8, trimmed, ',');
-    while (entries.next()) |raw_entry| {
-        const entry = std.mem.trim(u8, raw_entry, " \t");
-        const colon = std.mem.indexOfScalar(u8, entry, ':') orelse return error.InvalidValue;
-        if (std.mem.indexOfScalarPos(u8, entry, colon + 1, ':') != null) return error.InvalidValue;
-        const kind = std.mem.trim(u8, entry[0..colon], " \t");
-        const name = std.mem.trim(u8, entry[colon + 1 ..], " \t");
-        if (name.len == 0) return error.InvalidValue;
-        if (std.mem.eql(u8, kind, "light")) {
-            if (light != null) return error.InvalidValue;
-            light = try arena.dupeZ(u8, name);
-        } else if (std.mem.eql(u8, kind, "dark")) {
-            if (dark != null) return error.InvalidValue;
-            dark = try arena.dupeZ(u8, name);
-        } else {
-            return error.InvalidValue;
-        }
-    }
-    return .{
-        .light = light orelse return error.InvalidValue,
-        .dark = dark orelse return error.InvalidValue,
     };
 }
 
@@ -465,23 +353,6 @@ fn parseOpacity(value: []const u8) error{InvalidValue}!u8 {
     return @min(254, @as(u8, @intFromFloat(@round(opacity * 255))));
 }
 
-const PaletteEntry = struct {
-    index: u8,
-    color: vt.color.RGB,
-};
-
-fn parsePaletteEntry(value: []const u8) error{InvalidValue}!PaletteEntry {
-    const eq = std.mem.indexOfScalar(u8, value, '=') orelse return error.InvalidValue;
-    if (std.mem.indexOfScalarPos(u8, value, eq + 1, '=') != null) return error.InvalidValue;
-    const index_text = std.mem.trim(u8, value[0..eq], " \t");
-    const color_text = std.mem.trim(u8, value[eq + 1 ..], " \t");
-    if (index_text.len == 0 or color_text.len == 0) return error.InvalidValue;
-    return .{
-        .index = std.fmt.parseInt(u8, index_text, 0) catch return error.InvalidValue,
-        .color = try parseColor(color_text),
-    };
-}
-
 fn parseWindowPadding(value: []const u8) error{InvalidValue}!WindowPadding {
     var values = std.mem.splitScalar(u8, value, ',');
     const first_text = std.mem.trim(u8, values.next() orelse return error.InvalidValue, " \t");
@@ -495,125 +366,6 @@ fn parseWindowPadding(value: []const u8) error{InvalidValue}!WindowPadding {
         .first = first,
         .second = std.fmt.parseInt(u31, trimmed_second, 10) catch return error.InvalidValue,
     };
-}
-
-/// "#RRGGBB" or "RRGGBB".
-fn parseColor(value: []const u8) error{InvalidValue}!vt.color.RGB {
-    const hex = if (value.len > 0 and value[0] == '#') value[1..] else value;
-    if (hex.len != 6) return error.InvalidValue;
-    const num = std.fmt.parseInt(u24, hex, 16) catch return error.InvalidValue;
-    return .{
-        .r = @intCast(num >> 16),
-        .g = @intCast((num >> 8) & 0xff),
-        .b = @intCast(num & 0xff),
-    };
-}
-
-fn loadThemeOverrides(
-    io: std.Io,
-    arena: std.mem.Allocator,
-    environ: std.process.Environ,
-    name: []const u8,
-) error{OutOfMemory}!?ThemeOverrides {
-    if (std.fs.path.isAbsolute(name)) {
-        const path = try arena.dupeZ(u8, name);
-        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
-        warn("theme '{s}' could not be read", .{name});
-        return null;
-    }
-    if (!std.mem.eql(u8, name, std.fs.path.basename(name))) {
-        warn("theme '{s}' cannot contain path separators", .{name});
-        return null;
-    }
-
-    if (environ.getPosix("XDG_CONFIG_HOME")) |base| {
-        const path = try std.fs.path.joinZ(arena, &.{ base, "monstar", "themes", name });
-        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
-    } else if (environ.getPosix("HOME")) |home| {
-        const path = try std.fs.path.joinZ(arena, &.{ home, ".config", "monstar", "themes", name });
-        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
-    }
-
-    if (environ.getPosix("MONSTAR_RESOURCES_DIR")) |resources| {
-        const path = try std.fs.path.joinZ(arena, &.{ resources, "themes", name });
-        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
-    }
-
-    var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (std.process.executableDirPath(io, &exe_dir_buf)) |len| {
-        const path = try std.fs.path.joinZ(arena, &.{
-            exe_dir_buf[0..len], "..", "share", "monstar", "themes", name,
-        });
-        if (readFile(arena, path)) |text| return parseThemeOverrides(text);
-    } else |_| {}
-
-    warn("theme '{s}' not found", .{name});
-    return null;
-}
-
-fn parseThemeOverrides(text: []const u8) ThemeOverrides {
-    var result: ThemeOverrides = .{};
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var line_no: usize = 0;
-    while (lines.next()) |raw_line| {
-        line_no += 1;
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = std.mem.trim(u8, line[0..eq], " \t");
-        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
-
-        if (std.mem.eql(u8, key, "background")) {
-            result.background = parseColor(value) catch {
-                warn("theme line {d}: invalid background", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "foreground")) {
-            result.foreground = parseColor(value) catch {
-                warn("theme line {d}: invalid foreground", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "cursor-color")) {
-            result.cursor_color = parseColor(value) catch {
-                warn("theme line {d}: invalid cursor-color", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "cursor-text")) {
-            result.cursor_text = parseColor(value) catch {
-                warn("theme line {d}: invalid cursor-text", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "selection-background")) {
-            result.selection_background = parseColor(value) catch {
-                warn("theme line {d}: invalid selection-background", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "selection-foreground")) {
-            result.selection_foreground = parseColor(value) catch {
-                warn("theme line {d}: invalid selection-foreground", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "copy-highlight")) {
-            result.copy_highlight = parseColor(value) catch {
-                warn("theme line {d}: invalid copy-highlight", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "copy-highlight-foreground")) {
-            result.copy_highlight_foreground = parseColor(value) catch {
-                warn("theme line {d}: invalid copy-highlight-foreground", .{line_no});
-                continue;
-            };
-        } else if (std.mem.eql(u8, key, "palette")) {
-            const entry = parsePaletteEntry(value) catch {
-                warn("theme line {d}: invalid palette", .{line_no});
-                continue;
-            };
-            result.palette[entry.index] = entry.color;
-        } else {
-            warn("theme line {d}: unknown key '{s}', ignoring", .{ line_no, key });
-        }
-    }
-    return result;
 }
 
 /// Convert a configured size to physical pixels. Point sizes use the
@@ -631,12 +383,7 @@ pub fn fontSizePixels(size: FontSize, scale120: u32) u31 {
     return @max(1, @as(u31, @intFromFloat(@round(pixels))));
 }
 
-pub fn colorsForScheme(color_scheme: vt.device_status.ColorScheme) ThemeColors {
-    return switch (color_scheme) {
-        .light => light_theme,
-        .dark => dark_theme,
-    };
-}
+pub const colorsForScheme = config_theme.colorsForScheme;
 
 fn namedThemeOverrides(self: *const Config, color_scheme: vt.device_status.ColorScheme) ?*const ThemeOverrides {
     return switch (color_scheme) {
@@ -654,7 +401,11 @@ fn effectiveColor(
         @field(theme, field)
     else
         null;
-    return @field(self, field) orelse named orelse @field(colorsForScheme(color_scheme), field);
+    return config_theme.resolveColor(
+        @field(self, field),
+        named,
+        @field(colorsForScheme(color_scheme), field),
+    );
 }
 
 pub fn effectiveSelectionBackground(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.color.RGB {
@@ -681,19 +432,12 @@ pub fn effectiveCursorText(self: *const Config, color_scheme: vt.device_status.C
 /// The terminal color options this config describes: config colors form
 /// the *default* layer, so OSC 10/11/12/4 can still override and reset.
 pub fn terminalColors(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.Terminal.Colors {
-    var palette = vt.color.default;
     const themed = colorsForScheme(color_scheme);
-    for (themed.palette, 0..) |rgb, i| {
-        palette[i] = rgb;
-    }
-    if (self.namedThemeOverrides(color_scheme)) |theme| {
-        for (theme.palette, 0..) |entry, i| {
-            if (entry) |rgb| palette[i] = rgb;
-        }
-    }
-    for (self.palette, 0..) |entry, i| {
-        if (entry) |rgb| palette[i] = rgb;
-    }
+    const palette = config_theme.resolvePalette(
+        &self.palette,
+        self.namedThemeOverrides(color_scheme),
+        themed,
+    );
     return .{
         .background = .init(self.effectiveColor(color_scheme, "background")),
         .foreground = .init(self.effectiveColor(color_scheme, "foreground")),
@@ -1033,7 +777,7 @@ test "built-in colors do not replace explicit color overrides" {
 
 test "named themes follow color scheme and remain below explicit colors" {
     var config: Config = .{};
-    config.light_theme_overrides = parseThemeOverrides(
+    config.light_theme_overrides = config_theme.parseOverrides(
         \\background = #eeeeee
         \\foreground = #111111
         \\cursor-color = #222222
@@ -1045,7 +789,7 @@ test "named themes follow color scheme and remain below explicit colors" {
         \\palette = 1=#440000
         \\palette = 200=#abcdef
     );
-    config.dark_theme_overrides = parseThemeOverrides(
+    config.dark_theme_overrides = config_theme.parseOverrides(
         \\background = #101010
         \\foreground = #f0f0f0
         \\selection-background = #303030
