@@ -31,6 +31,7 @@ const ScrollbackSearch = @import("ScrollbackSearch.zig");
 const ScrollDetector = @import("ScrollDetector.zig");
 const TerminalLayout = @import("TerminalLayout.zig");
 const cgroup = @import("cgroup.zig");
+const clipboard_format = @import("clipboard_format.zig");
 const Window = @import("Window.zig");
 
 const log = std.log.scoped(.app);
@@ -236,23 +237,6 @@ paste_fd: posix.fd_t,
 paste_buf: std.ArrayList(u8),
 paste_action: PasteAction,
 
-const paste_mime = "text/plain;charset=utf-8";
-const uri_list_mime = "text/uri-list";
-const paste_mime_preference = [_][:0]const u8{
-    paste_mime,
-    "text/plain",
-    "UTF8_STRING",
-    "TEXT",
-    "STRING",
-};
-const dnd_mime_preference = [_][:0]const u8{
-    uri_list_mime,
-    paste_mime,
-    "text/plain",
-    "UTF8_STRING",
-    "TEXT",
-    "STRING",
-};
 const PasteAction = union(enum) {
     terminal,
     osc52_read: u8,
@@ -1146,7 +1130,7 @@ fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !
     // paths go through the fd-passing OpenFile/OpenDirectory methods.
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
-    if (try osc7Path(arena_state.allocator(), uri)) |path| {
+    if (try clipboard_format.osc7Path(arena_state.allocator(), uri)) |path| {
         return openFilePortal(connection, path, activation_token);
     }
 
@@ -1734,7 +1718,7 @@ fn spawnNewWindow(self: *App) void {
 
     const pwd: ?[:0]const u8 = pwd: {
         const url = self.term.getPwd() orelse break :pwd null;
-        break :pwd osc7Path(arena, url) catch null;
+        break :pwd clipboard_format.osc7Path(arena, url) catch null;
     };
 
     const envp = self.spawnEnvp(arena, pwd, null) catch |err| {
@@ -1903,7 +1887,7 @@ fn pipeCommandOutput(self: *App) void {
 
     const pwd: ?[:0]const u8 = pwd: {
         const url = self.term.getPwd() orelse break :pwd null;
-        break :pwd osc7Path(arena, url) catch null;
+        break :pwd clipboard_format.osc7Path(arena, url) catch null;
     };
     const envp = self.spawnEnvp(arena, pwd, null) catch |err| {
         log.err("pipe command env setup failed: {}", .{err});
@@ -2054,100 +2038,6 @@ fn spawnEnvp(
     }
     const slice = try list.toOwnedSliceSentinel(arena, null);
     return slice.ptr;
-}
-
-/// Decode an OSC 7 payload (`file://host/path`) into a local filesystem
-/// path. Returns null for anything that is not an absolute path on this
-/// machine: foreign schemes, remote hosts, malformed URIs.
-fn osc7Path(arena: std.mem.Allocator, url: []const u8) std.mem.Allocator.Error!?[:0]const u8 {
-    const uri = std.Uri.parse(url) catch return null;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "file")) return null;
-
-    if (uri.host) |host| {
-        const h = try host.toRawMaybeAlloc(arena);
-        if (h.len > 0 and !std.mem.eql(u8, h, "localhost")) {
-            var name_buf: [posix.HOST_NAME_MAX]u8 = undefined;
-            const hostname = posix.gethostname(&name_buf) catch return null;
-            if (!std.mem.eql(u8, h, hostname)) return null;
-        }
-    }
-
-    const path = try uri.path.toRawMaybeAlloc(arena);
-    if (path.len == 0 or path[0] != '/') return null;
-    return try arena.dupeZ(u8, path);
-}
-
-fn formatUriListDrop(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
-    var arena_state: std.heap.ArenaAllocator = .init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var writer: std.Io.Writer.Allocating = .init(alloc);
-    errdefer writer.deinit();
-
-    var first = true;
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw_line| {
-        const line = if (std.mem.endsWith(u8, raw_line, "\r"))
-            raw_line[0 .. raw_line.len - 1]
-        else
-            raw_line;
-        if (line.len == 0 or line[0] == '#') continue;
-        const path = (try osc7Path(arena, line)) orelse continue;
-
-        if (!first) try writer.writer.writeByte(' ');
-        first = false;
-        try writeShellQuoted(&writer.writer, path);
-    }
-
-    return writer.toOwnedSlice();
-}
-
-fn writeShellQuoted(writer: *std.Io.Writer, text: []const u8) !void {
-    try writer.writeByte('\'');
-    for (text) |byte| {
-        if (byte == '\'') {
-            try writer.writeAll("'\\''");
-        } else {
-            try writer.writeByte(byte);
-        }
-    }
-    try writer.writeByte('\'');
-}
-
-test "osc7Path decodes local file URIs" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try std.testing.expectEqualStrings(
-        "/home/tim",
-        (try osc7Path(arena, "file:///home/tim")).?,
-    );
-    try std.testing.expectEqualStrings(
-        "/home/tim",
-        (try osc7Path(arena, "file://localhost/home/tim")).?,
-    );
-    try std.testing.expectEqualStrings(
-        "/home/tim/my dir",
-        (try osc7Path(arena, "file:///home/tim/my%20dir")).?,
-    );
-
-    // Remote hosts, foreign schemes, and junk must not produce a path.
-    try std.testing.expectEqual(null, try osc7Path(arena, "file://otherhost.example/home/tim"));
-    try std.testing.expectEqual(null, try osc7Path(arena, "https://example.com/x"));
-    try std.testing.expectEqual(null, try osc7Path(arena, "not a uri"));
-    try std.testing.expectEqual(null, try osc7Path(arena, "file://"));
-}
-
-test "formatUriListDrop shell quotes local file paths" {
-    const text = try formatUriListDrop(
-        std.testing.allocator,
-        "# comment\r\nfile:///tmp/a%20b\r\nhttps://example.com/nope\nfile:///tmp/it%27s\n",
-    );
-    defer std.testing.allocator.free(text);
-
-    try std.testing.expectEqualStrings("'/tmp/a b' '/tmp/it'\\''s'", text);
 }
 
 fn applyConfig(self: *App, new_config: Config) !void {
@@ -3617,43 +3507,24 @@ fn syncActiveScreen(self: *App) void {
     self.syncScrollbarHover();
 }
 
-const MimeMask = u32;
-
-fn mimeBit(preferences: []const [:0]const u8, mime_type: [*:0]const u8) ?MimeMask {
-    const offered = std.mem.span(mime_type);
-    for (preferences, 0..) |candidate, i| {
-        if (std.mem.eql(u8, offered, candidate[0..candidate.len])) {
-            return @as(MimeMask, 1) << @intCast(i);
-        }
-    }
-    return null;
-}
-
-fn preferredMime(preferences: []const [:0]const u8, mask: MimeMask) ?[*:0]const u8 {
-    for (preferences, 0..) |candidate, i| {
-        if (mask & (@as(MimeMask, 1) << @intCast(i)) != 0) return candidate.ptr;
-    }
-    return null;
-}
-
 const ClipboardOffer = struct {
     app: *App,
     offer: *wl.DataOffer,
-    mimes: MimeMask = 0,
-    dnd_mimes: MimeMask = 0,
+    mimes: clipboard_format.MimeMask = 0,
+    dnd_mimes: clipboard_format.MimeMask = 0,
     dnd_action: wl.DataDeviceManager.DndAction = .{},
 
     fn noteMime(self: *ClipboardOffer, mime_type: [*:0]const u8) void {
-        if (mimeBit(&paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
-        if (mimeBit(&dnd_mime_preference, mime_type)) |bit| self.dnd_mimes |= bit;
+        if (clipboard_format.mimeBit(&clipboard_format.paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
+        if (clipboard_format.mimeBit(&clipboard_format.dnd_mime_preference, mime_type)) |bit| self.dnd_mimes |= bit;
     }
 
     fn bestMime(self: *const ClipboardOffer) ?[*:0]const u8 {
-        return preferredMime(&paste_mime_preference, self.mimes);
+        return clipboard_format.preferredMime(&clipboard_format.paste_mime_preference, self.mimes);
     }
 
     fn bestDndMime(self: *const ClipboardOffer) ?[*:0]const u8 {
-        return preferredMime(&dnd_mime_preference, self.dnd_mimes);
+        return clipboard_format.preferredMime(&clipboard_format.dnd_mime_preference, self.dnd_mimes);
     }
 
     fn destroy(self: *ClipboardOffer) void {
@@ -3669,14 +3540,14 @@ const ClipboardOffer = struct {
 const PrimaryOffer = struct {
     app: *App,
     offer: *zwp.PrimarySelectionOfferV1,
-    mimes: MimeMask = 0,
+    mimes: clipboard_format.MimeMask = 0,
 
     fn noteMime(self: *PrimaryOffer, mime_type: [*:0]const u8) void {
-        if (mimeBit(&paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
+        if (clipboard_format.mimeBit(&clipboard_format.paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
     }
 
     fn bestMime(self: *const PrimaryOffer) ?[*:0]const u8 {
-        return preferredMime(&paste_mime_preference, self.mimes);
+        return clipboard_format.preferredMime(&clipboard_format.paste_mime_preference, self.mimes);
     }
 
     fn destroy(self: *PrimaryOffer) void {
@@ -3934,7 +3805,7 @@ fn claimPrimaryText(self: *App, text: [:0]const u8) void {
     };
     ctx.* = .{ .app = self, .text = text, .source = .{ .primary = source } };
 
-    inline for (paste_mime_preference) |mime| source.offer(mime.ptr);
+    inline for (clipboard_format.paste_mime_preference) |mime| source.offer(mime.ptr);
     source.setListener(*SourceCtx, primarySourceListener, ctx);
     device.setSelection(source, self.last_serial);
 
@@ -3973,7 +3844,7 @@ fn claimClipboardText(self: *App, text: [:0]const u8) bool {
     };
     ctx.* = .{ .app = self, .text = text, .source = .{ .clipboard = source } };
 
-    inline for (paste_mime_preference) |mime| source.offer(mime.ptr);
+    inline for (clipboard_format.paste_mime_preference) |mime| source.offer(mime.ptr);
     source.setListener(*SourceCtx, dataSourceListener, ctx);
     device.setSelection(source, self.last_serial);
 
@@ -4098,8 +3969,8 @@ fn writeTerminalPaste(self: *App, data: []u8) void {
 
 fn formatDropPaste(self: *App, offer: *const ClipboardOffer, data: []const u8) ![]u8 {
     const mime = std.mem.span(offer.bestDndMime() orelse return self.alloc.dupe(u8, data));
-    if (!std.mem.eql(u8, mime, uri_list_mime)) return self.alloc.dupe(u8, data);
-    return try formatUriListDrop(self.alloc, data);
+    if (!std.mem.eql(u8, mime, clipboard_format.uri_list_mime)) return self.alloc.dupe(u8, data);
+    return try clipboard_format.formatUriListDrop(self.alloc, data);
 }
 
 /// Convert accumulated wheel movement into scrolled lines: wheel clicks
