@@ -132,11 +132,15 @@ pub const Discovery = struct {
         return self;
     }
 
+    /// Acquire one owning reference. Reference-count operations are thread-safe;
+    /// the shared discovery data is immutable after initialization.
     pub fn ref(self: *Discovery) void {
         const previous = self.refs.fetchAdd(1, .monotonic);
         std.debug.assert(previous > 0);
     }
 
+    /// Release one owning reference. The final release destroys the discovery,
+    /// so no thread may access `self` afterward.
     pub fn unref(self: *Discovery) void {
         const previous = self.refs.fetchSub(1, .acq_rel);
         std.debug.assert(previous > 0);
@@ -215,7 +219,9 @@ pub const Face = struct {
         return c.FT_Get_Char_Index(self.ft_face, cp) != 0;
     }
 
-    /// Rasterize (or fetch from cache) the glyph with the given index.
+    /// Rasterize (or fetch from cache) the glyph with the given index. The
+    /// returned cache pointer is owned by this face and may be invalidated by
+    /// a later cache-missing `glyph` call on the same face or by Font.deinit.
     pub fn glyph(
         self: *Face,
         alloc: std.mem.Allocator,
@@ -656,8 +662,9 @@ pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!
     return initWithDiscovery(alloc, discovery_data);
 }
 
-/// Build independent raster state from an existing immutable discovery.
-/// The returned Font retains `discovery_data`.
+/// Build independent FreeType, HarfBuzz, and glyph-cache state from an
+/// existing immutable discovery. The argument is borrowed for the call; on
+/// success the returned Font retains its own reference until deinit.
 pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) Error!Font {
     discovery_data.ref();
     errdefer discovery_data.unref();
@@ -806,6 +813,11 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     };
 }
 
+/// Release all faces, cached allocations, and the retained discovery reference.
+/// `alloc` must be the allocator passed to initialization, and every method
+/// that populates a face, fallback, sprite, or decoration cache must use that
+/// same allocator. This invalidates the Font and every face and glyph pointer
+/// obtained from it.
 pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
     for (self.faces.items) |*f| f.deinit(alloc);
     self.faces.deinit(alloc);
@@ -825,10 +837,14 @@ pub fn deinit(self: *Font, alloc: std.mem.Allocator) void {
     self.* = undefined;
 }
 
+/// Return a borrowed discovery pointer valid until this Font is deinitialized.
+/// Call ref before retaining it independently or sharing it beyond that lifetime.
 pub fn discovery(self: *const Font) *Discovery {
     return self.discovery_data;
 }
 
+/// Return a Font-owned face. Lazy fallback loading can grow `faces` and
+/// invalidate this pointer; Font.deinit invalidates it and its glyph cache.
 pub fn face(self: *Font, index: u16) *Face {
     std.debug.assert(index != sprite_face_index);
     return &self.faces.items[index];
@@ -841,7 +857,9 @@ fn faceCoversPrintableAscii(candidate: *const Face) bool {
     return true;
 }
 
-/// Rasterize (or fetch from cache) the sprite glyph for `cp`.
+/// Rasterize (or fetch from cache) the sprite glyph for `cp`. The returned
+/// Font-owned pointer may be invalidated by a later cache-missing spriteGlyph
+/// call or by Font.deinit.
 pub fn spriteGlyph(
     self: *Font,
     alloc: std.mem.Allocator,
@@ -866,7 +884,9 @@ pub fn spriteGlyph(
     return gop.value_ptr;
 }
 
-/// Rasterize (or fetch from cache) a text decoration sprite.
+/// Rasterize (or fetch from cache) a text decoration sprite. The returned
+/// Font-owned pointer may be invalidated by a later cache-missing
+/// decorationGlyph call or by Font.deinit.
 pub fn decorationGlyph(
     self: *Font,
     alloc: std.mem.Allocator,

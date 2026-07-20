@@ -17,8 +17,8 @@ height: u31,
 format: Format,
 busy: bool,
 rendering: bool,
-/// Window.frame_counter value when this buffer was last drawn;
-/// 0 means never (content undefined).
+/// Window.frame_counter assigned by the latest commitRender attempt;
+/// 0 means no commit attempt has been recorded.
 frame: u64,
 
 pub const Format = enum {

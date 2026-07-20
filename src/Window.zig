@@ -117,7 +117,7 @@ pub const DamageRect = struct {
 pub const Damage = union(enum) {
     full,
     /// Changed rectangles; an empty slice means nothing changed.
-    /// The slice must remain valid until the next render callback.
+    /// The slice is borrowed for the duration of `commitRender`.
     rects: []const DamageRect,
 };
 
@@ -166,8 +166,12 @@ const ActivationTokenPurpose = enum {
 
 const BufferFormat = ShmBuffer.Format;
 
-/// A wl_shm backed pixel buffer. `busy` is true while the compositor
-/// holds the buffer; the release event clears it.
+/// A wl_shm backed pixel buffer. `busy` prevents mutable reuse while the
+/// compositor owns it, but the mapping remains readable; wl_buffer.release
+/// clears the flag. `rendering` reserves it for one checked-out RenderTarget.
+/// `frame` records its latest commitRender attempt for age bookkeeping; 0
+/// means no attempt has been recorded. A failed commit attempt or a later
+/// canceled render can leave that record unrelated to displayed contents.
 pub const Buffer = ShmBuffer;
 
 /// Called when the output scale changed, before the resize/draw that
@@ -597,7 +601,10 @@ pub fn pointerHasFrames(self: *const Window) bool {
 }
 
 /// Request a token for transferring the activation caused by an input event
-/// to another client. Returns false when the compositor lacks the protocol.
+/// to another client. When the protocol and a seat are available, cancels any
+/// outstanding request before starting another. Completion is delivered
+/// asynchronously to ActivationTokenFn when installed. Returns false when the
+/// compositor lacks the protocol or there is no seat.
 pub fn requestActivationToken(self: *Window, serial: u32) !bool {
     const activation = self.activation orelse return false;
     const seat = self.seat orelse return false;
@@ -620,11 +627,15 @@ fn cancelActivationToken(self: *Window) void {
     self.activation_token_purpose = null;
 }
 
+/// Ask the compositor to activate this surface; does nothing when the
+/// activation protocol is unavailable.
 pub fn activate(self: *Window, token: [:0]const u8) void {
     const activation = self.activation orelse return;
     activation.activate(token, self.surface);
 }
 
+/// Enable compositor text input for terminal content and commit `rect` as
+/// the cursor rectangle. Does nothing when text-input-v3 is unavailable.
 pub fn enableTextInput(self: *Window, rect: TextInputRect) void {
     const text_input = self.text_input orelse return;
     text_input.enable();
@@ -635,6 +646,7 @@ pub fn enableTextInput(self: *Window, rect: TextInputRect) void {
     self.text_input_rect = rect;
 }
 
+/// Disable and commit compositor text input when currently enabled.
 pub fn disableTextInput(self: *Window) void {
     const text_input = self.text_input orelse return;
     if (!self.text_input_enabled) return;
@@ -644,6 +656,7 @@ pub fn disableTextInput(self: *Window) void {
     self.text_input_rect = null;
 }
 
+/// Commit a changed cursor rectangle while compositor text input is enabled.
 pub fn setTextInputCursorRect(self: *Window, rect: TextInputRect) void {
     const text_input = self.text_input orelse return;
     if (!self.text_input_enabled) return;
@@ -759,17 +772,29 @@ pub fn physicalDimension(logical: u31, scale120: u32) u31 {
 }
 
 pub const RenderTarget = struct {
+    /// The checked-out buffer to pass to commitRender or cancelRender.
     buffer: *Buffer,
+    /// Writable storage owned by `buffer`, valid until the checkout ends.
     pixels: []u32,
+    /// Read-only contents of the newest compatible committed buffer, when
+    /// available. It may alias `pixels`; the borrowed storage is valid until
+    /// the checkout ends.
     source_pixels: ?[]const u32,
     width: u31,
     height: u31,
+    /// Buffer-age hint derived from commit-attempt bookkeeping, or 0 when no
+    /// prior attempt is recorded. It does not guarantee that the current
+    /// pixels appeared in a displayed frame: a commit may have failed, or a
+    /// later canceled render may have changed them without updating the age.
     age: usize,
 };
 
 /// Check out a buffer for an asynchronous render. Allowed while a frame
 /// callback is outstanding so raster work can overlap the frame wait;
-/// refused only while another render target is already checked out.
+/// refused while suspended, unconfigured (`width == 0`), or another target is
+/// checked out.
+/// End every successful checkout with commitRender or cancelRender using the
+/// returned buffer; do not access either pixel slice afterward.
 pub fn acquireRenderTarget(self: *Window) !RenderTarget {
     if (self.width == 0 or self.suspended or self.rendering_pending) return error.NotReady;
     return self.beginRender(self.physical(self.width), self.physical(self.height));
@@ -791,11 +816,18 @@ fn beginRender(self: *Window, phys_width: u31, phys_height: u31) !RenderTarget {
     return .{ .buffer = buffer, .pixels = buffer.pixels(), .source_pixels = source_pixels, .width = phys_width, .height = phys_height, .age = age };
 }
 
+/// End the checkout for `buffer`. This does not restore pixels changed by the
+/// renderer or clear the buffer's prior frame-age bookkeeping.
 pub fn cancelRender(self: *Window, buffer: *Buffer) void {
     buffer.rendering = false;
     self.rendering_pending = false;
 }
 
+/// End the checkout for `buffer` and attempt to commit it to the surface. The
+/// caller must cancel instead if the window geometry changed since acquisition
+/// or the Window's current buffer format no longer matches `buffer.format`.
+/// The checkout and frame-age bookkeeping are consumed even when this function
+/// returns an error before the surface commit.
 pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
     std.debug.assert(buffer.rendering);
     std.debug.assert(buffer.format == self.buffer_format);
