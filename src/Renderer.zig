@@ -11,6 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c");
 const vt = @import("ghostty-vt");
+const CellDamageTracker = @import("CellDamageTracker.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const TextShaper = @import("TextShaper.zig");
@@ -89,16 +90,7 @@ overhang_scratch: bool = false,
 glyph_clip_x: ?PixelRange = null,
 /// Grid-local pixel rectangles modified by the last renderDirty call.
 rendered_rects: std.ArrayList(PixelRect),
-/// Fingerprints of the last fully rendered visual cell state. The
-/// cell-damage path compares only dirty rows against these.
-cell_fingerprints: std.ArrayList(CellFingerprint),
-cell_fingerprint_scratch: std.ArrayList(CellFingerprint),
-cell_fingerprint_valid: std.DynamicBitSetUnmanaged,
-cell_damage: std.ArrayList(?CellRange),
-cell_fingerprint_rows: usize = 0,
-cell_fingerprint_cols: usize = 0,
-cell_colors: ?@FieldType(vt.RenderState, "colors") = null,
-cell_damage_stats: CellDamageStats = .{},
+cell_damage_tracker: CellDamageTracker,
 track_cell_damage: bool,
 partial_cell_raster: bool,
 /// Scratch codepoints for cluster-width measurement of overlay text.
@@ -144,15 +136,7 @@ pub const InitOptions = struct {
 };
 
 pub const ShapeStats = TextShaper.ShapeStats;
-
-pub const CellDamageStats = struct {
-    dirty_rows: usize = 0,
-    unchanged_dirty_rows: usize = 0,
-    scanned_cells: usize = 0,
-    changed_cells: usize = 0,
-    /// Cells covered by one first-through-last changed interval per row.
-    spanned_cells: usize = 0,
-};
+pub const CellDamageStats = CellDamageTracker.CellDamageStats;
 
 pub const PixelRect = struct {
     x: u31,
@@ -161,26 +145,8 @@ pub const PixelRect = struct {
     height: u31,
 };
 
-const CellFingerprint = struct {
-    raw: vt.Cell,
-    style: vt.Style,
-    grapheme: u64,
-    visual: u8,
-    cursor_style: u8,
-
-    fn eql(self: CellFingerprint, other: CellFingerprint) bool {
-        return @as(u64, @bitCast(self.raw)) == @as(u64, @bitCast(other.raw)) and
-            (self.raw.style_id == 0 or self.style.eql(other.style)) and
-            self.grapheme == other.grapheme and
-            self.visual == other.visual and
-            self.cursor_style == other.cursor_style;
-    }
-};
-
-const CellRange = struct {
-    start: usize,
-    end: usize,
-};
+const CellFingerprint = CellDamageTracker.CellFingerprint;
+const CellRange = CellDamageTracker.CellRange;
 
 pub const LinkRange = struct {
     start: vt.Coordinate,
@@ -215,10 +181,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .reverse_scratch = .empty,
         .row_overhang = .{},
         .rendered_rects = .empty,
-        .cell_fingerprints = .empty,
-        .cell_fingerprint_scratch = .empty,
-        .cell_fingerprint_valid = .{},
-        .cell_damage = .empty,
+        .cell_damage_tracker = .init(alloc),
         .track_cell_damage = opts.track_cell_damage,
         .partial_cell_raster = opts.partial_cell_raster,
         .codepoint_scratch = .empty,
@@ -235,10 +198,7 @@ pub fn deinit(self: *Renderer) void {
     self.reverse_scratch.deinit(self.alloc);
     self.row_overhang.deinit(self.alloc);
     self.rendered_rects.deinit(self.alloc);
-    self.cell_fingerprints.deinit(self.alloc);
-    self.cell_fingerprint_scratch.deinit(self.alloc);
-    self.cell_fingerprint_valid.deinit(self.alloc);
-    self.cell_damage.deinit(self.alloc);
+    self.cell_damage_tracker.deinit();
     self.codepoint_scratch.deinit(self.alloc);
     self.cluster_scratch.deinit(self.alloc);
     self.clearKittyScaleCache();
@@ -262,11 +222,11 @@ pub fn shapeStats(self: *const Renderer) ShapeStats {
 }
 
 pub fn resetCellDamageStats(self: *Renderer) void {
-    self.cell_damage_stats = .{};
+    self.cell_damage_tracker.resetStats();
 }
 
 pub fn cellDamageStats(self: *const Renderer) CellDamageStats {
-    return self.cell_damage_stats;
+    return self.cell_damage_tracker.readStats();
 }
 
 fn pixelStride(self: *const Renderer, width: u31) u31 {
@@ -436,7 +396,7 @@ pub fn renderDirty(
     var rendered_until: usize = 0;
     for (all_dirty[0..state.rows], 0..) |dirty, y| {
         if (!dirty) continue;
-        if (self.partial_cell_raster and self.cell_damage.items[y] == null) continue;
+        if (self.partial_cell_raster and self.cell_damage_tracker.damageForRow(y) == null) continue;
         const expand_up = y > 0 and self.row_overhang.isSet(y);
         const expand_down = y + 1 < state.rows and self.row_overhang.isSet(y + 1);
         const start = y - @intFromBool(expand_up);
@@ -445,7 +405,7 @@ pub fn renderDirty(
         while (row < end) : (row += 1) {
             const cell_damage = if (self.partial_cell_raster and
                 row == y and start == y and end == y + 1)
-                self.cell_damage.items[y]
+                self.cell_damage_tracker.damageForRow(y)
             else
                 null;
             if (cell_damage) |cell_range| {
@@ -507,12 +467,7 @@ fn recordRenderedRect(
 fn snapshotCellFingerprints(self: *Renderer, state: *const vt.RenderState) !void {
     const rows: usize = state.rows;
     const cols: usize = state.cols;
-    const len = try std.math.mul(usize, rows, cols);
-    try self.cell_fingerprints.resize(self.alloc, len);
-    try self.cell_fingerprint_valid.resize(self.alloc, rows, false);
-    self.cell_fingerprint_rows = rows;
-    self.cell_fingerprint_cols = cols;
-    self.cell_colors = state.colors;
+    try self.cell_damage_tracker.beginSnapshot(rows, cols, state.colors);
 
     const row_data = state.row_data.slice();
     const all_cells = row_data.items(.cells);
@@ -520,160 +475,54 @@ fn snapshotCellFingerprints(self: *Renderer, state: *const vt.RenderState) !void
     for (0..rows) |y| {
         const cells = all_cells[y].slice();
         for (0..cols) |x| {
-            self.cell_fingerprints.items[y * cols + x] = self.cellFingerprint(
-                state,
-                cells,
-                all_selections[y],
+            self.cell_damage_tracker.snapshotCell(
+                y,
                 x,
-                @intCast(y),
+                self.cellFingerprint(state, cells, all_selections[y], x, @intCast(y)),
             );
         }
     }
-    if (rows > 0) self.cell_fingerprint_valid.setRangeValue(.{ .start = 0, .end = rows }, true);
 }
 
 fn measureCellDamage(self: *Renderer, state: *const vt.RenderState) !void {
     const rows: usize = state.rows;
     const cols: usize = state.cols;
-    const len = try std.math.mul(usize, rows, cols);
-    try self.cell_damage.resize(self.alloc, rows);
-    @memset(self.cell_damage.items, null);
-    if (self.cell_fingerprint_rows != rows or
-        self.cell_fingerprint_cols != cols or
-        self.cell_fingerprints.items.len != len or
-        self.cell_fingerprint_valid.bit_length != rows or
-        self.cell_colors == null or
-        !std.meta.eql(self.cell_colors.?, state.colors))
-    {
-        try self.snapshotCellFingerprints(state);
-        const dirty = state.row_data.items(.dirty);
-        for (dirty[0..rows], self.cell_damage.items) |is_dirty, *damage| {
-            if (is_dirty) damage.* = .{ .start = 0, .end = cols };
-        }
-        return;
-    }
-    try self.cell_fingerprint_scratch.resize(self.alloc, cols);
-
     const row_data = state.row_data.slice();
     const all_cells = row_data.items(.cells);
     const all_selections = row_data.items(.selection);
     const all_dirty = row_data.items(.dirty);
+    switch (try self.cell_damage_tracker.beginMeasurement(rows, cols, state.colors, all_dirty)) {
+        .snapshot => {
+            for (0..rows) |y| {
+                const cells = all_cells[y].slice();
+                for (0..cols) |x| {
+                    self.cell_damage_tracker.snapshotCell(
+                        y,
+                        x,
+                        self.cellFingerprint(state, cells, all_selections[y], x, @intCast(y)),
+                    );
+                }
+            }
+            return;
+        },
+        .compare => {},
+    }
+
     for (all_dirty[0..rows], 0..) |dirty, y| {
         if (!dirty) continue;
-        self.cell_damage_stats.dirty_rows += 1;
-        self.cell_damage_stats.scanned_cells += cols;
-        var first = cols;
-        var end: usize = 0;
         const cells = all_cells[y].slice();
+        const fingerprints = try self.cell_damage_tracker.rowScratch(cols);
         for (0..cols) |x| {
-            const fingerprint = self.cellFingerprint(
+            fingerprints[x] = self.cellFingerprint(
                 state,
                 cells,
                 all_selections[y],
                 x,
                 @intCast(y),
             );
-            self.cell_fingerprint_scratch.items[x] = fingerprint;
-            if (!self.cell_fingerprint_valid.isSet(y) or
-                !self.cell_fingerprints.items[y * cols + x].eql(fingerprint))
-            {
-                first = @min(first, x);
-                end = x + 1;
-                self.cell_damage_stats.changed_cells += 1;
-            }
         }
-        if (first == cols) {
-            self.cell_damage_stats.unchanged_dirty_rows += 1;
-        } else {
-            const damage = self.expandCellDamage(state, cells, y, .{ .start = first, .end = end });
-            self.cell_damage.items[y] = damage;
-            self.cell_damage_stats.spanned_cells += damage.end - damage.start;
-        }
-        @memcpy(
-            self.cell_fingerprints.items[y * cols ..][0..cols],
-            self.cell_fingerprint_scratch.items,
-        );
-        self.cell_fingerprint_valid.set(y);
+        self.cell_damage_tracker.measureRow(y, cells.items(.raw), fingerprints);
     }
-}
-
-fn expandCellDamage(
-    self: *const Renderer,
-    state: *const vt.RenderState,
-    cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
-    y: usize,
-    initial: CellRange,
-) CellRange {
-    const cols: usize = state.cols;
-    var result = initial;
-    const previous = self.cell_fingerprints.items[y * cols ..][0..cols];
-    const current = cells.items(.raw);
-
-    result.start = @min(
-        textRunStart(previous, result.start),
-        textRunStartRaw(current, result.start),
-    );
-    result.end = @max(
-        textRunEnd(previous, result.end, cols),
-        textRunEndRaw(current, result.end, cols),
-    );
-
-    // Covers horizontal glyph bearings and the symbol constraint heuristic,
-    // which can consume the empty cell immediately after a glyph.
-    result.start -|= 1;
-    result.end = @min(cols, result.end + 1);
-
-    // Keep wide heads and spacer tails in the same repaint interval.
-    if (result.start > 0 and
-        (previous[result.start].raw.wide == .spacer_tail or current[result.start].wide == .spacer_tail))
-    {
-        result.start -= 1;
-    }
-    if (result.end < cols and
-        (previous[result.end - 1].raw.wide == .wide or current[result.end - 1].wide == .wide))
-    {
-        result.end += 1;
-    }
-    return result;
-}
-
-fn textRunStart(cells: []const CellFingerprint, x: usize) usize {
-    if (x >= cells.len or !cellHasText(cells[x].raw)) return x;
-    var start = x;
-    while (start > 0 and cellHasText(cells[start - 1].raw)) start -= 1;
-    return start;
-}
-
-fn textRunStartRaw(cells: []const vt.Cell, x: usize) usize {
-    if (x >= cells.len or !cellHasText(cells[x])) return x;
-    var start = x;
-    while (start > 0 and cellHasText(cells[start - 1])) start -= 1;
-    return start;
-}
-
-fn textRunEnd(cells: []const CellFingerprint, end: usize, cols: usize) usize {
-    if (end == 0 or !cellHasText(cells[end - 1].raw)) return end;
-    var result = end;
-    while (result < cols and cellHasText(cells[result].raw)) result += 1;
-    return result;
-}
-
-fn textRunEndRaw(cells: []const vt.Cell, end: usize, cols: usize) usize {
-    if (end == 0 or !cellHasText(cells[end - 1])) return end;
-    var result = end;
-    while (result < cols and cellHasText(cells[result])) result += 1;
-    return result;
-}
-
-fn cellHasText(cell: vt.Cell) bool {
-    return switch (cell.content_tag) {
-        .codepoint => cell.content.codepoint.data != 0 and
-            cell.content.codepoint.data != ' ' and
-            cell.content.codepoint.data != kitty_placeholder,
-        .codepoint_grapheme => cell.content.codepoint.data != 0 and
-            cell.content.codepoint.data != kitty_placeholder,
-        else => false,
-    };
 }
 
 fn cellFingerprint(
@@ -737,39 +586,7 @@ pub fn shiftCellState(self: *Renderer, rows: usize, cols: usize, shift_rows: isi
         self.row_overhang.setRangeValue(.{ .start = 0, .end = shift }, true);
     }
 
-    if (!self.track_cell_damage) return;
-    if (self.cell_fingerprint_rows != rows or
-        self.cell_fingerprint_cols != cols or
-        self.cell_fingerprints.items.len != rows * cols or
-        self.cell_fingerprint_valid.bit_length != rows)
-    {
-        try self.cell_fingerprint_valid.resize(self.alloc, rows, false);
-        self.cell_fingerprint_valid.unsetAll();
-        return;
-    }
-    if (shift_rows > 0) {
-        for (0..rows - shift) |dst| {
-            const src = dst + shift;
-            @memcpy(
-                self.cell_fingerprints.items[dst * cols ..][0..cols],
-                self.cell_fingerprints.items[src * cols ..][0..cols],
-            );
-            self.cell_fingerprint_valid.setValue(dst, self.cell_fingerprint_valid.isSet(src));
-        }
-        self.cell_fingerprint_valid.setRangeValue(.{ .start = rows - shift, .end = rows }, false);
-    } else {
-        var dst = rows;
-        while (dst > shift) {
-            dst -= 1;
-            const src = dst - shift;
-            @memcpy(
-                self.cell_fingerprints.items[dst * cols ..][0..cols],
-                self.cell_fingerprints.items[src * cols ..][0..cols],
-            );
-            self.cell_fingerprint_valid.setValue(dst, self.cell_fingerprint_valid.isSet(src));
-        }
-        self.cell_fingerprint_valid.setRangeValue(.{ .start = 0, .end = shift }, false);
-    }
+    if (self.track_cell_damage) try self.cell_damage_tracker.shift(rows, cols, shift_rows);
 }
 
 pub fn renderPreedit(
@@ -2784,7 +2601,7 @@ test "cell damage clips an adjacent text run to the cleared interval" {
     stream.nextSlice("\x1b[H\x1b[41m \x1b[0m");
     try state.update(alloc, &term);
     try partial.renderDirty(&state, partial_pixels, width, height);
-    try std.testing.expectEqual(CellRange{ .start = 0, .end = 2 }, partial.cell_damage.items[0].?);
+    try std.testing.expectEqual(CellRange{ .start = 0, .end = 2 }, partial.cell_damage_tracker.damageForRow(0).?);
 
     try reference.render(&state, full_pixels, width, height);
     try std.testing.expectEqualSlices(u32, full_pixels, partial_pixels);
@@ -2831,7 +2648,7 @@ test "cell damage redraws symbol ink spilling into the interval" {
     stream.nextSlice("\x1b[1;8Hy");
     try state.update(alloc, &term);
     try partial.renderDirty(&state, partial_pixels, width, height);
-    try std.testing.expectEqual(CellRange{ .start = 6, .end = 9 }, partial.cell_damage.items[0].?);
+    try std.testing.expectEqual(CellRange{ .start = 6, .end = 9 }, partial.cell_damage_tracker.damageForRow(0).?);
 
     try reference.render(&state, full_pixels, width, height);
     try std.testing.expectEqualSlices(u32, full_pixels, partial_pixels);
@@ -2867,9 +2684,9 @@ test "scroll invalidates newly exposed cell fingerprints" {
     try renderer.render(&state, pixels, width, height);
 
     try renderer.shiftCellState(rows, cols, 1);
-    try std.testing.expect(renderer.cell_fingerprint_valid.isSet(0));
-    try std.testing.expect(renderer.cell_fingerprint_valid.isSet(1));
-    try std.testing.expect(!renderer.cell_fingerprint_valid.isSet(2));
+    try std.testing.expect(renderer.cell_damage_tracker.fingerprintIsValid(0));
+    try std.testing.expect(renderer.cell_damage_tracker.fingerprintIsValid(1));
+    try std.testing.expect(!renderer.cell_damage_tracker.fingerprintIsValid(2));
 
     const bottom_start = @as(usize, 2 * font.cell_height) * width;
     @memset(pixels[bottom_start..], 0xffabcdef);
@@ -2877,7 +2694,7 @@ test "scroll invalidates newly exposed cell fingerprints" {
     state.row_data.items(.dirty)[2] = true;
     state.dirty = .partial;
     try renderer.renderDirty(&state, pixels, width, height);
-    try std.testing.expectEqual(CellRange{ .start = 0, .end = cols }, renderer.cell_damage.items[2].?);
+    try std.testing.expectEqual(CellRange{ .start = 0, .end = cols }, renderer.cell_damage_tracker.damageForRow(2).?);
 
     try reference.render(&state, full_pixels, width, height);
     try std.testing.expectEqualSlices(u32, full_pixels, pixels);
@@ -2913,7 +2730,7 @@ test "cell damage repaints dirty rows after terminal colors change" {
     state.row_data.items(.dirty)[0] = true;
     state.dirty = .partial;
     try renderer.renderDirty(&state, pixels, width, height);
-    try std.testing.expectEqual(CellRange{ .start = 0, .end = 4 }, renderer.cell_damage.items[0].?);
+    try std.testing.expectEqual(CellRange{ .start = 0, .end = 4 }, renderer.cell_damage_tracker.damageForRow(0).?);
 
     try reference.render(&state, full_pixels, width, height);
     try std.testing.expectEqualSlices(u32, full_pixels, pixels);

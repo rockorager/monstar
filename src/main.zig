@@ -356,6 +356,7 @@ fn buildEnvp(
 test {
     _ = App;
     _ = @import("AsyncRaster.zig");
+    _ = @import("CellDamageTracker.zig");
     _ = Config;
     _ = Font;
     _ = @import("cgroup.zig");
