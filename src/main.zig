@@ -355,6 +355,7 @@ fn buildEnvp(
 
 test {
     _ = App;
+    _ = @import("AsyncJobSnapshot.zig");
     _ = @import("AsyncRaster.zig");
     _ = @import("CellDamageTracker.zig");
     _ = Config;
