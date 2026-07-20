@@ -381,6 +381,7 @@ test {
     _ = @import("sprite/draw/symbols_for_legacy_computing.zig");
     _ = @import("sprite/draw/symbols_for_legacy_computing_supplement.zig");
     _ = @import("sprite/draw/special.zig");
+    _ = @import("TextShaper.zig");
     _ = Window;
 }
 
