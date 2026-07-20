@@ -87,6 +87,7 @@ pub fn record(self: *FrameDamageTracker, async_raster: *AsyncRaster, rendered: A
         .full => unreachable,
         .partial => {
             try async_raster.copyRenderedRects(self.alloc, &damage.rects);
+            std.debug.assert(damage.rects.items.len > 0);
             for (damage.rects.items) |*rect| {
                 rect.x += damage.geometry.grid_x;
                 rect.y += damage.geometry.grid_y;

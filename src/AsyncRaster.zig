@@ -86,7 +86,12 @@ pub const Job = struct {
     }
 };
 
-pub const Damage = enum { full, partial, none };
+pub const Damage = enum {
+    full,
+    /// One or more buffer rectangles changed.
+    partial,
+    none,
+};
 
 pub const Result = struct {
     job: Job,
@@ -544,7 +549,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
                 return;
             }
             try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
-            damage.* = .partial;
+            damage.* = if (self.renderer.rendered_rects.items.len == 0) .none else .partial;
         },
         .false => {
             if (!repairToPreviousFrame(job)) {
@@ -645,6 +650,78 @@ fn scrollFromPreviousFrame(job: Job, shift_rows: isize, cell_height: u31) bool {
             Renderer.copyPixels(dst, src);
     }
     return true;
+}
+
+test "unchanged dirty rows report no damage" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25labcd");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var raster = try AsyncRaster.init(
+        font.discovery(),
+        .{ .r = 1, .g = 2, .b = 3 },
+        null,
+        null,
+        255,
+        false,
+        &state,
+    );
+    defer raster.deinit();
+
+    const width: u31 = raster.font.cell_width * 4;
+    const height: u31 = raster.font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const job: Job = .{
+        .pixels = pixels,
+        .source_pixels = null,
+        .width = width,
+        .height = height,
+        .grid_x = 0,
+        .grid_y = 0,
+        .grid_width = width,
+        .grid_height = height,
+        .age = 1,
+        .generation = 1,
+        .focused = true,
+        .hyperlink_hints = false,
+        .link_range = null,
+        .search_range = null,
+        .search_matches = &.{},
+        .search_background = .{ .r = 1, .g = 2, .b = 3 },
+        .search_foreground = .{ .r = 4, .g = 5, .b = 6 },
+        .preedit = null,
+        .link_hint = null,
+        .search = null,
+        .search_no_match = false,
+        .scrollbar = null,
+        .kitty_items = &.{},
+        .overlay_dirty = false,
+        .scroll_shift = null,
+        .repair = .none,
+    };
+
+    var damage: Damage = .none;
+    try raster.renderJob(job, &damage);
+    try std.testing.expectEqual(Damage.full, damage);
+
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+    state.row_data.items(.dirty)[0] = true;
+    state.dirty = .partial;
+    damage = .full;
+    try raster.renderJob(job, &damage);
+
+    try std.testing.expectEqual(Damage.none, damage);
+    try std.testing.expectEqual(@as(usize, 0), raster.renderer.rendered_rects.items.len);
 }
 
 test "repair previous frame" {

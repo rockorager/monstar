@@ -4868,6 +4868,14 @@ fn finishAsyncRender(self: *App) void {
         self.needs_redraw = true;
         return;
     }
+    if (result.damage == .none) {
+        // The target may have been repaired, but it matches the current
+        // surface. Do not advance frame history unless a commit does.
+        self.window.cancelRender(buffer);
+        self.clearRenderDirty();
+        self.syncTextInputCursorRect(&self.render_state);
+        return;
+    }
     self.frame_damage.begin(.{
         .width = result.job.width,
         .height = result.job.height,

@@ -116,7 +116,7 @@ pub const DamageRect = struct {
 /// The buffer region a render changed relative to the previous frame.
 pub const Damage = union(enum) {
     full,
-    /// Changed rectangles; an empty slice means nothing changed.
+    /// A non-empty slice of changed rectangles.
     /// The slice is borrowed for the duration of `commitRender`.
     rects: []const DamageRect,
 };
@@ -831,6 +831,10 @@ pub fn cancelRender(self: *Window, buffer: *Buffer) void {
 pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
     std.debug.assert(buffer.rendering);
     std.debug.assert(buffer.format == self.buffer_format);
+    switch (damage) {
+        .full => {},
+        .rects => |rects| std.debug.assert(rects.len > 0),
+    }
     buffer.rendering = false;
     self.rendering_pending = false;
     self.frame_counter += 1;
