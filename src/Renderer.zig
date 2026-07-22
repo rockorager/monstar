@@ -27,6 +27,8 @@ const kittyDestRect = kitty_graphics.kittyDestRect;
 const kittyItemOpaque = kitty_graphics.kittyItemOpaque;
 const kitty_placeholder = vt.kitty.graphics.unicode.placeholder;
 const search_match_alpha = 128;
+/// Foreground weight for faint (SGR 2) text; the rest blends to background.
+const faint_alpha = 128;
 
 pub const ScrollbarThumb = pixel_raster.ScrollbarThumb;
 pub const KittyRenderItem = kitty_graphics.KittyRenderItem;
@@ -1280,6 +1282,8 @@ fn prepareRowCells(
             fg = bg orelse colors.background;
             bg = old_fg;
         }
+        // Faint (SGR 2) dims the glyph halfway toward its background.
+        if (style.flags.faint) fg = blendRgb(fg, bg orelse colors.background, faint_alpha);
         var background_uses_alpha = self.background_alpha_cells and bg != null;
         // Selection overrides cell colors: fixed background, default
         // foreground, so selected text reads uniformly.

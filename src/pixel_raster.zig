@@ -415,6 +415,16 @@ test "blend endpoints" {
     );
 }
 
+test "blendRgb faint dims foreground toward background" {
+    const white: vt.color.RGB = .{ .r = 0xff, .g = 0xff, .b = 0xff };
+    const black: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    try std.testing.expectEqual(white, blendRgb(white, black, 255));
+    try std.testing.expectEqual(black, blendRgb(white, black, 0));
+    // Half blend (the faint weight) lands on mid-gray, dimmer than the source.
+    const gray: vt.color.RGB = .{ .r = 0x80, .g = 0x80, .b = 0x80 };
+    try std.testing.expectEqual(gray, blendRgb(white, black, 128));
+}
+
 test "scrollbar capsule has antialiased caps and a solid center" {
     const background: u32 = 0xff000000;
     var pixels = [_]u32{background} ** 48;
