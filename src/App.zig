@@ -469,8 +469,14 @@ pub fn init(
         .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
     });
     errdefer term.deinit(alloc);
-    term.width_px = startup_size.cols * font.cell_width;
-    term.height_px = startup_size.rows * font.cell_height;
+    try term.resize(alloc, .{
+        .cols = startup_size.cols,
+        .rows = startup_size.rows,
+        .cell_size_px = .{
+            .width = font.cell_width,
+            .height = font.cell_height,
+        },
+    });
 
     // Child-exit detection is driven by SIGCHLD, not pty EOF; config
     // reloads are driven by SIGUSR1. Block both and receive them through
@@ -5043,16 +5049,23 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     const rows = layout.rows;
     const grid_width_px = layout.grid_width;
     const grid_height_px = layout.grid_height;
-    const pixels_changed = grid_width_px != self.term.width_px or grid_height_px != self.term.height_px;
+    const terminal_width_px = std.math.mul(u32, cols, self.font.cell_width) catch std.math.maxInt(u32);
+    const terminal_height_px = std.math.mul(u32, rows, self.font.cell_height) catch std.math.maxInt(u32);
+    const pixels_changed = terminal_width_px != self.term.width_px or terminal_height_px != self.term.height_px;
     const cells_changed = cols != self.term.cols or rows != self.term.rows;
     if (!cells_changed and !pixels_changed and !layout_changed) return;
 
-    self.term.width_px = grid_width_px;
-    self.term.height_px = grid_height_px;
-    if (cells_changed) {
-        log.debug("resize to {d}x{d} cells", .{ cols, rows });
-        try self.term.resize(self.alloc, cols, rows);
-        self.refreshSearch();
+    if (cells_changed or pixels_changed) {
+        if (cells_changed) log.debug("resize to {d}x{d} cells", .{ cols, rows });
+        try self.term.resize(self.alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .cell_size_px = .{
+                .width = self.font.cell_width,
+                .height = self.font.cell_height,
+            },
+        });
+        if (cells_changed) self.refreshSearch();
     }
     try self.pty.setWinsize(.{
         .row = rows,
