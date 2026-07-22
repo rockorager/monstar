@@ -6,4 +6,5 @@
 #include "../vendor/stb_image.h"
 #include "../vendor/stb_image_resize.h"
 #include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
 #include <dbus/dbus.h>

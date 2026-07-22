@@ -119,21 +119,30 @@ pub fn translate(
     const state = self.state orelse return null;
     const keymap = self.keymap orelse return null;
     const keycode: c.xkb_keycode_t = evdev_keycode + 8;
-    const key = evdevToKey(evdev_keycode);
+    const keysym = c.xkb_state_key_get_one_sym(state, keycode);
+    const key = remapKey(
+        evdevToKey(evdev_keycode),
+        keysym,
+    );
     self.updateModSides(key, action);
 
     const utf8_len_c = c.xkb_state_key_get_utf8(state, keycode, utf8_buf.ptr, utf8_buf.len);
     const utf8_len: usize = if (utf8_len_c > 0) @intCast(utf8_len_c) else 0;
     // Don't send most control characters as text; the encoder derives
-    // them from the physical key. Plain Tab is the exception: ghostty-vt's
+    // them from the resolved key. Plain Tab is the exception: ghostty-vt's
     // legacy encoder expects the tab byte in utf8 when no modifiers are held.
     const utf8: []const u8 = if (utf8_len == 1 and utf8_buf[0] < 0x20 and utf8_buf[0] != '\t')
         ""
     else
         utf8_buf[0..utf8_len];
 
-    // The codepoint this key produces with no modifiers (shift level 0).
+    // The encoder's base codepoint: a Kitty functional PUA code for entries
+    // missing upstream, or the key's ordinary shift level 0 codepoint.
     const unshifted: u21 = unshifted: {
+        // The pinned ghostty-vt predates some Kitty functional-key entries,
+        // but its generic CSI-u fallback accepts their protocol PUA codes here.
+        if (kittyFunctionalCode(keysym)) |code| break :unshifted code;
+
         const layout = c.xkb_state_key_get_layout(state, keycode);
         var syms: [*c]const c.xkb_keysym_t = undefined;
         const n = c.xkb_keymap_key_get_syms_by_level(keymap, keycode, layout, 0, &syms);
@@ -244,6 +253,197 @@ fn modsFromMask(self: *Keyboard, mask: c.xkb_mod_mask_t) vt.input.KeyMods {
 fn bitSet(mask: c.xkb_mod_mask_t, index: c.xkb_mod_index_t) bool {
     if (index == c.XKB_MOD_INVALID) return false;
     return mask & (@as(c.xkb_mod_mask_t, 1) << @intCast(index)) != 0;
+}
+
+/// Use XKB remaps for functional keys while keeping writing-system keys
+/// physical so shortcuts remain layout-independent.
+fn remapKey(physical: vt.input.Key, keysym: c.xkb_keysym_t) vt.input.Key {
+    const remapped = keyFromKeysym(keysym) orelse return physical;
+    if (physical.shouldBeRemappable() or remapped.shouldBeRemappable()) return remapped;
+    return physical;
+}
+
+fn keyFromKeysym(keysym: c.xkb_keysym_t) ?vt.input.Key {
+    return switch (keysym) {
+        c.XKB_KEY_Up => .arrow_up,
+        c.XKB_KEY_Down => .arrow_down,
+        c.XKB_KEY_Right => .arrow_right,
+        c.XKB_KEY_Left => .arrow_left,
+        c.XKB_KEY_Home => .home,
+        c.XKB_KEY_End => .end,
+        c.XKB_KEY_Insert => .insert,
+        c.XKB_KEY_Delete => .delete,
+        c.XKB_KEY_Caps_Lock, c.XKB_KEY_Shift_Lock => .caps_lock,
+        c.XKB_KEY_Scroll_Lock => .scroll_lock,
+        c.XKB_KEY_Num_Lock => .num_lock,
+        c.XKB_KEY_Prior => .page_up,
+        c.XKB_KEY_Next => .page_down,
+        c.XKB_KEY_Escape => .escape,
+        c.XKB_KEY_Return => .enter,
+        c.XKB_KEY_Tab, c.XKB_KEY_ISO_Left_Tab => .tab,
+        c.XKB_KEY_BackSpace => .backspace,
+        c.XKB_KEY_Print => .print_screen,
+        c.XKB_KEY_Pause => .pause,
+        c.XKB_KEY_Menu, c.XKB_KEY_XF86ContextMenu => .context_menu,
+        c.XKB_KEY_Help => .help,
+        c.XKB_KEY_Henkan_Mode => .convert,
+        c.XKB_KEY_Muhenkan => .non_convert,
+        c.XKB_KEY_Kana_Lock,
+        c.XKB_KEY_Kana_Shift,
+        c.XKB_KEY_Hiragana_Katakana,
+        => .kana_mode,
+
+        c.XKB_KEY_F1 => .f1,
+        c.XKB_KEY_F2 => .f2,
+        c.XKB_KEY_F3 => .f3,
+        c.XKB_KEY_F4 => .f4,
+        c.XKB_KEY_F5 => .f5,
+        c.XKB_KEY_F6 => .f6,
+        c.XKB_KEY_F7 => .f7,
+        c.XKB_KEY_F8 => .f8,
+        c.XKB_KEY_F9 => .f9,
+        c.XKB_KEY_F10 => .f10,
+        c.XKB_KEY_F11 => .f11,
+        c.XKB_KEY_F12 => .f12,
+        c.XKB_KEY_F13 => .f13,
+        c.XKB_KEY_F14 => .f14,
+        c.XKB_KEY_F15 => .f15,
+        c.XKB_KEY_F16 => .f16,
+        c.XKB_KEY_F17 => .f17,
+        c.XKB_KEY_F18 => .f18,
+        c.XKB_KEY_F19 => .f19,
+        c.XKB_KEY_F20 => .f20,
+        c.XKB_KEY_F21 => .f21,
+        c.XKB_KEY_F22 => .f22,
+        c.XKB_KEY_F23 => .f23,
+        c.XKB_KEY_F24 => .f24,
+        c.XKB_KEY_F25 => .f25,
+        // ghostty-vt's Key enum currently ends at F25. Returning unidentified
+        // still lets an XKB remap override the original physical key while the
+        // Kitty PUA code below carries the exact F26-F35 identity.
+        c.XKB_KEY_F26,
+        c.XKB_KEY_F27,
+        c.XKB_KEY_F28,
+        c.XKB_KEY_F29,
+        c.XKB_KEY_F30,
+        c.XKB_KEY_F31,
+        c.XKB_KEY_F32,
+        c.XKB_KEY_F33,
+        c.XKB_KEY_F34,
+        c.XKB_KEY_F35,
+        => .unidentified,
+
+        c.XKB_KEY_KP_0 => .numpad_0,
+        c.XKB_KEY_KP_1 => .numpad_1,
+        c.XKB_KEY_KP_2 => .numpad_2,
+        c.XKB_KEY_KP_3 => .numpad_3,
+        c.XKB_KEY_KP_4 => .numpad_4,
+        c.XKB_KEY_KP_5 => .numpad_5,
+        c.XKB_KEY_KP_6 => .numpad_6,
+        c.XKB_KEY_KP_7 => .numpad_7,
+        c.XKB_KEY_KP_8 => .numpad_8,
+        c.XKB_KEY_KP_9 => .numpad_9,
+        c.XKB_KEY_KP_Decimal => .numpad_decimal,
+        c.XKB_KEY_KP_Divide => .numpad_divide,
+        c.XKB_KEY_KP_Multiply => .numpad_multiply,
+        c.XKB_KEY_KP_Subtract => .numpad_subtract,
+        c.XKB_KEY_KP_Add => .numpad_add,
+        c.XKB_KEY_KP_Enter => .numpad_enter,
+        c.XKB_KEY_KP_Equal => .numpad_equal,
+        c.XKB_KEY_KP_Separator => .numpad_separator,
+        c.XKB_KEY_KP_Left => .numpad_left,
+        c.XKB_KEY_KP_Right => .numpad_right,
+        c.XKB_KEY_KP_Up => .numpad_up,
+        c.XKB_KEY_KP_Down => .numpad_down,
+        c.XKB_KEY_KP_Prior => .numpad_page_up,
+        c.XKB_KEY_KP_Next => .numpad_page_down,
+        c.XKB_KEY_KP_Home => .numpad_home,
+        c.XKB_KEY_KP_End => .numpad_end,
+        c.XKB_KEY_KP_Insert => .numpad_insert,
+        c.XKB_KEY_KP_Delete => .numpad_delete,
+        c.XKB_KEY_KP_Begin => .numpad_begin,
+
+        c.XKB_KEY_Shift_L => .shift_left,
+        c.XKB_KEY_Control_L => .control_left,
+        c.XKB_KEY_Alt_L => .alt_left,
+        c.XKB_KEY_Super_L => .meta_left,
+        c.XKB_KEY_Shift_R => .shift_right,
+        c.XKB_KEY_Control_R => .control_right,
+        c.XKB_KEY_Alt_R => .alt_right,
+        c.XKB_KEY_Super_R => .meta_right,
+
+        c.XKB_KEY_XF86Back => .browser_back,
+        c.XKB_KEY_XF86Favorites => .browser_favorites,
+        c.XKB_KEY_XF86Forward => .browser_forward,
+        c.XKB_KEY_XF86HomePage => .browser_home,
+        c.XKB_KEY_XF86Refresh => .browser_refresh,
+        c.XKB_KEY_XF86Search => .browser_search,
+        c.XKB_KEY_XF86Stop => .browser_stop,
+        c.XKB_KEY_XF86Eject => .eject,
+        c.XKB_KEY_XF86MyComputer => .launch_app_1,
+        c.XKB_KEY_XF86Calculator, c.XKB_KEY_XF86Calculater => .launch_app_2,
+        c.XKB_KEY_XF86Mail => .launch_mail,
+        c.XKB_KEY_XF86AudioPlay, c.XKB_KEY_XF86AudioPause => .media_play_pause,
+        c.XKB_KEY_XF86AudioMedia => .media_select,
+        c.XKB_KEY_XF86AudioStop => .media_stop,
+        c.XKB_KEY_XF86AudioNext => .media_track_next,
+        c.XKB_KEY_XF86AudioPrev => .media_track_previous,
+        c.XKB_KEY_XF86PowerOff => .power,
+        c.XKB_KEY_XF86Sleep => .sleep,
+        c.XKB_KEY_XF86AudioLowerVolume => .audio_volume_down,
+        c.XKB_KEY_XF86AudioMute => .audio_volume_mute,
+        c.XKB_KEY_XF86AudioRaiseVolume => .audio_volume_up,
+        c.XKB_KEY_XF86WakeUp => .wake_up,
+        c.XKB_KEY_XF86Copy => .copy,
+        c.XKB_KEY_XF86Cut => .cut,
+        c.XKB_KEY_XF86Paste => .paste,
+        c.XKB_KEY_XF86Fn => .@"fn",
+
+        // Kitty distinguishes these media controls, but ghostty-vt's Key enum
+        // does not yet. Keep them unidentified and carry the exact protocol
+        // identity through kittyFunctionalCode.
+        c.XKB_KEY_XF86AudioForward,
+        c.XKB_KEY_XF86AudioRewind,
+        c.XKB_KEY_XF86AudioRecord,
+        => .unidentified,
+
+        else => ascii: {
+            const codepoint = c.xkb_keysym_to_utf32(keysym);
+            if (codepoint > std.math.maxInt(u8)) break :ascii null;
+            break :ascii vt.input.Key.fromASCII(@intCast(codepoint));
+        },
+    };
+}
+
+/// Kitty functional-key codes missing from the pinned ghostty-vt table.
+/// Browser, power, clipboard, and other XF86 keys are intentionally absent:
+/// the Kitty protocol does not assign functional codes to them.
+fn kittyFunctionalCode(keysym: c.xkb_keysym_t) ?u21 {
+    return switch (keysym) {
+        c.XKB_KEY_Menu, c.XKB_KEY_XF86ContextMenu => 57363,
+        c.XKB_KEY_F26 => 57389,
+        c.XKB_KEY_F27 => 57390,
+        c.XKB_KEY_F28 => 57391,
+        c.XKB_KEY_F29 => 57392,
+        c.XKB_KEY_F30 => 57393,
+        c.XKB_KEY_F31 => 57394,
+        c.XKB_KEY_F32 => 57395,
+        c.XKB_KEY_F33 => 57396,
+        c.XKB_KEY_F34 => 57397,
+        c.XKB_KEY_F35 => 57398,
+        c.XKB_KEY_XF86AudioPlay => 57428,
+        c.XKB_KEY_XF86AudioPause => 57429,
+        c.XKB_KEY_XF86AudioStop => 57432,
+        c.XKB_KEY_XF86AudioForward => 57433,
+        c.XKB_KEY_XF86AudioRewind => 57434,
+        c.XKB_KEY_XF86AudioNext => 57435,
+        c.XKB_KEY_XF86AudioPrev => 57436,
+        c.XKB_KEY_XF86AudioRecord => 57437,
+        c.XKB_KEY_XF86AudioLowerVolume => 57438,
+        c.XKB_KEY_XF86AudioRaiseVolume => 57439,
+        c.XKB_KEY_XF86AudioMute => 57440,
+        else => null,
+    };
 }
 
 /// Map an evdev keycode (linux/input-event-codes.h) to the physical key
@@ -380,6 +580,97 @@ fn testKeyboard() !Keyboard {
         return error.KeymapParseFailed;
     try kb.installKeymap(keymap);
     return kb;
+}
+
+fn testKeyboardWithOptions(options: [*:0]const u8) !Keyboard {
+    var kb: Keyboard = try .init();
+    errdefer kb.deinit();
+    const names: c.xkb_rule_names = .{
+        .rules = null,
+        .model = null,
+        .layout = "us",
+        .variant = null,
+        .options = options,
+    };
+    const keymap = c.xkb_keymap_new_from_names(kb.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse
+        return error.KeymapParseFailed;
+    try kb.installKeymap(keymap);
+    return kb;
+}
+
+test "xkb remaps functional keys but preserves physical writing keys" {
+    try std.testing.expectEqual(vt.input.Key.escape, remapKey(.caps_lock, c.XKB_KEY_Escape));
+    try std.testing.expectEqual(vt.input.Key.key_a, remapKey(.key_a, c.XKB_KEY_c));
+    try std.testing.expectEqual(vt.input.Key.copy, remapKey(.unidentified, c.XKB_KEY_XF86Copy));
+    try std.testing.expectEqual(vt.input.Key.browser_back, remapKey(.unidentified, c.XKB_KEY_XF86Back));
+}
+
+test "translate and encode: caps lock remapped to escape" {
+    var kb = testKeyboardWithOptions("caps:escape") catch return error.SkipZigTest;
+    defer kb.deinit();
+
+    var utf8_buf: [16]u8 = undefined;
+    const event = kb.translate(&utf8_buf, 58, .press).?;
+    try std.testing.expectEqual(vt.input.Key.escape, event.key);
+    try std.testing.expectEqualStrings("", event.utf8);
+
+    var out_buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&out_buf);
+    try vt.input.encodeKey(&writer, event, .{});
+    try std.testing.expectEqualStrings("\x1b", writer.buffered());
+}
+
+test "translate and encode: Kitty media key" {
+    var kb = testKeyboard() catch return error.SkipZigTest;
+    defer kb.deinit();
+
+    var utf8_buf: [16]u8 = undefined;
+    // Linux KEY_VOLUMEUP is evdev 115 and maps to XF86AudioRaiseVolume.
+    const event = kb.translate(&utf8_buf, 115, .press).?;
+    try std.testing.expectEqual(vt.input.Key.audio_volume_up, event.key);
+    try std.testing.expectEqual(@as(u21, 57439), event.unshifted_codepoint);
+
+    var out_buf: [64]u8 = undefined;
+    var legacy_writer: std.Io.Writer = .fixed(&out_buf);
+    try vt.input.encodeKey(&legacy_writer, event, .{});
+    try std.testing.expectEqualStrings("", legacy_writer.buffered());
+
+    var writer: std.Io.Writer = .fixed(&out_buf);
+    try vt.input.encodeKey(&writer, event, .{
+        .kitty_flags = .{ .disambiguate = true },
+    });
+    try std.testing.expectEqualStrings("\x1b[57439u", writer.buffered());
+
+    // Linux KEY_PLAYPAUSE is exposed by XKB as XF86AudioPlay. Keep the exact
+    // MEDIA_PLAY code rather than collapsing it to MEDIA_PLAY_PAUSE.
+    const play_event = kb.translate(&utf8_buf, 164, .press).?;
+    try std.testing.expectEqual(vt.input.Key.media_play_pause, play_event.key);
+    try std.testing.expectEqual(@as(u21, 57428), play_event.unshifted_codepoint);
+
+    var play_writer: std.Io.Writer = .fixed(&out_buf);
+    try vt.input.encodeKey(&play_writer, play_event, .{
+        .kitty_flags = .{ .disambiguate = true },
+    });
+    try std.testing.expectEqualStrings("\x1b[57428u", play_writer.buffered());
+}
+
+test "Kitty protocol-only keysyms retain their functional code" {
+    const key = remapKey(.f1, c.XKB_KEY_F26);
+    const code = kittyFunctionalCode(c.XKB_KEY_F26).?;
+    try std.testing.expectEqual(vt.input.Key.unidentified, key);
+    try std.testing.expectEqual(@as(u21, 57389), code);
+    try std.testing.expectEqual(@as(u21, 57437), kittyFunctionalCode(c.XKB_KEY_XF86AudioRecord).?);
+    try std.testing.expectEqual(@as(?u21, null), kittyFunctionalCode(c.XKB_KEY_XF86Back));
+
+    var out_buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&out_buf);
+    try vt.input.encodeKey(&writer, .{
+        .key = key,
+        .unshifted_codepoint = code,
+    }, .{
+        .kitty_flags = .{ .disambiguate = true },
+    });
+    try std.testing.expectEqualStrings("\x1b[57389u", writer.buffered());
 }
 
 test "translate and encode: plain, shifted, control" {
