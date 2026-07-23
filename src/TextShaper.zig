@@ -109,6 +109,9 @@ pub fn keyItems(self: *const TextShaper) []const u32 {
 /// full cache, or until `clearCache` or `deinit` is called.
 pub fn shape(self: *TextShaper, face_index: u16, style: Font.FaceStyle, shaped_cells: usize) ![]const ShapedGlyph {
     if (self.cache.get(std.mem.sliceAsBytes(self.key.items))) |cached| {
+        // Steady-state rendering overwhelmingly reuses shaped runs. Keeping
+        // the miss path out of line also keeps Renderer.drawRun compact.
+        @branchHint(.likely);
         self.stats.cache_hits += 1;
         return cached;
     }
