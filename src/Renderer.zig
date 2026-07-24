@@ -1443,9 +1443,11 @@ fn renderRowForegroundCells(
                 raws[x].content.codepoint.data != kitty_placeholder,
             else => false,
         };
+        // Break runs at the cursor cell so ligatures split around the cursor.
         const breaks_run = !has_text or
             raws[x].style_id != raws[run_start].style_id or
-            faces[x] != faces[run_start];
+            faces[x] != faces[run_start] or
+            (cursor_x != null and (x == cursor_x.? or run_start == cursor_x.?));
         if (breaks_run) {
             if (run_start <= range_end and x >= range_start) {
                 try self.drawRun(raws, styles, graphemes, run_start, x, cols, y, pixels, width, height);
@@ -2223,6 +2225,37 @@ test "render a simple grid" {
         if (px != bg) non_bg += 1;
     }
     try std.testing.expect(non_bg > 0);
+}
+
+test "cursor splits shaping runs" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    // Write "abc", then move the cursor onto 'b'.
+    stream.nextSlice("abc\x1b[1;2H");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 8;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    try renderer.render(&state, pixels, width, height);
+
+    // "a", "b" (under the cursor), and "c" shape as three separate runs,
+    // so ligatures cannot form across the cursor cell.
+    try std.testing.expectEqual(@as(usize, 3), renderer.text_shaper.readStats().cache_misses);
 }
 
 test "background opacity cells controls explicit cell backgrounds" {
