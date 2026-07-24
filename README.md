@@ -115,6 +115,14 @@ in its inherited cgroup. Link opening falls back to `xdg-open` when the portal
 is unavailable. Monstar disables optional Wayland protocols when the
 compositor does not support them.
 
+D-Bus is a build-time dependency of the default build (`libdbus-1` headers
+and library). Pass `-Ddbus=false` to drop it entirely, at the cost of desktop
+notifications, launcher progress, portal-based link/file opening (falls back
+to `xdg-open`), portal light/dark detection, and systemd cgroup isolation.
+Nothing else is affected. `systemd` itself is never a build dependency; it is
+only used at runtime, over the session bus, when `linux-cgroup = always` is
+configured and a systemd user session is detected.
+
 ## Install
 
 Install the current development version on Arch Linux from the
