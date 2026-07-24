@@ -6,6 +6,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const c = @import("c");
+const build_options = @import("build_options");
 
 const log = std.log.scoped(.cgroup);
 
@@ -28,7 +29,7 @@ pub fn systemdBooted() bool {
 /// `finish` (confirm the migration, then release the gated child) or
 /// `cancel` (abandon it on an error path).
 pub const Pending = struct {
-    call: *c.DBusPendingCall,
+    call: if (build_options.enable_dbus) *c.DBusPendingCall else void,
     pid: u32,
 
     /// Wait for systemd's reply and for the pid migration to become
@@ -38,6 +39,7 @@ pub const Pending = struct {
     /// this returns so grandchildren cannot escape into the terminal's
     /// cgroup.
     pub fn finish(self: Pending) Error!void {
+        if (!build_options.enable_dbus) return;
         defer c.dbus_pending_call_unref(self.call);
         c.dbus_pending_call_block(self.call);
         const reply = c.dbus_pending_call_steal_reply(self.call) orelse
@@ -60,6 +62,7 @@ pub const Pending = struct {
     }
 
     pub fn cancel(self: Pending) void {
+        if (!build_options.enable_dbus) return;
         c.dbus_pending_call_cancel(self.call);
         c.dbus_pending_call_unref(self.call);
     }

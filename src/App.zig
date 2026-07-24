@@ -33,6 +33,12 @@ const ScrollbackSearch = @import("ScrollbackSearch.zig");
 const ScrollDetector = @import("ScrollDetector.zig");
 const TerminalLayout = @import("TerminalLayout.zig");
 const cgroup = @import("cgroup.zig");
+
+/// Type of the session-bus connection handle. Collapses to `void` when
+/// D-Bus support is compiled out (`-Ddbus=false`), so the `dbus` field
+/// below always has a valid, zero-cost type regardless of the option.
+const DbusHandle = if (build_options.enable_dbus) ?*c.DBusConnection else void;
+const no_dbus: DbusHandle = if (build_options.enable_dbus) null else {};
 const clipboard_format = @import("clipboard_format.zig");
 const Window = @import("Window.zig");
 
@@ -140,7 +146,8 @@ child_exited: bool,
 /// Keep the window open after the child exits.
 hold: bool,
 /// Session bus connection, used for notifications and future desktop settings.
-dbus: ?*c.DBusConnection,
+/// `void` when built with `-Ddbus=false`.
+dbus: DbusHandle,
 dbus_fd: posix.fd_t,
 /// URI held while the compositor creates a token for activating its handler.
 pending_open_uri: ?[]u8,
@@ -495,12 +502,21 @@ pub fn init(
 
     // Connect to dbus before the fork so the child can be moved into
     // its own systemd scope before it execs. Filter and fd wiring happen
-    // in initDbus once the App has a stable address.
-    const dbus_connection: ?*c.DBusConnection = c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null);
-    if (dbus_connection == null) log.warn("session dbus unavailable; desktop integration disabled", .{});
-    errdefer if (dbus_connection) |connection| {
-        c.dbus_connection_close(connection);
-        c.dbus_connection_unref(connection);
+    // in initDbus once the App has a stable address. With -Ddbus=false,
+    // dbus_connection is always the sole `void` value and every dependent
+    // feature below (notifications, portals, cgroup isolation) is inert.
+    const dbus_connection: DbusHandle = if (build_options.enable_dbus)
+        c.dbus_bus_get_private(c.DBUS_BUS_SESSION, null)
+    else
+        no_dbus;
+    if (build_options.enable_dbus) {
+        if (dbus_connection == null) log.warn("session dbus unavailable; desktop integration disabled", .{});
+    }
+    errdefer if (build_options.enable_dbus) {
+        if (dbus_connection) |connection| {
+            c.dbus_connection_close(connection);
+            c.dbus_connection_unref(connection);
+        }
     };
 
     var pty: Pty = try .open(.{
@@ -516,20 +532,24 @@ pub fn init(
     // escape the scope; on failure, releasing the gate lets it proceed
     // un-isolated. Only the request is sent here: systemd's reply and the
     // pid migration land while we set up the window, and the gate is
-    // released once both are confirmed below.
-    const use_cgroup_scope = config.linux_cgroup == .always and
-        dbus_connection != null and
-        cgroup.systemdBooted();
+    // released once both are confirmed below. Always false with
+    // -Ddbus=false, since scope creation is a systemd1 D-Bus call.
+    const use_cgroup_scope = if (build_options.enable_dbus)
+        config.linux_cgroup == .always and dbus_connection != null and cgroup.systemdBooted()
+    else
+        false;
     const child_pid = try pty.spawn(path, argv, envp, .{
         .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
         .gate_child = use_cgroup_scope,
     });
     var pending_scope: ?cgroup.Pending = null;
-    if (use_cgroup_scope) {
-        pending_scope = cgroup.startMoveIntoScope(dbus_connection.?, @intCast(child_pid)) catch blk: {
-            log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
-            break :blk null;
-        };
+    if (build_options.enable_dbus) {
+        if (use_cgroup_scope) {
+            pending_scope = cgroup.startMoveIntoScope(dbus_connection.?, @intCast(child_pid)) catch blk: {
+                log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+                break :blk null;
+            };
+        }
     }
     // On error paths the errdefer'd pty.deinit releases the gate.
     errdefer if (pending_scope) |pending| pending.cancel();
@@ -869,6 +889,7 @@ fn reportTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) void
 /// matches, poll fd); the connection itself is created before the child
 /// fork so that cgroup scope creation can use it.
 fn initDbus(self: *App) void {
+    if (!build_options.enable_dbus) return;
     const connection = self.dbus orelse return;
 
     if (c.dbus_connection_add_filter(connection, dbusFilter, self, null) == 0) {
@@ -901,6 +922,7 @@ fn deinitDbus(self: *App) void {
     }
     self.notifications.deinit(self.alloc);
 
+    if (!build_options.enable_dbus) return;
     if (self.dbus) |connection| {
         c.dbus_connection_remove_filter(connection, dbusFilter, self);
         c.dbus_connection_close(connection);
@@ -911,12 +933,14 @@ fn deinitDbus(self: *App) void {
 }
 
 fn dispatchDbus(self: *App) void {
+    if (!build_options.enable_dbus) return;
     const connection = self.dbus orelse return;
     _ = c.dbus_connection_read_write(connection, 0);
     while (c.dbus_connection_dispatch(connection) == c.DBUS_DISPATCH_DATA_REMAINS) {}
 }
 
 fn readPortalColorScheme(self: *App) void {
+    if (!build_options.enable_dbus) return;
     const connection = self.dbus orelse return;
 
     const message = c.dbus_message_new_method_call(
@@ -951,6 +975,7 @@ fn portalColorScheme(value: u32) vt.device_status.ColorScheme {
 }
 
 fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !void {
+    if (!build_options.enable_dbus) return error.DBusUnavailable;
     const connection = self.dbus orelse return error.DBusUnavailable;
 
     const title_z = try self.alloc.dupeZ(u8, title);
@@ -1006,6 +1031,7 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
 }
 
 fn sendTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) !void {
+    if (!build_options.enable_dbus) return error.DBusUnavailable;
     const connection = self.dbus orelse return error.DBusUnavailable;
 
     const message = c.dbus_message_new_signal(
@@ -1047,6 +1073,7 @@ fn taskbarProgressValue(report: vt.osc.Command.ProgressReport) f64 {
 }
 
 fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !void {
+    if (!build_options.enable_dbus) return error.PortalUnavailable;
     const connection = self.dbus orelse return error.PortalUnavailable;
 
     // The portal's OpenURI method rejects file:// URIs by design; local
