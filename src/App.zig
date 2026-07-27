@@ -4335,6 +4335,49 @@ fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
     }
 }
 
+const ScrollbackKeyAction = enum {
+    page_up,
+    page_down,
+    top,
+    bottom,
+};
+
+fn scrollbackKeyAction(
+    active_screen: vt.ScreenSet.Key,
+    event: vt.input.KeyEvent,
+) ?ScrollbackKeyAction {
+    // Like foot, leave scrollback shortcuts to full-screen applications.
+    if (active_screen != .primary or !event.mods.shift or
+        event.mods.ctrl or event.mods.alt or event.mods.super) return null;
+
+    return switch (event.key) {
+        .page_up => .page_up,
+        .page_down => .page_down,
+        .home => .top,
+        .end => .bottom,
+        else => null,
+    };
+}
+
+fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent) bool {
+    const scroll = scrollbackKeyAction(self.term.screens.active_key, event) orelse return false;
+    // Consume the matching release too, but move only on press/repeat.
+    if (event.action == .release) return true;
+
+    self.stopFling();
+    const rows: isize = @intCast(self.term.rows);
+    switch (scroll) {
+        .page_up => self.term.screens.active.pages.scroll(.{ .delta_row = -rows }),
+        .page_down => self.term.screens.active.pages.scroll(.{ .delta_row = rows }),
+        .top => self.term.screens.active.pages.scroll(.top),
+        .bottom => self.term.screens.active.pages.scroll(.active),
+    }
+    self.revealScrollbar();
+    self.needs_redraw = true;
+    self.syncHoveredLink(true);
+    return true;
+}
+
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
@@ -4364,6 +4407,8 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
             else => {},
         }
     }
+
+    if (self.handleScrollbackKey(event)) return;
 
     const wrote = self.encodeAndWriteKey(event);
 
@@ -5207,6 +5252,42 @@ test "search backspace removes one UTF-8 codepoint" {
     try std.testing.expectEqualStrings("a", query.items);
     try std.testing.expect(truncateLastUtf8(&query));
     try std.testing.expect(!truncateLastUtf8(&query));
+}
+
+test "scrollback keys require shift on the primary screen" {
+    const shifted: vt.input.KeyMods = .{ .shift = true };
+    try std.testing.expectEqual(
+        ScrollbackKeyAction.page_up,
+        scrollbackKeyAction(.primary, .{ .key = .page_up, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        ScrollbackKeyAction.page_down,
+        scrollbackKeyAction(.primary, .{ .key = .page_down, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        ScrollbackKeyAction.top,
+        scrollbackKeyAction(.primary, .{ .key = .home, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        ScrollbackKeyAction.bottom,
+        scrollbackKeyAction(.primary, .{ .key = .end, .mods = shifted }).?,
+    );
+
+    try std.testing.expectEqual(
+        null,
+        scrollbackKeyAction(.alternate, .{ .key = .page_up, .mods = shifted }),
+    );
+    try std.testing.expectEqual(
+        null,
+        scrollbackKeyAction(.primary, .{ .key = .page_up }),
+    );
+    try std.testing.expectEqual(
+        null,
+        scrollbackKeyAction(.primary, .{
+            .key = .page_up,
+            .mods = .{ .shift = true, .ctrl = true },
+        }),
+    );
 }
 
 test "scrollback search scrolls a history match into the viewport" {

@@ -228,6 +228,8 @@ settings apply to new windows.
 | `Ctrl+Shift+F` | Search scrollback |
 | `Ctrl+Shift+N` | Open a new window in the current directory |
 | `Ctrl+Shift+,` | Reload configuration |
+| `Shift+PageUp` / `Shift+PageDown` | Scroll back / forward one page |
+| `Shift+Home` / `Shift+End` | Scroll to the top / bottom of scrollback |
 | `Ctrl++` / `Ctrl+=` / `Ctrl+-` | Adjust the font size |
 | `Ctrl+0` | Reset the font size |
 | `Ctrl` + left click | Open a hyperlink or detected URI |
@@ -236,6 +238,8 @@ settings apply to new windows.
 Scrollback search updates as you type. Press `Ctrl+N` and `Ctrl+P` to move
 between matches. Press `Enter` to copy a match to the primary selection. Press
 `Escape` to restore the previous viewport.
+
+Scrollback keybindings pass through to applications using the alternate screen.
 
 Hold `Shift` while dragging to select text after an application captures the
 mouse. Hold `Ctrl+Shift` instead of `Ctrl` to open a link in this state.
