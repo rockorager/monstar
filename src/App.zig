@@ -467,7 +467,7 @@ pub fn init(
     var term: vt.Terminal = try .init(io, alloc, .{
         .cols = startup_size.cols,
         .rows = startup_size.rows,
-        .max_scrollback = config.scrollback_limit,
+        .max_scrollback_bytes = config.scrollback_limit,
         .colors = config.terminalColors(.dark),
         .default_modes = .{ .grapheme_cluster = true },
         // libghostty-vt defaults to a conservative 10MB, which rejects a
@@ -5295,7 +5295,7 @@ test "scrollback search scrolls a history match into the viewport" {
     var term: vt.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 16,
         .rows = 3,
-        .max_scrollback = 100,
+        .max_scrollback_bytes = 100,
     });
     defer term.deinit(alloc);
     var stream = term.vtStream();

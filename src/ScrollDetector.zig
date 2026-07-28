@@ -131,7 +131,7 @@ test "scroll detector finds viewport shifts and narrows dirty rows" {
     var term: vt.Terminal = try .init(std.testing.io, alloc, .{
         .cols = 10,
         .rows = 4,
-        .max_scrollback = 100,
+        .max_scrollback_bytes = 100,
     });
     defer term.deinit(alloc);
     var stream = term.vtStream();

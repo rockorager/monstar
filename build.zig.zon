@@ -5,16 +5,16 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ghostty = .{
-            .url = "git+https://github.com/ghostty-org/ghostty.git#7aa9591746ffa4d2eee458960c76554352832595",
-            .hash = "ghostty-1.3.2-dev-5UdBC-edJAVXTdYsgHOzIqgAI7hE8VqpmriEi8zgufw2",
+            .url = "git+https://github.com/ghostty-org/ghostty.git#2dd79f3bc6af649e68422b08e21ad0300fd8b391",
+            .hash = "ghostty-1.3.2-dev-5UdBC4JhJgXdhefpqPX727nCW5VepJv5QfDEU3nwsyDM",
         },
         .wayland = .{
             .url = "git+https://codeberg.org/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
             .hash = "wayland-0.7.0-dev-lQa1kjT8AQDBstL61Gy3WCMtGwVaMN1p6w5wGfdDvP15",
         },
         .z2d = .{
-            .url = "git+https://github.com/vancluever/z2d#3edb5d1bba7192352c17592a218eca8b646679dc",
-            .hash = "z2d-0.12.0-j5P_HsE8EQAuRulQMsEkrCevU85rTFl4JIOz7uJdCYA-",
+            .url = "git+https://github.com/vancluever/z2d#47fc1030c1636dcfb75ea1cc238f706dd1feb379",
+            .hash = "z2d-0.12.2-pre-j5P_HtA8EQDpzu5RUtQhr_Sn9MeQF3_q7rWMw3ouesd0",
         },
         .iterm2_themes = .{
             .url = "https://deps.files.ghostty.org/ghostty-themes-release-20260629-161812-8c97c3c.tgz",
