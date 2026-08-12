@@ -41,9 +41,9 @@ if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
   gh release upload "$RELEASE_TAG" "$TARBALL" --clobber
 else
   if [ -f "$NOTES_FILE" ]; then
-    gh release create "$RELEASE_TAG" "$TARBALL" --title "Monstar $VERSION" --notes-file "$NOTES_FILE"
+    gh release create "$RELEASE_TAG" "$TARBALL" --verify-tag --title "Monstar $VERSION" --notes-file "$NOTES_FILE"
   else
-    gh release create "$RELEASE_TAG" "$TARBALL" --title "Monstar $VERSION" --generate-notes
+    gh release create "$RELEASE_TAG" "$TARBALL" --verify-tag --title "Monstar $VERSION" --generate-notes
   fi
 fi
 

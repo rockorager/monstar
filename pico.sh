@@ -6,7 +6,7 @@ JOB_ID="${PICI_JOB:-local}"
 REPO="${PICI_REPO:-monstar}"
 BRANCH="${PICI_BRANCH:-main}"
 COMMIT="${PICI_COMMIT:-dev}"
-ZMX_SESSION_PREFIX="${ZMX_SESSION_PREFIX:-local.}"
+export ZMX_SESSION_PREFIX="${ZMX_SESSION_PREFIX:-local.}"
 export PICI_ARTIFACTS_DIR="${PICI_ARTIFACTS_DIR:-/tmp/pici-artifacts/$REPO/$JOB_ID}"
 export ARTIFACTS_DIR="$PICI_ARTIFACTS_DIR"
 
@@ -19,10 +19,16 @@ zmx run format zig build fmt
 # 2. Serial unit test step
 zmx run test zig build test --summary all
 
-# 3. Build pre-built binary release archive, bake SHA256, and stage all artifacts
-zmx run build-binary ./packaging/build-binary-dist.sh
+# 3. Build release artifacts only for a pushed tag.
+if [ "${PICI_EVENT:-}" = "git.tag" ]; then
+  zmx run build-binary ./packaging/build-binary-dist.sh
+else
+  echo "Skipping release packaging for ${PICI_EVENT:-local} event"
+fi
 
 zmx wait "*"
 
-echo "✅ Artifacts staged in $ARTIFACTS_DIR"
-echo "   To publish a release: ./packaging/upload-release.sh <tag> [artifacts-dir]"
+if [ "${PICI_EVENT:-}" = "git.tag" ]; then
+  echo "✅ Artifacts staged in $ARTIFACTS_DIR"
+  echo "   To publish a release: ./packaging/upload-release.sh <tag> [artifacts-dir]"
+fi

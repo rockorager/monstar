@@ -24,11 +24,19 @@ STAGING_DIR="dist/staging"
 ARCHIVE_ROOT="monstar-${VERSION}-${ARCH}-${OS}"
 
 echo "==> Building pre-built release binary for monstar ${TAG} (version: ${VERSION})..."
-rm -rf "$STAGING_DIR" "dist/monstar-*.tar.gz"
+rm -rf "$STAGING_DIR" dist/monstar-*.tar.gz
 mkdir -p "$STAGING_DIR/${ARCHIVE_ROOT}"
 
 # Build ReleaseFast release prefix
 zig build -Doptimize=ReleaseFast --prefix "$STAGING_DIR/${ARCHIVE_ROOT}"
+
+EXPECTED_VERSION="monstar ${VERSION}"
+ACTUAL_VERSION=$("$STAGING_DIR/${ARCHIVE_ROOT}/bin/monstar" --version)
+if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+  echo "error: built binary reports '$ACTUAL_VERSION', expected '$EXPECTED_VERSION'" >&2
+  echo "       Build release artifacts from the exact ${TAG} tag." >&2
+  exit 1
+fi
 
 echo "==> Creating release tarball dist/${TARBALL_NAME}..."
 tar -czf "dist/${TARBALL_NAME}" -C "$STAGING_DIR" "${ARCHIVE_ROOT}"
