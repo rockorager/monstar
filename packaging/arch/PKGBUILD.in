@@ -1,4 +1,4 @@
-# Maintainer: Tim Culverhouse <tim@culverhouse.dev>
+# Maintainer: Tim Culverhouse <tim@timculverhouse.com>
 pkgname=monstar
 pkgver=@VERSION@
 pkgrel=1
