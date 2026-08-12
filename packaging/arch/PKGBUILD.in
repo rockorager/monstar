@@ -1,0 +1,32 @@
+# Maintainer: Tim Culverhouse <tim@culverhouse.dev>
+pkgname=monstar
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Wayland-native terminal emulator written in Zig"
+arch=('x86_64')
+url="https://github.com/rockorager/monstar"
+license=('MIT')
+depends=(
+  'wayland'
+  'fontconfig'
+  'freetype2'
+  'harfbuzz'
+  'libxkbcommon'
+  'dbus'
+)
+optdepends=(
+  'noto-fonts-emoji: emoji support'
+  'noto-fonts-cjk: CJK font support'
+)
+source=("$pkgname-$pkgver-x86_64-linux.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver-x86_64-linux.tar.gz")
+sha256sums=('@SHA256@')
+
+build() {
+  :
+}
+
+package() {
+  cd "$srcdir/${pkgname}-${pkgver}-x86_64-linux"
+  mkdir -p "$pkgdir/usr"
+  cp -r bin share "$pkgdir/usr/"
+}
