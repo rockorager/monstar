@@ -2,7 +2,7 @@
 pkgname=monstar-bin
 pkgver=@VERSION@
 pkgrel=1
-pkgdesc="Wayland-native terminal emulator written in Zig"
+pkgdesc="wayland terminal based on libghostty"
 arch=('x86_64')
 url="https://github.com/rockorager/monstar"
 license=('MIT')
