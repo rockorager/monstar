@@ -5,7 +5,17 @@
 
   outputs = { self, nixpkgs }:
     let
-      forAllSystems = nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed;
+      inherit (nixpkgs) lib;
+      forAllSystems = lib.genAttrs lib.systems.flakeExposed;
+      buildInputs = pkgs: [
+        pkgs.wayland
+        pkgs.wayland-scanner
+        pkgs.wayland-protocols
+        pkgs.fontconfig
+        pkgs.freetype
+        pkgs.harfbuzz
+        pkgs.libxkbcommon
+      ];
     in
     {
       packages = forAllSystems (system:
@@ -18,6 +28,9 @@
             version = "1.0.1";
             src = self;
 
+            nativeBuildInputs = [ pkgs.zig pkgs.pkg-config ];
+            buildInputs = buildInputs pkgs;
+
             zigDeps = pkgs.zig.fetchDeps {
               inherit (finalAttrs) src pname version;
               fetchAll = true;
@@ -27,28 +40,13 @@
             postConfigure = ''
               ln -s ${finalAttrs.zigDeps} "$ZIG_GLOBAL_CACHE_DIR/p"
             '';
-
-            nativeBuildInputs = [
-              pkgs.zig
-              pkgs.pkg-config
-            ];
-
-            buildInputs = [
-              pkgs.wayland
-              pkgs.wayland-scanner
-              pkgs.wayland-protocols
-              pkgs.fontconfig
-              pkgs.freetype
-              pkgs.harfbuzz
-              pkgs.libxkbcommon
-            ];
           });
         });
 
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/monstar";
+          program = lib.getExe' self.packages.${system}.default "monstar";
         };
       });
 
@@ -59,15 +57,7 @@
         {
           default = pkgs.mkShell {
             nativeBuildInputs = [ pkgs.zig pkgs.pkg-config ];
-            buildInputs = [
-              pkgs.wayland
-              pkgs.wayland-scanner
-              pkgs.wayland-protocols
-              pkgs.fontconfig
-              pkgs.freetype
-              pkgs.harfbuzz
-              pkgs.libxkbcommon
-            ];
+            buildInputs = buildInputs pkgs;
           };
         });
     };
