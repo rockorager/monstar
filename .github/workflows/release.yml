@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
 
       - name: Install system dependencies
         run: |
@@ -106,4 +108,4 @@ jobs:
           ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
 
       - name: Publish PKGBUILD to AUR
-        run: ./packaging/upload-aur.sh
+        run: ./packaging/upload-aur.sh packaging/arch

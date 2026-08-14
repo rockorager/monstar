@@ -6,6 +6,8 @@ pkgdesc="Wayland-native terminal emulator written in Zig"
 arch=('x86_64')
 url="https://github.com/rockorager/monstar"
 license=('MIT')
+provides=('monstar')
+conflicts=('monstar')
 depends=(
   'wayland'
   'fontconfig'

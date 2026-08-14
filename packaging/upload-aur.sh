@@ -37,7 +37,12 @@ if command -v makepkg >/dev/null 2>&1; then
   (cd "$AUR_DIR" && makepkg --printsrcinfo > .SRCINFO)
 elif command -v docker >/dev/null 2>&1; then
   echo "==> makepkg not found on host, using docker (archlinux:latest)..."
-  docker run --rm -v "$AUR_DIR:/pkg" -w /pkg archlinux:latest makepkg --printsrcinfo > "$AUR_DIR/.SRCINFO"
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    --env HOME=/tmp \
+    --volume "$AUR_DIR:/pkg" \
+    --workdir /pkg \
+    archlinux:latest makepkg --printsrcinfo > "$AUR_DIR/.SRCINFO"
 else
   echo "error: neither makepkg nor docker is available to generate .SRCINFO" >&2
   exit 1
@@ -47,6 +52,8 @@ VERSION=$(grep '^pkgver=' "$AUR_DIR/PKGBUILD" | cut -d= -f2)
 
 echo "==> Committing and pushing v${VERSION}..."
 cd "$AUR_DIR"
+git config user.name "Tim Culverhouse"
+git config user.email "tim@timculverhouse.com"
 git add PKGBUILD .SRCINFO
 git commit -m "Update to v${VERSION}"
 git push
