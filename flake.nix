@@ -6,7 +6,10 @@
   outputs = { self, nixpkgs }:
     let
       inherit (nixpkgs) lib;
-      forAllSystems = lib.genAttrs lib.systems.flakeExposed;
+      linuxSystems = builtins.filter
+        (system: (lib.systems.elaborate system).isLinux)
+        lib.systems.flakeExposed;
+      forAllSystems = lib.genAttrs linuxSystems;
       buildInputs = pkgs: [
         pkgs.wayland
         pkgs.wayland-scanner
