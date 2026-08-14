@@ -55,7 +55,10 @@ cd "$AUR_DIR"
 git config user.name "Tim Culverhouse"
 git config user.email "tim@timculverhouse.com"
 git add PKGBUILD .SRCINFO
-git commit -m "Update to v${VERSION}"
-git push
-
-echo "✅ monstar-bin v${VERSION} published to AUR."
+if git diff --staged --quiet; then
+  echo "==> No changes detected in PKGBUILD or .SRCINFO, already up to date."
+else
+  git commit -m "Update to v${VERSION}"
+  git push origin master
+  echo "✅ monstar-bin v${VERSION} published to AUR."
+fi
