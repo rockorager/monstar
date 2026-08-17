@@ -51,6 +51,8 @@ const CliOptions = struct {
     hold: bool = false,
     command_mode: CommandMode = .shell,
     command: []const [:0]const u8 = &.{},
+    attach_command: ?[:0]const u8 = null,
+    share_command: ?[:0]const u8 = null,
 };
 
 const CliError = error{InvalidCli} || std.mem.Allocator.Error;
@@ -105,6 +107,10 @@ const CliParser = struct {
             } else if (try self.initialSizeOption(arg, "--window-size-chars", .chars)) {
                 continue;
             } else if (try self.initialSizeOption(arg, "--window-size-pixels", .pixels)) {
+                continue;
+            } else if (try self.pathOption(arg, "--attach", &self.cli.attach_command)) {
+                continue;
+            } else if (try self.pathOption(arg, "--share", &self.cli.share_command)) {
                 continue;
             } else {
                 // Keep bare words reserved for future subcommands. Commands
@@ -225,6 +231,8 @@ fn printUsage(init: std.process.Init) !void {
         \\      --font FAMILY                  Override font-family config
         \\      --config PATH                  Load alternate config file
         \\  -o key=value                       Override a config key
+        \\      --attach CMD                   Attach to a snapshot/terminal stream command
+        \\      --share CMD                    Share terminal session with a coprocess command
         \\  -e command [args...]               Execute command directly
         \\  -- command...                      Run command through /bin/sh -c
         \\
@@ -278,6 +286,8 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
             .title = cli.title,
             .initial_size = cli.initial_size,
             .hold = cli.hold,
+            .attach_command = cli.attach_command,
+            .share_command = cli.share_command,
         },
     );
     defer app.deinit();
@@ -403,6 +413,8 @@ test {
     _ = @import("sprite/draw/symbols_for_legacy_computing.zig");
     _ = @import("sprite/draw/symbols_for_legacy_computing_supplement.zig");
     _ = @import("sprite/draw/special.zig");
+    _ = @import("Snapshot.zig");
+    _ = @import("Coprocess.zig");
     _ = @import("TextShaper.zig");
     _ = Window;
 }
