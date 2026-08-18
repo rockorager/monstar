@@ -4502,11 +4502,12 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 
     if (self.search != null) return self.handleSearchKey(event);
 
+    // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
     if (action == .press and event.mods.ctrl) {
         switch (event.key) {
             .equal => return self.adjustRuntimeFontSize(1),
-            .minus => return self.adjustRuntimeFontSize(-1),
-            .digit_0 => return self.resetRuntimeFontSize(),
+            .minus => if (!event.mods.shift) return self.adjustRuntimeFontSize(-1),
+            .digit_0 => if (!event.mods.shift) return self.resetRuntimeFontSize(),
             else => {},
         }
     }
