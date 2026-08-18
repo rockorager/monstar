@@ -194,7 +194,7 @@ pub fn translate(
                 else => {},
             }
         }
-        break :utf8_len c.xkb_state_key_get_utf8(state, keycode, utf8_buf.ptr, utf8_buf.len);
+        break :utf8_len self.keyUtf8(keycode, keysym, utf8_buf);
     };
     const utf8_len: usize = if (utf8_len_c > 0 and utf8_len_c < utf8_buf.len)
         @intCast(utf8_len_c)
@@ -237,6 +237,19 @@ pub fn translate(
         .utf8 = utf8,
         .unshifted_codepoint = unshifted,
     };
+}
+
+/// UTF-8 text for a key press, written into `buf`; returns the byte count without the terminator.
+fn keyUtf8(self: *Keyboard, keycode: c.xkb_keycode_t, keysym: c.xkb_keysym_t, buf: []u8) c_int {
+    const state = self.state orelse return 0;
+    const len = c.xkb_state_key_get_utf8(state, keycode, buf.ptr, buf.len);
+    if (len != 1 or (buf[0] >= 0x20 and buf[0] != 0x7f)) return len;
+    // XKB folds ctrl+<char> into a C0 or DEL byte; ghostty-vt's encoder needs the original char.
+    const mods = c.xkb_state_serialize_mods(state, c.XKB_STATE_MODS_EFFECTIVE);
+    if (!bitSet(mods, self.mod_indices.ctrl)) return len;
+    const sym_len = c.xkb_keysym_to_utf8(keysym, buf.ptr, buf.len);
+    // Keep the folded byte if the keysym has no Unicode form (0) or `buf` is too small (-1).
+    return if (sym_len > 0) sym_len - 1 else len;
 }
 
 pub fn currentMods(self: *Keyboard) vt.input.KeyMods {
@@ -912,4 +925,61 @@ test "translate and encode: plain, shifted, control" {
         try vt_input.encodeKey(&writer, event, .{});
         try std.testing.expectEqualStrings("\x1b[A", writer.buffered());
     }
+}
+
+test "translate and encode: ctrl punctuation and shifted ctrl" {
+    const vt_input = vt.input;
+    var kb = testKeyboard() catch return error.SkipZigTest;
+    defer kb.deinit();
+
+    var utf8_buf: [16]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+
+    // Left ctrl (evdev 29) is held for every case below.
+    _ = c.xkb_state_update_key(kb.state.?, 29 + 8, c.XKB_KEY_DOWN);
+    defer _ = c.xkb_state_update_key(kb.state.?, 29 + 8, c.XKB_KEY_UP);
+    _ = kb.translate(&utf8_buf, 29, .press).?;
+
+    // XKB folds all of these to a C0 or DEL byte; the encoder needs the character behind it.
+    const cases = [_]struct { evdev: u32, shift: bool, expected: []const u8 }{
+        .{ .evdev = 12, .shift = true, .expected = "\x1f" }, // ctrl+_ (readline undo)
+        .{ .evdev = 7, .shift = true, .expected = "\x1e" }, // ctrl+^
+        .{ .evdev = 53, .shift = false, .expected = "\x1f" }, // ctrl+/
+        .{ .evdev = 30, .shift = false, .expected = "\x01" }, // ctrl+a
+        .{ .evdev = 3, .shift = false, .expected = "\x00" }, // ctrl+2 folds to NUL
+        .{ .evdev = 57, .shift = false, .expected = "\x00" }, // ctrl+space folds to NUL
+        .{ .evdev = 9, .shift = false, .expected = "\x7f" }, // ctrl+8 folds to DEL
+        // Shifted letters, ctrl+@, ctrl+[, ctrl+i, and ctrl+m are CSI u.
+        .{ .evdev = 30, .shift = true, .expected = "\x1b[97;6u" },
+        .{ .evdev = 3, .shift = true, .expected = "\x1b[64;5u" },
+        .{ .evdev = 26, .shift = false, .expected = "\x1b[91;5u" },
+        .{ .evdev = 23, .shift = false, .expected = "\x1b[105;5u" },
+        .{ .evdev = 50, .shift = false, .expected = "\x1b[109;5u" },
+    };
+
+    for (cases) |case| {
+        if (case.shift) {
+            _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_DOWN);
+            _ = kb.translate(&utf8_buf, 42, .press).?;
+        }
+        defer if (case.shift) {
+            _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_UP);
+            _ = kb.translate(&utf8_buf, 42, .release).?;
+        };
+
+        const event = kb.translate(&utf8_buf, case.evdev, .press).?;
+        var writer: std.Io.Writer = .fixed(&out_buf);
+        try vt_input.encodeKey(&writer, event, .{});
+        try std.testing.expectEqualStrings(case.expected, writer.buffered());
+    }
+
+    // Caps lock (evdev 58) uppercases the keysym; the encoder still lowercases ctrl+A to a C0 byte.
+    _ = c.xkb_state_update_key(kb.state.?, 58 + 8, c.XKB_KEY_DOWN);
+    _ = c.xkb_state_update_key(kb.state.?, 58 + 8, c.XKB_KEY_UP);
+    const event = kb.translate(&utf8_buf, 30, .press).?;
+    try std.testing.expectEqualStrings("A", event.utf8);
+    try std.testing.expect(event.mods.caps_lock);
+    var writer: std.Io.Writer = .fixed(&out_buf);
+    try vt_input.encodeKey(&writer, event, .{});
+    try std.testing.expectEqualStrings("\x01", writer.buffered());
 }
