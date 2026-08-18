@@ -3990,6 +3990,12 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
         .repeat_info => |info| {
             self.repeat_rate = info.rate;
             self.repeat_delay = info.delay;
+            if (self.repeat_keycode) |keycode| {
+                if (repeatTimerSpec(info.rate, info.delay)) |_|
+                    self.armRepeat(keycode)
+                else
+                    self.cancelRepeat();
+            }
         },
         // Keys held across a focus change must not keep repeating.
         .leave => {
@@ -4112,20 +4118,39 @@ fn clearImeText(self: *App) void {
 /// Start (or move) key repeat to the given key: first fire after the
 /// configured delay, then at the configured rate.
 fn armRepeat(self: *App, evdev_keycode: u32) void {
-    if (self.repeat_rate <= 0 or self.repeat_delay <= 0) return;
+    const spec = repeatTimerSpec(self.repeat_rate, self.repeat_delay) orelse return;
     self.repeat_keycode = evdev_keycode;
-
-    const delay_ms: u64 = @intCast(self.repeat_delay);
-    const interval_ns: u64 = @divTrunc(std.time.ns_per_s, @as(u64, @intCast(self.repeat_rate)));
-    _ = setTimer(self.repeat_fd, .{
-        .it_value = timespecFromNs(delay_ms * std.time.ns_per_ms),
-        .it_interval = timespecFromNs(interval_ns),
-    }, "key repeat");
+    _ = setTimer(self.repeat_fd, spec, "key repeat");
 }
 
 fn cancelRepeat(self: *App) void {
     self.repeat_keycode = null;
     _ = setTimer(self.repeat_fd, disarmed_timer, "key repeat");
+}
+
+fn repeatTimerSpec(rate: i32, delay_ms: i32) ?std.os.linux.itimerspec {
+    if (rate <= 0 or delay_ms < 0) return null;
+    const interval_ns = @max(
+        1,
+        @divTrunc(std.time.ns_per_s, @as(u64, @intCast(rate))),
+    );
+    // A zero timerfd value disarms the timer, so represent Wayland's legal
+    // zero-millisecond delay with the shortest possible initial interval.
+    const delay_ns = @max(1, @as(u64, @intCast(delay_ms)) * std.time.ns_per_ms);
+    return .{
+        .it_value = timespecFromNs(delay_ns),
+        .it_interval = timespecFromNs(interval_ns),
+    };
+}
+
+test "key repeat timer accepts zero delay and disables zero rate" {
+    const immediate = repeatTimerSpec(25, 0).?;
+    try std.testing.expectEqual(@as(isize, 0), immediate.it_value.sec);
+    try std.testing.expectEqual(@as(isize, 1), immediate.it_value.nsec);
+    try std.testing.expectEqual(@as(isize, 40 * std.time.ns_per_ms), immediate.it_interval.nsec);
+
+    try std.testing.expectEqual(null, repeatTimerSpec(0, 500));
+    try std.testing.expectEqual(null, repeatTimerSpec(25, -1));
 }
 
 fn createTimerFd() !posix.fd_t {
