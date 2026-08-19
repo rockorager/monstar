@@ -123,12 +123,13 @@ fn kittyPlacementViewport(
     const vp_tl = pages.getTopLeft(.viewport);
     const vp_screen = pages.pointFromPin(.screen, vp_tl) orelse return null;
 
-    const pixel_size = kittyPlacementPixelSize(placement, image, cell_width, cell_height);
-    const grid_rows = std.math.divCeil(u32, pixel_size.height + placement.y_offset, cell_height) catch return null;
+    const pixel_size = kittyPlacementPixelSize(placement, image, cell_width, cell_height) orelse return null;
+    const placement_height = std.math.add(u32, pixel_size.height, placement.y_offset) catch return null;
+    const grid_rows = std.math.divCeil(u32, placement_height, cell_height) catch return null;
     const viewport_row: i32 = @as(i32, @intCast(pin_screen.screen.y)) -
         @as(i32, @intCast(vp_screen.screen.y));
     const viewport_col: i32 = @intCast(pin_screen.screen.x);
-    const visible = viewport_row + @as(i32, @intCast(grid_rows)) > 0 and
+    const visible = @as(i64, viewport_row) + grid_rows > 0 and
         viewport_row < @as(i32, @intCast(terminal.rows));
 
     const source_x = @min(placement.source_x, image.width);
@@ -215,7 +216,7 @@ fn kittyPlacementPixelSize(
     image: KittyImage,
     cell_width: u31,
     cell_height: u31,
-) struct { width: u32, height: u32 } {
+) ?struct { width: u32, height: u32 } {
     const source_width = if (placement.source_width > 0) placement.source_width else image.width;
     const source_height = if (placement.source_height > 0) placement.source_height else image.height;
 
@@ -225,23 +226,28 @@ fn kittyPlacementPixelSize(
     };
 
     if (placement.columns > 0 and placement.rows > 0) return .{
-        .width = placement.columns * cell_width,
-        .height = placement.rows * cell_height,
+        .width = std.math.mul(u32, placement.columns, cell_width) catch return null,
+        .height = std.math.mul(u32, placement.rows, cell_height) catch return null,
     };
 
+    if (source_width == 0 or source_height == 0) return null;
     const width_f64: f64 = @floatFromInt(source_width);
     const height_f64: f64 = @floatFromInt(source_height);
     if (placement.columns > 0) {
-        const width = placement.columns * cell_width;
+        const width = std.math.mul(u32, placement.columns, cell_width) catch return null;
+        const height = @round(@as(f64, @floatFromInt(width)) * height_f64 / width_f64);
+        if (height > std.math.maxInt(u32)) return null;
         return .{
             .width = width,
-            .height = @intFromFloat(@round(@as(f64, @floatFromInt(width)) * height_f64 / width_f64)),
+            .height = @intFromFloat(height),
         };
     }
 
-    const height = placement.rows * cell_height;
+    const height = std.math.mul(u32, placement.rows, cell_height) catch return null;
+    const width = @round(@as(f64, @floatFromInt(height)) * width_f64 / height_f64);
+    if (width > std.math.maxInt(u32)) return null;
     return .{
-        .width = @intFromFloat(@round(@as(f64, @floatFromInt(height)) * width_f64 / height_f64)),
+        .width = @intFromFloat(width),
         .height = height,
     };
 }
@@ -413,4 +419,21 @@ test "cullOccludedKittyItems drops placements under later opaque covers" {
         makeItem(10, 0, .rgb, 2, 1, 30, 40),
     };
     try std.testing.expect(!keepOnlyFinalKittyCover(&tied, cell_w, cell_h));
+}
+
+test "kitty placement dimensions reject unrepresentable geometry" {
+    const image: KittyImage = .{ .width = 1, .height = 1 };
+
+    try std.testing.expectEqual(null, kittyPlacementPixelSize(
+        .{ .location = .virtual, .columns = std.math.maxInt(u32), .rows = 1 },
+        image,
+        10,
+        20,
+    ));
+    try std.testing.expectEqual(null, kittyPlacementPixelSize(
+        .{ .location = .virtual, .columns = 1, .rows = std.math.maxInt(u32) },
+        image,
+        10,
+        20,
+    ));
 }
