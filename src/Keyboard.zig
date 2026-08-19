@@ -683,14 +683,14 @@ fn testKeyboardWithOptions(options: [*:0]const u8) !Keyboard {
     return kb;
 }
 
-fn testKeyboardWithLayout(layout: [*:0]const u8) !Keyboard {
+fn testKeyboardWithLayout(layout: [*:0]const u8, variant: ?[*:0]const u8) !Keyboard {
     var kb: Keyboard = try .init();
     errdefer kb.deinit();
     const names: c.xkb_rule_names = .{
         .rules = null,
         .model = null,
         .layout = layout,
-        .variant = null,
+        .variant = variant,
         .options = null,
     };
     const keymap = c.xkb_keymap_new_from_names(kb.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse
@@ -704,6 +704,17 @@ test "xkb remaps functional keys but preserves physical writing keys" {
     try std.testing.expectEqual(vt.input.Key.key_a, remapKey(.key_a, c.XKB_KEY_c));
     try std.testing.expectEqual(vt.input.Key.copy, remapKey(.unidentified, c.XKB_KEY_XF86Copy));
     try std.testing.expectEqual(vt.input.Key.browser_back, remapKey(.unidentified, c.XKB_KEY_XF86Back));
+}
+
+test "Dvorak writing key exposes its logical shortcut codepoint" {
+    var kb = testKeyboardWithLayout("us", "dvorak") catch return error.SkipZigTest;
+    defer kb.deinit();
+
+    var utf8_buf: [16]u8 = undefined;
+    // The physical QWERTY I key produces C under Dvorak.
+    const event = kb.translate(&utf8_buf, 23, .press).?;
+    try std.testing.expectEqual(vt.input.Key.key_i, event.key);
+    try std.testing.expectEqual(@as(u21, 'c'), event.unshifted_codepoint);
 }
 
 test "translate and encode: caps lock remapped to escape" {
@@ -775,7 +786,7 @@ test "Kitty protocol-only keysyms retain their functional code" {
 }
 
 test "translate and encode: Spanish Unicode and dead-key composition" {
-    var kb = testKeyboardWithLayout("es") catch return error.SkipZigTest;
+    var kb = testKeyboardWithLayout("es", null) catch return error.SkipZigTest;
     defer kb.deinit();
 
     var utf8_buf: [16]u8 = undefined;

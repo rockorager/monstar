@@ -4430,11 +4430,11 @@ fn truncateLastUtf8(text: *std.ArrayList(u8)) bool {
 fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
     if (event.action == .release) return;
     if (event.mods.ctrl) {
-        switch (event.key) {
-            .key_n => self.selectSearch(.prev),
-            .key_p => self.selectSearch(.next),
-            .key_c, .key_g => self.finishSearch(false),
-            .key_u => {
+        switch (event.unshifted_codepoint) {
+            'n' => self.selectSearch(.prev),
+            'p' => self.selectSearch(.next),
+            'c', 'g' => self.finishSearch(false),
+            'u' => {
                 const search = if (self.search) |*value| value else return;
                 if (search.query.items.len == 0) return;
                 search.query.clearRetainingCapacity();
@@ -4504,25 +4504,25 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 
     // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
     if (action == .press and event.mods.ctrl) {
-        switch (event.key) {
-            .equal => return self.adjustRuntimeFontSize(1),
-            .minus => if (!event.mods.shift) return self.adjustRuntimeFontSize(-1),
-            .digit_0 => if (!event.mods.shift) return self.resetRuntimeFontSize(),
+        switch (event.unshifted_codepoint) {
+            '=' => return self.adjustRuntimeFontSize(1),
+            '-' => if (!event.mods.shift) return self.adjustRuntimeFontSize(-1),
+            '0' => if (!event.mods.shift) return self.resetRuntimeFontSize(),
             else => {},
         }
     }
 
     // Copy/paste bindings take priority over the application.
     if (action == .press and event.mods.ctrl and event.mods.shift) {
-        switch (event.key) {
-            .key_c => return self.copyToClipboard(),
-            .key_f => return self.startSearch(),
-            .key_g => return self.pipeCommandOutput(),
-            .key_n => return self.spawnNewWindow(),
-            .key_v => return self.beginPaste(.clipboard),
-            .key_x => return self.jumpPrompt(1),
-            .key_z => return self.jumpPrompt(-1),
-            .comma => return self.reloadConfig(),
+        switch (event.unshifted_codepoint) {
+            'c' => return self.copyToClipboard(),
+            'f' => return self.startSearch(),
+            'g' => return self.pipeCommandOutput(),
+            'n' => return self.spawnNewWindow(),
+            'v' => return self.beginPaste(.clipboard),
+            'x' => return self.jumpPrompt(1),
+            'z' => return self.jumpPrompt(-1),
+            ',' => return self.reloadConfig(),
             else => {},
         }
     }

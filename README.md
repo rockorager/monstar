@@ -151,6 +151,8 @@ settings apply to new windows.
 | `Ctrl` + right click | Copy a hyperlink or detected URI |
 | `Ctrl` + drag | Make a rectangular selection |
 
+Writing-key shortcuts follow the active XKB keyboard layout.
+
 Scrollback search updates as you type. Press `Ctrl+N` and `Ctrl+P` to move
 between matches. Press `Enter` to copy a match to the primary selection. Press
 `Escape` to restore the previous viewport.
