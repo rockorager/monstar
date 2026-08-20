@@ -42,6 +42,8 @@ const DbusHandle = if (build_options.enable_dbus) ?DbusConnection else void;
 const no_dbus: DbusHandle = if (build_options.enable_dbus) null else {};
 const clipboard_format = @import("clipboard_format.zig");
 const Window = @import("Window.zig");
+const Coprocess = @import("Coprocess.zig");
+const Snapshot = @import("Snapshot.zig");
 
 const log = std.log.scoped(.app);
 
@@ -105,6 +107,10 @@ pty: Pty,
 /// consumes parsed batches via its ready_fd in the poll set.
 pipeline: ReadPipeline,
 child_pid: posix.pid_t,
+attach_coprocess: ?Coprocess = null,
+share_coprocess: ?Coprocess = null,
+share_command: ?[]const u8 = null,
+is_attach_mode: bool = false,
 font: Font,
 /// The physical pixel size the font is currently loaded at.
 font_size_px: u31,
@@ -301,6 +307,8 @@ pub const InitOptions = struct {
     title: [:0]const u8 = "monstar",
     initial_size: InitialSize = .default,
     hold: bool = false,
+    attach_command: ?[:0]const u8 = null,
+    share_command: ?[:0]const u8 = null,
 };
 
 const StartupSize = struct {
@@ -458,48 +466,6 @@ pub fn init(
 
     vt.sys.decode_png = decodePng;
 
-    const startup_size = initialTerminalSize(options.initial_size, &font, config);
-    const startup_padding = physicalPadding(config, 120);
-    const startup_layout = TerminalLayout.init(
-        dimensionForCells(startup_size.cols, font.cell_width, startup_padding.left, startup_padding.right),
-        dimensionForCells(startup_size.rows, font.cell_height, startup_padding.top, startup_padding.bottom),
-        font.cell_width,
-        font.cell_height,
-        startup_padding,
-    );
-
-    var term: vt.Terminal = try .init(io, alloc, .{
-        .cols = startup_size.cols,
-        .rows = startup_size.rows,
-        .max_scrollback_bytes = config.scrollback_limit,
-        .colors = config.terminalColors(.dark),
-        .default_modes = .{ .grapheme_cluster = true },
-        // libghostty-vt defaults to a conservative 10MB, which rejects a
-        // single fullscreen image on large displays (a 4K RGBA frame is
-        // ~32MB). Default matches the Ghostty app (320MB).
-        .kitty_image_storage_limit = config.image_storage_limit,
-        // Accept every kitty transmission medium, matching the Ghostty
-        // app. t=s shared memory matters most for throughput: senders
-        // like `mpv --vo=kitty --vo-kitty-use-shm=yes` move pixels
-        // through POSIX shm instead of base64 escape data, which is
-        // orders of magnitude cheaper to parse. t=t temporary files are
-        // only read (and then deleted) from inside the temp dir.
-        .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
-    });
-    errdefer term.deinit(alloc);
-    try term.resize(alloc, .{
-        .cols = startup_size.cols,
-        .rows = startup_size.rows,
-        .cell_size_px = .{
-            .width = font.cell_width,
-            .height = font.cell_height,
-        },
-    });
-
-    // Child-exit detection is driven by SIGCHLD, not pty EOF; config
-    // reloads are driven by SIGUSR1. Block both and receive them through
-    // signalfd in the poll loop. This must happen before the fork so an
-    // early child exit cannot be missed.
     var sigmask = posix.sigemptyset();
     posix.sigaddset(&sigmask, .CHLD);
     posix.sigaddset(&sigmask, .USR1);
@@ -511,11 +477,6 @@ pub fn init(
     ) catch return error.SignalFdFailed;
     errdefer _ = std.os.linux.close(signal_fd);
 
-    // Connect to dbus before the fork so the child can be moved into
-    // its own systemd scope before it execs. Filter and fd wiring happen
-    // in initDbus once the App has a stable address. With -Ddbus=false,
-    // dbus_connection is always the sole `void` value and every dependent
-    // feature below (notifications, portals, cgroup isolation) is inert.
     var dbus_connection: DbusHandle = if (build_options.enable_dbus) connection: {
         break :connection DbusConnection.connectSession(io, alloc, environ) catch |err| {
             log.warn("session dbus unavailable; desktop integration disabled: {}", .{err});
@@ -526,51 +487,174 @@ pub fn init(
         if (dbus_connection) |*connection| connection.deinit();
     };
 
-    var pty: Pty = try .open(.{
-        .row = startup_size.rows,
-        .col = startup_size.cols,
-        .xpixel = @intCast(startup_size.cols * font.cell_width),
-        .ypixel = @intCast(startup_size.rows * font.cell_height),
-    });
-    errdefer pty.deinit();
+    var attach_coproc: ?Coprocess = null;
+    var initial_continuation: ?Snapshot.Continuation = null;
+    var term: vt.Terminal = undefined;
+    var startup_layout: TerminalLayout = undefined;
+    var window: *Window = undefined;
+    var pty: Pty = undefined;
+    var child_pid: posix.pid_t = 0;
+    var pipeline_read_fd: posix.fd_t = undefined;
 
-    // When enabled, move the child into its own transient systemd scope
-    // before it can exec. The gate holds the child so grandchildren cannot
-    // escape the scope; on failure, releasing the gate lets it proceed
-    // un-isolated. Only the request is sent here: systemd's reply and the
-    // pid migration land while we set up the window, and the gate is
-    // released once both are confirmed below. Always false with
-    // -Ddbus=false, since scope creation is a systemd1 D-Bus call.
-    const use_cgroup_scope = if (build_options.enable_dbus)
-        config.linux_cgroup == .always and dbus_connection != null and cgroup.systemdBooted()
-    else
-        false;
-    const child_pid = try pty.spawn(path, argv, envp, .{
-        .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
-        .gate_child = use_cgroup_scope,
-    });
-    var pending_scope: ?cgroup.Pending = null;
-    if (build_options.enable_dbus) {
-        if (use_cgroup_scope) {
-            pending_scope = cgroup.startMoveIntoScope(&dbus_connection.?, @intCast(child_pid)) catch blk: {
+    if (options.attach_command) |attach_cmd| {
+        var coproc = try Coprocess.spawn(io, attach_cmd);
+        errdefer coproc.deinit();
+
+        _ = coproc.writeNonblocking("\x1b_Gsnap=req\x1b\\");
+
+        setBlocking(coproc.stdout_fd);
+        var read_buf: [4096]u8 = undefined;
+        var file_reader: std.Io.File.Reader = .initStreaming(
+            .{ .handle = coproc.stdout_fd, .flags = .{ .nonblocking = false } },
+            io,
+            &read_buf,
+        );
+        const import_opt: ?Snapshot.ImportResult = Snapshot.startImport(alloc, io, &file_reader.interface, 1024 * 1024) catch |err| switch (err) {
+            error.InvalidMagic, error.UnsupportedVersion, error.EndOfStream => null,
+            else => return err,
+        };
+        setNonblocking(coproc.stdout_fd);
+
+        if (import_opt) |import_res| {
+            var mut_res = import_res;
+            term = mut_res.terminal;
+            initial_continuation = mut_res.continuation;
+
+            while (try Snapshot.pumpHistory(alloc, &mut_res.decoder, &term)) {}
+
+            const startup_padding = physicalPadding(config, 120);
+            startup_layout = TerminalLayout.init(
+                dimensionForCells(term.cols, font.cell_width, startup_padding.left, startup_padding.right),
+                dimensionForCells(term.rows, font.cell_height, startup_padding.top, startup_padding.bottom),
+                font.cell_width,
+                font.cell_height,
+                startup_padding,
+            );
+        } else {
+            const startup_size = initialTerminalSize(options.initial_size, &font, config);
+            const startup_padding = physicalPadding(config, 120);
+            startup_layout = TerminalLayout.init(
+                dimensionForCells(startup_size.cols, font.cell_width, startup_padding.left, startup_padding.right),
+                dimensionForCells(startup_size.rows, font.cell_height, startup_padding.top, startup_padding.bottom),
+                font.cell_width,
+                font.cell_height,
+                startup_padding,
+            );
+
+            term = try .init(io, alloc, .{
+                .cols = startup_size.cols,
+                .rows = startup_size.rows,
+                .max_scrollback_bytes = config.scrollback_limit,
+                .colors = config.terminalColors(.dark),
+                .default_modes = .{ .grapheme_cluster = true },
+                .kitty_image_storage_limit = config.image_storage_limit,
+                .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
+            });
+            errdefer term.deinit(alloc);
+            try term.resize(alloc, .{
+                .cols = startup_size.cols,
+                .rows = startup_size.rows,
+                .cell_size_px = .{
+                    .width = font.cell_width,
+                    .height = font.cell_height,
+                },
+            });
+        }
+
+        window = try Window.create(alloc, config.app_id, options.title, .{
+            .width = startup_layout.surface_width,
+            .height = startup_layout.surface_height,
+        });
+        pty = .{ .master = -1, .slave = -1, .gate = -1 };
+        pipeline_read_fd = coproc.stdout_fd;
+        attach_coproc = coproc;
+    } else {
+        const startup_size = initialTerminalSize(options.initial_size, &font, config);
+        const startup_padding = physicalPadding(config, 120);
+        startup_layout = TerminalLayout.init(
+            dimensionForCells(startup_size.cols, font.cell_width, startup_padding.left, startup_padding.right),
+            dimensionForCells(startup_size.rows, font.cell_height, startup_padding.top, startup_padding.bottom),
+            font.cell_width,
+            font.cell_height,
+            startup_padding,
+        );
+
+        term = try .init(io, alloc, .{
+            .cols = startup_size.cols,
+            .rows = startup_size.rows,
+            .max_scrollback_bytes = config.scrollback_limit,
+            .colors = config.terminalColors(.dark),
+            .default_modes = .{ .grapheme_cluster = true },
+            .kitty_image_storage_limit = config.image_storage_limit,
+            .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
+        });
+        errdefer term.deinit(alloc);
+        try term.resize(alloc, .{
+            .cols = startup_size.cols,
+            .rows = startup_size.rows,
+            .cell_size_px = .{
+                .width = font.cell_width,
+                .height = font.cell_height,
+            },
+        });
+
+        pty = try .open(.{
+            .row = startup_size.rows,
+            .col = startup_size.cols,
+            .xpixel = @intCast(startup_size.cols * font.cell_width),
+            .ypixel = @intCast(startup_size.rows * font.cell_height),
+        });
+        errdefer pty.deinit();
+
+        const use_cgroup_scope = if (build_options.enable_dbus)
+            config.linux_cgroup == .always and dbus_connection != null and cgroup.systemdBooted()
+        else
+            false;
+        child_pid = try pty.spawn(path, argv, envp, .{
+            .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
+            .gate_child = use_cgroup_scope,
+        });
+        var pending_scope: ?cgroup.Pending = null;
+        if (build_options.enable_dbus) {
+            if (use_cgroup_scope) {
+                pending_scope = cgroup.startMoveIntoScope(&dbus_connection.?, @intCast(child_pid)) catch blk: {
+                    log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+                    break :blk null;
+                };
+            }
+        }
+        errdefer if (pending_scope) |pending| pending.cancel();
+        if (pending_scope == null) pty.releaseChild();
+
+        setNonblocking(pty.master);
+        pipeline_read_fd = pty.master;
+
+        window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
+
+        if (pending_scope) |pending| {
+            pending.finish() catch {
                 log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
-                break :blk null;
             };
+            pty.releaseChild();
         }
     }
-    // On error paths the errdefer'd pty.deinit releases the gate.
-    errdefer if (pending_scope) |pending| pending.cancel();
-    if (pending_scope == null) pty.releaseChild();
-
-    // Nonblocking master: a blocking write can deadlock the whole loop
-    // when the child floods output (echoed responses need output-queue
-    // space) while we respond to queries embedded in that output.
-    setNonblocking(pty.master);
-
-    const window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
     errdefer window.destroy();
     window.setBufferAlpha(config.background_opacity < 255);
     window.setBackgroundBlur(config.background_blur and config.background_opacity < 255);
+
+    var share_coproc: ?Coprocess = null;
+    if (options.share_command) |share_cmd| {
+        var coproc = try Coprocess.spawn(io, share_cmd);
+        errdefer coproc.deinit();
+
+        var snapshot_buf: std.Io.Writer.Allocating = .init(alloc);
+        defer snapshot_buf.deinit();
+        Snapshot.exportSnapshot(alloc, &snapshot_buf.writer, &term, .{}) catch |err| {
+            log.warn("failed to export initial share snapshot: {}", .{err});
+        };
+        _ = coproc.writeNonblocking(snapshot_buf.written());
+        share_coproc = coproc;
+    }
 
     // Timerfds must be nonblocking: disarming a timerfd clears its
     // pending expirations, so a reader acting on stale poll revents
@@ -600,17 +684,6 @@ pub fn init(
     const scrollbar_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(scrollbar_fd);
 
-    // Scope confirmation ran concurrently with the window setup above,
-    // so this rarely waits; the child stays gated until its migration
-    // is confirmed (or abandoned).
-    if (pending_scope) |pending| {
-        pending_scope = null;
-        pending.finish() catch {
-            log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
-        };
-        pty.releaseChild();
-    }
-
     // Self-reference into listeners/streams requires a stable address.
     const self = try alloc.create(App);
     errdefer alloc.destroy(self);
@@ -636,8 +709,12 @@ pub fn init(
         .geometry_redraw = false,
         .frame_damage = .init(alloc),
         .pty = pty,
-        .pipeline = try .init(pty.master),
+        .pipeline = try .init(pipeline_read_fd),
         .child_pid = child_pid,
+        .attach_coprocess = attach_coproc,
+        .share_coprocess = share_coproc,
+        .share_command = options.share_command,
+        .is_attach_mode = attach_coproc != null,
         .font = font,
         .font_size_px = font_size_px,
         .runtime_font_size = null,
@@ -726,6 +803,17 @@ pub fn init(
             .terminal_handler = .init(&self.term),
         },
     });
+
+    if (initial_continuation) |cont| {
+        switch (cont) {
+            .ground => {},
+            .bytes => |b| self.stream.nextSlice(b),
+        }
+        switch (cont) {
+            .ground => {},
+            .bytes => |bytes| alloc.free(bytes),
+        }
+    }
 
     // Handle sequences that need responses or side effects.
     var effects: Effects = .readonly;
@@ -1342,6 +1430,14 @@ fn setNonblocking(fd: posix.fd_t) void {
     _ = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
 }
 
+fn setBlocking(fd: posix.fd_t) void {
+    const linux = std.os.linux;
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return;
+    _ = linux.fcntl(fd, linux.F.SETFL, flags & ~nonblock);
+}
+
 pub fn deinit(self: *App) void {
     self.hangupChild();
     self.pipeline.deinit();
@@ -1411,6 +1507,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.fling_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.search_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1427,10 +1524,12 @@ pub fn run(self: *App) !void {
     const fling_fd = &fds[12];
     const search_fd = &fds[13];
     const scrollbar_fd = &fds[14];
+    const share_in_fd = &fds[15];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
+        share_in_fd.fd = if (self.share_coprocess) |s| s.stdout_fd else -1;
         async_fd.fd = if (self.async_raster_loader) |*loader|
             loader.complete_fd
         else if (self.async_raster) |*async_raster|
@@ -1469,9 +1568,12 @@ pub fn run(self: *App) !void {
             },
         }
 
-        // Only poll the master while a write backlog exists, otherwise
+        // Only poll the master/coprocess while a write backlog exists, otherwise
         // POLLOUT would make every poll return immediately.
-        pty_write_fd.fd = if (self.write_queue.items.len > 0) self.pty.master else -1;
+        pty_write_fd.fd = if (self.write_queue.items.len > 0)
+            (if (self.is_attach_mode) (if (self.attach_coprocess) |a| a.stdin_fd else -1) else self.pty.master)
+        else
+            -1;
         paste_fd.fd = self.clipboard.transferFd();
 
         const ready = posix.poll(&fds, -1) catch {
@@ -1498,6 +1600,29 @@ pub fn run(self: *App) !void {
         }
         if (pipeline_fd.revents & posix.POLL.IN != 0) {
             try self.drainPipeline();
+        }
+
+        if (share_in_fd.fd >= 0 and (share_in_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0)) {
+            var share_in_buf: [4096]u8 = undefined;
+            const n = posix.read(share_in_fd.fd, &share_in_buf) catch 0;
+            if (n > 0) {
+                const input = share_in_buf[0..n];
+                if (std.mem.indexOf(u8, input, "\x1b_Gsnap=req\x1b\\")) |_| {
+                    if (self.share_coprocess) |*share| {
+                        var snap_buf: std.Io.Writer.Allocating = .init(self.alloc);
+                        defer snap_buf.deinit();
+                        if (Snapshot.exportSnapshot(self.alloc, &snap_buf.writer, &self.term, .{})) |_| {
+                            _ = share.writeNonblocking(snap_buf.written());
+                        } else |err| {
+                            log.warn("failed to export dynamic snapshot: {}", .{err});
+                        }
+                    }
+                } else {
+                    self.writePty(input);
+                }
+            } else {
+                self.respawnShareCoprocess();
+            }
         }
 
         if (repeat_fd.revents & posix.POLL.IN != 0) {
@@ -1570,7 +1695,15 @@ fn hangupChild(self: *App) void {
     // The gather thread must be joined before the master can be closed;
     // stop() is idempotent and deinit covers the child-exited path.
     self.pipeline.stop();
-    if (self.child_exited) {
+    if (self.attach_coprocess) |*attach| {
+        attach.deinit();
+        self.attach_coprocess = null;
+    }
+    if (self.share_coprocess) |*share| {
+        share.deinit();
+        self.share_coprocess = null;
+    }
+    if (self.child_exited or self.is_attach_mode) {
         return;
     }
     self.pty.closeMaster();
@@ -1594,10 +1727,16 @@ fn drainSignals(self: *App) !void {
     }
     if (saw_sigusr1) self.reloadConfig();
     if (saw_sigchld) {
-        if (try Pty.tryWait(self.child_pid)) |status| {
-            log.debug("child exited with status {d}", .{status});
-            self.child_exited = true;
-            try self.finishChildOutput();
+        const pid_to_wait = if (self.is_attach_mode)
+            (if (self.attach_coprocess) |attach| attach.child_id else null)
+        else
+            self.child_pid;
+        if (pid_to_wait) |pid| {
+            if (try Pty.tryWait(pid)) |status| {
+                log.debug("child exited with status {d}", .{status});
+                self.child_exited = true;
+                try self.finishChildOutput();
+            }
         }
     }
 }
@@ -1608,10 +1747,16 @@ fn drainSignals(self: *App) !void {
 fn finishChildOutput(self: *App) !void {
     self.pipeline.stop();
     try self.drainPipeline();
-    const consumed = try drainPtyTail(self.pty.master, &self.stream);
-    if (consumed) {
-        self.needs_redraw = true;
-        self.syncPtyOutput(true);
+    const read_fd = if (self.is_attach_mode)
+        (if (self.attach_coprocess) |attach| attach.stdout_fd else -1)
+    else
+        self.pty.master;
+    if (read_fd >= 0) {
+        const consumed = try drainPtyTail(read_fd, &self.stream);
+        if (consumed) {
+            self.needs_redraw = true;
+            self.syncPtyOutput(true);
+        }
     }
 }
 
@@ -1989,9 +2134,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.window.toplevel.setAppId(new_config.app_id);
 
     if (new_config.image_storage_limit != self.config.image_storage_limit) {
-        self.term.setKittyGraphicsSizeLimit(self.alloc, new_config.image_storage_limit) catch |err| {
-            log.warn("kitty image storage limit change failed: {}", .{err});
-        };
+        self.term.setKittyGraphicsSizeLimit(self.alloc, new_config.image_storage_limit);
     }
 
     // Always rebuild the Font on config reload so a reload also picks up
@@ -2103,6 +2246,25 @@ fn resetRuntimeFontSize(self: *App) void {
     self.setRuntimeFontSize(null);
 }
 
+fn respawnShareCoprocess(self: *App) void {
+    const share_cmd = self.share_command orelse return;
+    if (self.share_coprocess) |*share| {
+        share.deinit();
+        self.share_coprocess = null;
+    }
+    var coproc = Coprocess.spawn(self.io, share_cmd) catch |err| {
+        log.warn("failed to respawn share coprocess: {}", .{err});
+        return;
+    };
+    var snapshot_buf: std.Io.Writer.Allocating = .init(self.alloc);
+    defer snapshot_buf.deinit();
+    Snapshot.exportSnapshot(self.alloc, &snapshot_buf.writer, &self.term, .{}) catch |err| {
+        log.warn("failed to export share snapshot on respawn: {}", .{err});
+    };
+    _ = coproc.writeNonblocking(snapshot_buf.written());
+    self.share_coprocess = coproc;
+}
+
 /// Feed pipeline batches of PTY output into the terminal. Bounded to
 /// one ring's worth so a flooding child cannot starve the Wayland side
 /// of the loop; rearm() keeps the eventfd hot while batches remain.
@@ -2114,13 +2276,25 @@ fn drainPipeline(self: *App) !void {
     var consumed = false;
     for (0..ReadPipeline.buffer_count) |_| {
         const batch = self.pipeline.take() orelse break;
+        if (self.share_coprocess) |*share| {
+            const written = share.writeNonblocking(batch);
+            if (written == 0 and batch.len > 0) {
+                self.respawnShareCoprocess();
+            }
+        }
         self.stream.nextSlice(batch);
         self.pipeline.release();
         consumed = true;
         self.needs_redraw = true;
     }
     self.pipeline.rearm();
-    if (self.pipeline.hasFailed()) return error.PtyReadFailed;
+    if (self.pipeline.hasFailed()) {
+        if (self.is_attach_mode) {
+            self.child_exited = true;
+            return;
+        }
+        return error.PtyReadFailed;
+    }
     self.syncPtyOutput(consumed);
 }
 
@@ -4580,6 +4754,12 @@ fn flushWriteQueue(self: *App) void {
 /// Write as much as the kernel accepts; returns the number of bytes
 /// consumed. Never blocks.
 fn tryPtyWrite(self: *App, bytes: []const u8) usize {
+    if (self.is_attach_mode) {
+        if (self.attach_coprocess) |*attach| {
+            return attach.writeNonblocking(bytes);
+        }
+        return bytes.len;
+    }
     const linux = std.os.linux;
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -5293,12 +5473,14 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
         });
         if (cells_changed) self.refreshSearch();
     }
-    try self.pty.setWinsize(.{
-        .row = rows,
-        .col = cols,
-        .xpixel = @intCast(grid_width_px),
-        .ypixel = @intCast(grid_height_px),
-    });
+    if (!self.is_attach_mode) {
+        try self.pty.setWinsize(.{
+            .row = rows,
+            .col = cols,
+            .xpixel = @intCast(grid_width_px),
+            .ypixel = @intCast(grid_height_px),
+        });
+    }
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
     self.geometry_redraw = true;
     self.needs_redraw = true;
