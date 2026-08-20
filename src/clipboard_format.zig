@@ -58,7 +58,7 @@ pub fn osc7Path(arena: std.mem.Allocator, url: []const u8) std.mem.Allocator.Err
     }
 
     const path = try uri.path.toRawMaybeAlloc(arena);
-    if (path.len == 0 or path[0] != '/') return null;
+    if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null) return null;
     return try arena.dupeZ(u8, path);
 }
 
@@ -137,6 +137,7 @@ test "osc7Path decodes local file URIs" {
     try std.testing.expectEqual(null, try osc7Path(arena, "https://example.com/x"));
     try std.testing.expectEqual(null, try osc7Path(arena, "not a uri"));
     try std.testing.expectEqual(null, try osc7Path(arena, "file://"));
+    try std.testing.expectEqual(null, try osc7Path(arena, "file:///tmp%00/other"));
 }
 
 test "formatLinkCopy reduces local file URIs and preserves other links" {
