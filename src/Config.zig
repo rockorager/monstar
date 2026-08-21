@@ -62,7 +62,7 @@ pub const FontSize = union(enum) {
 
 /// Wayland app-id and desktop-entry hint for desktop integration.
 app_id: [:0]const u8 = default_app_id,
-font_family: [:0]const u8 = "monospace",
+font_family: [:0]const u8 = "Monstar",
 /// Bare and `pt` values are typographic points; `px` values are logical
 /// pixels. Both apply the output's fractional scale during rasterization.
 font_size: FontSize = .{ .points = 12 },
@@ -468,7 +468,7 @@ fn readFile(arena: std.mem.Allocator, path: [:0]const u8) ?[]const u8 {
 test "defaults" {
     const config: Config = .{};
     try std.testing.expectEqualStrings(default_app_id, config.app_id);
-    try std.testing.expectEqualStrings("monospace", config.font_family);
+    try std.testing.expectEqualStrings("Monstar", config.font_family);
     try std.testing.expectEqual(FontSize{ .points = 12 }, config.font_size);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
