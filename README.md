@@ -300,3 +300,12 @@ zig build
 zig build fmt
 zig build test
 ```
+
+To smoke-test Kitty graphics animation in a running Monstar window:
+
+```sh
+python3 scripts/kitty-animation.py
+```
+
+The checkerboard image should change colors four times per second for eight
+seconds, including while no terminal output or input occurs.

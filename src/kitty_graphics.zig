@@ -30,9 +30,10 @@ pub const KittyRenderItem = struct {
     image_id: u32,
     placement_id: u32,
     z: i32,
-    /// Value copy of the storage's image record. `data` points into
-    /// the terminal's storage after collection; async callers must
-    /// repoint it at a pinned copy before handing items to the worker.
+    /// Value copy of the storage's image record. `data` is the current
+    /// frame and points into terminal storage after collection; async
+    /// callers must repoint it at a pinned copy before handing items to
+    /// the worker. The terminal-owned `animation` pointer is cleared.
     image: KittyImage,
     viewport: KittyPlacementViewport,
 };
@@ -53,11 +54,13 @@ pub fn collectKittyPlacements(
 
     var it = storage.placements.iterator();
     while (it.next()) |entry| {
-        const image = storage.imageById(entry.key_ptr.image_id) orelse continue;
+        var image = storage.imageById(entry.key_ptr.image_id) orelse continue;
+        image.data = image.renderData();
+        image.animation = null;
         if (image.data.bytes() == null) continue;
         switch (entry.value_ptr.location) {
             .pin => {},
-            .virtual => continue,
+            .virtual, .relative => continue,
         }
         const viewport = kittyPlacementViewport(terminal, entry.value_ptr.*, image, font.cell_width, font.cell_height) orelse continue;
         if (!viewport.visible) continue;
@@ -115,7 +118,7 @@ fn kittyPlacementViewport(
 ) ?KittyPlacementViewport {
     const pin = switch (placement.location) {
         .pin => |pin| pin,
-        .virtual => return null,
+        .virtual, .relative => return null,
     };
 
     const pages = &terminal.screens.active.pages;
@@ -166,7 +169,9 @@ fn collectKittyVirtualPlacements(
 
     var it = vt.kitty.graphics.unicode.placementIterator(top, bot);
     while (it.next()) |virtual_placement| {
-        const image = storage.imageById(virtual_placement.image_id) orelse continue;
+        var image = storage.imageById(virtual_placement.image_id) orelse continue;
+        image.data = image.renderData();
+        image.animation = null;
         if (image.data.bytes() == null) continue;
         const render_placement = virtual_placement.renderPlacement(
             storage,

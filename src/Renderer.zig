@@ -2405,6 +2405,33 @@ test "render kitty image placement" {
     try std.testing.expectEqual(@as(usize, 0), pending_items.len);
 }
 
+test "kitty placement collection uses the current animation frame" {
+    const alloc = std.testing.allocator;
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer term.deinit(alloc);
+    term.width_px = term.cols * font.cell_width;
+    term.height_px = term.rows * font.cell_height;
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b_Ga=T,t=d,f=24,i=1,s=1,v=1,c=1,r=1;/wAA\x1b\\");
+    stream.nextSlice("\x1b_Ga=f,t=d,f=24,i=1,s=1,v=1,z=40;AAD/\x1b\\");
+    stream.nextSlice("\x1b_Ga=a,i=1,r=1,z=40,s=3\x1b\\");
+
+    const storage = &term.screens.active.kitty_images;
+    try std.testing.expectEqual(@as(?u64, 40), storage.animationTick(std.testing.io, 0));
+    try std.testing.expectEqual(@as(?u64, 40), storage.animationTick(std.testing.io, 40));
+
+    const items = try collectKittyPlacements(&font, alloc, &term);
+    defer alloc.free(items);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, items[0].image.data.bytes().?);
+}
+
 test "render kitty unicode placeholder placement" {
     const alloc = std.testing.allocator;
 

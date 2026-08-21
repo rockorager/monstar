@@ -188,6 +188,8 @@ taskbar_progress_fd: posix.fd_t,
 search_fd: posix.fd_t,
 /// One-shot visibility delay followed by periodic scrollbar fade ticks.
 scrollbar_fd: posix.fd_t,
+/// One-shot wake for the next libghostty Kitty animation frame.
+kitty_animation_fd: posix.fd_t,
 scrollbar_alpha: u8,
 scrollbar_fading: bool,
 scrollbar_fade_elapsed_ms: u16,
@@ -600,6 +602,9 @@ pub fn init(
     const scrollbar_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(scrollbar_fd);
 
+    const kitty_animation_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(kitty_animation_fd);
+
     // Scope confirmation ran concurrently with the window setup above,
     // so this rarely waits; the child stays gated until its migration
     // is confirmed (or abandoned).
@@ -686,6 +691,7 @@ pub fn init(
         .taskbar_progress_fd = taskbar_progress_fd,
         .search_fd = search_fd,
         .scrollbar_fd = scrollbar_fd,
+        .kitty_animation_fd = kitty_animation_fd,
         .scrollbar_alpha = 0,
         .scrollbar_fading = false,
         .scrollbar_fade_elapsed_ms = 0,
@@ -1361,6 +1367,7 @@ pub fn deinit(self: *App) void {
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
+    _ = std.os.linux.close(self.kitty_animation_fd);
     _ = std.os.linux.close(self.scrollbar_fd);
     _ = std.os.linux.close(self.search_fd);
     _ = std.os.linux.close(self.taskbar_progress_fd);
@@ -1411,6 +1418,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.fling_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.search_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1427,6 +1435,7 @@ pub fn run(self: *App) !void {
     const fling_fd = &fds[12];
     const search_fd = &fds[13];
     const scrollbar_fd = &fds[14];
+    const kitty_animation_fd = &fds[15];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         wl_fd.events = posix.POLL.IN;
@@ -1526,6 +1535,10 @@ pub fn run(self: *App) !void {
 
         if (scrollbar_fd.revents & posix.POLL.IN != 0) {
             self.fireScrollbarFade();
+        }
+
+        if (kitty_animation_fd.revents & posix.POLL.IN != 0) {
+            self.fireKittyAnimation();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -1989,9 +2002,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
     self.window.toplevel.setAppId(new_config.app_id);
 
     if (new_config.image_storage_limit != self.config.image_storage_limit) {
-        self.term.setKittyGraphicsSizeLimit(self.alloc, new_config.image_storage_limit) catch |err| {
-            log.warn("kitty image storage limit change failed: {}", .{err});
-        };
+        self.term.setKittyGraphicsSizeLimit(self.alloc, new_config.image_storage_limit);
     }
 
     // Always rebuild the Font on config reload so a reload also picks up
@@ -3095,14 +3106,12 @@ fn detectHoveredLink(self: *App) !?HoveredLink {
         .whitespace = null,
         .semantic_prompt_boundary = true,
     }) orelse return null;
-    var strmap: vt.StringMap = undefined;
-    const text = try screen.selectionString(self.alloc, .{
+    var strmap = try screen.selectionStringMap(self.alloc, .{
         .sel = line,
         .trim = false,
-        .map = &strmap,
     });
-    defer self.alloc.free(text);
     defer strmap.deinit(self.alloc);
+    const text = strmap.string;
 
     var offset: usize = 0;
     while (Link.find(text, offset)) |match| {
@@ -4188,6 +4197,11 @@ fn fireRepeat(self: *App) void {
     for (0..@min(expirations, 8)) |_| self.onKey(keycode, .repeat);
 }
 
+fn fireKittyAnimation(self: *App) void {
+    _ = readTimer(self.kitty_animation_fd) orelse return;
+    self.needs_redraw = true;
+}
+
 fn startSearch(self: *App) void {
     if (self.search != null) return;
     self.search = ScrollbackSearch.init(&self.term) catch |err| {
@@ -4766,6 +4780,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
     var scroll: ?ScrollDetector.Scroll = null;
     var old_cursor: vt.RenderState.Cursor = self.render_state.cursor;
     if (!frozen) {
+        self.tickKittyAnimations();
         const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
         const new_scrollbar = self.currentScrollbarThumb();
         // Detection must precede update(). Both the previous and next frame
@@ -4921,6 +4936,17 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
     if (!frozen) self.term.screens.active.kitty_images.dirty = false;
     if (!frozen) self.async_force_full = false;
     return .submitted;
+}
+
+fn tickKittyAnimations(self: *App) void {
+    const now_ns = std.Io.Clock.awake.now(self.io).nanoseconds;
+    const now_ms: u64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+    const delay_ms = self.term.screens.active.kitty_images.animationTick(self.io, now_ms);
+    const spec: std.os.linux.itimerspec = if (delay_ms) |delay| .{
+        .it_value = timespecFromNs(@max(delay, 1) *| std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    } else disarmed_timer;
+    _ = setTimer(self.kitty_animation_fd, spec, "kitty animation");
 }
 
 fn optionalStrEql(a: ?[]const u8, b: ?[]const u8) bool {

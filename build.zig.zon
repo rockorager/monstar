@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ghostty = .{
-            .url = "git+https://github.com/ghostty-org/ghostty.git#9ed61428daa9f15b2dc89e73f9fe0d16d3a6bb71",
-            .hash = "ghostty-1.3.2-dev-5UdBC77jPAVhNK7BJBrcGwNVvAYqeOUYAUUaoAw6Lifr",
+            .url = "git+https://github.com/ghostty-org/ghostty.git#8d6d300cdf0ea95626424f25c82341dfdfb4a802",
+            .hash = "ghostty-1.3.2-dev-5UdBC6gjnQiLFwmL_PV285cEvVe78ciF47m-9aliblLB",
         },
         .wayland = .{
             .url = "git+https://codeberg.org/ifreund/zig-wayland#a8e10e87e5ebb49ce518ac3d2198909c87ee615a",
@@ -28,6 +28,7 @@
         "dist",
         "LICENSE",
         "README.md",
+        "scripts",
         "src",
         "vendor",
     },
