@@ -91,21 +91,11 @@ The default font request is the virtual family `Monstar`, followed by
 Fontconfig's standard `monospace` family. To customize Monstar without changing
 other applications, define the virtual family in
 `$XDG_CONFIG_HOME/fontconfig/conf.d/50-monstar.conf` (normally
-`~/.config/fontconfig/conf.d/50-monstar.conf`):
-
-```xml
-<?xml version="1.0"?>
-<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
-<fontconfig>
-  <alias binding="strong">
-    <family>Monstar</family>
-    <prefer>
-      <family>Iosevka</family>
-      <family>Noto Sans Mono CJK SC</family>
-    </prefer>
-  </alias>
-</fontconfig>
-```
+`~/.config/fontconfig/conf.d/50-monstar.conf`). An annotated template showing
+separate regular, bold, italic, bold-italic, and language fallback families is
+installed at `<prefix>/share/doc/monstar/examples/50-monstar.conf` and lives at
+[`dist/50-monstar.conf`](dist/50-monstar.conf) in the source tree. Copy it to
+the user configuration directory and replace its example family names.
 
 Fontconfig supplies further language and emoji fallbacks. Monstar also bundles
 Nerd Font symbols. An explicit `font-family` setting replaces the virtual
