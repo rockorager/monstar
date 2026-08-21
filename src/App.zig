@@ -363,7 +363,6 @@ const AppStreamHandler = struct {
             .kitty_color_report => self.app.answerKittySelectionColorQueries(value),
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
-            .progress_report => self.app.reportTaskbarProgress(value),
             .mouse_shape => {
                 self.app.mouse_shape_explicit = true;
                 self.app.syncCursorShape();
@@ -714,6 +713,7 @@ pub fn init(
     effects.xtversion = effectXtversion;
     effects.title_changed = effectTitleChanged;
     effects.bell = effectBell;
+    effects.progress_report = effectProgressReport;
     self.stream.handler.terminal_handler.effects = effects;
 
     self.initDbus();
@@ -809,6 +809,10 @@ fn deviceAttributes() EffectResult("device_attributes") {
 
 fn effectEnquiry(_: *Handler) []const u8 {
     return "";
+}
+
+fn effectProgressReport(handler: *Handler, report: vt.osc.Command.ProgressReport) void {
+    appFromHandler(handler).reportTaskbarProgress(report);
 }
 
 fn effectSize(handler: *Handler) ?vt.size_report.Size {
