@@ -17,12 +17,8 @@ A missing or unreadable file produces the default configuration.
 .SH TERMINAL COMPATIBILITY
 Monstar uses Ghostty's
 .B libghostty-vt
-terminal core and implements every terminal feature available from that
-library.
-It therefore uses the same
-.B xterm-ghostty
-terminfo entry and answers XTGETTCAP queries from Ghostty's terminfo definition.
-If Monstar's terminal behavior ever diverges, it will install and use its own
+terminal core and identifies itself through its installed
+.B monstar
 terminfo entry.
 .SH SYNTAX
 The file contains one
