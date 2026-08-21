@@ -183,6 +183,9 @@ search_fd: posix.fd_t,
 scrollbar_fd: posix.fd_t,
 /// One-shot wake for the next libghostty Kitty animation frame.
 kitty_animation_fd: posix.fd_t,
+/// Idle scheduler for incremental cold scrollback compression.
+compression_fd: posix.fd_t,
+compression_activity: u64,
 scrollbar_alpha: u8,
 scrollbar_fading: bool,
 scrollbar_fade_elapsed_ms: u16,
@@ -249,6 +252,8 @@ const scrollbar_hold_ms = 700;
 // Fluent durationFast with curveAccelerateMin for a small exiting overlay.
 const scrollbar_fade_duration_ms = 150;
 const scrollbar_fade_interval_ms = 15;
+const compression_idle_ms = 250;
+const compression_step_ms = 1;
 const scrollbar_default_alpha = 150;
 const scrollbar_hover_alpha = 220;
 const scrollbar_width = 6;
@@ -574,6 +579,9 @@ pub fn init(
     const kitty_animation_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(kitty_animation_fd);
 
+    const compression_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(compression_fd);
+
     // Scope confirmation ran concurrently with the window setup above,
     // so this rarely waits; the child stays gated until its migration
     // is confirmed (or abandoned).
@@ -661,6 +669,8 @@ pub fn init(
         .search_fd = search_fd,
         .scrollbar_fd = scrollbar_fd,
         .kitty_animation_fd = kitty_animation_fd,
+        .compression_fd = compression_fd,
+        .compression_activity = term.compressionActivity(),
         .scrollbar_alpha = 0,
         .scrollbar_fading = false,
         .scrollbar_fade_elapsed_ms = 0,
@@ -1342,6 +1352,7 @@ pub fn deinit(self: *App) void {
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
+    _ = std.os.linux.close(self.compression_fd);
     _ = std.os.linux.close(self.kitty_animation_fd);
     _ = std.os.linux.close(self.scrollbar_fd);
     _ = std.os.linux.close(self.search_fd);
@@ -1394,6 +1405,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.search_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
     };
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1411,8 +1423,10 @@ pub fn run(self: *App) !void {
     const search_fd = &fds[13];
     const scrollbar_fd = &fds[14];
     const kitty_animation_fd = &fds[15];
+    const compression_fd = &fds[16];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
+        self.syncScrollbackCompression();
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
         async_fd.fd = if (self.async_raster_loader) |*loader|
@@ -1514,6 +1528,10 @@ pub fn run(self: *App) !void {
 
         if (kitty_animation_fd.revents & posix.POLL.IN != 0) {
             self.fireKittyAnimation();
+        }
+
+        if (compression_fd.revents & posix.POLL.IN != 0) {
+            self.fireScrollbackCompression();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -4094,6 +4112,35 @@ fn fireRepeat(self: *App) void {
 fn fireKittyAnimation(self: *App) void {
     _ = readTimer(self.kitty_animation_fd) orelse return;
     self.needs_redraw = true;
+}
+
+fn syncScrollbackCompression(self: *App) void {
+    const activity = self.term.compressionActivity();
+    if (activity == self.compression_activity) return;
+    self.compression_activity = activity;
+    self.armScrollbackCompression(compression_idle_ms);
+}
+
+fn fireScrollbackCompression(self: *App) void {
+    _ = readTimer(self.compression_fd) orelse return;
+
+    const activity = self.term.compressionActivity();
+    if (activity != self.compression_activity) {
+        self.compression_activity = activity;
+        self.armScrollbackCompression(compression_idle_ms);
+        return;
+    }
+
+    if (self.term.compress(.incremental) == .pending) {
+        self.armScrollbackCompression(compression_step_ms);
+    }
+}
+
+fn armScrollbackCompression(self: *App, delay_ms: u64) void {
+    _ = setTimer(self.compression_fd, .{
+        .it_value = timespecFromNs(delay_ms * std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    }, "scrollback compression");
 }
 
 fn startSearch(self: *App) void {
