@@ -19,12 +19,15 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Generate PKGBUILD
         run: |
-          VERSION=$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)",/\1/p' build.zig.zon | head -n1)
+          VERSION=$(git describe --long --tags --match 'v[0-9]*' | \
+            sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/')
           test -n "$VERSION"
-          sed "s/@VERSION@/${VERSION}.r0/g" \
+          sed "s/@VERSION@/${VERSION}/g" \
             packaging/arch/monstar-git.PKGBUILD.in > packaging/arch/PKGBUILD.git
 
       - name: Setup SSH key for AUR

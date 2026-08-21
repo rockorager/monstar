@@ -60,11 +60,13 @@ git archive \
 SOURCE_SHA256=$(sha256sum "dist/${SOURCE_TARBALL_NAME}" | cut -d' ' -f1)
 
 echo "==> Generating AUR PKGBUILDs..."
+GIT_VERSION=$(git describe --long --tags --match 'v[0-9]*' | \
+  sed -E 's/^v//; s/-([0-9]+)-g/.r\1.g/')
 sed "s/@VERSION@/${VERSION}/g; s/@SHA256@/${SHA256}/g" \
   packaging/arch/monstar-bin.PKGBUILD.in > packaging/arch/PKGBUILD
 sed "s/@VERSION@/${VERSION}/g; s/@SHA256@/${SOURCE_SHA256}/g" \
   packaging/arch/monstar.PKGBUILD.in > packaging/arch/PKGBUILD.source
-sed "s/@VERSION@/${VERSION}.r0/g" \
+sed "s/@VERSION@/${GIT_VERSION}/g" \
   packaging/arch/monstar-git.PKGBUILD.in > packaging/arch/PKGBUILD.git
 
 
