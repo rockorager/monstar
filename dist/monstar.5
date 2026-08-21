@@ -101,7 +101,13 @@ The default is unset.
 .BI font-family " = family"
 Set the primary font family requested from fontconfig.
 The default is
-.BR monospace .
+.BR Monstar ,
+a virtual family that may be defined in the user's fontconfig configuration
+to provide preferences specific to Monstar.
+The standard
+.B monospace
+family is appended as a fallback to both the default and explicitly configured
+families.
 .TP
 .BI font-size " = size[pt|px]"
 Set the font size.
