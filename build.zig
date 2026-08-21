@@ -167,6 +167,7 @@ pub fn build(b: *std.Build) void {
     b.installFile("dist/dev.rockorager.monstar.svg", "share/icons/hicolor/scalable/apps/dev.rockorager.monstar.svg");
     b.installFile("dist/monstar.1", "share/man/man1/monstar.1");
     b.installFile("dist/monstar.5", "share/man/man5/monstar.5");
+    b.installFile("dist/50-monstar.conf", "share/doc/monstar/examples/50-monstar.conf");
     if (b.lazyDependency("iterm2_themes", .{})) |themes| {
         b.installDirectory(.{
             .source_dir = themes.path(""),
