@@ -10,7 +10,19 @@ const Font = @import("Font.zig");
 const log = std.log.scoped(.renderer);
 const KittyImage = vt.kitty.graphics.Image;
 const KittyPlacement = vt.kitty.graphics.ImageStorage.Placement;
+const KittyPlacementKey = vt.kitty.graphics.ImageStorage.PlacementKey;
 const KittyRenderPlacement = vt.kitty.graphics.RenderPlacement;
+
+const PendingRelativePlacement = struct {
+    image_id: u32,
+    placement_id: u32,
+    z: i32,
+    image: KittyImage,
+    placement: KittyPlacement,
+    root_key: KittyPlacementKey,
+    horizontal_offset: i32,
+    vertical_offset: i32,
+};
 
 pub const KittyPlacementViewport = struct {
     viewport_col: i32,
@@ -51,6 +63,8 @@ pub fn collectKittyPlacements(
 
     var placements: std.ArrayList(KittyRenderItem) = .empty;
     errdefer placements.deinit(alloc);
+    var pending_relative: std.ArrayList(PendingRelativePlacement) = .empty;
+    defer pending_relative.deinit(alloc);
 
     var it = storage.placements.iterator();
     while (it.next()) |entry| {
@@ -58,22 +72,60 @@ pub fn collectKittyPlacements(
         image.data = image.renderData();
         image.animation = null;
         if (image.data.bytes() == null) continue;
-        switch (entry.value_ptr.location) {
-            .pin => {},
-            .virtual, .relative => continue,
-        }
-        const viewport = kittyPlacementViewport(terminal, entry.value_ptr.*, image, font.cell_width, font.cell_height) orelse continue;
+        const placement = entry.value_ptr.*;
+        const viewport = switch (placement.location) {
+            .pin => |pin| kittyPlacementViewportFromPin(
+                terminal,
+                placement,
+                image,
+                pin,
+                0,
+                0,
+                font.cell_width,
+                font.cell_height,
+            ) orelse continue,
+            .virtual => continue,
+            .relative => |relative| relative: {
+                const chain = storage.resolveChain(relative) orelse continue;
+                switch (chain.root.location) {
+                    .pin => |pin| break :relative kittyPlacementViewportFromPin(
+                        terminal,
+                        placement,
+                        image,
+                        pin,
+                        chain.horizontal_offset,
+                        chain.vertical_offset,
+                        font.cell_width,
+                        font.cell_height,
+                    ) orelse continue,
+                    .virtual => {
+                        try pending_relative.append(alloc, .{
+                            .image_id = entry.key_ptr.image_id,
+                            .placement_id = entry.key_ptr.placement_id.id,
+                            .z = placement.z,
+                            .image = image,
+                            .placement = placement,
+                            .root_key = chain.root_key,
+                            .horizontal_offset = chain.horizontal_offset,
+                            .vertical_offset = chain.vertical_offset,
+                        });
+                        continue;
+                    },
+                    .relative => unreachable,
+                }
+            },
+        };
         if (!viewport.visible) continue;
         try placements.append(alloc, .{
             .image_id = entry.key_ptr.image_id,
             .placement_id = entry.key_ptr.placement_id.id,
-            .z = entry.value_ptr.z,
+            .z = placement.z,
             .image = image,
             .viewport = viewport,
         });
     }
 
-    try collectKittyVirtualPlacements(font, alloc, terminal, &placements);
+    try collectKittyVirtualPlacements(font, alloc, terminal, &placements, pending_relative.items);
 
     // Video senders commonly retain every prior full-frame placement
     // until the storage quota evicts it. If the final item in draw order
@@ -109,29 +161,47 @@ pub fn kittyItemsEqual(a: []const KittyRenderItem, b: []const KittyRenderItem) b
     return true;
 }
 
-fn kittyPlacementViewport(
+fn kittyPlacementViewportFromPin(
     terminal: *const vt.Terminal,
     placement: KittyPlacement,
     image: KittyImage,
+    pin: *const vt.Pin,
+    horizontal_offset: i32,
+    vertical_offset: i32,
     cell_width: u31,
     cell_height: u31,
 ) ?KittyPlacementViewport {
-    const pin = switch (placement.location) {
-        .pin => |pin| pin,
-        .virtual, .relative => return null,
-    };
-
     const pages = &terminal.screens.active.pages;
     const pin_screen = pages.pointFromPin(.screen, pin.*) orelse return null;
     const vp_tl = pages.getTopLeft(.viewport);
     const vp_screen = pages.pointFromPin(.screen, vp_tl) orelse return null;
 
+    const viewport_col = std.math.cast(i32, @as(i64, pin_screen.screen.x) + horizontal_offset) orelse return null;
+    const viewport_row = std.math.cast(i32, @as(i64, pin_screen.screen.y) -
+        @as(i64, vp_screen.screen.y) + vertical_offset) orelse return null;
+    return kittyPlacementViewportAt(
+        terminal,
+        placement,
+        image,
+        viewport_col,
+        viewport_row,
+        cell_width,
+        cell_height,
+    );
+}
+
+fn kittyPlacementViewportAt(
+    terminal: *const vt.Terminal,
+    placement: KittyPlacement,
+    image: KittyImage,
+    viewport_col: i32,
+    viewport_row: i32,
+    cell_width: u31,
+    cell_height: u31,
+) ?KittyPlacementViewport {
     const pixel_size = kittyPlacementPixelSize(placement, image, cell_width, cell_height) orelse return null;
     const placement_height = std.math.add(u32, pixel_size.height, placement.y_offset) catch return null;
     const grid_rows = std.math.divCeil(u32, placement_height, cell_height) catch return null;
-    const viewport_row: i32 = @as(i32, @intCast(pin_screen.screen.y)) -
-        @as(i32, @intCast(vp_screen.screen.y));
-    const viewport_col: i32 = @intCast(pin_screen.screen.x);
     const visible = @as(i64, viewport_row) + grid_rows > 0 and
         viewport_row < @as(i32, @intCast(terminal.rows));
 
@@ -162,13 +232,31 @@ fn collectKittyVirtualPlacements(
     alloc: std.mem.Allocator,
     terminal: *const vt.Terminal,
     placements: *std.ArrayList(KittyRenderItem),
+    pending_relative: []const PendingRelativePlacement,
 ) !void {
     const storage = &terminal.screens.active.kitty_images;
     const top = terminal.screens.active.pages.getTopLeft(.viewport);
     const bot = terminal.screens.active.pages.getBottomRight(.viewport) orelse return;
 
+    var virtual_origins: std.AutoHashMapUnmanaged(KittyPlacementKey, struct { x: u32, y: u32 }) = .empty;
+    defer virtual_origins.deinit(alloc);
+
     var it = vt.kitty.graphics.unicode.placementIterator(top, bot);
     while (it.next()) |virtual_placement| {
+        if (pending_relative.len > 0) {
+            if (storage.placeholderTarget(virtual_placement.image_id, virtual_placement.placement_id)) |target| {
+                if (terminal.screens.active.pages.pointFromPin(.viewport, virtual_placement.pin)) |point| {
+                    const gop = try virtual_origins.getOrPut(alloc, target.key);
+                    if (gop.found_existing) {
+                        gop.value_ptr.x = @min(gop.value_ptr.x, point.viewport.x);
+                        gop.value_ptr.y = @min(gop.value_ptr.y, point.viewport.y);
+                    } else {
+                        gop.value_ptr.* = .{ .x = point.viewport.x, .y = point.viewport.y };
+                    }
+                }
+            }
+        }
+
         var image = storage.imageById(virtual_placement.image_id) orelse continue;
         image.data = image.renderData();
         image.animation = null;
@@ -189,6 +277,29 @@ fn collectKittyVirtualPlacements(
             .placement_id = virtual_placement.placement_id,
             .z = -1,
             .image = image,
+            .viewport = viewport,
+        });
+    }
+
+    for (pending_relative) |pending| {
+        const origin = virtual_origins.get(pending.root_key) orelse continue;
+        const viewport_col = std.math.cast(i32, @as(i64, origin.x) + pending.horizontal_offset) orelse continue;
+        const viewport_row = std.math.cast(i32, @as(i64, origin.y) + pending.vertical_offset) orelse continue;
+        const viewport = kittyPlacementViewportAt(
+            terminal,
+            pending.placement,
+            pending.image,
+            viewport_col,
+            viewport_row,
+            font.cell_width,
+            font.cell_height,
+        ) orelse continue;
+        if (!viewport.visible) continue;
+        try placements.append(alloc, .{
+            .image_id = pending.image_id,
+            .placement_id = pending.placement_id,
+            .z = pending.z,
+            .image = pending.image,
             .viewport = viewport,
         });
     }
@@ -441,4 +552,105 @@ test "kitty placement dimensions reject unrepresentable geometry" {
         10,
         20,
     ));
+}
+
+test "collect relative kitty placement rooted at a pin" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var terminal: vt.Terminal = try .init(std.testing.io, alloc, .{ .rows = 10, .cols = 10 });
+    defer terminal.deinit(alloc);
+    terminal.width_px = terminal.cols * font.cell_width;
+    terminal.height_px = terminal.rows * font.cell_height;
+
+    const storage = &terminal.screens.active.kitty_images;
+    try storage.addImage(std.testing.io, alloc, terminal.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgb,
+        .data = .{ .complete = try alloc.dupe(u8, &.{ 0, 0, 0 }) },
+    });
+    const pin = try terminal.screens.active.pages.trackPin(
+        terminal.screens.active.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+    );
+    try storage.addPlacement(std.testing.io, alloc, terminal.screens.active, 1, 1, .{
+        .location = .{ .pin = pin },
+        .columns = 1,
+        .rows = 1,
+    });
+    try storage.addPlacement(std.testing.io, alloc, terminal.screens.active, 1, 2, .{
+        .location = .{ .relative = .{
+            .parent = .{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = 1 },
+            },
+            .horizontal_offset = 3,
+            .vertical_offset = 2,
+        } },
+        .columns = 1,
+        .rows = 1,
+        .z = 1,
+    });
+
+    const items = try collectKittyPlacements(&font, alloc, &terminal);
+    defer alloc.free(items);
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqual(@as(i32, 2), items[0].viewport.viewport_col);
+    try std.testing.expectEqual(@as(i32, 1), items[0].viewport.viewport_row);
+    try std.testing.expectEqual(@as(i32, 5), items[1].viewport.viewport_col);
+    try std.testing.expectEqual(@as(i32, 3), items[1].viewport.viewport_row);
+}
+
+test "collect relative kitty placement rooted at virtual placeholders" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var terminal: vt.Terminal = try .init(std.testing.io, alloc, .{ .rows = 5, .cols = 5 });
+    defer terminal.deinit(alloc);
+    terminal.width_px = terminal.cols * font.cell_width;
+    terminal.height_px = terminal.rows * font.cell_height;
+    terminal.modes.set(.grapheme_cluster, true);
+
+    const storage = &terminal.screens.active.kitty_images;
+    const pixels = try alloc.alloc(u8, 10 * 10 * 3);
+    @memset(pixels, 0);
+    try storage.addImage(std.testing.io, alloc, terminal.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 10,
+        .format = .rgb,
+        .data = .{ .complete = pixels },
+    });
+    try storage.addPlacement(std.testing.io, alloc, terminal.screens.active, 1, 1, .{
+        .location = .virtual,
+    });
+
+    try terminal.setAttribute(.{ .@"256_fg" = 1 });
+    try terminal.setAttribute(.{ .@"256_underline_color" = 1 });
+    terminal.screens.active.cursorAbsolute(1, 1);
+    try terminal.printString("\u{10EEEE}\u{0305}\u{0305}");
+    terminal.screens.active.cursorAbsolute(3, 2);
+    try terminal.printString("\u{10EEEE}\u{0305}\u{0305}");
+
+    try storage.addPlacement(std.testing.io, alloc, terminal.screens.active, 1, 2, .{
+        .location = .{ .relative = .{
+            .parent = .{
+                .image_id = 1,
+                .placement_id = .{ .tag = .external, .id = 1 },
+            },
+            .horizontal_offset = 1,
+            .vertical_offset = 2,
+        } },
+        .columns = 1,
+        .rows = 1,
+        .z = 5,
+    });
+
+    const items = try collectKittyPlacements(&font, alloc, &terminal);
+    defer alloc.free(items);
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    try std.testing.expectEqual(@as(i32, 5), items[2].z);
+    try std.testing.expectEqual(@as(i32, 2), items[2].viewport.viewport_col);
+    try std.testing.expectEqual(@as(i32, 3), items[2].viewport.viewport_row);
 }
