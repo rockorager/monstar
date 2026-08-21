@@ -16,7 +16,6 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
-const terminfo = @import("ghostty-terminfo");
 const Clipboard = @import("Clipboard.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
@@ -44,12 +43,6 @@ const clipboard_format = @import("clipboard_format.zig");
 const Window = @import("Window.zig");
 
 const log = std.log.scoped(.app);
-
-const xtgettcap_map = terminfo.ghostty.xtgettcapMap();
-
-fn hexEncodeComptime(comptime input: []const u8) []const u8 {
-    return comptime &(std.fmt.bytesToHex(input, .upper));
-}
 
 const HoveredLink = struct {
     uri: []u8,
@@ -354,10 +347,8 @@ const AppStream = vt.Stream(AppStreamHandler);
 const AppStreamHandler = struct {
     app: *App,
     terminal_handler: TerminalHandler,
-    dcs: @import("ghostty-vt").dcs.Handler = .{},
 
     pub fn deinit(self: *AppStreamHandler) void {
-        self.dcs.deinit();
         self.terminal_handler.deinit();
     }
 
@@ -373,9 +364,6 @@ const AppStreamHandler = struct {
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
             .progress_report => self.app.reportTaskbarProgress(value),
-            .dcs_hook => self.dcsHook(value),
-            .dcs_put => self.dcsPut(value),
-            .dcs_unhook => self.dcsUnhook(),
             .mouse_shape => {
                 self.app.mouse_shape_explicit = true;
                 self.app.syncCursorShape();
@@ -410,24 +398,6 @@ const AppStreamHandler = struct {
             },
             else => {},
         }
-    }
-
-    fn dcsHook(self: *AppStreamHandler, dcs: @import("ghostty-vt").DCS) void {
-        var cmd = self.dcs.hook(self.app.alloc, dcs) orelse return;
-        defer cmd.deinit();
-        self.app.answerDcsCommand(&cmd);
-    }
-
-    fn dcsPut(self: *AppStreamHandler, byte: u8) void {
-        var cmd = self.dcs.put(byte) orelse return;
-        defer cmd.deinit();
-        self.app.answerDcsCommand(&cmd);
-    }
-
-    fn dcsUnhook(self: *AppStreamHandler) void {
-        var cmd = self.dcs.unhook() orelse return;
-        defer cmd.deinit();
-        self.app.answerDcsCommand(&cmd);
     }
 };
 
@@ -732,6 +702,7 @@ pub fn init(
             .terminal_handler = .init(&self.term),
         },
     });
+    self.stream.handler.terminal_handler.terminfo_name = "monstar";
 
     // Handle sequences that need responses or side effects.
     var effects: Effects = .readonly;
@@ -2362,72 +2333,6 @@ fn decodeOsc52ClipboardData(alloc: std.mem.Allocator, data: []const u8) ![:0]con
     return buf;
 }
 
-fn answerDcsCommand(self: *App, cmd: *vt.dcs.Command) void {
-    switch (cmd.*) {
-        .xtgettcap => |*gettcap| self.answerXtgettcap(gettcap),
-        .decrqss => |decrqss| self.answerDecrqss(decrqss),
-        .tmux => {},
-    }
-}
-
-fn answerXtgettcap(self: *App, gettcap: *vt.dcs.Command.XTGETTCAP) void {
-    while (gettcap.next()) |key| {
-        const response = xtgettcap_map.get(key) orelse continue;
-        self.writePty(response);
-    }
-}
-
-fn answerDecrqss(self: *App, decrqss: vt.dcs.Command.DECRQSS) void {
-    var response: [128]u8 = undefined;
-    const len = formatDecrqssResponse(&response, &self.term, decrqss) catch return;
-    self.writePty(response[0..len]);
-}
-
-fn formatDecrqssResponse(
-    response: []u8,
-    term: *vt.Terminal,
-    decrqss: vt.dcs.Command.DECRQSS,
-) !usize {
-    var writer: std.Io.Writer = .fixed(response);
-
-    const prefix_fmt = "\x1bP{d}$r";
-    const prefix_len = std.fmt.comptimePrint(prefix_fmt, .{0}).len;
-    writer.end = prefix_len;
-
-    switch (decrqss) {
-        .none => {},
-        .sgr => {
-            const attrs = try term.printAttributes(writer.buffer[writer.end..]);
-            writer.end += attrs.len;
-            try writer.writeByte('m');
-        },
-        .decscusr => {
-            const blink = term.modes.get(.cursor_blinking);
-            const style: u8 = switch (term.screens.active.cursor.cursor_style) {
-                .block, .block_hollow => if (blink) 1 else 2,
-                .underline => if (blink) 3 else 4,
-                .bar => if (blink) 5 else 6,
-            };
-            try writer.print("{d} q", .{style});
-        },
-        .decstbm => try writer.print("{d};{d}r", .{
-            term.scrolling_region.top + 1,
-            term.scrolling_region.bottom + 1,
-        }),
-        .decslrm => if (term.modes.get(.enable_left_and_right_margin)) {
-            try writer.print("{d};{d}s", .{
-                term.scrolling_region.left + 1,
-                term.scrolling_region.right + 1,
-            });
-        },
-    }
-
-    const valid = writer.end > prefix_len;
-    try writer.writeAll("\x1b\\");
-    _ = try std.fmt.bufPrint(response[0..prefix_len], prefix_fmt, .{@intFromBool(valid)});
-    return writer.end;
-}
-
 fn answerOscSelectionColorQuery(
     self: *App,
     target: vt.osc.color.Target,
@@ -2694,21 +2599,6 @@ test "portal appearance values map to application preferences" {
     try std.testing.expect(!portalReducedMotion(0));
     try std.testing.expect(portalReducedMotion(1));
     try std.testing.expect(!portalReducedMotion(99));
-}
-
-test "XTGETTCAP reports hex encoded capabilities" {
-    try std.testing.expectEqualStrings(
-        "\x1bP1+r5463\x1b\\",
-        xtgettcap_map.get(hexEncodeComptime("Tc")).?,
-    );
-    try std.testing.expectEqualStrings(
-        "\x1bP1+r636C656172=1B5B481B5B324A\x1b\\",
-        xtgettcap_map.get(hexEncodeComptime("clear")).?,
-    );
-    try std.testing.expectEqualStrings(
-        "\x1bP1+r62656C=07\x1b\\",
-        xtgettcap_map.get(hexEncodeComptime("bel")).?,
-    );
 }
 
 /// DEC mode 2048 (in-band size reports): the terminal must send a size
