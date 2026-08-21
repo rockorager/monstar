@@ -87,19 +87,18 @@ window-padding-y = 6
 mouse-scroll-multiplier = precision:1,discrete:3
 ```
 
-The default font request is the virtual family `Monstar`, followed by
-Fontconfig's standard `monospace` family. To customize Monstar without changing
-other applications, define the virtual family in
+The default `font-family` is Fontconfig's standard `monospace` family. To
+configure ordered primary, styled, and language fallback fonts without changing
+other applications, create a virtual family such as `Monstar Custom` in
 `$XDG_CONFIG_HOME/fontconfig/conf.d/50-monstar.conf` (normally
-`~/.config/fontconfig/conf.d/50-monstar.conf`). An annotated template showing
-separate regular, bold, italic, bold-italic, and language fallback families is
-installed at `<prefix>/share/doc/monstar/examples/50-monstar.conf` and lives at
-[`dist/50-monstar.conf`](dist/50-monstar.conf) in the source tree. Copy it to
-the user configuration directory and replace its example family names.
+`~/.config/fontconfig/conf.d/50-monstar.conf`) and select it with
+`font-family = Monstar Custom`. An annotated template showing separate regular,
+bold, italic, bold-italic, and language fallback families is installed at
+`<prefix>/share/doc/monstar/examples/50-monstar.conf` and lives at
+[`dist/50-monstar.conf`](dist/50-monstar.conf) in the source tree.
 
 Fontconfig supplies further language and emoji fallbacks. Monstar also bundles
-Nerd Font symbols. An explicit `font-family` setting replaces the virtual
-family but still falls back to `monospace`.
+Nerd Font symbols.
 
 By default, `background-opacity` affects only the default terminal background
 and padding. Set `background-opacity-cells = true` to apply it to explicit cell

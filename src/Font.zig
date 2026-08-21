@@ -602,11 +602,6 @@ fn fontSort(family: [:0]const u8, size_px: u31, style: FaceStyle) Error!*c.FcFon
     const pattern = c.FcPatternCreate() orelse return error.FontLoadFailed;
     defer c.FcPatternDestroy(pattern);
     _ = c.FcPatternAddString(pattern, c.FC_FAMILY, family.ptr);
-    // Keep Fontconfig's standard generic family as the final preference.
-    // The default virtual "Monstar" family is an application-specific hook
-    // that users can alias without changing the rest of their desktop.
-    if (!std.mem.eql(u8, family, "monospace"))
-        _ = c.FcPatternAddString(pattern, c.FC_FAMILY, "monospace");
     _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, @floatFromInt(size_px));
     _ = c.FcPatternAddInteger(pattern, c.FC_SPACING, c.FC_MONO);
     if (style.weight()) |weight| _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
@@ -1279,9 +1274,9 @@ fn loadFromPattern(
     return Face.load(ft_lib, @ptrCast(file), index, size_px, metrics);
 }
 
-test "virtual default family falls back and rasterizes a glyph" {
+test "load monospace font and rasterize a glyph" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "Monstar", 16);
+    var font: Font = try .init(alloc, "monospace", 16);
     defer font.deinit(alloc);
 
     try std.testing.expect(font.cell_width > 0);
