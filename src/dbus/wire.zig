@@ -458,7 +458,7 @@ pub const Decoder = struct {
             },
             'a' => {
                 const start = index.*;
-                try signatureOne(sig, index, depth + 1);
+                try signatureOne(sig, index, depth + 1, true);
                 const alignment_value = typeAlignment(sig[start]);
                 const end_pos = try self.beginArray(alignment_value);
                 while (!(try self.arrayFinished(end_pos))) {
@@ -518,10 +518,10 @@ fn validSignature(value: []const u8, allow_empty: bool) bool {
     if (value.len > 255 or (!allow_empty and value.len == 0)) return false;
     var i: usize = 0;
     var count: usize = 0;
-    while (i < value.len) : (count += 1) signatureOne(value, &i, 0) catch return false;
+    while (i < value.len) : (count += 1) signatureOne(value, &i, 0, false) catch return false;
     return allow_empty or count == 1;
 }
-fn signatureOne(sig: []const u8, i: *usize, depth: usize) !void {
+fn signatureOne(sig: []const u8, i: *usize, depth: usize, dict_allowed: bool) !void {
     if (depth >= max_container_depth or i.* >= sig.len) return error.InvalidSignature;
     const c = sig[i.*];
     i.* += 1;
@@ -529,18 +529,18 @@ fn signatureOne(sig: []const u8, i: *usize, depth: usize) !void {
         'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h', 'v' => {},
         'a' => {
             if (i.* >= sig.len) return error.InvalidSignature;
-            try signatureOne(sig, i, depth + 1);
+            try signatureOne(sig, i, depth + 1, true);
         },
         '(' => {
             const start = i.*;
-            while (i.* < sig.len and sig[i.*] != ')') try signatureOne(sig, i, depth + 1);
+            while (i.* < sig.len and sig[i.*] != ')') try signatureOne(sig, i, depth + 1, false);
             if (i.* == start or i.* >= sig.len) return error.InvalidSignature;
             i.* += 1;
         },
         '{' => {
-            if (depth == 0 or i.* >= sig.len or std.mem.indexOfScalar(u8, "ybnqiuxtdsogh", sig[i.*]) == null) return error.InvalidSignature;
+            if (!dict_allowed or i.* >= sig.len or std.mem.indexOfScalar(u8, "ybnqiuxtdsogh", sig[i.*]) == null) return error.InvalidSignature;
             i.* += 1;
-            try signatureOne(sig, i, depth + 1);
+            try signatureOne(sig, i, depth + 1, false);
             if (i.* >= sig.len or sig[i.*] != '}') return error.InvalidSignature;
             i.* += 1;
         },
@@ -629,4 +629,14 @@ test "invalid values and oversized prefix" {
     var h = [_]u8{ 'l', 1, 0, 1 } ++ [_]u8{0} ** 12;
     std.mem.writeInt(u32, h[4..8], @intCast(max_message_size), .little);
     try std.testing.expectError(error.MessageTooLarge, messageLength(&h));
+}
+
+test "dictionary entries are only valid as array elements" {
+    var e = Encoder.init(std.testing.allocator);
+    defer e.deinit();
+
+    try std.testing.expectError(error.InvalidSignature, e.signature("({sv})"));
+    try std.testing.expectError(error.InvalidSignature, e.signature("a{s{sv}}"));
+    try e.signature("a{sv}");
+    try e.signature("(a{sv})");
 }
