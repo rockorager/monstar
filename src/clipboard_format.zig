@@ -88,11 +88,15 @@ pub fn formatUriListDrop(alloc: std.mem.Allocator, data: []const u8) ![]u8 {
         else
             raw_line;
         if (line.len == 0 or line[0] == '#') continue;
-        const path = (try osc7Path(arena, line)) orelse continue;
+        const text = (try osc7Path(arena, line)) orelse uri: {
+            _ = std.Uri.parse(line) catch continue;
+            if (std.mem.indexOfScalar(u8, line, 0) != null) continue;
+            break :uri line;
+        };
 
         if (!first) try writer.writer.writeByte(' ');
         first = false;
-        try writeShellQuoted(&writer.writer, path);
+        try writeShellQuoted(&writer.writer, text);
     }
 
     return writer.toOwnedSlice();
@@ -162,12 +166,15 @@ test "formatLinkCopy reduces local file URIs and preserves other links" {
     try std.testing.expectEqualStrings("https://example.com/a%20b", web);
 }
 
-test "formatUriListDrop shell quotes local file paths" {
+test "formatUriListDrop shell quotes local paths and preserves other URIs" {
     const text = try formatUriListDrop(
         std.testing.allocator,
-        "# comment\r\nfile:///tmp/a%20b\r\nhttps://example.com/nope\nfile:///tmp/it%27s\n",
+        "# comment\r\nfile:///tmp/a%20b\r\nhttps://example.com/a?q=one%20two\nfile:///tmp/it%27s\nnot a URI\n",
     );
     defer std.testing.allocator.free(text);
 
-    try std.testing.expectEqualStrings("'/tmp/a b' '/tmp/it'\\''s'", text);
+    try std.testing.expectEqualStrings(
+        "'/tmp/a b' 'https://example.com/a?q=one%20two' '/tmp/it'\\''s'",
+        text,
+    );
 }
