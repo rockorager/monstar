@@ -30,7 +30,7 @@ rm -rf "$STAGING_DIR" dist/monstar-*.tar.gz \
 mkdir -p "$STAGING_DIR/${ARCHIVE_ROOT}"
 
 # Build stripped ReleaseFast release prefix
-zig build -Doptimize=ReleaseFast -Dstrip=true --prefix "$STAGING_DIR/${ARCHIVE_ROOT}"
+zig build -Doptimize=ReleaseFast -Dstrip=true -Dcpu=baseline --prefix "$STAGING_DIR/${ARCHIVE_ROOT}"
 
 EXPECTED_VERSION="monstar ${VERSION}"
 ACTUAL_VERSION=$("$STAGING_DIR/${ARCHIVE_ROOT}/bin/monstar" --version)
