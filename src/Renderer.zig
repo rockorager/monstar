@@ -868,10 +868,8 @@ fn renderKittyPlacement(
     const source_height = viewport.source_height;
     if (source_width == 0 or source_height == 0) return;
 
-    const dest_x = viewport.viewport_col * @as(i32, @intCast(self.font.cell_width)) +
-        @as(i32, @intCast(viewport.offset_x));
-    const dest_y = viewport.viewport_row * @as(i32, @intCast(self.font.cell_height)) +
-        @as(i32, @intCast(viewport.offset_y));
+    const dest_x = @as(i64, viewport.viewport_col) * self.font.cell_width + viewport.offset_x;
+    const dest_y = @as(i64, viewport.viewport_row) * self.font.cell_height + viewport.offset_y;
 
     // Senders like mpv pre-scale frames to the cell area and place them
     // without c=/r=, making dest dims equal source dims. Blit straight
@@ -940,8 +938,8 @@ fn blitKittyUnscaled(
     height: u31,
     image: KittyImage,
     viewport: KittyPlacementViewport,
-    dest_x: i32,
-    dest_y: i32,
+    dest_x: i64,
+    dest_y: i64,
 ) void {
     std.debug.assert(viewport.pixel_width == viewport.source_width);
     std.debug.assert(viewport.pixel_height == viewport.source_height);
@@ -959,8 +957,8 @@ fn blitKittyUnscaled(
 
     const x_begin: i64 = @max(dest_x, 0);
     const y_begin: i64 = @max(dest_y, 0);
-    const x_end: i64 = @min(@as(i64, dest_x) + viewport.source_width, width);
-    const y_end: i64 = @min(@as(i64, dest_y) + viewport.source_height, height);
+    const x_end: i64 = @min(dest_x + viewport.source_width, width);
+    const y_end: i64 = @min(dest_y + viewport.source_height, height);
     if (x_end <= x_begin or y_end <= y_begin) return;
 
     const cols: usize = @intCast(x_end - x_begin);
@@ -1126,15 +1124,15 @@ fn blendRgba(
     rgba: []const u8,
     image_width: u32,
     image_height: u32,
-    dest_x: i32,
-    dest_y: i32,
+    dest_x: i64,
+    dest_y: i64,
 ) void {
     for (0..image_height) |src_y| {
-        const y = dest_y + @as(i32, @intCast(src_y));
+        const y = dest_y + @as(i64, @intCast(src_y));
         if (y < 0 or y >= height) continue;
 
         for (0..image_width) |src_x| {
-            const x = dest_x + @as(i32, @intCast(src_x));
+            const x = dest_x + @as(i64, @intCast(src_x));
             if (x < 0 or x >= width) continue;
 
             const src_offset = (@as(usize, src_y) * image_width + src_x) * 4;
@@ -1768,6 +1766,38 @@ test "kitty unscaled blit honors rgba alpha" {
         pixels[2],
     ); // partial alpha blends
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
+}
+
+test "kitty placement clips offsets above signed 32-bit range" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const image: KittyImage = .{
+        .width = 1,
+        .height = 1,
+        .format = .rgb,
+        .data = .{ .complete = &.{ 255, 255, 255 } },
+    };
+    const viewport: KittyPlacementViewport = .{
+        .viewport_col = 0,
+        .viewport_row = 0,
+        .visible = true,
+        .offset_x = @as(u32, std.math.maxInt(i32)) + 1,
+        .offset_y = @as(u32, std.math.maxInt(i32)) + 1,
+        .pixel_width = 1,
+        .pixel_height = 1,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 1,
+        .source_height = 1,
+    };
+    var pixels = [_]u32{0xff000000};
+
+    try renderer.renderKittyPlacement(&pixels, 1, 1, image, viewport);
+    try std.testing.expectEqual(@as(u32, 0xff000000), pixels[0]);
 }
 
 test "scaled kitty placement reuses cached rgba variant" {
