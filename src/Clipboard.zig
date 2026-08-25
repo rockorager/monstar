@@ -12,6 +12,11 @@ const clipboard_format = @import("clipboard_format.zig");
 
 const log = std.log.scoped(.app);
 
+// Keep one transfer within the PTY write backlog's bound. Without a cap, a
+// clipboard owner that never closes its pipe can grow this process without
+// limit while the event loop continues draining it.
+const max_transfer_size = 1024 * 1024;
+
 pub const Target = enum { clipboard, primary };
 
 pub const Purpose = union(enum) {
@@ -248,6 +253,10 @@ pub fn readTransfer(self: *Clipboard) !?Event {
             },
         };
         if (n == 0) break;
+        if (n > max_transfer_size -| self.transfer_buf.items.len) {
+            self.abortTransfer();
+            return error.TransferTooLarge;
+        }
         self.transfer_buf.appendSlice(self.alloc, buf[0..n]) catch |err| {
             self.abortTransfer();
             return err;
@@ -534,6 +543,26 @@ test "transfer read failure discards partial data" {
     clipboard.transfer_fd = @intCast(rc);
 
     try std.testing.expectError(error.IsDir, clipboard.readTransfer());
+    try std.testing.expectEqual(@as(posix.fd_t, -1), clipboard.transfer_fd);
+    try std.testing.expectEqual(@as(usize, 0), clipboard.transfer_buf.items.len);
+}
+
+test "oversized transfer is aborted before growing past the paste backlog" {
+    const linux = std.os.linux;
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+    defer clipboard.deinit();
+
+    try clipboard.transfer_buf.resize(std.testing.allocator, max_transfer_size);
+    var pipe_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        .SUCCESS,
+        linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
+    clipboard.transfer_fd = pipe_fds[0];
+    _ = linux.write(pipe_fds[1], "x", 1);
+    _ = linux.close(pipe_fds[1]);
+
+    try std.testing.expectError(error.TransferTooLarge, clipboard.readTransfer());
     try std.testing.expectEqual(@as(posix.fd_t, -1), clipboard.transfer_fd);
     try std.testing.expectEqual(@as(usize, 0), clipboard.transfer_buf.items.len);
 }
