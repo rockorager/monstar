@@ -28,7 +28,7 @@
         {
           default = pkgs.stdenv.mkDerivation (finalAttrs: {
             pname = "monstar";
-            version = "1.0.1";
+            version = "1.1.0";
             src = self;
 
             nativeBuildInputs = [ pkgs.zig pkgs.pkg-config pkgs.ncurses ];
@@ -37,7 +37,7 @@
             zigDeps = pkgs.zig.fetchDeps {
               inherit (finalAttrs) src pname version;
               fetchAll = true;
-              hash = "sha256-uAedHwfkI3NrdiRJ90gy4fcg9n/N4xmx3bq15m1h1oU=";
+              hash = "sha256-JpYY9P94+8rjl3J/DI9ja/4i21uHb+1yHxrYVtVDXLQ=";
             };
 
             postConfigure = ''
