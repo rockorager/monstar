@@ -17,6 +17,7 @@ const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
 const Clipboard = @import("Clipboard.zig");
+const KittyClipboard = @import("KittyClipboard.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
@@ -229,6 +230,7 @@ active_screen: vt.ScreenSet.Key,
 /// Serial of the most recent input event, required to claim selections.
 last_serial: u32,
 clipboard: Clipboard,
+kitty_clipboard: KittyClipboard,
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
     '│',
@@ -362,11 +364,23 @@ const AppStreamHandler = struct {
         comptime action: AppStream.Action.Tag,
         value: AppStream.Action.Value(action),
     ) void {
-        self.terminal_handler.vt(action, value);
+        // Clipboard reads are asynchronous on Wayland. Keep libghostty's
+        // parsing, but route both clipboard protocols around its synchronous
+        // TerminalStream effect contract and through Monstar's poll loop.
+        switch (action) {
+            .clipboard_contents, .kitty_clipboard => {},
+            else => self.terminal_handler.vt(action, value),
+        }
         switch (action) {
             .color_operation => self.app.handleOscColorOperation(&value.requests, value.terminator),
             .kitty_color_report => self.app.answerKittySelectionColorQueries(value),
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
+            .kitty_clipboard => {
+                self.app.kitty_clipboard.handle(value) catch |err| {
+                    log.warn("failed to handle OSC 5522 command: {}", .{err});
+                };
+                self.app.pumpKittyClipboard();
+            },
             .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
             .mouse_shape => {
                 self.app.mouse_shape_explicit = true;
@@ -396,6 +410,7 @@ const AppStreamHandler = struct {
                 self.app.syncCursorShape();
             },
             .full_reset => {
+                self.app.kitty_clipboard.reset();
                 self.app.mouse_shape_explicit = false;
                 self.app.in_band_reports = false;
                 self.app.syncCursorShape();
@@ -703,6 +718,7 @@ pub fn init(
         .active_screen = .primary,
         .last_serial = 0,
         .clipboard = .init(alloc, window.data_manager, window.primary_manager),
+        .kitty_clipboard = .init(alloc),
     };
     self.stream = .init(.{
         .allocator = alloc,
@@ -724,7 +740,10 @@ pub fn init(
     effects.title_changed = effectTitleChanged;
     effects.bell = effectBell;
     effects.progress_report = effectProgressReport;
+    effects.clipboard_read = effectClipboardRead;
+    effects.drag_and_drop = effectDragAndDrop;
     self.stream.handler.terminal_handler.effects = effects;
+    self.clipboard.setDndCallback(self, dndEvent);
 
     self.initDbus();
     window.setCallbacks(
@@ -801,7 +820,7 @@ fn EffectResult(comptime field_name: []const u8) type {
     return @typeInfo(@typeInfo(FnPtr).pointer.child).@"fn".return_type.?;
 }
 
-fn effectWritePty(handler: *Handler, data: [:0]const u8) void {
+fn effectWritePty(handler: *Handler, data: []const u8) void {
     appFromHandler(handler).writePty(data);
 }
 
@@ -861,6 +880,32 @@ fn effectTitleChanged(handler: *Handler) void {
 
 fn effectBell(handler: *Handler) void {
     appFromHandler(handler).window.ringBell();
+}
+
+fn effectClipboardRead(_: *Handler, read: vt.clipboard.Read) void {
+    // Presence advertises mode 5522 support in DECRQM. OSC 5522 actions are
+    // intercepted by AppStreamHandler and never use this synchronous path.
+    read.reply(.unsupported);
+}
+
+fn effectDragAndDrop(handler: *Handler, event: vt.kitty.dnd.Event) void {
+    if (event != .acceptance) return;
+    const self = appFromHandler(handler);
+    const state = self.term.kitty_dnd orelse return;
+    const accepted = state.clientAccepted() orelse return;
+    self.clipboard.setDndAcceptance(switch (accepted) {
+        .none => .none,
+        .copy => .copy,
+        .move => .move,
+    });
+}
+
+fn clipboardTarget(location: vt.clipboard.Location) ?Clipboard.Target {
+    return switch (location) {
+        .standard => .clipboard,
+        .selection, .primary => .primary,
+        else => null,
+    };
 }
 
 fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void {
@@ -1348,6 +1393,7 @@ pub fn deinit(self: *App) void {
     self.kitty_cache.deinit(self.alloc);
     self.clearImeText();
     if (self.search) |*search| search.deinit(self.alloc, &self.term);
+    self.kitty_clipboard.deinit();
     self.clipboard.deinit();
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
@@ -3453,36 +3499,289 @@ fn fireCopyHighlightTimeout(self: *App) void {
 /// Ask the offer's owner to stream its contents into a pipe; the read
 /// end joins the poll loop and the paste completes on EOF.
 fn beginPaste(self: *App, target: Clipboard.Target) void {
-    _ = self.clipboard.request(target, .terminal);
+    _ = self.clipboard.request(target, .{ .terminal = target });
 }
 
 fn readClipboardTransfer(self: *App) void {
     const event = self.clipboard.readTransfer() catch |err| {
         log.warn("clipboard transfer failed: {}", .{err});
+        self.failStartedKittyRead(.EIO);
+        self.pumpKittyClipboard();
         return;
     } orelse return;
+    defer self.pumpKittyClipboard();
     defer self.clipboard.finishEvent();
     switch (event) {
-        .terminal => |data| self.writeTerminalPaste(data),
+        .terminal => |paste| self.writeTerminalPaste(
+            .{ .clipboard = clipboardLocation(paste.target) },
+            paste.mime,
+            paste.data,
+        ),
         .osc52_read => |read| self.writeOsc52ClipboardReport(read.kind, read.data),
+        .kitty_read => |read| {
+            const request = switch (self.kitty_clipboard.front().?.*) {
+                .read => |*request| request,
+                else => unreachable,
+            };
+            std.debug.assert(request.started);
+            var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
+            self.finishKittyClipboardRead(
+                request,
+                self.clipboard.availableMimes(clipboardTargetFromKitty(request.target), &available_buf),
+                .{ .mime = read.mime, .data = read.data },
+            );
+        },
         .dnd => |drop| {
+            if (self.term.kitty_dnd) |state| {
+                self.writeKittyDndDrop(state, drop);
+                return;
+            }
             const text = self.formatDropPaste(drop.mime, drop.data) catch return;
             defer self.alloc.free(text);
-            self.writeTerminalPaste(text);
+            self.writeTerminalPaste(.text, "text/plain", text);
         },
     }
 }
 
-fn writeTerminalPaste(self: *App, data: []u8) void {
+/// Start and retire committed OSC 5522 operations strictly from the FIFO
+/// head. Asynchronous reads stop the pump until their Wayland pipe reaches
+/// EOF; writes and metadata-only replies complete immediately in order.
+fn pumpKittyClipboard(self: *App) void {
+    while (self.kitty_clipboard.front()) |request| switch (request.*) {
+        .status => |*status| {
+            self.writeKittyClipboardStatus(status.op, status.id, status.terminator, status.status);
+            self.kitty_clipboard.pop();
+        },
+        .write => |*write| {
+            self.kitty_clipboard.prepareWrite(write);
+            const target = clipboardTarget(write.committed.loc) orelse {
+                self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, .ENOSYS);
+                self.kitty_clipboard.pop();
+                continue;
+            };
+            const status: vt.kitty.clipboard.Status = if (write.committed.contents.len == 0)
+                if (self.clipboard.clear(target, self.last_serial)) .DONE else .ENOSYS
+            else status: {
+                const text = for (write.committed.contents) |content| {
+                    if (vt.clipboard.isTextMime(content.mime)) break content.data;
+                } else break :status .ENOSYS;
+                const owned = self.alloc.dupeZ(u8, text) catch break :status .EIO;
+                break :status if (self.clipboard.claim(target, owned, self.last_serial)) .DONE else .ENOSYS;
+            };
+            self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, status);
+            self.kitty_clipboard.pop();
+        },
+        .read => |*read| {
+            if (read.started) return;
+            self.kitty_clipboard.prepareRead(read) catch {
+                self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EIO);
+                self.kitty_clipboard.pop();
+                continue;
+            };
+            if (read.paste) |paste| {
+                const available = [_][]const u8{paste.mime};
+                self.finishKittyClipboardRead(read, &available, paste);
+                continue;
+            }
+            if (!read.needsTransfer()) {
+                var available_buf: [clipboard_format.paste_mime_preference.len][]const u8 = undefined;
+                self.finishKittyClipboardRead(
+                    read,
+                    self.clipboard.availableMimes(clipboardTargetFromKitty(read.target), &available_buf),
+                    null,
+                );
+                continue;
+            }
+
+            switch (self.clipboard.request(clipboardTargetFromKitty(read.target), .kitty_read)) {
+                .started => {
+                    read.started = true;
+                    return;
+                },
+                .busy => return,
+                .unavailable => {
+                    self.finishKittyClipboardRead(read, &.{}, null);
+                    continue;
+                },
+            }
+        },
+    };
+}
+
+fn finishKittyClipboardRead(
+    self: *App,
+    read: *const KittyClipboard.Read,
+    available: []const []const u8,
+    content: ?vt.clipboard.Content,
+) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    read.encodeSuccess(&writer.writer, available, content) catch {
+        self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EIO);
+        self.kitty_clipboard.pop();
+        return;
+    };
+    self.writePty(writer.writer.buffered());
+    self.kitty_clipboard.pop();
+}
+
+fn failStartedKittyRead(self: *App, status: vt.kitty.clipboard.Status) void {
+    const request = self.kitty_clipboard.front() orelse return;
+    const read = switch (request.*) {
+        .read => |*read| read,
+        else => return,
+    };
+    if (!read.started) return;
+    self.writeKittyClipboardStatus(.read, read.id, read.terminator, status);
+    self.kitty_clipboard.pop();
+}
+
+fn writeKittyClipboardStatus(
+    self: *App,
+    op: vt.kitty.clipboard.Operation,
+    id: []const u8,
+    terminator: vt.osc.Terminator,
+    status: vt.kitty.clipboard.Status,
+) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    (vt.kitty.clipboard.Response{
+        .op = op,
+        .status = status,
+        .id = id,
+        .terminator = terminator,
+    }).encode(&writer.writer) catch return;
+    self.writePty(writer.writer.buffered());
+}
+
+fn writeTerminalPaste(
+    self: *App,
+    source: vt.PasteSource,
+    mime: []const u8,
+    data: []const u8,
+) void {
     if (data.len == 0) return;
 
-    // Mutable input lets the encoder sanitize control bytes in place,
-    // so this cannot fail.
-    const parts = vt.input.encodePaste(
-        data,
-        .fromTerminal(&self.term),
-    );
-    for (parts) |part| self.writePty(part);
+    switch (source) {
+        .clipboard => |location| if (self.term.modes.get(.kitty_paste_events)) {
+            const target = clipboardTarget(location) orelse return;
+            var writer: std.Io.Writer.Allocating = .init(self.alloc);
+            defer writer.deinit();
+            self.kitty_clipboard.paste(
+                self.io,
+                kittyClipboardTarget(target),
+                mime,
+                data,
+                &writer.writer,
+            ) catch |err| {
+                log.warn("Kitty clipboard paste event failed: {}", .{err});
+                return;
+            };
+            self.writePty(writer.writer.buffered());
+            return;
+        },
+        .text => {},
+    }
+
+    const contents = [_]vt.clipboard.Content{.{ .mime = mime, .data = data }};
+    _ = self.stream.handler.terminal_handler.paste(.{
+        .source = source,
+        .contents = .{ .memory = &contents },
+        // Preserve Monstar's existing paste policy. libghostty still applies
+        // bracket framing and xterm control-byte sanitization.
+        .allow_unsafe = true,
+    }) catch |err| {
+        log.warn("terminal paste failed: {}", .{err});
+    };
+}
+
+fn kittyClipboardTarget(target: Clipboard.Target) KittyClipboard.Target {
+    return switch (target) {
+        .clipboard => .clipboard,
+        .primary => .primary,
+    };
+}
+
+fn clipboardTargetFromKitty(target: KittyClipboard.Target) Clipboard.Target {
+    return switch (target) {
+        .clipboard => .clipboard,
+        .primary => .primary,
+    };
+}
+
+fn clipboardLocation(target: Clipboard.Target) vt.clipboard.Location {
+    return switch (target) {
+        .clipboard => .standard,
+        .primary => .primary,
+    };
+}
+
+fn dndEvent(ctx: *anyopaque, event: Clipboard.DndEvent) bool {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    const state = self.term.kitty_dnd orelse return false;
+
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    switch (event) {
+        .motion => |motion| {
+            const mimes = [_][]const u8{motion.mime};
+            state.dragMove(
+                self.alloc,
+                &writer.writer,
+                self.kittyDndMove(motion.x, motion.y, motion.operations),
+                &mimes,
+            ) catch return true;
+        },
+        .leave => state.dragLeave(self.alloc, &writer.writer) catch return true,
+    }
+    self.writePty(writer.writer.buffered());
+    return true;
+}
+
+fn writeKittyDndDrop(
+    self: *App,
+    state: *vt.kitty.dnd.State,
+    drop: Clipboard.DndData,
+) void {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    const items = [_]vt.kitty.dnd.Item{.{ .mime = drop.mime, .data = drop.data }};
+    state.dragDrop(
+        self.alloc,
+        &writer.writer,
+        self.kittyDndMove(drop.x, drop.y, drop.operations),
+        &items,
+    ) catch |err| {
+        log.warn("Kitty drag-and-drop failed: {}", .{err});
+        return;
+    };
+    self.writePty(writer.writer.buffered());
+}
+
+fn kittyDndMove(
+    self: *const App,
+    logical_x: f64,
+    logical_y: f64,
+    operations: Clipboard.DndOperations,
+) vt.kitty.dnd.MoveEvent {
+    const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
+    const pixel_x = @max(0, logical_x * scale - @as(f64, @floatFromInt(self.layout.grid_x)));
+    const pixel_y = @max(0, logical_y * scale - @as(f64, @floatFromInt(self.layout.grid_y)));
+    const cell_x: u32 = @intFromFloat(@min(
+        pixel_x / @as(f64, @floatFromInt(self.font.cell_width)),
+        @as(f64, @floatFromInt(self.term.cols -| 1)),
+    ));
+    const cell_y: u32 = @intFromFloat(@min(
+        pixel_y / @as(f64, @floatFromInt(self.font.cell_height)),
+        @as(f64, @floatFromInt(self.term.rows -| 1)),
+    ));
+    return .{
+        .cell_x = cell_x,
+        .cell_y = cell_y,
+        .pixel_x = @intFromFloat(@min(pixel_x, std.math.maxInt(i32))),
+        .pixel_y = @intFromFloat(@min(pixel_y, std.math.maxInt(i32))),
+        .operations = .{ .copy = operations.copy, .move = operations.move },
+    };
 }
 
 fn formatDropPaste(self: *App, mime: []const u8, data: []const u8) ![]u8 {

@@ -20,17 +20,50 @@ const max_transfer_size = 1024 * 1024;
 pub const Target = enum { clipboard, primary };
 
 pub const Purpose = union(enum) {
-    terminal,
+    terminal: Target,
     osc52_read: u8,
+    kitty_read,
 };
 
 pub const RequestResult = enum { started, busy, unavailable };
 
-pub const Event = union(enum) {
-    terminal: []u8,
-    osc52_read: struct { kind: u8, data: []const u8 },
-    dnd: struct { mime: []const u8, data: []const u8 },
+pub const DndData = struct {
+    mime: []const u8,
+    data: []const u8,
+    x: f64,
+    y: f64,
+    operations: DndOperations,
 };
+
+pub const Event = union(enum) {
+    terminal: struct {
+        target: Target,
+        mime: []const u8,
+        data: []const u8,
+    },
+    osc52_read: struct { kind: u8, data: []const u8 },
+    kitty_read: struct { mime: []const u8, data: []const u8 },
+    dnd: DndData,
+};
+
+pub const DndOperations = packed struct(u2) {
+    copy: bool = false,
+    move: bool = false,
+};
+
+pub const DndMotion = struct {
+    x: f64,
+    y: f64,
+    mime: []const u8,
+    operations: DndOperations,
+};
+
+pub const DndEvent = union(enum) {
+    motion: DndMotion,
+    leave,
+};
+
+pub const DndFn = *const fn (ctx: *anyopaque, event: DndEvent) bool;
 
 alloc: std.mem.Allocator,
 data_manager: ?*wl.DataDeviceManager,
@@ -47,10 +80,16 @@ primary_source: ?*Source,
 transfer_fd: posix.fd_t,
 transfer_buf: std.ArrayList(u8),
 transfer_action: TransferAction,
+dnd_ctx: ?*anyopaque,
+dnd_fn: ?DndFn,
 
 const TransferAction = union(enum) {
-    terminal,
+    terminal: struct {
+        target: Target,
+        mime: [*:0]const u8,
+    },
     osc52_read: u8,
+    kitty_read: [*:0]const u8,
     dnd: *DataOffer,
 };
 
@@ -72,6 +111,10 @@ const DataOffer = struct {
     mimes: clipboard_format.MimeMask = 0,
     dnd_mimes: clipboard_format.MimeMask = 0,
     dnd_action: wl.DataDeviceManager.DndAction = .{},
+    source_actions: wl.DataDeviceManager.DndAction = .{ .copy = true },
+    enter_serial: u32 = 0,
+    x: f64 = 0,
+    y: f64 = 0,
 
     fn noteMime(self: *DataOffer, mime_type: [*:0]const u8) void {
         if (clipboard_format.mimeBit(&clipboard_format.paste_mime_preference, mime_type)) |bit| self.mimes |= bit;
@@ -179,7 +222,12 @@ pub fn init(
         .primary_source = null,
         .transfer_fd = -1,
         .transfer_buf = .empty,
-        .transfer_action = .terminal,
+        .transfer_action = .{ .terminal = .{
+            .target = .clipboard,
+            .mime = clipboard_format.paste_mime_preference[0].ptr,
+        } },
+        .dnd_ctx = null,
+        .dnd_fn = null,
     };
 }
 
@@ -206,6 +254,28 @@ pub fn setDevices(
     if (primary_device) |device| device.setListener(*Clipboard, primaryDeviceListener, self);
 }
 
+pub fn setDndCallback(self: *Clipboard, ctx: *anyopaque, callback: DndFn) void {
+    self.dnd_ctx = ctx;
+    self.dnd_fn = callback;
+}
+
+/// Apply the running program's OSC 72 acceptance to the active Wayland drag.
+pub fn setDndAcceptance(self: *Clipboard, operation: enum { none, copy, move }) void {
+    const offer = self.dnd_offer orelse return;
+    const mime = if (operation == .none) null else offer.bestDndMime();
+    offer.offer.accept(offer.enter_serial, mime);
+    const allowed: wl.DataDeviceManager.DndAction = .{
+        .copy = offer.source_actions.copy,
+        .move = offer.source_actions.move,
+    };
+    const preferred: wl.DataDeviceManager.DndAction = switch (operation) {
+        .none => .{},
+        .copy => .{ .copy = true },
+        .move => .{ .move = true },
+    };
+    offer.offer.setActions(allowed, preferred);
+}
+
 /// Takes ownership of `text` on every path.
 pub fn claim(self: *Clipboard, target: Target, text: [:0]const u8, serial: u32) bool {
     return switch (target) {
@@ -217,19 +287,25 @@ pub fn claim(self: *Clipboard, target: Target, text: [:0]const u8, serial: u32) 
 pub fn request(self: *Clipboard, target: Target, purpose: Purpose) RequestResult {
     if (self.transfer_fd >= 0) return .busy;
 
-    const action: TransferAction = switch (purpose) {
-        .terminal => .terminal,
-        .osc52_read => |kind| .{ .osc52_read = kind },
-    };
     switch (target) {
         .clipboard => {
             const offer = self.clip_offer orelse return .unavailable;
             const mime = offer.bestMime() orelse return .unavailable;
+            const action: TransferAction = switch (purpose) {
+                .terminal => |source| .{ .terminal = .{ .target = source, .mime = mime } },
+                .osc52_read => |kind| .{ .osc52_read = kind },
+                .kitty_read => .{ .kitty_read = mime },
+            };
             self.beginTransfer(mime, .{ .clipboard = offer }, action) catch return .unavailable;
         },
         .primary => {
             const offer = self.primary_offer orelse return .unavailable;
             const mime = offer.bestMime() orelse return .unavailable;
+            const action: TransferAction = switch (purpose) {
+                .terminal => |source| .{ .terminal = .{ .target = source, .mime = mime } },
+                .osc52_read => |kind| .{ .osc52_read = kind },
+                .kitty_read => .{ .kitty_read = mime },
+            };
             self.beginTransfer(mime, .{ .primary = offer }, action) catch return .unavailable;
         },
     }
@@ -266,11 +342,22 @@ pub fn readTransfer(self: *Clipboard) !?Event {
     _ = std.os.linux.close(self.transfer_fd);
     self.transfer_fd = -1;
     return switch (self.transfer_action) {
-        .terminal => .{ .terminal = self.transfer_buf.items },
+        .terminal => |transfer| .{ .terminal = .{
+            .target = transfer.target,
+            .mime = std.mem.span(transfer.mime),
+            .data = self.transfer_buf.items,
+        } },
         .osc52_read => |kind| .{ .osc52_read = .{ .kind = kind, .data = self.transfer_buf.items } },
+        .kitty_read => |mime| .{ .kitty_read = .{
+            .mime = std.mem.span(mime),
+            .data = self.transfer_buf.items,
+        } },
         .dnd => |offer| .{ .dnd = .{
             .mime = std.mem.span(offer.bestDndMime() orelse unreachable),
             .data = self.transfer_buf.items,
+            .x = offer.x,
+            .y = offer.y,
+            .operations = dndOperations(offer.source_actions),
         } },
     };
 }
@@ -284,7 +371,10 @@ pub fn finishEvent(self: *Clipboard) void {
         else => {},
     }
     self.transfer_buf.clearRetainingCapacity();
-    self.transfer_action = .terminal;
+    self.transfer_action = .{ .terminal = .{
+        .target = .clipboard,
+        .mime = clipboard_format.paste_mime_preference[0].ptr,
+    } };
 }
 
 fn abortTransfer(self: *Clipboard) void {
@@ -295,7 +385,48 @@ fn abortTransfer(self: *Clipboard) void {
         else => {},
     }
     self.transfer_buf.clearRetainingCapacity();
-    self.transfer_action = .terminal;
+    self.transfer_action = .{ .terminal = .{
+        .target = .clipboard,
+        .mime = clipboard_format.paste_mime_preference[0].ptr,
+    } };
+}
+
+/// Clear a selection immediately. Wayland accepts the request without a
+/// round trip, which lets terminal protocol writes be answered synchronously.
+pub fn clear(self: *Clipboard, target: Target, serial: u32) bool {
+    switch (target) {
+        .clipboard => {
+            const device = self.data_device orelse return false;
+            device.setSelection(null, serial);
+            if (self.clip_source) |source| source.destroy();
+        },
+        .primary => {
+            const device = self.primary_device orelse return false;
+            device.setSelection(null, serial);
+            if (self.primary_source) |source| source.destroy();
+        },
+    }
+    return true;
+}
+
+/// Return the text representations currently offered for a selection.
+/// The returned slice borrows `buf` and the static MIME names.
+pub fn availableMimes(
+    self: *const Clipboard,
+    target: Target,
+    buf: *[clipboard_format.paste_mime_preference.len][]const u8,
+) []const []const u8 {
+    const mask: clipboard_format.MimeMask = switch (target) {
+        .clipboard => if (self.clip_offer) |offer| offer.mimes else 0,
+        .primary => if (self.primary_offer) |offer| offer.mimes else 0,
+    };
+    var len: usize = 0;
+    for (clipboard_format.paste_mime_preference, 0..) |mime, i| {
+        if (mask & (@as(clipboard_format.MimeMask, 1) << @intCast(i)) == 0) continue;
+        buf[len] = mime;
+        len += 1;
+    }
+    return buf[0..len];
 }
 
 fn claimClipboard(self: *Clipboard, text: [:0]const u8, serial: u32) bool {
@@ -449,8 +580,8 @@ fn primarySourceListener(
 fn dataOfferListener(_: *wl.DataOffer, event: wl.DataOffer.Event, offer: *DataOffer) void {
     switch (event) {
         .offer => |ev| offer.noteMime(ev.mime_type),
+        .source_actions => |ev| offer.source_actions = ev.source_actions,
         .action => |ev| offer.dnd_action = ev.dnd_action,
-        else => {},
     }
 }
 
@@ -484,19 +615,61 @@ fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *Clip
                 return;
             };
             if (offer.bestDndMime()) |mime| {
+                offer.enter_serial = enter.serial;
+                offer.x = enter.x.toDouble();
+                offer.y = enter.y.toDouble();
                 offer.offer.accept(enter.serial, mime);
                 offer.offer.setActions(.{ .copy = true }, .{ .copy = true });
                 if (self.dnd_offer) |old| old.destroy();
                 self.dnd_offer = offer;
+                if (self.reportDndMotion(offer)) {
+                    const allowed: wl.DataDeviceManager.DndAction = .{
+                        .copy = offer.source_actions.copy,
+                        .move = offer.source_actions.move,
+                    };
+                    const preferred: wl.DataDeviceManager.DndAction = if (allowed.copy)
+                        .{ .copy = true }
+                    else if (allowed.move)
+                        .{ .move = true }
+                    else
+                        .{};
+                    offer.offer.setActions(allowed, preferred);
+                }
             } else {
                 offer.offer.accept(enter.serial, null);
                 offer.destroy();
             }
         },
-        .leave => if (self.dnd_offer) |offer| offer.destroy(),
+        .leave => if (self.dnd_offer) |offer| {
+            _ = self.reportDnd(.leave);
+            offer.destroy();
+        },
         .drop => self.beginDrop(),
-        .motion => {},
+        .motion => |motion| if (self.dnd_offer) |offer| {
+            offer.x = motion.x.toDouble();
+            offer.y = motion.y.toDouble();
+            _ = self.reportDndMotion(offer);
+        },
     }
+}
+
+fn reportDndMotion(self: *Clipboard, offer: *const DataOffer) bool {
+    const mime = offer.bestDndMime() orelse return false;
+    return self.reportDnd(.{ .motion = .{
+        .x = offer.x,
+        .y = offer.y,
+        .mime = std.mem.span(mime),
+        .operations = dndOperations(offer.source_actions),
+    } });
+}
+
+fn reportDnd(self: *Clipboard, event: DndEvent) bool {
+    const callback = self.dnd_fn orelse return false;
+    return callback(self.dnd_ctx orelse return false, event);
+}
+
+fn dndOperations(actions: wl.DataDeviceManager.DndAction) DndOperations {
+    return .{ .copy = actions.copy, .move = actions.move };
 }
 
 fn primaryDeviceListener(

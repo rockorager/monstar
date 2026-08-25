@@ -11,7 +11,8 @@ Monstar is a Wayland terminal emulator built on libghostty.
 ## Features
 
 - Native Wayland with fractional scaling, IME (text-input-v3), activation, and background blur.
-- Kitty graphics, OSC 8 hyperlinks, automatic URI detection, and synchronized output.
+- Kitty graphics, clipboard/paste, and drag-and-drop protocols; OSC 8 hyperlinks;
+  automatic URI detection; and synchronized output.
 - Deep Linux integration: XDG desktop portals, D-Bus notifications, and optional systemd cgroups.
 - Non-blocking scrollback search and rectangular block selection.
 - Inertial touchpad scrolling with distinct precision/discrete wheel tuning.
