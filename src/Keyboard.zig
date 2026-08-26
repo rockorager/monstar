@@ -340,12 +340,30 @@ fn bitSet(mask: c.xkb_mod_mask_t, index: c.xkb_mod_index_t) bool {
     return mask & (@as(c.xkb_mod_mask_t, 1) << @intCast(index)) != 0;
 }
 
-/// Use XKB remaps for functional keys while keeping writing-system keys
-/// physical so shortcuts remain layout-independent.
+/// XKB remaps win for functional keys, writing-system keys stay physical for layout-independent shortcuts, and virtual-keyboard text on a key that never types yields .unidentified.
 fn remapKey(physical: vt.input.Key, keysym: c.xkb_keysym_t) vt.input.Key {
-    const remapped = keyFromKeysym(keysym) orelse return physical;
+    const remapped = keyFromKeysym(keysym) orelse {
+        // Virtual keyboards put text on arbitrary keycodes, so a text keysym on a key that never types makes the physical identity fiction.
+        if (!physicalCanProduceText(physical) and keysymProducesText(keysym)) return .unidentified;
+        return physical;
+    };
     if (physical.shouldBeRemappable() or remapped.shouldBeRemappable()) return remapped;
     return physical;
+}
+
+/// Whether the keysym resolves to ordinary text rather than a control or private-use codepoint.
+fn keysymProducesText(keysym: c.xkb_keysym_t) bool {
+    const codepoint = c.xkb_keysym_to_utf32(keysym);
+    if (codepoint < 0x20 or codepoint == 0x7f) return false;
+    // C1 controls are not text, and the BMP private-use area carries APL layout commands and Kitty functional codes.
+    if (codepoint >= 0x80 and codepoint <= 0x9f) return false;
+    return codepoint < 0xe000 or codepoint > 0xf8ff;
+}
+
+/// Whether a physical key can carry text on real hardware: writing-system keys, space, or unknown keys.
+fn physicalCanProduceText(key: vt.input.Key) bool {
+    // The numpad is excluded: real numpad text arrives as KP_* keysyms that keyFromKeysym already resolves.
+    return !key.shouldBeRemappable() or key == .space or key == .unidentified;
 }
 
 fn keyFromKeysym(keysym: c.xkb_keysym_t) ?vt.input.Key {
@@ -715,6 +733,67 @@ test "Dvorak writing key exposes its logical shortcut codepoint" {
     const event = kb.translate(&utf8_buf, 23, .press).?;
     try std.testing.expectEqual(vt.input.Key.key_i, event.key);
     try std.testing.expectEqual(@as(u21, 'c'), event.unshifted_codepoint);
+}
+
+test "virtual keyboard text on a non-writing keycode ignores the physical key" {
+    // wtype assigns keycodes by first appearance, so text lands on evdev 29 (ctrl), 15 (tab), 14 (backspace), 59 (f1), 96 (kp enter), 103 (up), ...
+    try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.control_left, c.XKB_KEY_Cyrillic_sha));
+    try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.tab, c.XKB_KEY_Cyrillic_yu));
+    try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.backspace, c.XKB_KEY_Cyrillic_ya));
+    try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.f1, c.XKB_KEY_Cyrillic_sha));
+    try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.arrow_up, c.XKB_KEY_Cyrillic_yu));
+    try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.numpad_enter, c.XKB_KEY_Cyrillic_ya));
+    // Uppercase has no Key entry either, so it reaches the same guard; lowercase resolves through keyFromKeysym.
+    try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.shift_left, c.XKB_KEY_A));
+    try std.testing.expectEqual(vt.input.Key.key_a, remapKey(.shift_left, c.XKB_KEY_a));
+
+    // Real hardware keeps its physical identity: non-text keysyms, PUA overlays like apl(dyalog), and text on text-capable keys.
+    try std.testing.expectEqual(vt.input.Key.alt_left, remapKey(.alt_left, c.XKB_KEY_Meta_L));
+    try std.testing.expectEqual(vt.input.Key.escape, remapKey(.escape, 0x0100f800));
+    try std.testing.expectEqual(vt.input.Key.key_a, remapKey(.key_a, c.XKB_KEY_Cyrillic_ef));
+    try std.testing.expectEqual(vt.input.Key.space, remapKey(.space, c.XKB_KEY_nobreakspace));
+    try std.testing.expectEqual(vt.input.Key.numpad_1, remapKey(.numpad_1, c.XKB_KEY_KP_1));
+}
+
+test "translate: wtype-style keymap keeps injected text off functional keycodes" {
+    // The keymap below mirrors wtype's template: sequential keycodes named K<n> with one text keysym each.
+    const wtype_keymap =
+        \\xkb_keymap {
+        \\xkb_keycodes "(unnamed)" {
+        \\  minimum = 8;
+        \\  maximum = 255;
+        \\  <K37> = 37;
+        \\  <K67> = 67;
+        \\};
+        \\xkb_types "(unnamed)" { type "ONE_LEVEL" { modifiers = none; map[none] = Level1; }; };
+        \\xkb_compatibility "(unnamed)" { };
+        \\xkb_symbols "(unnamed)" {
+        \\  key <K37> {[ Cyrillic_sha ]};
+        \\  key <K67> {[ Cyrillic_yu ]};
+        \\};
+        \\};
+    ;
+    var kb: Keyboard = try .init();
+    defer kb.deinit();
+    const keymap = c.xkb_keymap_new_from_string(
+        kb.context,
+        wtype_keymap,
+        c.XKB_KEYMAP_FORMAT_TEXT_V1,
+        c.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return error.KeymapParseFailed;
+    try kb.installKeymap(keymap);
+
+    var utf8_buf: [16]u8 = undefined;
+    // evdev 29 is left ctrl on real hardware; the injected letter must not become a ctrl press.
+    const on_ctrl = kb.translate(&utf8_buf, 29, .press).?;
+    try std.testing.expectEqual(vt.input.Key.unidentified, on_ctrl.key);
+    try std.testing.expectEqualStrings("\u{0448}", on_ctrl.utf8);
+    try std.testing.expect(!on_ctrl.mods.ctrl);
+    // evdev 59 is F1 on real hardware; the injected letter must not become an F1 escape sequence.
+    var utf8_buf2: [16]u8 = undefined;
+    const on_f1 = kb.translate(&utf8_buf2, 59, .press).?;
+    try std.testing.expectEqual(vt.input.Key.unidentified, on_f1.key);
+    try std.testing.expectEqualStrings("\u{044e}", on_f1.utf8);
 }
 
 test "translate and encode: caps lock remapped to escape" {
