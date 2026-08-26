@@ -4175,6 +4175,8 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
                 _ = std.os.linux.close(keymap.fd);
                 return;
             }
+            // A new keymap redefines what the armed repeat keycode means, so stop it.
+            self.cancelRepeat();
             // setKeymap takes ownership of the fd.
             self.keyboard.setKeymap(keymap.fd, keymap.size) catch |err| {
                 log.err("keymap load failed: {}", .{err});
