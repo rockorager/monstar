@@ -188,19 +188,48 @@ const Source = struct {
     }
 
     fn send(self: *Source, fd: i32) void {
-        const linux = std.os.linux;
-        defer _ = linux.close(fd);
-        var offset: usize = 0;
-        while (offset < self.text.len) {
-            const rc = linux.write(fd, self.text.ptr + offset, self.text.len - offset);
-            switch (linux.errno(rc)) {
-                .SUCCESS => offset += rc,
-                .INTR => continue,
-                else => return,
-            }
-        }
+        sendSelection(self.text, fd);
     }
 };
+
+/// Wayland dispatch must not block on a clipboard consumer. The compositor
+/// supplies a blocking pipe, which can fill before the consumer starts
+/// reading, so each transfer owns a copy of the selection on a detached
+/// writer thread.
+fn sendSelection(text: []const u8, fd: posix.fd_t) void {
+    // A detached transfer may outlive Clipboard teardown, so its memory must
+    // not borrow the application's allocator lifetime.
+    const alloc = std.heap.page_allocator;
+    const owned = alloc.dupe(u8, text) catch {
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    const thread = std.Thread.spawn(.{}, writeSelection, .{ alloc, owned, fd }) catch |err| {
+        log.err("failed to start clipboard writer: {}", .{err});
+        alloc.free(owned);
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    thread.detach();
+}
+
+fn writeSelection(alloc: std.mem.Allocator, text: []u8, fd: posix.fd_t) void {
+    const linux = std.os.linux;
+    defer _ = linux.close(fd);
+    // Free before closing so pipe EOF also synchronizes tests and teardown
+    // with the transfer's allocator use.
+    defer alloc.free(text);
+
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const rc = linux.write(fd, text.ptr + offset, text.len - offset);
+        switch (linux.errno(rc)) {
+            .SUCCESS => offset += rc,
+            .INTR => continue,
+            else => return,
+        }
+    }
+}
 
 pub fn init(
     alloc: std.mem.Allocator,
@@ -738,4 +767,32 @@ test "oversized transfer is aborted before growing past the paste backlog" {
     try std.testing.expectError(error.TransferTooLarge, clipboard.readTransfer());
     try std.testing.expectEqual(@as(posix.fd_t, -1), clipboard.transfer_fd);
     try std.testing.expectEqual(@as(usize, 0), clipboard.transfer_buf.items.len);
+}
+
+test "selection send does not block while the consumer is idle" {
+    const linux = std.os.linux;
+    var pipe_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        .SUCCESS,
+        linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })),
+    );
+    defer _ = linux.close(pipe_fds[0]);
+
+    const text = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(text);
+    for (text, 0..) |*byte, i| byte.* = @truncate(i);
+
+    // This returns before anyone reads. A synchronous send blocks once the
+    // payload exceeds the pipe capacity and never reaches the read loop.
+    sendSelection(text, pipe_fds[1]);
+
+    var received: usize = 0;
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = try posix.read(pipe_fds[0], &buf);
+        if (n == 0) break;
+        try std.testing.expectEqualSlices(u8, text[received .. received + n], buf[0..n]);
+        received += n;
+    }
+    try std.testing.expectEqual(text.len, received);
 }
