@@ -1,7 +1,8 @@
 //! HarfBuzz text shaping and shaped-run caching for terminal cell runs.
 //!
-//! Keys contain a face followed by run-relative (cluster, codepoint) pairs,
-//! allowing identical text to reuse shaping results at any screen position.
+//! Keys contain a face and style followed by run-relative (cluster, codepoint)
+//! pairs, allowing identical text to reuse shaping results at any screen
+//! position without mixing style-sensitive fallback repair.
 
 const TextShaper = @This();
 
@@ -12,7 +13,7 @@ const Font = @import("Font.zig");
 alloc: std.mem.Allocator,
 font: *Font,
 hb_buf: *c.hb_buffer_t,
-/// HarfBuzz output keyed by face and run content.
+/// HarfBuzz output keyed by face, style, and run content.
 cache: std.StringHashMapUnmanaged([]ShapedGlyph),
 /// Scratch for the current run's cache key.
 key: std.ArrayList(u32),
@@ -27,6 +28,7 @@ const cache_max_entries = 8192;
 /// Fallback candidates tried when a cluster shapes to .notdef before
 /// accepting the tofu box.
 const max_notdef_retries = 3;
+const key_header_len = 2;
 
 pub const ShapedGlyph = struct {
     glyph: u32,
@@ -88,9 +90,9 @@ pub fn readStats(self: *const TextShaper) ShapeStats {
     return self.stats;
 }
 
-pub fn beginKey(self: *TextShaper, face_index: u16) !void {
+pub fn beginKey(self: *TextShaper, face_index: u16, style: Font.FaceStyle) !void {
     self.key.clearRetainingCapacity();
-    try self.key.append(self.alloc, face_index);
+    try self.key.appendSlice(self.alloc, &.{ face_index, @intFromEnum(style) });
 }
 
 pub fn appendKeyCodepoints(self: *TextShaper, cluster: u32, cp: u21, grapheme: []const u21) !void {
@@ -108,6 +110,9 @@ pub fn keyItems(self: *const TextShaper) []const u32 {
 /// owned by this shaper and remains valid until a later shape call clears a
 /// full cache, or until `clearCache` or `deinit` is called.
 pub fn shape(self: *TextShaper, face_index: u16, style: Font.FaceStyle, shaped_cells: usize) ![]const ShapedGlyph {
+    std.debug.assert(self.key.items.len >= key_header_len);
+    std.debug.assert(self.key.items[0] == face_index);
+    std.debug.assert(self.key.items[1] == @intFromEnum(style));
     if (self.cache.get(std.mem.sliceAsBytes(self.key.items))) |cached| {
         // Steady-state rendering overwhelmingly reuses shaped runs. Keeping
         // the miss path out of line also keeps Renderer.drawRun compact.
@@ -126,10 +131,13 @@ pub fn shape(self: *TextShaper, face_index: u16, style: Font.FaceStyle, shaped_c
 /// lifetime as one returned by `shape`.
 pub fn shapeRun(self: *TextShaper, face_index: u16, style: Font.FaceStyle) ![]ShapedGlyph {
     const key = self.key.items;
+    std.debug.assert(key.len >= key_header_len);
+    std.debug.assert(key[0] == face_index);
+    std.debug.assert(key[1] == @intFromEnum(style));
     const face = self.font.face(face_index);
 
     c.hb_buffer_clear_contents(self.hb_buf);
-    var i: usize = 1;
+    var i: usize = key_header_len;
     while (i + 1 < key.len) : (i += 2) {
         c.hb_buffer_add(self.hb_buf, key[i + 1], key[i]);
     }
@@ -212,7 +220,7 @@ fn repairNotdefClusters(
         }
 
         cps.clearRetainingCapacity();
-        var k: usize = 1;
+        var k: usize = key_header_len;
         while (k + 1 < key.len) : (k += 2) {
             if (key[k] == cluster) try cps.append(self.alloc, @intCast(key[k + 1]));
         }
@@ -280,4 +288,23 @@ fn shapeClusterWith(
         });
     }
     return true;
+}
+
+test "cache separates identical runs by fallback style" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var shaper: TextShaper = try .init(alloc, &font);
+    defer shaper.deinit();
+
+    try shaper.beginKey(0, .regular);
+    try shaper.appendKeyCodepoints(0, 'A', &.{});
+    _ = try shaper.shape(0, .regular, 1);
+
+    try shaper.beginKey(0, .bold);
+    try shaper.appendKeyCodepoints(0, 'A', &.{});
+    _ = try shaper.shape(0, .bold, 1);
+
+    try std.testing.expectEqual(@as(usize, 2), shaper.readStats().cache_misses);
+    try std.testing.expectEqual(@as(usize, 0), shaper.readStats().cache_hits);
 }

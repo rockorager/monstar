@@ -1605,11 +1605,11 @@ fn drawRun(
     const run_style: vt.Style = if (raws[start].style_id == 0) .{} else styles[start];
     const face_style: Font.FaceStyle = .init(run_style.flags.bold, run_style.flags.italic);
 
-    // Build the run's cache key: the face plus (run-relative cluster,
-    // codepoint) pairs. Relative clusters make the shape result
+    // Build the run's cache key: the face and style plus (run-relative
+    // cluster, codepoint) pairs. Relative clusters make the shape result
     // position-independent, so the same text hits one entry anywhere
     // on screen.
-    try self.text_shaper.beginKey(face_index);
+    try self.text_shaper.beginKey(face_index, face_style);
     var non_space = false;
     for (start..end) |x| {
         const raw = raws[x];
@@ -1907,9 +1907,9 @@ test "emoji keycap grapheme selects emoji fallback face" {
     try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
     try testing.expectEqual(keycap_face, renderer.face_scratch.items[0]);
 
-    try renderer.text_shaper.beginKey(keycap_face);
+    try renderer.text_shaper.beginKey(keycap_face, .regular);
     try renderer.text_shaper.appendKeyCodepoints(0, raws[0].content.codepoint.data, graphemes[0]);
-    try testing.expectEqualSlices(u32, &.{ keycap_face, 0, '1', 0, 0xFE0F, 0, 0x20E3 }, renderer.text_shaper.keyItems());
+    try testing.expectEqualSlices(u32, &.{ keycap_face, @intFromEnum(Font.FaceStyle.regular), 0, '1', 0, 0xFE0F, 0, 0x20E3 }, renderer.text_shaper.keyItems());
     try testing.expect(try renderer.shapeKeyHasColorGlyph(keycap_face));
 
     try renderer.render(&state, pixels, width, height);
@@ -1972,7 +1972,7 @@ test "emoji presentation graphemes select emoji fallback face" {
         try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
         try testing.expectEqual(case_face, renderer.face_scratch.items[0]);
 
-        try renderer.text_shaper.beginKey(case_face);
+        try renderer.text_shaper.beginKey(case_face, .regular);
         try renderer.text_shaper.appendKeyCodepoints(
             0,
             raws[0].content.codepoint.data,
@@ -2039,7 +2039,7 @@ test "default emoji presentation squares select emoji fallback face" {
         try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
         try testing.expectEqual(case_face, renderer.face_scratch.items[0]);
 
-        try renderer.text_shaper.beginKey(case_face);
+        try renderer.text_shaper.beginKey(case_face, .regular);
         try renderer.text_shaper.appendKeyCodepoints(
             0,
             raws[0].content.codepoint.data,
