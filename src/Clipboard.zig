@@ -220,6 +220,13 @@ fn writeSelection(alloc: std.mem.Allocator, text: []u8, fd: posix.fd_t) void {
     // with the transfer's allocator use.
     defer alloc.free(text);
 
+    // A clipboard consumer may close its pipe before reading the selection.
+    // Keep that routine cancellation local to this detached writer instead of
+    // letting SIGPIPE terminate the entire terminal process.
+    var signal_mask = posix.sigemptyset();
+    posix.sigaddset(&signal_mask, .PIPE);
+    posix.sigprocmask(linux.SIG.BLOCK, &signal_mask, null);
+
     var offset: usize = 0;
     while (offset < text.len) {
         const rc = linux.write(fd, text.ptr + offset, text.len - offset);
@@ -795,4 +802,21 @@ test "selection send does not block while the consumer is idle" {
         received += n;
     }
     try std.testing.expectEqual(text.len, received);
+}
+
+test "selection writer survives a consumer closing early" {
+    const linux = std.os.linux;
+    var pipe_fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        .SUCCESS,
+        linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })),
+    );
+    _ = linux.close(pipe_fds[0]);
+    errdefer _ = linux.close(pipe_fds[1]);
+
+    const alloc = std.heap.page_allocator;
+    const text = try alloc.dupe(u8, "selection");
+    errdefer alloc.free(text);
+    const thread = try std.Thread.spawn(.{}, writeSelection, .{ alloc, text, pipe_fds[1] });
+    thread.join();
 }
