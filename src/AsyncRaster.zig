@@ -13,6 +13,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const vt = @import("ghostty-vt");
+const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Renderer = @import("Renderer.zig");
 
@@ -112,7 +113,8 @@ pub const Loader = struct {
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
-    cursor_text: ?vt.color.RGB,
+    cursor_color: ?Config.TerminalColor,
+    cursor_text: ?Config.TerminalColor,
     background_alpha: u8,
     background_alpha_cells: bool,
     state: *vt.RenderState,
@@ -128,7 +130,8 @@ pub const Loader = struct {
         discovery: *Font.Discovery,
         selection_background: vt.color.RGB,
         selection_foreground: ?vt.color.RGB,
-        cursor_text: ?vt.color.RGB,
+        cursor_color: ?Config.TerminalColor,
+        cursor_text: ?Config.TerminalColor,
         background_alpha: u8,
         background_alpha_cells: bool,
         state: *vt.RenderState,
@@ -140,6 +143,7 @@ pub const Loader = struct {
             .discovery = discovery,
             .selection_background = selection_background,
             .selection_foreground = selection_foreground,
+            .cursor_color = cursor_color,
             .cursor_text = cursor_text,
             .background_alpha = background_alpha,
             .background_alpha_cells = background_alpha_cells,
@@ -191,6 +195,7 @@ pub const Loader = struct {
             self.discovery,
             self.selection_background,
             self.selection_foreground,
+            self.cursor_color,
             self.cursor_text,
             self.background_alpha,
             self.background_alpha_cells,
@@ -234,7 +239,8 @@ pub fn init(
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
-    cursor_text: ?vt.color.RGB,
+    cursor_color: ?Config.TerminalColor,
+    cursor_text: ?Config.TerminalColor,
     background_alpha: u8,
     background_alpha_cells: bool,
     state: *vt.RenderState,
@@ -247,6 +253,7 @@ pub fn init(
     var renderer: Renderer = try .init(alloc, font, .{
         .selection_background = selection_background,
         .selection_foreground = selection_foreground,
+        .cursor_color = cursor_color,
         .cursor_text = cursor_text,
         .background_alpha = background_alpha,
         .background_alpha_cells = background_alpha_cells,
@@ -304,7 +311,8 @@ pub fn reconfigure(
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
-    cursor_text: ?vt.color.RGB,
+    cursor_color: ?Config.TerminalColor,
+    cursor_text: ?Config.TerminalColor,
     background_alpha: u8,
     background_alpha_cells: bool,
 ) !void {
@@ -318,6 +326,7 @@ pub fn reconfigure(
     var renderer: Renderer = try .init(self.alloc, font, .{
         .selection_background = selection_background,
         .selection_foreground = selection_foreground,
+        .cursor_color = cursor_color,
         .cursor_text = cursor_text,
         .background_alpha = background_alpha,
         .background_alpha_cells = background_alpha_cells,
@@ -344,7 +353,8 @@ pub fn configuredFor(
     discovery: *Font.Discovery,
     selection_background: vt.color.RGB,
     selection_foreground: ?vt.color.RGB,
-    cursor_text: ?vt.color.RGB,
+    cursor_color: ?Config.TerminalColor,
+    cursor_text: ?Config.TerminalColor,
     background_alpha: u8,
     background_alpha_cells: bool,
 ) bool {
@@ -353,7 +363,8 @@ pub fn configuredFor(
     return self.font.discovery() == discovery and
         self.renderer.selection_bg.eql(selection_background) and
         optionalRgbEql(self.renderer.selection_fg, selection_foreground) and
-        optionalRgbEql(self.renderer.cursor_text, cursor_text) and
+        optionalTerminalColorEql(self.renderer.cursor_color, cursor_color) and
+        optionalTerminalColorEql(self.renderer.cursor_text, cursor_text) and
         self.renderer.background_alpha == background_alpha and
         self.renderer.background_alpha_cells == background_alpha_cells;
 }
@@ -402,6 +413,11 @@ fn lock(self: *AsyncRaster) void {
 }
 
 fn optionalRgbEql(a: ?vt.color.RGB, b: ?vt.color.RGB) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
+}
+
+fn optionalTerminalColorEql(a: ?Config.TerminalColor, b: ?Config.TerminalColor) bool {
     if (a == null or b == null) return a == null and b == null;
     return a.?.eql(b.?);
 }
@@ -669,6 +685,7 @@ test "unchanged dirty rows report no damage" {
     var raster = try AsyncRaster.init(
         font.discovery(),
         .{ .r = 1, .g = 2, .b = 3 },
+        null,
         null,
         null,
         255,

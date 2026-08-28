@@ -219,6 +219,14 @@ For example,
 and
 .B ffe629
 are equivalent.
+.B cursor-color
+and
+.B cursor-text
+also accept
+.B cell-foreground
+and
+.B cell-background
+to match the cursor cell's colors at runtime.
 .PP
 An explicit color in the main configuration overrides the named theme.
 Runtime OSC color changes may override terminal, cursor, and selection colors
@@ -246,6 +254,14 @@ in both color schemes.
 .TP
 .BI cursor-color " = color"
 Set the cursor color.
+A direct color uses six hexadecimal RGB digits, with an optional leading
+.BR # .
+The special values
+.B cell-foreground
+and
+.B cell-background
+match the cursor cell's foreground or background, after reverse video.
+An OSC 12 cursor color from the application overrides this until it is reset.
 Built-in defaults are
 .B #242424
 in light mode and
@@ -254,7 +270,13 @@ in dark mode.
 .TP
 .BI cursor-text " = color"
 Set text beneath a focused block cursor.
+Accepts the same values as
+.BR cursor-color .
 When unset, the terminal background is used.
+The usual pairing with
+.B cursor-color = cell-foreground
+is
+.BR "cursor-text = cell-background" .
 .TP
 .BI foreground " = color"
 Set the default terminal foreground.

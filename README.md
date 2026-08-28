@@ -135,6 +135,8 @@ Other settings:
   `0` disables the flash (default `200`).
 - **background / foreground / cursor-color / cursor-text** — Terminal colors
   as `#RRGGBB` or `RRGGBB`; explicit colors override the theme.
+  `cursor-color` and `cursor-text` also accept `cell-foreground` and
+  `cell-background` to match the cursor cell at runtime.
 - **selection-background / selection-foreground** — Selection colors.
 - **copy-highlight / copy-highlight-foreground** — Post-copy flash colors.
 - **palette** — Override one palette entry by index `0`–`255`; repeat the key

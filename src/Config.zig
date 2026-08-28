@@ -37,6 +37,7 @@ pub const MouseScrollMultiplier = struct {
 
 pub const Theme = config_theme.Theme;
 pub const ThemeColors = config_theme.ThemeColors;
+pub const TerminalColor = config_theme.TerminalColor;
 pub const light_theme = config_theme.light_theme;
 pub const dark_theme = config_theme.dark_theme;
 const ThemeOverrides = config_theme.ThemeOverrides;
@@ -103,8 +104,8 @@ light_theme_overrides: ?ThemeOverrides = null,
 dark_theme_overrides: ?ThemeOverrides = null,
 background: ?vt.color.RGB = null,
 foreground: ?vt.color.RGB = null,
-cursor_color: ?vt.color.RGB = null,
-cursor_text: ?vt.color.RGB = null,
+cursor_color: ?TerminalColor = null,
+cursor_text: ?TerminalColor = null,
 selection_background: ?vt.color.RGB = null,
 selection_foreground: ?vt.color.RGB = null,
 copy_highlight: ?vt.color.RGB = null,
@@ -253,9 +254,9 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else if (std.mem.eql(u8, key, "foreground")) {
         self.foreground = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "cursor-color")) {
-        self.cursor_color = try config_theme.parseColor(value);
+        self.cursor_color = try config_theme.parseTerminalColor(value);
     } else if (std.mem.eql(u8, key, "cursor-text")) {
-        self.cursor_text = try config_theme.parseColor(value);
+        self.cursor_text = try config_theme.parseTerminalColor(value);
     } else if (std.mem.eql(u8, key, "selection-background")) {
         self.selection_background = try config_theme.parseColor(value);
     } else if (std.mem.eql(u8, key, "selection-foreground")) {
@@ -424,7 +425,16 @@ pub fn effectiveCopyHighlightForeground(self: *const Config, color_scheme: vt.de
     return self.effectiveColor(color_scheme, "copy_highlight_foreground");
 }
 
-pub fn effectiveCursorText(self: *const Config, color_scheme: vt.device_status.ColorScheme) ?vt.color.RGB {
+pub fn effectiveCursorColor(self: *const Config, color_scheme: vt.device_status.ColorScheme) TerminalColor {
+    const named = if (self.namedThemeOverrides(color_scheme)) |theme| theme.cursor_color else null;
+    return config_theme.resolveTerminalColor(
+        self.cursor_color,
+        named,
+        colorsForScheme(color_scheme).cursor_color,
+    );
+}
+
+pub fn effectiveCursorText(self: *const Config, color_scheme: vt.device_status.ColorScheme) ?TerminalColor {
     const named = if (self.namedThemeOverrides(color_scheme)) |theme| theme.cursor_text else null;
     return self.cursor_text orelse named;
 }
@@ -441,7 +451,10 @@ pub fn terminalColors(self: *const Config, color_scheme: vt.device_status.ColorS
     return .{
         .background = .init(self.effectiveColor(color_scheme, "background")),
         .foreground = .init(self.effectiveColor(color_scheme, "foreground")),
-        .cursor = .init(self.effectiveColor(color_scheme, "cursor_color")),
+        .cursor = if (self.effectiveCursorColor(color_scheme).toRgb()) |rgb|
+            .init(rgb)
+        else
+            .unset,
         .palette = .init(palette),
     };
 }
@@ -489,8 +502,8 @@ test "defaults" {
     try std.testing.expectEqual(@as(?ThemeOverrides, null), config.dark_theme_overrides);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.foreground);
-    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.cursor_color);
-    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.cursor_text);
+    try std.testing.expectEqual(@as(?TerminalColor, null), config.cursor_color);
+    try std.testing.expectEqual(@as(?TerminalColor, null), config.cursor_text);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.selection_background);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.selection_foreground);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.copy_highlight);
@@ -560,8 +573,8 @@ test "parse config" {
     try std.testing.expect(config.background_opacity_cells);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
-    try std.testing.expectEqual(vt.color.RGB{ .r = 0xaa, .g = 0xbb, .b = 0xcc }, config.cursor_color.?);
-    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.cursor_text.?);
+    try std.testing.expectEqual(TerminalColor{ .rgb = .{ .r = 0xaa, .g = 0xbb, .b = 0xcc } }, config.cursor_color.?);
+    try std.testing.expectEqual(TerminalColor{ .rgb = .{ .r = 1, .g = 2, .b = 3 } }, config.cursor_text.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, config.selection_background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.selection_foreground.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 10, .g = 11, .b = 12 }, config.copy_highlight.?);
@@ -811,15 +824,53 @@ test "named themes follow color scheme and remain below explicit colors" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xdd, .g = 0xdd, .b = 0xdd }, config.effectiveSelectionBackground(.light));
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xff, .g = 0xe6, .b = 0x29 }, config.effectiveCopyHighlight(.light));
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1c, .g = 0x20, .b = 0x24 }, config.effectiveCopyHighlightForeground(.light));
-    try std.testing.expectEqual(vt.color.RGB{ .r = 0xfe, .g = 0xdc, .b = 0xba }, config.effectiveCursorText(.light).?);
+    try std.testing.expectEqual(TerminalColor{ .rgb = .{ .r = 0xfe, .g = 0xdc, .b = 0xba } }, config.effectiveCursorText(.light).?);
 
-    config.cursor_text = .{ .r = 7, .g = 8, .b = 9 };
-    try std.testing.expectEqual(vt.color.RGB{ .r = 7, .g = 8, .b = 9 }, config.effectiveCursorText(.light).?);
+    config.cursor_text = .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } };
+    try std.testing.expectEqual(TerminalColor{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }, config.effectiveCursorText(.light).?);
 
     const dark = config.terminalColors(.dark);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, dark.foreground.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, dark.palette.current[1]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xe0, .g = 0xe0, .b = 0xe0 }, config.effectiveSelectionForeground(.dark));
+}
+
+test "cell cursor colors stay out of the VT default layer" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const config = parse(arena_state.allocator(),
+        \\cursor-color = cell-foreground
+        \\cursor-text = cell-background
+        \\cursor-color = not-a-color
+    );
+    try std.testing.expectEqual(@as(TerminalColor, .cell_foreground), config.cursor_color.?);
+    try std.testing.expectEqual(@as(TerminalColor, .cell_background), config.cursor_text.?);
+    try std.testing.expectEqual(@as(TerminalColor, .cell_foreground), config.effectiveCursorColor(.dark));
+    try std.testing.expectEqual(@as(TerminalColor, .cell_background), config.effectiveCursorText(.dark).?);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.terminalColors(.dark).cursor.get());
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.terminalColors(.light).cursor.get());
+}
+
+test "named theme cell cursor colors stay below explicit colors" {
+    var config: Config = .{};
+    config.light_theme_overrides = config_theme.parseOverrides(
+        \\cursor-color = cell-foreground
+        \\cursor-text = cell-background
+    );
+    try std.testing.expectEqual(@as(TerminalColor, .cell_foreground), config.effectiveCursorColor(.light));
+    try std.testing.expectEqual(@as(TerminalColor, .cell_background), config.effectiveCursorText(.light).?);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.terminalColors(.light).cursor.get());
+    try std.testing.expectEqual(
+        TerminalColor{ .rgb = dark_theme.cursor_color },
+        config.effectiveCursorColor(.dark),
+    );
+
+    config.cursor_color = .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } };
+    try std.testing.expectEqual(
+        TerminalColor{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
+        config.effectiveCursorColor(.light),
+    );
+    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.terminalColors(.light).cursor.get().?);
 }
 
 test "absolute theme file resolves" {

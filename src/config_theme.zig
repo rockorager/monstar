@@ -15,11 +15,51 @@ pub const Theme = struct {
     dark: [:0]const u8,
 };
 
+/// A configured color that can be a concrete RGB value or a runtime
+/// reference to the cell's foreground or background.
+pub const TerminalColor = union(enum) {
+    rgb: vt.color.RGB,
+    cell_foreground,
+    cell_background,
+
+    pub fn toRgb(self: TerminalColor) ?vt.color.RGB {
+        return switch (self) {
+            .rgb => |color| color,
+            .cell_foreground, .cell_background => null,
+        };
+    }
+
+    pub fn resolve(self: TerminalColor, cell_fg: vt.color.RGB, cell_bg: vt.color.RGB) vt.color.RGB {
+        return switch (self) {
+            .rgb => |color| color,
+            .cell_foreground => cell_fg,
+            .cell_background => cell_bg,
+        };
+    }
+
+    pub fn eql(self: TerminalColor, other: TerminalColor) bool {
+        return switch (self) {
+            .rgb => |color| switch (other) {
+                .rgb => |other_color| color.eql(other_color),
+                else => false,
+            },
+            .cell_foreground => switch (other) {
+                .cell_foreground => true,
+                else => false,
+            },
+            .cell_background => switch (other) {
+                .cell_background => true,
+                else => false,
+            },
+        };
+    }
+};
+
 pub const ThemeOverrides = struct {
     background: ?vt.color.RGB = null,
     foreground: ?vt.color.RGB = null,
-    cursor_color: ?vt.color.RGB = null,
-    cursor_text: ?vt.color.RGB = null,
+    cursor_color: ?TerminalColor = null,
+    cursor_text: ?TerminalColor = null,
     selection_background: ?vt.color.RGB = null,
     selection_foreground: ?vt.color.RGB = null,
     copy_highlight: ?vt.color.RGB = null,
@@ -160,6 +200,13 @@ pub fn parseColor(value: []const u8) error{InvalidValue}!vt.color.RGB {
     };
 }
 
+/// Hex color, `cell-foreground`, or `cell-background`.
+pub fn parseTerminalColor(value: []const u8) error{InvalidValue}!TerminalColor {
+    if (std.mem.eql(u8, value, "cell-foreground")) return .cell_foreground;
+    if (std.mem.eql(u8, value, "cell-background")) return .cell_background;
+    return .{ .rgb = try parseColor(value) };
+}
+
 pub fn loadOverrides(
     io: std.Io,
     arena: std.mem.Allocator,
@@ -225,12 +272,12 @@ pub fn parseOverrides(text: []const u8) ThemeOverrides {
                 continue;
             };
         } else if (std.mem.eql(u8, key, "cursor-color")) {
-            result.cursor_color = parseColor(value) catch {
+            result.cursor_color = parseTerminalColor(value) catch {
                 warn("theme line {d}: invalid cursor-color", .{line_no});
                 continue;
             };
         } else if (std.mem.eql(u8, key, "cursor-text")) {
-            result.cursor_text = parseColor(value) catch {
+            result.cursor_text = parseTerminalColor(value) catch {
                 warn("theme line {d}: invalid cursor-text", .{line_no});
                 continue;
             };
@@ -278,6 +325,14 @@ pub fn resolveColor(explicit: ?vt.color.RGB, named: ?vt.color.RGB, built_in: vt.
     return explicit orelse named orelse built_in;
 }
 
+pub fn resolveTerminalColor(
+    explicit: ?TerminalColor,
+    named: ?TerminalColor,
+    built_in: vt.color.RGB,
+) TerminalColor {
+    return explicit orelse named orelse .{ .rgb = built_in };
+}
+
 pub fn resolvePalette(
     explicit: *const [256]?vt.color.RGB,
     named: ?*const ThemeOverrides,
@@ -313,4 +368,37 @@ fn readFile(arena: std.mem.Allocator, path: [:0]const u8) ?[]const u8 {
         buf.items.len += n;
     }
     return buf.items;
+}
+
+test "parse terminal colors" {
+    try std.testing.expectEqual(@as(TerminalColor, .cell_foreground), try parseTerminalColor("cell-foreground"));
+    try std.testing.expectEqual(@as(TerminalColor, .cell_background), try parseTerminalColor("cell-background"));
+    try std.testing.expectEqual(
+        TerminalColor{ .rgb = .{ .r = 0xaa, .g = 0xbb, .b = 0xcc } },
+        try parseTerminalColor("#aabbcc"),
+    );
+    try std.testing.expectError(error.InvalidValue, parseTerminalColor("cell-foo"));
+    try std.testing.expectError(error.InvalidValue, parseColor("cell-foreground"));
+}
+
+test "terminal color resolve and equality" {
+    const fg: vt.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const bg: vt.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+    const rgb: TerminalColor = .{ .rgb = fg };
+    try std.testing.expectEqual(fg, @as(TerminalColor, .cell_foreground).resolve(fg, bg));
+    try std.testing.expectEqual(bg, @as(TerminalColor, .cell_background).resolve(fg, bg));
+    try std.testing.expectEqual(fg, rgb.resolve(bg, bg));
+    try std.testing.expect(rgb.eql(.{ .rgb = fg }));
+    try std.testing.expect(!rgb.eql(.cell_foreground));
+    try std.testing.expect(@as(TerminalColor, .cell_foreground).eql(.cell_foreground));
+    try std.testing.expect(!@as(TerminalColor, .cell_foreground).eql(.cell_background));
+}
+
+test "theme overrides parse cell cursor colors" {
+    const theme = parseOverrides(
+        \\cursor-color = cell-foreground
+        \\cursor-text = cell-background
+    );
+    try std.testing.expectEqual(@as(TerminalColor, .cell_foreground), theme.cursor_color.?);
+    try std.testing.expectEqual(@as(TerminalColor, .cell_background), theme.cursor_text.?);
 }

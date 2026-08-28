@@ -52,9 +52,12 @@ selection_fg: ?vt.color.RGB,
 /// Highlight colors for the selected scrollback-search match.
 search_bg: vt.color.RGB,
 search_fg: vt.color.RGB,
+/// Configured cursor fill when OSC 12 has not set a VT cursor color.
+/// Null keeps the previous fallback of window foreground.
+cursor_color: ?Config.TerminalColor,
 /// Explicit text color under a focused block cursor. Null preserves the
 /// terminal background fallback.
-cursor_text: ?vt.color.RGB,
+cursor_text: ?Config.TerminalColor,
 /// Alpha applied to the default terminal background and window padding.
 background_alpha: u8,
 /// Whether background alpha also applies to explicit terminal cell
@@ -129,7 +132,8 @@ const KittyScaleKey = struct {
 pub const InitOptions = struct {
     selection_background: ?vt.color.RGB = null,
     selection_foreground: ?vt.color.RGB = null,
-    cursor_text: ?vt.color.RGB = null,
+    cursor_color: ?Config.TerminalColor = null,
+    cursor_text: ?Config.TerminalColor = null,
     background_alpha: u8 = 255,
     background_alpha_cells: bool = false,
     /// Benchmark escape hatch for comparing the superseded row path.
@@ -175,6 +179,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .selection_fg = opts.selection_foreground,
         .search_bg = Config.dark_theme.copy_highlight,
         .search_fg = Config.dark_theme.copy_highlight_foreground,
+        .cursor_color = opts.cursor_color,
         .cursor_text = opts.cursor_text,
         .background_alpha = opts.background_alpha,
         .background_alpha_cells = opts.background_alpha_cells,
@@ -1188,6 +1193,41 @@ fn renderRowCells(
     try self.renderRowForegroundCells(state, cells, cell_range, y, pixels, width, height);
 }
 
+/// Cell SGR colors after reverse video, used to resolve `cell-foreground`
+/// / `cell-background` cursor colors. Faint, selection, and search are
+/// not applied, matching Ghostty.
+fn cursorCellRgb(
+    style: vt.Style,
+    cell: anytype,
+    colors: *const vt.RenderState.Colors,
+) struct { fg: vt.color.RGB, bg: vt.color.RGB } {
+    const fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
+    const bg = style.bg(cell, &colors.palette) orelse colors.background;
+    if (style.flags.inverse) return .{ .fg = bg, .bg = fg };
+    return .{ .fg = fg, .bg = bg };
+}
+
+fn cursorFill(
+    self: *const Renderer,
+    colors: *const vt.RenderState.Colors,
+    cell_fg: vt.color.RGB,
+    cell_bg: vt.color.RGB,
+) vt.color.RGB {
+    if (colors.cursor) |color| return color;
+    if (self.cursor_color) |configured| return configured.resolve(cell_fg, cell_bg);
+    return colors.foreground;
+}
+
+fn cursorGlyph(
+    self: *const Renderer,
+    colors: *const vt.RenderState.Colors,
+    cell_fg: vt.color.RGB,
+    cell_bg: vt.color.RGB,
+) vt.color.RGB {
+    if (self.cursor_text) |configured| return configured.resolve(cell_fg, cell_bg);
+    return colors.background;
+}
+
 /// Which cell backgrounds prepareRow paints. `.all` covers the entire
 /// row rect (unstyled cells and the right margin get the default
 /// background), so callers need no separate clear pass. `.styled`
@@ -1311,8 +1351,9 @@ fn prepareRowCells(
         if (cursor_x != null and cursor_x.? == x and
             state.cursor.visual_style == .block and self.focused)
         {
-            bg = colors.cursor orelse colors.foreground;
-            fg = self.cursor_text orelse colors.background;
+            const cell = cursorCellRgb(style, &raws[x], colors);
+            bg = self.cursorFill(colors, cell.fg, cell.bg);
+            fg = self.cursorGlyph(colors, cell.fg, cell.bg);
             reverse_color_glyph = false;
             dim_search_bg = false;
             background_uses_alpha = false;
@@ -1514,7 +1555,8 @@ fn renderRowForegroundCells(
             .block_hollow => .cursor_hollow_rect,
         };
         if (kind) |k| {
-            const color = colors.cursor orelse colors.foreground;
+            const cell = cursorCellRgb(state.cursor.style, &state.cursor.cell, colors);
+            const color = self.cursorFill(colors, cell.fg, cell.bg);
             try self.blitDecoration(k, cx, y, argb(color), pixels, width, height);
         }
     }
@@ -2288,6 +2330,90 @@ test "cursor splits shaping runs" {
     // "a", "b" (under the cursor), and "c" shape as three separate runs,
     // so ligatures cannot form across the cursor cell.
     try std.testing.expectEqual(@as(usize, 3), renderer.text_shaper.readStats().cache_misses);
+}
+
+test "cursor colors resolve from cells unless OSC 12 is set" {
+    const alloc = std.testing.allocator;
+    const window_bg: vt.color.RGB = .{ .r = 10, .g = 20, .b = 30 };
+    const window_fg: vt.color.RGB = .{ .r = 240, .g = 230, .b = 220 };
+    const cell_fg: vt.color.RGB = .{ .r = 200, .g = 10, .b = 20 };
+    const cell_bg: vt.color.RGB = .{ .r = 30, .g = 40, .b = 50 };
+    const osc_cursor: vt.color.RGB = .{ .r = 9, .g = 8, .b = 7 };
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 1 });
+    defer term.deinit(alloc);
+    term.colors.background = .init(window_bg);
+    term.colors.foreground = .init(window_fg);
+    term.colors.cursor = .unset;
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[38;2;200;10;20;48;2;30;40;50m \x1b[1;1H");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{
+        .cursor_color = .cell_foreground,
+        .cursor_text = .cell_background,
+    });
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 2;
+    const height: u31 = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+
+    const center = @as(usize, font.cell_height / 2) * width + font.cell_width / 2;
+    try renderer.render(&state, pixels, width, height);
+    try std.testing.expectEqual(argb(cell_fg), pixels[center]);
+
+    stream.nextSlice("\x1b[H\x1b[7;38;2;200;10;20;48;2;30;40;50m \x1b[1;1H");
+    try state.update(alloc, &term);
+    try renderer.render(&state, pixels, width, height);
+    try std.testing.expectEqual(argb(cell_bg), pixels[center]);
+
+    term.colors.cursor.set(osc_cursor);
+    try state.update(alloc, &term);
+    try renderer.render(&state, pixels, width, height);
+    try std.testing.expectEqual(argb(osc_cursor), pixels[center]);
+}
+
+test "cursor fill and glyph helpers follow TerminalColor" {
+    const alloc = std.testing.allocator;
+    const colors: vt.RenderState.Colors = .{
+        .background = .{ .r = 1, .g = 2, .b = 3 },
+        .foreground = .{ .r = 4, .g = 5, .b = 6 },
+        .cursor = null,
+        .palette = vt.color.default,
+    };
+    const fg: vt.color.RGB = .{ .r = 10, .g = 20, .b = 30 };
+    const bg: vt.color.RGB = .{ .r = 40, .g = 50, .b = 60 };
+
+    var font: Font = try .init(alloc, "monospace", 16);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    try std.testing.expectEqual(colors.foreground, renderer.cursorFill(&colors, fg, bg));
+    try std.testing.expectEqual(colors.background, renderer.cursorGlyph(&colors, fg, bg));
+
+    renderer.cursor_color = .cell_foreground;
+    renderer.cursor_text = .cell_background;
+    try std.testing.expectEqual(fg, renderer.cursorFill(&colors, fg, bg));
+    try std.testing.expectEqual(bg, renderer.cursorGlyph(&colors, fg, bg));
+
+    renderer.cursor_color = .cell_background;
+    renderer.cursor_text = .cell_foreground;
+    try std.testing.expectEqual(bg, renderer.cursorFill(&colors, fg, bg));
+    try std.testing.expectEqual(fg, renderer.cursorGlyph(&colors, fg, bg));
+
+    var osc_colors = colors;
+    osc_colors.cursor = .{ .r = 9, .g = 8, .b = 7 };
+    try std.testing.expectEqual(osc_colors.cursor.?, renderer.cursorFill(&osc_colors, fg, bg));
 }
 
 test "background opacity cells controls explicit cell backgrounds" {

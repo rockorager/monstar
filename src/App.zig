@@ -117,8 +117,10 @@ selection_fg_override: ?vt.color.RGB,
 copy_highlight: vt.color.RGB,
 copy_highlight_fg: vt.color.RGB,
 copy_highlight_active: bool,
+/// Configured cursor fill when OSC 12 has not set a VT cursor color.
+cursor_color: Config.TerminalColor,
 /// Configured text color beneath a focused block cursor.
-cursor_text: ?vt.color.RGB,
+cursor_text: ?Config.TerminalColor,
 window: *Window,
 keyboard: Keyboard,
 /// Terminal contents changed since the last committed frame.
@@ -646,6 +648,7 @@ pub fn init(
         .copy_highlight = config.effectiveCopyHighlight(.dark),
         .copy_highlight_fg = config.effectiveCopyHighlightForeground(.dark),
         .copy_highlight_active = false,
+        .cursor_color = config.effectiveCursorColor(.dark),
         .cursor_text = config.effectiveCursorText(.dark),
         .window = window,
         .keyboard = try .init(),
@@ -2086,6 +2089,7 @@ fn applyColorDefaultsForConfig(self: *App, config: Config) void {
     );
     self.copy_highlight = config.effectiveCopyHighlight(self.color_scheme);
     self.copy_highlight_fg = config.effectiveCopyHighlightForeground(self.color_scheme);
+    self.cursor_color = config.effectiveCursorColor(self.color_scheme);
     self.cursor_text = config.effectiveCursorText(self.color_scheme);
 }
 
@@ -4994,6 +4998,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         self.font.discovery(),
         selection_bg,
         selection_fg,
+        self.cursor_color,
         self.cursor_text,
         self.config.background_opacity,
         self.config.background_opacity_cells,
@@ -5002,6 +5007,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             self.font.discovery(),
             selection_bg,
             selection_fg,
+            self.cursor_color,
             self.cursor_text,
             self.config.background_opacity,
             self.config.background_opacity_cells,
@@ -5279,6 +5285,7 @@ fn startAsyncRasterLoad(self: *App) void {
         self.font.discovery(),
         self.selectionBackgroundForRender(),
         self.selectionForegroundForRender(),
+        self.cursor_color,
         self.cursor_text,
         self.config.background_opacity,
         self.config.background_opacity_cells,
@@ -5310,6 +5317,7 @@ fn finishAsyncRasterLoad(self: *App) void {
                 self.font.discovery(),
                 self.selectionBackgroundForRender(),
                 self.selectionForegroundForRender(),
+                self.cursor_color,
                 self.cursor_text,
                 self.config.background_opacity,
                 self.config.background_opacity_cells,
