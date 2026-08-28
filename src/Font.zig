@@ -253,6 +253,7 @@ pub const Face = struct {
             .height = 0,
         } else switch (bitmap.pixel_mode) {
             c.FT_PIXEL_MODE_GRAY => try self.copyGrayBitmap(alloc, bitmap, constraint_width, constrain_alpha),
+            c.FT_PIXEL_MODE_MONO => try self.copyMonoBitmap(alloc, bitmap, constraint_width, constrain_alpha),
             c.FT_PIXEL_MODE_BGRA => try self.copyBgraBitmap(alloc, bitmap, constraint_width),
             else => return error.FontLoadFailed,
         };
@@ -350,6 +351,36 @@ pub const Face = struct {
             .top = top,
             .constrained = true,
         };
+    }
+
+    fn copyMonoBitmap(
+        self: *const Face,
+        alloc: std.mem.Allocator,
+        bitmap: c.FT_Bitmap,
+        constraint_width: u2,
+        constrain_alpha: bool,
+    ) Error!RenderedBitmap {
+        const src_width: u31 = @intCast(bitmap.width);
+        const src_height: u31 = @intCast(bitmap.rows);
+        const copy = try alloc.alloc(u8, @as(usize, src_width) * src_height);
+        copyMonoRows(copy, bitmap, src_width, src_height) catch |err| {
+            alloc.free(copy);
+            return err;
+        };
+
+        if (!constrain_alpha) {
+            return .{ .bitmap = copy, .format = .alpha, .width = src_width, .height = src_height };
+        }
+
+        // Reuse the alpha constraint path after expanding FreeType's packed,
+        // MSB-first monochrome pixels into tightly packed A8 coverage.
+        var gray_bitmap = bitmap;
+        gray_bitmap.buffer = copy.ptr;
+        gray_bitmap.pitch = @intCast(src_width);
+        gray_bitmap.pixel_mode = c.FT_PIXEL_MODE_GRAY;
+        gray_bitmap.num_grays = 256;
+        defer alloc.free(copy);
+        return self.copyGrayBitmap(alloc, gray_bitmap, constraint_width, true);
     }
 
     fn copyBgraBitmap(
@@ -494,10 +525,10 @@ fn selectNearestStrike(ft_face: c.FT_Face, size_px: u31) bool {
     var best_delta: i64 = std.math.maxInt(i64);
     const sizes = ft_face.*.available_sizes[0..@intCast(ft_face.*.num_fixed_sizes)];
     for (sizes, 0..) |strike, i| {
-        const strike_size: i64 = if (strike.width > 0)
-            strike.width
+        const strike_size: i64 = if (strike.height > 0)
+            strike.height
         else
-            strike.x_ppem >> 6;
+            strike.y_ppem >> 6;
         const delta = if (strike_size > target) strike_size - target else target - strike_size;
         if (delta < best_delta) {
             best_delta = delta;
@@ -516,6 +547,51 @@ fn copyGrayRows(dst: []u8, bitmap: c.FT_Bitmap, width: u31, height: u31) Error!v
         const src = bitmap.buffer[src_y * pitch ..][0..width];
         @memcpy(dst[y * width ..][0..width], src);
     }
+}
+
+fn copyMonoRows(dst: []u8, bitmap: c.FT_Bitmap, width: u31, height: u31) Error!void {
+    const pitch: usize = @intCast(@abs(bitmap.pitch));
+    for (0..height) |y| {
+        const src_y = bitmapRow(bitmap, height, y);
+        const src = bitmap.buffer[src_y * pitch ..][0..pitch];
+        for (0..width) |x| {
+            const mask = @as(u8, 0x80) >> @intCast(x & 7);
+            dst[y * width + x] = if (src[x / 8] & mask != 0) 0xff else 0;
+        }
+    }
+}
+
+test "unpack monochrome bitmap rows to alpha" {
+    const width: u31 = 10;
+    const height: u31 = 2;
+    const expected = [_]u8{
+        0xff, 0,    0xff, 0, 0, 0xff, 0,    0xff, 0xff, 0,
+        0,    0xff, 0,    0, 0, 0,    0xff, 0,    0,    0xff,
+    };
+    const top_down = [_]u8{ 0xA5, 0x80, 0x77, 0x42, 0x40, 0x88 };
+    const bottom_up = [_]u8{ 0x42, 0x40, 0x88, 0xA5, 0x80, 0x77 };
+
+    var bitmap: c.FT_Bitmap = undefined;
+    bitmap.width = 10;
+    bitmap.rows = 2;
+    bitmap.pitch = 3;
+    bitmap.buffer = @constCast(&top_down);
+    var actual: [expected.len]u8 = undefined;
+    try copyMonoRows(&actual, bitmap, width, height);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+
+    bitmap.pitch = -3;
+    bitmap.buffer = @constCast(&bottom_up);
+    try copyMonoRows(&actual, bitmap, width, height);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+
+    var test_face: Face = undefined;
+    test_face.cell_width = 20;
+    test_face.cell_height = 20;
+    const rendered = try test_face.copyMonoBitmap(std.testing.allocator, bitmap, 1, true);
+    defer std.testing.allocator.free(rendered.bitmap);
+    try std.testing.expectEqual(GlyphFormat.alpha, rendered.format);
+    try std.testing.expectEqualSlices(u8, &expected, rendered.bitmap);
 }
 
 fn resizeGrayWithStbir(
