@@ -616,7 +616,13 @@ fn primarySourceListener(
 fn dataOfferListener(_: *wl.DataOffer, event: wl.DataOffer.Event, offer: *DataOffer) void {
     switch (event) {
         .offer => |ev| offer.noteMime(ev.mime_type),
-        .source_actions => |ev| offer.source_actions = ev.source_actions,
+        .source_actions => |ev| {
+            offer.source_actions = ev.source_actions;
+            const clipboard = offer.clipboard;
+            // Wayland sends the source's real actions after data-device enter,
+            // so refresh both the application and compositor negotiation.
+            if (clipboard.dnd_offer == offer) clipboard.updateDndNegotiation(offer);
+        },
         .action => |ev| offer.dnd_action = ev.dnd_action,
     }
 }
@@ -658,19 +664,7 @@ fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *Clip
                 offer.offer.setActions(.{ .copy = true }, .{ .copy = true });
                 if (self.dnd_offer) |old| old.destroy();
                 self.dnd_offer = offer;
-                if (self.reportDndMotion(offer)) {
-                    const allowed: wl.DataDeviceManager.DndAction = .{
-                        .copy = offer.source_actions.copy,
-                        .move = offer.source_actions.move,
-                    };
-                    const preferred: wl.DataDeviceManager.DndAction = if (allowed.copy)
-                        .{ .copy = true }
-                    else if (allowed.move)
-                        .{ .move = true }
-                    else
-                        .{};
-                    offer.offer.setActions(allowed, preferred);
-                }
+                self.updateDndNegotiation(offer);
             } else {
                 offer.offer.accept(enter.serial, null);
                 offer.destroy();
@@ -702,6 +696,29 @@ fn reportDndMotion(self: *Clipboard, offer: *const DataOffer) bool {
 fn reportDnd(self: *Clipboard, event: DndEvent) bool {
     const callback = self.dnd_fn orelse return false;
     return callback(self.dnd_ctx orelse return false, event);
+}
+
+fn updateDndNegotiation(self: *Clipboard, offer: *DataOffer) void {
+    if (!self.reportDndMotion(offer)) return;
+    const actions = dndActions(offer.source_actions);
+    offer.offer.setActions(actions.allowed, actions.preferred);
+}
+
+fn dndActions(source: wl.DataDeviceManager.DndAction) struct {
+    allowed: wl.DataDeviceManager.DndAction,
+    preferred: wl.DataDeviceManager.DndAction,
+} {
+    const allowed: wl.DataDeviceManager.DndAction = .{
+        .copy = source.copy,
+        .move = source.move,
+    };
+    const preferred: wl.DataDeviceManager.DndAction = if (allowed.copy)
+        .{ .copy = true }
+    else if (allowed.move)
+        .{ .move = true }
+    else
+        .{};
+    return .{ .allowed = allowed, .preferred = preferred };
 }
 
 fn dndOperations(actions: wl.DataDeviceManager.DndAction) DndOperations {
@@ -819,4 +836,18 @@ test "selection writer survives a consumer closing early" {
     errdefer alloc.free(text);
     const thread = try std.Thread.spawn(.{}, writeSelection, .{ alloc, text, pipe_fds[1] });
     thread.join();
+}
+
+test "drag negotiation prefers a supported source action" {
+    const move_only = dndActions(.{ .move = true });
+    try std.testing.expect(!move_only.allowed.copy);
+    try std.testing.expect(move_only.allowed.move);
+    try std.testing.expect(!move_only.preferred.copy);
+    try std.testing.expect(move_only.preferred.move);
+
+    const copy_and_move = dndActions(.{ .copy = true, .move = true });
+    try std.testing.expect(copy_and_move.allowed.copy);
+    try std.testing.expect(copy_and_move.allowed.move);
+    try std.testing.expect(copy_and_move.preferred.copy);
+    try std.testing.expect(!copy_and_move.preferred.move);
 }
