@@ -80,6 +80,7 @@ const CliParser = struct {
                 self.cli.action = .version;
                 return self.cli;
             } else if (std.mem.eql(u8, arg, "--")) {
+                if (self.index + 1 >= self.args.len) return error.InvalidCli;
                 self.setCommand(.shell, self.index + 1);
                 break;
             } else if (std.mem.eql(u8, arg, "-e")) {
@@ -489,6 +490,14 @@ test "parse CLI double dash command uses shell mode" {
     try std.testing.expectEqual(.shell, cli.command_mode);
     try std.testing.expectEqualStrings("echo", cli.command[0]);
     try std.testing.expectEqualStrings("hello", cli.command[1]);
+}
+
+test "parse CLI rejects double dash without a command" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const args = [_][:0]const u8{"--"};
+    try std.testing.expectError(error.InvalidCli, parseCli(arena_state.allocator(), &args));
 }
 
 test "parse CLI rejects invalid dimensions" {
