@@ -210,7 +210,8 @@ pub fn paste(
 ) !void {
     const pw = try clipboard.generateOtp(io);
     var arena: std.heap.ArenaAllocator = .init(self.alloc);
-    errdefer arena.deinit();
+    var grant_installed = false;
+    errdefer if (!grant_installed) arena.deinit();
     const grant_alloc = arena.allocator();
     const owned_pw = try grant_alloc.dupe(u8, &pw);
     const owned_mime = try grant_alloc.dupe(u8, mime);
@@ -231,6 +232,7 @@ pub fn paste(
         oldest.deinit();
     }
     try self.paste_grants.append(self.alloc, grant);
+    grant_installed = true;
     errdefer {
         var removed = self.paste_grants.pop().?;
         removed.deinit();
@@ -484,4 +486,17 @@ test "targets listing does not consume a paste grant" {
     try state.prepareRead(&state.front().?.read);
     try std.testing.expectEqual(@as(usize, 0), state.paste_grants.items.len);
     try std.testing.expectEqualStrings("snapshot", state.front().?.read.paste.?.data);
+}
+
+test "paste event write failure discards its grant" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    var output: [0]u8 = .{};
+    var writer: std.Io.Writer = .fixed(&output);
+    try std.testing.expectError(
+        error.WriteFailed,
+        state.paste(std.testing.io, .clipboard, "text/plain", "snapshot", &writer),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.paste_grants.items.len);
 }
