@@ -61,15 +61,41 @@ pub const FontSize = union(enum) {
     }
 };
 
+/// Adjustment applied to a font's natural cell height. Absolute values are
+/// physical pixel deltas; percentages scale with the natural metrics.
+pub const MetricModifier = union(enum) {
+    absolute: i32,
+    percent: f64,
+
+    pub fn apply(self: MetricModifier, natural: u31) u31 {
+        return switch (self) {
+            .absolute => |delta| @intCast(std.math.clamp(
+                @as(i64, natural) + delta,
+                1,
+                std.math.maxInt(u31),
+            )),
+            .percent => |percent| percent: {
+                const multiplier = @max(0, 1 + percent / 100);
+                const adjusted = @round(@as(f64, @floatFromInt(natural)) * multiplier);
+                break :percent @intFromFloat(std.math.clamp(
+                    adjusted,
+                    1,
+                    @as(f64, @floatFromInt(std.math.maxInt(u31))),
+                ));
+            },
+        };
+    }
+};
+
 /// Wayland app-id and desktop-entry hint for desktop integration.
 app_id: [:0]const u8 = default_app_id,
 font_family: [:0]const u8 = "monospace",
 /// Bare and `pt` values are typographic points; `px` values are logical
 /// pixels. Both apply the output's fractional scale during rasterization.
 font_size: FontSize = .{ .points = 12 },
-/// Absolute cell-height override like foot's `line-height`; unset uses
-/// the font's natural metrics.
-line_height: ?FontSize = null,
+/// Signed physical-pixel or percentage adjustment to the font's natural cell
+/// height. Unset preserves the natural metrics.
+adjust_cell_height: ?MetricModifier = null,
 /// Minimum window padding in logical pixels. One configured value applies to
 /// both sides; two values are left/right for X and top/bottom for Y.
 window_padding_x: WindowPadding = .{},
@@ -206,8 +232,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.font_family = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "font-size")) {
         self.font_size = try parseFontSize(value);
-    } else if (std.mem.eql(u8, key, "line-height")) {
-        self.line_height = try parseFontSize(value);
+    } else if (std.mem.eql(u8, key, "adjust-cell-height")) {
+        self.adjust_cell_height = try parseMetricModifier(value);
     } else if (std.mem.eql(u8, key, "window-padding-x")) {
         self.window_padding_x = try parseWindowPadding(value);
     } else if (std.mem.eql(u8, key, "window-padding-y")) {
@@ -294,6 +320,20 @@ fn parseFontSize(value: []const u8) error{InvalidValue}!FontSize {
     return switch (unit) {
         .points => .{ .points = size },
         .pixels => .{ .pixels = size },
+    };
+}
+
+fn parseMetricModifier(value: []const u8) error{InvalidValue}!MetricModifier {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    if (std.mem.endsWith(u8, trimmed, "%")) {
+        const number = trimmed[0 .. trimmed.len - 1];
+        if (number.len == 0) return error.InvalidValue;
+        const percent = std.fmt.parseFloat(f64, number) catch return error.InvalidValue;
+        if (!std.math.isFinite(percent)) return error.InvalidValue;
+        return .{ .percent = percent };
+    }
+    return .{
+        .absolute = std.fmt.parseInt(i32, trimmed, 10) catch return error.InvalidValue,
     };
 }
 
@@ -387,17 +427,6 @@ pub fn fontSizePixels(size: FontSize, scale120: u32) u31 {
     };
     const pixels = logical_pixels * output_scale;
     return @max(1, @as(u31, @intFromFloat(@round(pixels))));
-}
-
-/// Resolves the line-height override to physical pixels for a font
-/// rendering at `font_size_px`, scaled by the font's zoom ratio like
-/// foot. Returns 0 when unset.
-pub fn lineHeightPixels(self: *const Config, font_size_px: u31, scale120: u32) u31 {
-    const lh = self.line_height orelse return 0;
-    const ratio = @as(f64, @floatFromInt(font_size_px)) /
-        @as(f64, @floatFromInt(fontSizePixels(self.font_size, scale120)));
-    const scaled = @round(@as(f64, @floatFromInt(fontSizePixels(lh, scale120))) * ratio);
-    return @intFromFloat(@max(1, scaled));
 }
 
 pub const colorsForScheme = config_theme.colorsForScheme;
@@ -739,21 +768,30 @@ test "font size accepts bare points and explicit point or pixel units" {
     try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "font-size", "px"));
 }
 
-test "line height parses units and scales with font zoom" {
+test "cell height adjustment accepts signed pixels and percentages" {
     var config: Config = .{};
-    try std.testing.expectEqual(@as(?FontSize, null), config.line_height);
-    try config.set(std.testing.allocator, "line-height", "1.5");
-    try std.testing.expectEqual(FontSize{ .points = 1.5 }, config.line_height.?);
-    try config.set(std.testing.allocator, "line-height", "20px");
-    try std.testing.expectEqual(FontSize{ .pixels = 20 }, config.line_height.?);
-    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "line-height", "-1"));
-    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "line-height", ""));
+    try std.testing.expectEqual(@as(?MetricModifier, null), config.adjust_cell_height);
 
-    // 12pt at scale 120 is 16px: unset resolves to 0, 20px stays 20px,
-    // and zooming the font to 24px scales the line height to 30px.
-    try std.testing.expectEqual(@as(u31, 20), config.lineHeightPixels(16, 120));
-    try std.testing.expectEqual(@as(u31, 30), config.lineHeightPixels(24, 120));
-    try std.testing.expectEqual(@as(u31, 0), (Config{}).lineHeightPixels(24, 120));
+    try config.set(std.testing.allocator, "adjust-cell-height", "2");
+    try std.testing.expectEqual(MetricModifier{ .absolute = 2 }, config.adjust_cell_height.?);
+    try std.testing.expectEqual(@as(u31, 22), config.adjust_cell_height.?.apply(20));
+
+    try config.set(std.testing.allocator, "adjust-cell-height", "-2");
+    try std.testing.expectEqual(MetricModifier{ .absolute = -2 }, config.adjust_cell_height.?);
+    try std.testing.expectEqual(@as(u31, 18), config.adjust_cell_height.?.apply(20));
+
+    try config.set(std.testing.allocator, "adjust-cell-height", "20%");
+    try std.testing.expectEqual(MetricModifier{ .percent = 20 }, config.adjust_cell_height.?);
+    try std.testing.expectEqual(@as(u31, 24), config.adjust_cell_height.?.apply(20));
+
+    try config.set(std.testing.allocator, "adjust-cell-height", "-150%");
+    try std.testing.expectEqual(@as(u31, 1), config.adjust_cell_height.?.apply(20));
+    try std.testing.expectEqual(@as(u31, 1), (MetricModifier{ .absolute = -100 }).apply(20));
+
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "adjust-cell-height", "1.5"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "adjust-cell-height", "2px"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "adjust-cell-height", "nan%"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "adjust-cell-height", ""));
 }
 
 test "invalid window padding keeps the previous value" {

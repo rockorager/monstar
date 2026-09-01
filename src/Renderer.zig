@@ -393,6 +393,18 @@ pub fn renderDirty(
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
     self.rendered_rects.clearRetainingCapacity();
     if (state.rows == 0 or state.cols == 0) return;
+    if (self.font.multi_row_overhang) {
+        try self.render(state, pixels, width, height);
+        if (width > 0 and height > 0) {
+            try self.rendered_rects.append(self.alloc, .{
+                .x = 0,
+                .y = 0,
+                .width = width,
+                .height = height,
+            });
+        }
+        return;
+    }
     if (self.track_cell_damage) try self.measureCellDamage(state);
     try self.row_overhang.resize(self.alloc, state.rows, false);
 
@@ -404,8 +416,10 @@ pub fn renderDirty(
     for (all_dirty[0..state.rows], 0..) |dirty, y| {
         if (!dirty) continue;
         if (self.partial_cell_raster and self.cell_damage_tracker.damageForRow(y) == null) continue;
-        const expand_up = y > 0 and self.row_overhang.isSet(y);
-        const expand_down = y + 1 < state.rows and self.row_overhang.isSet(y + 1);
+        const expand_up = y > 0 and
+            (self.font.neighbor_row_overhang or self.row_overhang.isSet(y));
+        const expand_down = y + 1 < state.rows and
+            (self.font.neighbor_row_overhang or self.row_overhang.isSet(y + 1));
         const start = y - @intFromBool(expand_up);
         const end = y + 1 + @intFromBool(expand_down);
         var row = @max(start, rendered_until);
@@ -1345,18 +1359,17 @@ fn prepareRowCells(
         } else if (search_match) {
             dim_search_bg = true;
         }
-        // Focused block cursor: swap in the cursor color, invert the
-        // glyph. All other cursor shapes (and any unfocused cursor)
-        // overlay a sprite after drawing instead.
+        // Focused block cursor: recolor its glyph. Its background is painted
+        // after the cell backgrounds so it can retain the font's natural
+        // height when the cell height is adjusted. All other cursor shapes
+        // (and any unfocused cursor) overlay a sprite after drawing instead.
         if (cursor_x != null and cursor_x.? == x and
             state.cursor.visual_style == .block and self.focused)
         {
             const cell = cursorCellRgb(style, &raws[x], colors);
-            bg = self.cursorFill(colors, cell.fg, cell.bg);
             fg = self.cursorGlyph(colors, cell.fg, cell.bg);
             reverse_color_glyph = false;
             dim_search_bg = false;
-            background_uses_alpha = false;
         }
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
@@ -1404,6 +1417,37 @@ fn prepareRowCells(
         }
     }
     bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
+
+    if (cursor_x) |cx| {
+        if (self.focused and state.cursor.visual_style == .block and
+            cx >= cell_range.start and cx < cell_range.end)
+        {
+            const style: vt.Style = if (raws[cx].style_id == 0) .{} else styles[cx];
+            const cell = cursorCellRgb(style, &raws[cx], colors);
+            const cursor_height = font.sprite_metrics.cursor_height;
+            const top = @as(i64, y_px) + @divTrunc(
+                @as(i64, font.cell_height) - cursor_height,
+                2,
+            );
+            const bottom = top + cursor_height;
+            const clipped_top: u31 = @intCast(std.math.clamp(top, 0, height));
+            const clipped_bottom: u31 = @intCast(std.math.clamp(bottom, 0, height));
+            if (clipped_bottom > clipped_top) {
+                const cursor_width = font.cell_width * glyph_constraints.cellSpan(raws[cx]);
+                fillRect(
+                    pixels,
+                    self.pixelStride(width),
+                    width,
+                    height,
+                    cx * font.cell_width,
+                    clipped_top,
+                    cursor_width,
+                    clipped_bottom - clipped_top,
+                    argb(self.cursorFill(colors, cell.fg, cell.bg)),
+                );
+            }
+        }
+    }
 }
 
 /// A pending run of adjacent equal-color cell backgrounds.
@@ -1812,7 +1856,7 @@ test "kitty unscaled blit honors rgba alpha" {
 
 test "kitty placement clips offsets above signed 32-bit range" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -1844,7 +1888,7 @@ test "kitty placement clips offsets above signed 32-bit range" {
 
 test "scaled kitty placement reuses cached rgba variant" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -1931,7 +1975,7 @@ test "emoji keycap grapheme selects emoji fallback face" {
     try testing.expectEqual(@as(u21, '1'), raws[0].content.codepoint.data);
     try testing.expectEqualSlices(u21, &.{ 0xFE0F, 0x20E3 }, graphemes[0]);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     const keycap_face = font.faceForCluster(alloc, &.{ '1', 0xFE0F, 0x20E3 }, .regular);
     if (keycap_face == 0) return error.SkipZigTest;
@@ -1963,7 +2007,7 @@ test "emoji presentation graphemes select emoji fallback face" {
     const alloc = testing.allocator;
     const grinning: u21 = 0x1F600;
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     const emoji_face = font.faceForCodepoint(alloc, grinning);
     if (emoji_face == 0) return error.SkipZigTest;
@@ -2032,7 +2076,7 @@ test "default emoji presentation squares select emoji fallback face" {
     const alloc = testing.allocator;
 
     const grinning: u21 = 0x1F600;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     const emoji_face = font.faceForCodepoint(alloc, grinning);
     if (emoji_face == 0) return error.SkipZigTest;
@@ -2280,7 +2324,7 @@ test "render a simple grid" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -2315,7 +2359,7 @@ test "cursor splits shaping runs" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -2354,7 +2398,7 @@ test "cursor colors resolve from cells unless OSC 12 is set" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{
         .cursor_color = .cell_foreground,
@@ -2382,6 +2426,34 @@ test "cursor colors resolve from cells unless OSC 12 is set" {
     try std.testing.expectEqual(argb(osc_cursor), pixels[center]);
 }
 
+test "focused block cursor keeps natural height in an expanded cell" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 1, .rows = 1 });
+    defer term.deinit(alloc);
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16, .{ .absolute = 4 });
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width = font.cell_width;
+    const height = font.cell_height;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    try renderer.render(&state, pixels, width, height);
+
+    const x = font.cell_width / 2;
+    try std.testing.expectEqual(argb(state.colors.background), pixels[x]);
+    try std.testing.expectEqual(
+        argb(state.colors.foreground),
+        pixels[@as(usize, 2) * width + x],
+    );
+}
+
 test "cursor fill and glyph helpers follow TerminalColor" {
     const alloc = std.testing.allocator;
     const colors: vt.RenderState.Colors = .{
@@ -2393,7 +2465,7 @@ test "cursor fill and glyph helpers follow TerminalColor" {
     const fg: vt.color.RGB = .{ .r = 10, .g = 20, .b = 30 };
     const bg: vt.color.RGB = .{ .r = 40, .g = 50, .b = 60 };
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -2429,7 +2501,7 @@ test "background opacity cells controls explicit cell backgrounds" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{ .background_alpha = 128 });
     defer renderer.deinit();
@@ -2456,7 +2528,7 @@ test "render rectangular selection spans" {
     const alloc = std.testing.allocator;
     const selection_bg: vt.color.RGB = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 5 });
@@ -2516,7 +2588,7 @@ test "render rectangular selection spans" {
 test "render kitty image placement" {
     const alloc = std.testing.allocator;
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
@@ -2564,7 +2636,7 @@ test "render kitty image placement" {
 test "kitty placement collection uses the current animation frame" {
     const alloc = std.testing.allocator;
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
@@ -2591,7 +2663,7 @@ test "kitty placement collection uses the current animation frame" {
 test "render kitty unicode placeholder placement" {
     const alloc = std.testing.allocator;
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
@@ -2641,7 +2713,7 @@ test "dirty row render matches full render" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -2666,6 +2738,36 @@ test "dirty row render matches full render" {
     try std.testing.expectEqualSlices(u32, full_pixels, dirty_pixels);
 }
 
+test "extreme cell height shrinking falls back to full damage" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 2, .rows = 2 });
+    defer term.deinit(alloc);
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16, .{ .percent = -100 });
+    defer font.deinit(alloc);
+    try std.testing.expect(font.multi_row_overhang);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 2;
+    const height: u31 = font.cell_height * 2;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    try renderer.renderDirty(&state, pixels, width, height);
+
+    try std.testing.expectEqual(@as(usize, 1), renderer.rendered_rects.items.len);
+    try std.testing.expectEqual(PixelRect{
+        .x = 0,
+        .y = 0,
+        .width = width,
+        .height = height,
+    }, renderer.rendered_rects.items[0]);
+}
+
 test "cell damage render matches full render for sparse row churn" {
     const alloc = std.testing.allocator;
     const cols = 48;
@@ -2678,7 +2780,7 @@ test "cell damage render matches full render for sparse row churn" {
 
     var state: vt.RenderState = .empty;
     defer state.deinit(alloc);
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var partial: Renderer = try .init(alloc, &font, .{
         .track_cell_damage = true,
@@ -2730,7 +2832,7 @@ test "cell damage repairs rotating stale buffers" {
     defer stream.deinit();
     var state: vt.RenderState = .empty;
     defer state.deinit(alloc);
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var partial: Renderer = try .init(alloc, &font, .{});
     defer partial.deinit();
@@ -2805,7 +2907,7 @@ test "cell damage clips an adjacent text run to the cleared interval" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var partial: Renderer = try .init(alloc, &font, .{
         .track_cell_damage = true,
@@ -2856,7 +2958,7 @@ test "cell damage redraws symbol ink spilling into the interval" {
         glyph_constraints.constraintWidth(state.row_data.get(0).cells.items(.raw), 5, cols),
     );
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var partial: Renderer = try .init(alloc, &font, .{});
     defer partial.deinit();
@@ -2899,7 +3001,7 @@ test "scroll invalidates newly exposed cell fingerprints" {
     var state: vt.RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &term);
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -2942,7 +3044,7 @@ test "cell damage repaints dirty rows after terminal colors change" {
     var state: vt.RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &term);
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -2996,7 +3098,7 @@ test "search match uses its own highlight background" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -3035,7 +3137,7 @@ test "unselected search match tints its existing background" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();

@@ -450,7 +450,7 @@ pub fn init(
         alloc,
         config.font_family,
         font_size_px,
-        config.lineHeightPixels(font_size_px, 120),
+        config.adjust_cell_height,
     );
     errdefer font.deinit(alloc);
 
@@ -809,7 +809,7 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
         self.alloc,
         self.config.font_family,
         size_px,
-        self.config.lineHeightPixels(size_px, scale120),
+        self.config.adjust_cell_height,
     );
     self.font.deinit(self.alloc);
     self.font = new_font;
@@ -2050,7 +2050,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
         self.alloc,
         new_config.font_family,
         desired_font_size,
-        new_config.lineHeightPixels(desired_font_size, self.window.scale120),
+        new_config.adjust_cell_height,
     );
 
     self.applyColorDefaultsForConfig(new_config);
@@ -2141,7 +2141,7 @@ fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
         self.alloc,
         self.config.font_family,
         size_px,
-        self.config.lineHeightPixels(size_px, self.window.scale120),
+        self.config.adjust_cell_height,
     ) catch |err| {
         log.warn("font size change failed: {}", .{err});
         return;
