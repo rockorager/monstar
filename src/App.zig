@@ -446,7 +446,12 @@ pub fn init(
     options: InitOptions,
 ) !*App {
     const font_size_px = Config.fontSizePixels(config.font_size, 120);
-    var font: Font = try .init(alloc, config.font_family, font_size_px);
+    var font: Font = try .init(
+        alloc,
+        config.font_family,
+        font_size_px,
+        config.lineHeightPixels(font_size_px, 120),
+    );
     errdefer font.deinit(alloc);
 
     vt.sys.decode_png = decodePng;
@@ -800,7 +805,12 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const size_px = Config.fontSizePixels(self.effectiveFontSize(), scale120);
     if (size_px == 0 or size_px == self.font_size_px) return;
 
-    const new_font: Font = try .init(self.alloc, self.config.font_family, size_px);
+    const new_font: Font = try .init(
+        self.alloc,
+        self.config.font_family,
+        size_px,
+        self.config.lineHeightPixels(size_px, scale120),
+    );
     self.font.deinit(self.alloc);
     self.font = new_font;
     self.font_size_px = size_px;
@@ -2036,7 +2046,12 @@ fn spawnEnvp(
 
 fn applyConfig(self: *App, new_config: Config) !void {
     const desired_font_size = Config.fontSizePixels(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
-    const new_font: Font = try .init(self.alloc, new_config.font_family, desired_font_size);
+    const new_font: Font = try .init(
+        self.alloc,
+        new_config.font_family,
+        desired_font_size,
+        new_config.lineHeightPixels(desired_font_size, self.window.scale120),
+    );
 
     self.applyColorDefaultsForConfig(new_config);
     self.window.setBufferAlpha(new_config.background_opacity < 255);
@@ -2122,7 +2137,12 @@ fn effectiveFontSize(self: *const App) Config.FontSize {
 fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
     const next_size = configured_size orelse self.config.font_size;
     const size_px = Config.fontSizePixels(next_size, self.window.scale120);
-    const new_font: Font = Font.init(self.alloc, self.config.font_family, size_px) catch |err| {
+    const new_font: Font = Font.init(
+        self.alloc,
+        self.config.font_family,
+        size_px,
+        self.config.lineHeightPixels(size_px, self.window.scale120),
+    ) catch |err| {
         log.warn("font size change failed: {}", .{err});
         return;
     };
