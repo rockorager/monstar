@@ -2628,6 +2628,16 @@ test "OSC 52 read reports base64 clipboard payload" {
     try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", writer.buffered());
 }
 
+test "PNG decode rejects oversized dimensions before rasterization" {
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAJxEAAAABCAYAAACXHN81AAAAPUlEQVR42u3BMQEAAADCoPVP7W0HoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgDOcRQABLx9QIgAAAABJRU5ErkJggg==";
+    const decoder = std.base64.standard.Decoder;
+    const png = try std.testing.allocator.alloc(u8, try decoder.calcSizeForSlice(encoded));
+    defer std.testing.allocator.free(png);
+    try decoder.decode(png, encoded);
+
+    try std.testing.expectError(error.InvalidData, decodePng(std.testing.allocator, png));
+}
+
 test "kitty PNG direct transmit installs decoded RGBA image" {
     const alloc = std.testing.allocator;
     const old_decode_png = vt.sys.decode_png;
