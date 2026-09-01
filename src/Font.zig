@@ -13,6 +13,7 @@ const Font = @This();
 const std = @import("std");
 const c = @import("c");
 const uucode = @import("uucode");
+const Config = @import("Config.zig");
 const sprite = @import("sprite.zig");
 
 const log = std.log.scoped(.font);
@@ -62,6 +63,13 @@ cell_width: u31,
 cell_height: u31,
 /// Distance from the cell top to the text baseline.
 baseline: u31,
+/// Shrinking the cell can make glyphs overlap adjacent rows, so dirty-row
+/// rendering must repaint both neighbors.
+neighbor_row_overhang: bool,
+/// Extreme shrinking can make one glyph span multiple rows. The incremental
+/// renderer falls back to a full frame when its one-neighbor repair is
+/// insufficient.
+multi_row_overhang: bool,
 
 pub const Error = error{ FontNotFound, FontLoadFailed, GlyphResizeFailed, OutOfMemory };
 
@@ -101,11 +109,14 @@ pub const Discovery = struct {
     refs: std.atomic.Value(usize),
     family: [:0]u8,
     size_px: u31,
-    /// Cell height override in physical pixels; 0 uses natural metrics.
-    line_height_px: u31,
+    adjust_cell_height: ?Config.MetricModifier,
     sort_sets: [style_count]*c.FcFontSet,
 
-    fn init(family: [:0]const u8, size_px: u31, line_height_px: u31) Error!*Discovery {
+    fn init(
+        family: [:0]const u8,
+        size_px: u31,
+        adjust_cell_height: ?Config.MetricModifier,
+    ) Error!*Discovery {
         if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
 
         var sort_sets_opt: [style_count]?*c.FcFontSet = @splat(null);
@@ -123,12 +134,13 @@ pub const Discovery = struct {
 
         const alloc = std.heap.smp_allocator;
         const family_copy = try alloc.dupeZ(u8, family);
+        errdefer alloc.free(family_copy);
         const self = try alloc.create(Discovery);
         self.* = .{
             .refs = .init(1),
             .family = family_copy,
             .size_px = size_px,
-            .line_height_px = line_height_px,
+            .adjust_cell_height = adjust_cell_height,
             .sort_sets = sort_sets,
         };
         return self;
@@ -731,12 +743,18 @@ fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
     return a_index == b_index and std.mem.orderZ(u8, @ptrCast(a_file), @ptrCast(b_file)) == .eq;
 }
 
-/// Load the best match for `family` at `size_px`. `line_height_px`
-/// overrides the cell height in physical pixels; 0 uses natural metrics.
-pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31, line_height_px: u31) Error!Font {
+/// Load the best match for `family` at `size_px` and optionally adjust its
+/// natural cell height.
+pub fn init(
+    alloc: std.mem.Allocator,
+    family: [:0]const u8,
+    size_px: u31,
+    adjust_cell_height: ?Config.MetricModifier,
+) Error!Font {
     std.debug.assert(size_px > 0);
 
-    const discovery_data = try Discovery.init(family, size_px, line_height_px);
+    const discovery_data = try Discovery.init(family, size_px, adjust_cell_height);
+    defer discovery_data.unref();
     return initWithDiscovery(alloc, discovery_data);
 }
 
@@ -767,19 +785,19 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     }
     const primary = &faces.items[0];
     // Cell metrics: advance of a reference glyph for width, font-global
-    // ascender/descender for height, or a line-height override with the
-    // text vertically centered. ft metrics are 26.6 fixed point.
+    // ascender/descender for height. A configured adjustment changes the
+    // height and keeps the text vertically centered. ft metrics are 26.6
+    // fixed point.
     const metrics = primary.ft_face.*.size.*.metrics;
     const natural_height: u31 = @intCast((metrics.ascender - metrics.descender) >> 6);
     const ascender: u31 = @intCast(metrics.ascender >> 6);
-    const cell_height: u31 = if (discovery_data.line_height_px > 0)
-        discovery_data.line_height_px
+    const cell_height = if (discovery_data.adjust_cell_height) |modifier|
+        modifier.apply(natural_height)
     else
         natural_height;
-    // Centering offset goes negative when the override shrinks the cell.
-    const baseline: u31 = if (discovery_data.line_height_px > 0)
+    const baseline: u31 = if (discovery_data.adjust_cell_height != null)
         @intCast(std.math.clamp(
-            @as(i64, ascender) + @divTrunc(@as(i64, cell_height) - natural_height, 2),
+            @as(i64, ascender) + @divFloor(@as(i64, cell_height) - natural_height, 2),
             0,
             cell_height,
         ))
@@ -849,7 +867,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
             const scaled: i64 = @divTrunc(units * y_scale, 1 << 22);
             if (scaled > 0) break :thickness @intCast(scaled);
         }
-        break :thickness @max(1, cell_height / 16);
+        break :thickness @max(1, natural_height / 16);
     };
 
     // FreeType underline position: relative to baseline, +up.
@@ -857,7 +875,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         const units: i64 = ft_face.*.underline_position;
         const scaled: i64 = @divTrunc(units * y_scale, 1 << 22);
         const top: i64 = baseline - scaled;
-        break :position @intCast(std.math.clamp(top, 0, cell_height - thickness));
+        break :position @intCast(std.math.clamp(top, 0, cell_height -| thickness));
     };
 
     // Center the strikethrough on lowercase text (x-height).
@@ -867,10 +885,10 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
             if (idx != 0 and c.FT_Load_Glyph(ft_face, idx, c.FT_LOAD_DEFAULT) == 0) {
                 break :ex @intCast(ft_face.*.glyph.*.metrics.horiBearingY >> 6);
             }
-            break :ex @divTrunc(@as(i64, cell_height) * 3, 10);
+            break :ex @divTrunc(@as(i64, natural_height) * 3, 10);
         };
         const top: i64 = baseline - @divTrunc(ex_height + thickness, 2);
-        break :position @intCast(std.math.clamp(top, 0, cell_height - thickness));
+        break :position @intCast(std.math.clamp(top, 0, cell_height -| thickness));
     };
 
     return .{
@@ -895,12 +913,15 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
             .strikethrough_thickness = thickness,
             .overline_position = 0,
             .overline_thickness = thickness,
+            .cursor_height = natural_height,
             .cursor_thickness = thickness,
         },
         .size_px = size_px,
         .cell_width = cell_width,
         .cell_height = cell_height,
         .baseline = baseline,
+        .neighbor_row_overhang = natural_height > cell_height,
+        .multi_row_overhang = @as(u64, natural_height) > @as(u64, cell_height) * 2,
     };
 }
 
@@ -1367,7 +1388,7 @@ fn loadFromPattern(
 
 test "load monospace font and rasterize a glyph" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     try std.testing.expect(font.cell_width > 0);
@@ -1384,7 +1405,7 @@ test "load monospace font and rasterize a glyph" {
 
 test "rasterizers share discovery but own face state" {
     const alloc = std.testing.allocator;
-    var first: Font = try .init(alloc, "monospace", 16, 0);
+    var first: Font = try .init(alloc, "monospace", 16, null);
     var first_live = true;
     defer if (first_live) first.deinit(alloc);
     var second: Font = try .initWithDiscovery(alloc, first.discovery());
@@ -1407,7 +1428,7 @@ test "styled primary faces are selected when available" {
     try std.testing.expectEqual(FaceStyle.bold_italic, FaceStyle.init(true, true));
 
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     const bold_idx = font.primary_faces[@intFromEnum(FaceStyle.bold)];
@@ -1417,7 +1438,7 @@ test "styled primary faces are selected when available" {
 
 test "embedded symbols face serves nerd font codepoints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1440,7 +1461,7 @@ test "embedded symbols face serves nerd font codepoints" {
 
 test "alpha symbols do not upscale for double-cell constraints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1460,7 +1481,7 @@ test "alpha symbols do not upscale for double-cell constraints" {
 
 test "alpha symbols fit within single-cell constraints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1479,7 +1500,7 @@ test "alpha symbols fit within single-cell constraints" {
 
 test "fallback face for a codepoint the primary lacks" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     // ASCII stays on the primary face.
@@ -1500,7 +1521,7 @@ test "fallback face for a codepoint the primary lacks" {
 
 test "color emoji fallback rasterizes as scaled BGRA" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
 
     const cp: u21 = 0x1F600; // grinning face
@@ -1525,18 +1546,35 @@ test "color emoji fallback rasterizes as scaled BGRA" {
     try std.testing.expect(opaque_pixels > 0);
 }
 
-test "line-height override expands the cell and centers the baseline" {
+test "cell height adjustment changes metrics and centers the baseline" {
     const alloc = std.testing.allocator;
-    var natural: Font = try .init(alloc, "monospace", 16, 0);
+    var natural: Font = try .init(alloc, "monospace", 16, null);
     defer natural.deinit(alloc);
-    const doubled: u31 = natural.cell_height * 2;
-    var font: Font = try .init(alloc, "monospace", 16, doubled);
-    defer font.deinit(alloc);
 
-    try std.testing.expectEqual(doubled, font.cell_height);
-    try std.testing.expectEqual(natural.cell_width, font.cell_width);
+    var expanded: Font = try .init(alloc, "monospace", 16, .{ .percent = 100 });
+    defer expanded.deinit(alloc);
+    try std.testing.expectEqual(natural.cell_height * 2, expanded.cell_height);
+    try std.testing.expectEqual(natural.cell_width, expanded.cell_width);
     try std.testing.expectEqual(
-        natural.baseline + (doubled - natural.cell_height) / 2,
-        font.baseline,
+        natural.baseline + natural.cell_height / 2,
+        expanded.baseline,
     );
+
+    var tighter: Font = try .init(alloc, "monospace", 16, .{ .absolute = -2 });
+    defer tighter.deinit(alloc);
+    try std.testing.expectEqual(natural.cell_height - 2, tighter.cell_height);
+    try std.testing.expectEqual(natural.baseline - 1, tighter.baseline);
+
+    var odd_tighter: Font = try .init(alloc, "monospace", 16, .{ .absolute = -1 });
+    defer odd_tighter.deinit(alloc);
+    try std.testing.expectEqual(natural.cell_height - 1, odd_tighter.cell_height);
+    try std.testing.expectEqual(natural.baseline - 1, odd_tighter.baseline);
+
+    // Extreme shrinking remains valid even when natural decoration thickness
+    // exceeds the adjusted cell.
+    var minimum: Font = try .init(alloc, "monospace", 16, .{ .percent = -100 });
+    defer minimum.deinit(alloc);
+    try std.testing.expectEqual(@as(u31, 1), minimum.cell_height);
+    try std.testing.expect(minimum.baseline <= minimum.cell_height);
+    try std.testing.expect(minimum.multi_row_overhang);
 }

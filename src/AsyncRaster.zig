@@ -680,7 +680,7 @@ test "unchanged dirty rows report no damage" {
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var raster = try AsyncRaster.init(
         font.discovery(),

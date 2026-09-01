@@ -292,7 +292,7 @@ fn shapeClusterWith(
 
 test "cache separates identical runs by fallback style" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, 0);
+    var font: Font = try .init(alloc, "monospace", 16, null);
     defer font.deinit(alloc);
     var shaper: TextShaper = try .init(alloc, &font);
     defer shaper.deinit();

@@ -148,7 +148,7 @@ pub fn render(
 ) !Glyph {
     std.debug.assert(cell_span >= 1);
     const draw = getDrawFn(cp) orelse unreachable; // covers() gates this
-    return renderWith(alloc, draw, cp, metrics, baseline, cell_span);
+    return renderWith(alloc, draw, cp, metrics, baseline, cell_span, metrics.cell_height);
 }
 
 /// Render a text decoration sprite.
@@ -166,6 +166,10 @@ pub fn renderDecoration(
             metrics,
             baseline,
             1,
+            switch (k) {
+                .cursor_bar, .cursor_hollow_rect => metrics.cursor_height,
+                else => metrics.cell_height,
+            },
         ),
     };
 }
@@ -177,25 +181,32 @@ fn renderWith(
     metrics: Metrics,
     baseline: u31,
     cell_span: u2,
+    draw_height: u32,
 ) !Glyph {
     var draw_metrics = metrics;
     draw_metrics.cell_width *= cell_span;
     const pad_x = metrics.cell_width / 4;
-    const pad_y = metrics.cell_height / 4;
+    const pad_y = draw_height / 4;
     var canvas: canvas_mod.Canvas = try .init(
         alloc,
         draw_metrics.cell_width,
-        metrics.cell_height,
+        draw_height,
         pad_x,
         pad_y,
     );
     defer canvas.deinit();
 
-    try draw(cp, &canvas, draw_metrics.cell_width, metrics.cell_height, draw_metrics);
+    try draw(cp, &canvas, draw_metrics.cell_width, draw_height, draw_metrics);
 
     const bitmap = try canvas.toBitmap(alloc);
-    // Bitmap top relative to the cell top: clip_top - pad_y.
-    const top: i32 = @as(i32, @intCast(bitmap.clip_top)) - @as(i32, @intCast(pad_y));
+    // Full-height cursors keep their natural height and remain centered when
+    // cell height is adjusted.
+    const center_offset = @divTrunc(
+        @as(i32, @intCast(metrics.cell_height)) - @as(i32, @intCast(draw_height)),
+        2,
+    );
+    const top: i32 = @as(i32, @intCast(bitmap.clip_top)) -
+        @as(i32, @intCast(pad_y)) + center_offset;
     return .{
         .bitmap = bitmap.data,
         .width = @intCast(bitmap.width),
@@ -215,6 +226,7 @@ const test_metrics: Metrics = .{
     .strikethrough_thickness = 1,
     .overline_position = 0,
     .overline_thickness = 1,
+    .cursor_height = 20,
     .cursor_thickness = 1,
 };
 
@@ -281,6 +293,7 @@ test "render box drawing sprites" {
         .cell_width = 11,
         .cell_height = 23,
         .box_thickness = 1,
+        .cursor_height = 23,
     };
     inline for (&.{ 0x1FB98, 0x1FB99, 0x1CC1F, 0x1CC20 }) |cp| {
         const g = try render(alloc, cp, odd_metrics, 17, 1);
@@ -305,4 +318,13 @@ test "render decorations" {
         for (g.bitmap) |px| sum += px;
         try std.testing.expect(sum > 0);
     }
+
+    var adjusted = test_metrics;
+    adjusted.cell_height = 10;
+    const cursor = try renderDecoration(alloc, .cursor_bar, adjusted, 8);
+    defer alloc.free(cursor.bitmap);
+    try std.testing.expectEqual(@as(u31, 20), cursor.height);
+    // The natural-height cursor is centered five pixels above the shorter
+    // adjusted cell.
+    try std.testing.expectEqual(@as(i32, 13), cursor.bearing_y);
 }

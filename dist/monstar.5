@@ -118,19 +118,21 @@ The default is
 .BR 12pt ,
 equivalent to 16 logical pixels at 96 DPI.
 .TP
-.BI line-height " = size[pt|px]"
-Set the line height, overriding the height derived from the font metrics.
-Units follow
-.BR font-size :
-bare values and
-.B pt
-are typographic points;
-.B px
-are logical pixels before Wayland output scaling.
-Glyphs are vertically centered within the taller or shorter cell; a value
-below the font's natural height may clip text, and runtime font size changes
-scale the line height by the same ratio.
-By default the line height comes from the font metrics.
+.BI adjust-cell-height " = pixels|percent%"
+Adjust the height derived from the font metrics.
+A signed integer adds or removes physical pixels; a percentage scales the
+natural height.
+For example,
+.B 2
+adds two pixels,
+.B -2
+removes two pixels, and
+.B 20%
+increases the natural height by twenty percent.
+The result is at least one pixel, and glyphs remain vertically centered.
+Pixel adjustments stay fixed while zooming or changing output scale;
+percentage adjustments follow the font metrics.
+By default no adjustment is applied.
 .SH WINDOW SETTINGS
 .TP
 .BI background-opacity " = opacity"

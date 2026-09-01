@@ -16,5 +16,6 @@ pub const Metrics = struct {
     overline_position: i32 = 0,
     overline_thickness: u32 = 1,
 
+    cursor_height: u32,
     cursor_thickness: u32 = 1,
 };
