@@ -101,9 +101,11 @@ pub const Discovery = struct {
     refs: std.atomic.Value(usize),
     family: [:0]u8,
     size_px: u31,
+    /// Cell height override in physical pixels; 0 uses natural metrics.
+    line_height_px: u31,
     sort_sets: [style_count]*c.FcFontSet,
 
-    fn init(family: [:0]const u8, size_px: u31) Error!*Discovery {
+    fn init(family: [:0]const u8, size_px: u31, line_height_px: u31) Error!*Discovery {
         if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
 
         var sort_sets_opt: [style_count]?*c.FcFontSet = @splat(null);
@@ -121,12 +123,12 @@ pub const Discovery = struct {
 
         const alloc = std.heap.smp_allocator;
         const family_copy = try alloc.dupeZ(u8, family);
-        errdefer alloc.free(family_copy);
         const self = try alloc.create(Discovery);
         self.* = .{
             .refs = .init(1),
             .family = family_copy,
             .size_px = size_px,
+            .line_height_px = line_height_px,
             .sort_sets = sort_sets,
         };
         return self;
@@ -729,12 +731,12 @@ fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
     return a_index == b_index and std.mem.orderZ(u8, @ptrCast(a_file), @ptrCast(b_file)) == .eq;
 }
 
-/// Load the best match for `family` (e.g. "monospace") at `size_px`.
-pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31) Error!Font {
+/// Load the best match for `family` at `size_px`. `line_height_px`
+/// overrides the cell height in physical pixels; 0 uses natural metrics.
+pub fn init(alloc: std.mem.Allocator, family: [:0]const u8, size_px: u31, line_height_px: u31) Error!Font {
     std.debug.assert(size_px > 0);
 
-    const discovery_data = try Discovery.init(family, size_px);
-    defer discovery_data.unref();
+    const discovery_data = try Discovery.init(family, size_px, line_height_px);
     return initWithDiscovery(alloc, discovery_data);
 }
 
@@ -764,12 +766,25 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         try faces.append(alloc, primary);
     }
     const primary = &faces.items[0];
-
     // Cell metrics: advance of a reference glyph for width, font-global
-    // ascender/descender for height. 26.6 fixed point.
+    // ascender/descender for height, or a line-height override with the
+    // text vertically centered. ft metrics are 26.6 fixed point.
     const metrics = primary.ft_face.*.size.*.metrics;
-    const cell_height: u31 = @intCast((metrics.ascender - metrics.descender) >> 6);
-    const baseline: u31 = @intCast(metrics.ascender >> 6);
+    const natural_height: u31 = @intCast((metrics.ascender - metrics.descender) >> 6);
+    const ascender: u31 = @intCast(metrics.ascender >> 6);
+    const cell_height: u31 = if (discovery_data.line_height_px > 0)
+        discovery_data.line_height_px
+    else
+        natural_height;
+    // Centering offset goes negative when the override shrinks the cell.
+    const baseline: u31 = if (discovery_data.line_height_px > 0)
+        @intCast(std.math.clamp(
+            @as(i64, ascender) + @divTrunc(@as(i64, cell_height) - natural_height, 2),
+            0,
+            cell_height,
+        ))
+    else
+        ascender;
     const cell_width: u31 = width: {
         const idx = c.FT_Get_Char_Index(primary.ft_face, 'M');
         if (idx != 0 and c.FT_Load_Glyph(primary.ft_face, idx, c.FT_LOAD_DEFAULT) == 0) {
@@ -1352,7 +1367,7 @@ fn loadFromPattern(
 
 test "load monospace font and rasterize a glyph" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16, 0);
     defer font.deinit(alloc);
 
     try std.testing.expect(font.cell_width > 0);
@@ -1369,7 +1384,7 @@ test "load monospace font and rasterize a glyph" {
 
 test "rasterizers share discovery but own face state" {
     const alloc = std.testing.allocator;
-    var first: Font = try .init(alloc, "monospace", 16);
+    var first: Font = try .init(alloc, "monospace", 16, 0);
     var first_live = true;
     defer if (first_live) first.deinit(alloc);
     var second: Font = try .initWithDiscovery(alloc, first.discovery());
@@ -1392,7 +1407,7 @@ test "styled primary faces are selected when available" {
     try std.testing.expectEqual(FaceStyle.bold_italic, FaceStyle.init(true, true));
 
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16, 0);
     defer font.deinit(alloc);
 
     const bold_idx = font.primary_faces[@intFromEnum(FaceStyle.bold)];
@@ -1402,7 +1417,7 @@ test "styled primary faces are selected when available" {
 
 test "embedded symbols face serves nerd font codepoints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16, 0);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1425,7 +1440,7 @@ test "embedded symbols face serves nerd font codepoints" {
 
 test "alpha symbols do not upscale for double-cell constraints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16, 0);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1445,7 +1460,7 @@ test "alpha symbols do not upscale for double-cell constraints" {
 
 test "alpha symbols fit within single-cell constraints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16, 0);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1464,7 +1479,7 @@ test "alpha symbols fit within single-cell constraints" {
 
 test "fallback face for a codepoint the primary lacks" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16, 0);
     defer font.deinit(alloc);
 
     // ASCII stays on the primary face.
@@ -1485,7 +1500,7 @@ test "fallback face for a codepoint the primary lacks" {
 
 test "color emoji fallback rasterizes as scaled BGRA" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16);
+    var font: Font = try .init(alloc, "monospace", 16, 0);
     defer font.deinit(alloc);
 
     const cp: u21 = 0x1F600; // grinning face
@@ -1508,4 +1523,20 @@ test "color emoji fallback rasterizes as scaled BGRA" {
         if (g.bitmap[i] != 0) opaque_pixels += 1;
     }
     try std.testing.expect(opaque_pixels > 0);
+}
+
+test "line-height override expands the cell and centers the baseline" {
+    const alloc = std.testing.allocator;
+    var natural: Font = try .init(alloc, "monospace", 16, 0);
+    defer natural.deinit(alloc);
+    const doubled: u31 = natural.cell_height * 2;
+    var font: Font = try .init(alloc, "monospace", 16, doubled);
+    defer font.deinit(alloc);
+
+    try std.testing.expectEqual(doubled, font.cell_height);
+    try std.testing.expectEqual(natural.cell_width, font.cell_width);
+    try std.testing.expectEqual(
+        natural.baseline + (doubled - natural.cell_height) / 2,
+        font.baseline,
+    );
 }

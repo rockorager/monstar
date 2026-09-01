@@ -117,6 +117,20 @@ Fractional values greater than zero and no greater than 512 are accepted.
 The default is
 .BR 12pt ,
 equivalent to 16 logical pixels at 96 DPI.
+.TP
+.BI line-height " = size[pt|px]"
+Set the line height, overriding the height derived from the font metrics.
+Units follow
+.BR font-size :
+bare values and
+.B pt
+are typographic points;
+.B px
+are logical pixels before Wayland output scaling.
+Glyphs are vertically centered within the taller or shorter cell; a value
+below the font's natural height may clip text, and runtime font size changes
+scale the line height by the same ratio.
+By default the line height comes from the font metrics.
 .SH WINDOW SETTINGS
 .TP
 .BI background-opacity " = opacity"
