@@ -86,9 +86,13 @@ pub const FaceStyle = enum(u2) {
         else if (italic) .italic else .regular;
     }
 
-    fn weight(self: FaceStyle, configured: Config.FontWeight) ?c_int {
+    fn weight(self: FaceStyle, configured: Config.FontWeight, synthetic_italic_weight: Config.SyntheticItalicWeight) ?c_int {
         return switch (self) {
-            .regular, .italic => switch (configured) {
+            .regular => switch (configured) {
+                .default => null,
+                .medium => c.FC_WEIGHT_MEDIUM,
+            },
+            .italic => if (synthetic_italic_weight == .bold) c.FC_WEIGHT_BOLD else switch (configured) {
                 .default => null,
                 .medium => c.FC_WEIGHT_MEDIUM,
             },
@@ -104,18 +108,21 @@ pub const FaceStyle = enum(u2) {
     }
 };
 
-test "select configured regular and bold emphasized weights" {
-    try std.testing.expectEqual(null, FaceStyle.regular.weight(.default));
-    try std.testing.expectEqual(c.FC_WEIGHT_MEDIUM, FaceStyle.regular.weight(.medium).?);
-    try std.testing.expectEqual(c.FC_WEIGHT_MEDIUM, FaceStyle.italic.weight(.medium).?);
-    try std.testing.expectEqual(c.FC_WEIGHT_BOLD, FaceStyle.bold.weight(.default).?);
-    try std.testing.expectEqual(c.FC_WEIGHT_BOLD, FaceStyle.bold_italic.weight(.default).?);
+test "select configured regular and synthetic italic weights" {
+    try std.testing.expectEqual(null, FaceStyle.regular.weight(.default, .regular));
+    try std.testing.expectEqual(c.FC_WEIGHT_MEDIUM, FaceStyle.regular.weight(.medium, .regular).?);
+    try std.testing.expectEqual(c.FC_WEIGHT_MEDIUM, FaceStyle.italic.weight(.medium, .regular).?);
+    try std.testing.expectEqual(c.FC_WEIGHT_BOLD, FaceStyle.italic.weight(.medium, .bold).?);
+    try std.testing.expectEqual(c.FC_WEIGHT_BOLD, FaceStyle.bold.weight(.default, .regular).?);
+    try std.testing.expectEqual(c.FC_WEIGHT_BOLD, FaceStyle.bold_italic.weight(.default, .regular).?);
 }
 
 const style_count = std.meta.fields(FaceStyle).len;
 
 pub const Options = struct {
     weight: Config.FontWeight = .default,
+    synthetic_italic: bool = false,
+    synthetic_italic_weight: Config.SyntheticItalicWeight = .regular,
 };
 
 /// Immutable Fontconfig results. Rasterizers need independent FreeType,
@@ -190,6 +197,8 @@ pub const Discovery = struct {
 pub const Face = struct {
     ft_face: c.FT_Face,
     hb_font: *c.hb_font_t,
+    load_flags: c.FT_Int32,
+    synthetic_italic: bool,
     glyphs: std.AutoHashMapUnmanaged(GlyphKey, Glyph),
     cell_width: u31,
     cell_height: u31,
@@ -237,6 +246,8 @@ pub const Face = struct {
             .ft_face = ft_face,
             .hb_font = hb_font,
             .glyphs = .empty,
+            .load_flags = loadFlags(ft_face),
+            .synthetic_italic = false,
             .cell_width = metrics.cell_width,
             .cell_height = metrics.cell_height,
             .baseline = metrics.baseline,
@@ -313,11 +324,10 @@ pub const Face = struct {
         var delta: c.FT_Vector = undefined;
         c.FT_Get_Transform(self.ft_face, &matrix, &delta);
         var translation: c.FT_Vector = .{ .x = key.phase.x, .y = -@as(c.FT_Pos, key.phase.y) };
-        c.FT_Set_Transform(self.ft_face, null, &translation);
+        c.FT_Set_Transform(self.ft_face, &matrix, &translation);
         defer c.FT_Set_Transform(self.ft_face, &matrix, &delta);
-        if (c.FT_Load_Glyph(self.ft_face, index, loadFlags(self.ft_face)) != 0)
-            return error.FontLoadFailed;
-        if (c.FT_Render_Glyph(self.ft_face.*.glyph, c.FT_RENDER_MODE_NORMAL) != 0)
+        const load_flags = self.load_flags | @as(c.FT_Int32, @intCast(c.FT_LOAD_RENDER));
+        if (c.FT_Load_Glyph(self.ft_face, index, load_flags) != 0)
             return error.FontLoadFailed;
 
         const slot = self.ft_face.*.glyph;
@@ -380,10 +390,17 @@ pub const Face = struct {
         }
 
         if (!constrain_alpha) {
-            const copy = try alloc.alloc(u8, @as(usize, src_width) * src_height);
+            const available_width = @as(u31, constraint_width) * self.cell_width;
+            const crop = if (self.synthetic_italic and
+                src_width > available_width and src_width - available_width < self.cell_width / 2)
+                italicCrop(bitmap, available_width)
+            else
+                .{ @as(u31, 0), src_width };
+            const start_x, const width = crop;
+            const copy = try alloc.alloc(u8, @as(usize, width) * src_height);
             errdefer alloc.free(copy);
-            try copyGrayRows(copy, bitmap, src_width, src_height);
-            return .{ .bitmap = copy, .format = .alpha, .width = src_width, .height = src_height };
+            try copyGrayRowsRange(copy, bitmap, start_x, width, src_height);
+            return .{ .bitmap = copy, .format = .alpha, .width = width, .height = src_height };
         }
 
         const available_width = @as(u31, constraint_width) * self.cell_width;
@@ -623,15 +640,56 @@ fn selectNearestStrike(ft_face: c.FT_Face, size_px: u31) bool {
     return c.FT_Select_Size(ft_face, best) == 0;
 }
 
-fn copyGrayRows(dst: []u8, bitmap: c.FT_Bitmap, width: u31, height: u31) Error!void {
+fn italicCrop(bitmap: c.FT_Bitmap, available_width: u31) struct { u31, u31 } {
+    var width: u31 = @intCast(bitmap.width);
+    var extra = width - available_width;
+    const pitch: usize = @intCast(@abs(bitmap.pitch));
+    while (extra > 0) {
+        const x = width - 1;
+        for (0..@intCast(bitmap.rows)) |y| {
+            const src_y = bitmapRow(bitmap, @intCast(bitmap.rows), y);
+            if (bitmap.buffer[src_y * pitch + x] > 200) break;
+        } else {
+            width -= 1;
+            extra -= 1;
+            continue;
+        }
+        break;
+    }
+    return .{ extra, width - extra };
+}
+
+fn copyGrayRowsRange(
+    dst: []u8,
+    bitmap: c.FT_Bitmap,
+    start_x: u31,
+    width: u31,
+    height: u31,
+) Error!void {
     if (height == 0) return;
 
     const pitch: usize = @intCast(@abs(bitmap.pitch));
     for (0..height) |y| {
         const src_y = bitmapRow(bitmap, height, y);
-        const src = bitmap.buffer[src_y * pitch ..][0..width];
+        const src = bitmap.buffer[src_y * pitch + start_x ..][0..width];
         @memcpy(dst[y * width ..][0..width], src);
     }
+}
+
+fn copyGrayRows(dst: []u8, bitmap: c.FT_Bitmap, width: u31, height: u31) Error!void {
+    return copyGrayRowsRange(dst, bitmap, 0, width, height);
+}
+test "trim synthetic italic overflow like KiTTY" {
+    const pixels = [_]u8{
+        10, 255, 255, 255, 0,
+        10, 255, 255, 255, 0,
+    };
+    var bitmap: c.FT_Bitmap = undefined;
+    bitmap.width = 5;
+    bitmap.rows = 2;
+    bitmap.pitch = 5;
+    bitmap.buffer = @constCast(&pixels);
+    try std.testing.expectEqual(.{ @as(u31, 1), @as(u31, 3) }, italicCrop(bitmap, 3));
 }
 
 fn copyMonoRows(dst: []u8, bitmap: c.FT_Bitmap, width: u31, height: u31) Error!void {
@@ -765,7 +823,7 @@ fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle, options: Optio
     _ = c.FcPatternAddString(pattern, c.FC_FAMILY, family.ptr);
     _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, size_px);
     _ = c.FcPatternAddInteger(pattern, c.FC_SPACING, c.FC_MONO);
-    if (style.weight(options.weight)) |weight| _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
+    if (style.weight(options.weight, options.synthetic_italic_weight)) |weight| _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
     if (style.slant()) |slant| _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, slant);
     if (c.FcConfigSubstitute(null, pattern, c.FcMatchPattern) != c.FcTrue)
         return error.FontLoadFailed;
@@ -776,6 +834,26 @@ fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle, options: Optio
         return error.FontNotFound;
     errdefer c.FcFontSetDestroy(sort_set);
     if (result != c.FcResultMatch or sort_set.*.nfont < 1) return error.FontNotFound;
+    if (options.synthetic_italic) {
+        var match_result: c.FcResult = undefined;
+        if (c.FcFontMatch(null, pattern, &match_result)) |matched| {
+            defer c.FcPatternDestroy(matched);
+            if (match_result == c.FcResultMatch and samePatternSource(sort_set.*.fonts[0], matched)) {
+                if (patternMatrix(matched)) |matrix| {
+                    const first = sort_set.*.fonts[0];
+                    if (c.FcPatternDuplicate(first)) |with_matrix| {
+                        _ = c.FcPatternDel(with_matrix, c.FC_MATRIX);
+                        if (c.FcPatternAddMatrix(with_matrix, c.FC_MATRIX, &matrix) == c.FcTrue) {
+                            c.FcPatternDestroy(first);
+                            sort_set.*.fonts[0] = with_matrix;
+                        } else {
+                            c.FcPatternDestroy(with_matrix);
+                        }
+                    }
+                }
+            }
+        }
+    }
     return sort_set;
 }
 
@@ -802,7 +880,39 @@ fn loadPrimaryStyle(
     return face_idx;
 }
 
-fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
+fn patternLoadFlags(pattern: ?*c.FcPattern) c.FT_Int32 {
+    var flags: c.FT_Int32 = @intCast(c.FT_LOAD_DEFAULT | c.FT_LOAD_COLOR);
+    var hinting: c.FcBool = c.FcTrue;
+    if (c.FcPatternGetBool(pattern, c.FC_HINTING, 0, &hinting) == c.FcResultMatch and
+        hinting == c.FcFalse)
+    {
+        return flags | @as(c.FT_Int32, @intCast(c.FT_LOAD_NO_HINTING));
+    }
+
+    var hint_style: c_int = c.FC_HINT_NONE;
+    if (c.FcPatternGetInteger(pattern, c.FC_HINT_STYLE, 0, &hint_style) == c.FcResultMatch and
+        hint_style > c.FC_HINT_NONE and hint_style < c.FC_HINT_FULL)
+    {
+        flags |= @as(c.FT_Int32, @intCast(c.FT_LOAD_TARGET_LIGHT));
+    }
+    return flags;
+}
+
+fn patternMatrix(pattern: ?*c.FcPattern) ?c.FcMatrix {
+    var matrix: [*c]c.FcMatrix = undefined;
+    if (c.FcPatternGetMatrix(pattern, c.FC_MATRIX, 0, &matrix) != c.FcResultMatch) return null;
+    const value = matrix[0];
+    if (value.xx == 1 and value.xy == 0 and value.yx == 0 and value.yy == 1) return null;
+    return value;
+}
+
+fn matrixEqual(a: ?c.FcMatrix, b: ?c.FcMatrix) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.xx == b.?.xx and a.?.xy == b.?.xy and
+        a.?.yx == b.?.yx and a.?.yy == b.?.yy;
+}
+
+fn samePatternSource(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
     var a_file: [*c]c.FcChar8 = undefined;
     var b_file: [*c]c.FcChar8 = undefined;
     if (c.FcPatternGetString(a, c.FC_FILE, 0, &a_file) != c.FcResultMatch) return false;
@@ -811,7 +921,39 @@ fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
     var b_index: c_int = 0;
     _ = c.FcPatternGetInteger(a, c.FC_INDEX, 0, &a_index);
     _ = c.FcPatternGetInteger(b, c.FC_INDEX, 0, &b_index);
-    return a_index == b_index and std.mem.orderZ(u8, @ptrCast(a_file), @ptrCast(b_file)) == .eq;
+    return a_index == b_index and
+        std.mem.orderZ(u8, @ptrCast(a_file), @ptrCast(b_file)) == .eq;
+}
+
+fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
+    return samePatternSource(a, b) and matrixEqual(patternMatrix(a), patternMatrix(b));
+}
+
+test "font pattern identity includes synthetic transforms" {
+    const regular = c.FcPatternCreate() orelse return error.OutOfMemory;
+    defer c.FcPatternDestroy(regular);
+    const italic = c.FcPatternCreate() orelse return error.OutOfMemory;
+    defer c.FcPatternDestroy(italic);
+    inline for (.{ regular, italic }) |pattern| {
+        try std.testing.expect(c.FcPatternAddString(pattern, c.FC_FILE, "/test/font".ptr) == c.FcTrue);
+        try std.testing.expect(c.FcPatternAddInteger(pattern, c.FC_INDEX, 0) == c.FcTrue);
+    }
+    var shear: c.FcMatrix = .{ .xx = 1, .xy = 0.2, .yx = 0, .yy = 1 };
+    try std.testing.expect(c.FcPatternAddMatrix(italic, c.FC_MATRIX, &shear) == c.FcTrue);
+    try std.testing.expect(!samePatternFace(regular, italic));
+}
+
+test "font pattern controls FreeType hinting" {
+    const pattern = c.FcPatternCreate() orelse return error.OutOfMemory;
+    defer c.FcPatternDestroy(pattern);
+
+    try std.testing.expect(c.FcPatternAddBool(pattern, c.FC_HINTING, c.FcTrue) == c.FcTrue);
+    try std.testing.expect(c.FcPatternAddInteger(pattern, c.FC_HINT_STYLE, c.FC_HINT_SLIGHT) == c.FcTrue);
+    try std.testing.expect(patternLoadFlags(pattern) & @as(c.FT_Int32, @intCast(c.FT_LOAD_TARGET_LIGHT)) != 0);
+
+    _ = c.FcPatternDel(pattern, c.FC_HINTING);
+    try std.testing.expect(c.FcPatternAddBool(pattern, c.FC_HINTING, c.FcFalse) == c.FcTrue);
+    try std.testing.expect(patternLoadFlags(pattern) & @as(c.FT_Int32, @intCast(c.FT_LOAD_NO_HINTING)) != 0);
 }
 
 /// Load the best match for `family` at `size_px` and optionally adjust its
@@ -828,7 +970,7 @@ pub fn init(
 pub fn initOptions(
     alloc: std.mem.Allocator,
     family: [:0]const u8,
-    size_px: u31,
+    size_px: f64,
     adjust_cell_height: ?Config.MetricModifier,
     options: Options,
 ) Error!Font {
@@ -1467,7 +1609,25 @@ fn loadFromPattern(
         return error.FontNotFound;
     var index: c_int = 0;
     _ = c.FcPatternGetInteger(pattern, c.FC_INDEX, 0, &index);
-    return Face.load(ft_lib, @ptrCast(file), index, size_px, metrics);
+    var loaded_face = try Face.load(ft_lib, @ptrCast(file), index, size_px, metrics);
+    loaded_face.load_flags |= patternLoadFlags(pattern);
+    c.hb_ft_font_set_load_flags(loaded_face.hb_font, loaded_face.load_flags & ~@as(c.FT_Int32, c.FT_LOAD_COLOR));
+    if (patternMatrix(pattern)) |matrix| {
+        const scale = 65536;
+        var transform: c.FT_Matrix = .{
+            .xx = @intFromFloat(matrix.xx * scale),
+            .xy = @intFromFloat(matrix.xy * scale),
+            .yx = @intFromFloat(matrix.yx * scale),
+            .yy = @intFromFloat(matrix.yy * scale),
+        };
+        loaded_face.synthetic_italic = true;
+        c.FT_Set_Transform(loaded_face.ft_face, &transform, null);
+        if (transform.xx != 0) {
+            c.hb_font_set_synthetic_slant(loaded_face.hb_font, @floatCast(matrix.xy / matrix.xx));
+        }
+        c.hb_ft_font_changed(loaded_face.hb_font);
+    }
+    return loaded_face;
 }
 
 test "load monospace font and rasterize a glyph" {

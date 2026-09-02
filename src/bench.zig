@@ -28,7 +28,11 @@ pub fn run(init: std.process.Init) !void {
         config.font_family,
         font_size_px,
         config.adjust_cell_height,
-        .{ .weight = config.font_weight },
+        .{
+            .weight = config.font_weight,
+            .synthetic_italic = config.synthetic_italic,
+            .synthetic_italic_weight = config.synthetic_italic_weight,
+        },
     );
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});

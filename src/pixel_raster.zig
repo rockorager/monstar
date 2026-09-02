@@ -300,7 +300,7 @@ const CoverageCache = struct {
 };
 threadlocal var coverage_cache: [32]CoverageCache = @splat(.{});
 
-fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) void {
+pub fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) void {
     std.debug.assert(dst.len == coverage.len and color >> 24 == 255);
     if (dst.len == 0) return;
     const fg = decodeRgb(color);

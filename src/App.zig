@@ -468,7 +468,11 @@ fn tmpDirPath(environ: std.process.Environ) []const u8 {
 /// copies them via execve). `config` strings must remain valid until the
 /// first successful reload or App teardown.
 fn fontOptions(config: Config) Font.Options {
-    return .{ .weight = config.font_weight };
+    return .{
+        .weight = config.font_weight,
+        .synthetic_italic = config.synthetic_italic,
+        .synthetic_italic_weight = config.synthetic_italic_weight,
+    };
 }
 
 pub fn init(

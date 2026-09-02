@@ -41,6 +41,7 @@ const blendCapsule = pixel_raster.blendCapsule;
 const blendPixel = pixel_raster.blendPixel;
 const blendRgb = pixel_raster.blendRgb;
 const blitGlyph = pixel_raster.blitGlyph;
+const blendAlphaSpan = pixel_raster.blendAlphaSpan;
 const fillRect = pixel_raster.fillRect;
 
 alloc: std.mem.Allocator,
@@ -81,6 +82,8 @@ fg_scratch: std.ArrayList(vt.color.RGB),
 face_scratch: std.ArrayList(u16),
 /// Per-cell reverse-video state for color glyphs, including block cursor.
 reverse_scratch: std.ArrayList(bool),
+/// Reusable run-wide coverage mask for synthetic italic glyphs.
+italic_mask_scratch: std.ArrayList(u8),
 /// Per-row flag: the row's last render blitted ink above its own
 /// pixel strip (accented capitals exceed the font ascender in many
 /// fonts). renderDirty repaints a dirty row's neighbors only when
@@ -192,6 +195,7 @@ pub fn init(alloc: std.mem.Allocator, font: *Font, opts: InitOptions) !Renderer 
         .fg_scratch = .empty,
         .face_scratch = .empty,
         .reverse_scratch = .empty,
+        .italic_mask_scratch = .empty,
         .row_overhang = .{},
         .rendered_rects = .empty,
         .cell_damage_tracker = .init(alloc),
@@ -209,6 +213,7 @@ pub fn deinit(self: *Renderer) void {
     self.fg_scratch.deinit(self.alloc);
     self.face_scratch.deinit(self.alloc);
     self.reverse_scratch.deinit(self.alloc);
+    self.italic_mask_scratch.deinit(self.alloc);
     self.row_overhang.deinit(self.alloc);
     self.rendered_rects.deinit(self.alloc);
     self.cell_damage_tracker.deinit();
@@ -1709,6 +1714,154 @@ fn blitDecoration(
     );
 }
 
+fn kittyItalicX(run_left: i32, run_right: i32, glyph_index: usize, glyph_x: i32, glyph_width: u31) i32 {
+    if (glyph_index >= 4 or glyph_x <= run_left) return glyph_x;
+    const right = @as(i64, glyph_x) + glyph_width;
+    if (right <= run_right) return glyph_x;
+    const extra: i32 = @intCast(right - run_right);
+    return glyph_x - @min(extra, glyph_x - run_left);
+}
+
+test "KiTTY italic placement keeps early glyphs inside the run" {
+    try std.testing.expectEqual(@as(i32, 20), kittyItalicX(20, 30, 0, 22, 10));
+    try std.testing.expectEqual(@as(i32, 19), kittyItalicX(20, 30, 0, 19, 12));
+    try std.testing.expectEqual(@as(i32, 22), kittyItalicX(20, 30, 4, 22, 10));
+    try std.testing.expectEqual(@as(i32, 21), kittyItalicX(20, 30, 0, 21, 8));
+}
+
+fn maxGlyphCoverage(
+    mask: []u8,
+    mask_width: u31,
+    mask_height: u31,
+    clip_start: u31,
+    clip_end: u31,
+    g: *const Font.Glyph,
+    x0: i32,
+    y0: i32,
+) void {
+    std.debug.assert(g.format == .alpha);
+    std.debug.assert(clip_start <= clip_end and clip_end <= mask_width);
+    const gx_start: i64 = @max(0, @max(-@as(i64, x0), @as(i64, clip_start) - x0));
+    const gy_start: i64 = @max(0, -@as(i64, y0));
+    const gx_end: i64 = @min(
+        @as(i64, g.width),
+        @min(@as(i64, mask_width), clip_end) - x0,
+    );
+    const gy_end: i64 = @min(@as(i64, g.height), @as(i64, mask_height) - y0);
+    if (gx_end <= gx_start or gy_end <= gy_start) return;
+
+    for (@intCast(gy_start)..@intCast(gy_end)) |gy| {
+        const mx: usize = @intCast(x0 + @as(i32, @intCast(gx_start)));
+        const my: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+        const src = g.bitmap[gy * g.width + @as(usize, @intCast(gx_start)) ..][0..@intCast(gx_end - gx_start)];
+        const dst = mask[my * mask_width + mx ..][0..src.len];
+        for (dst, src) |*coverage, glyph_coverage|
+            coverage.* = @max(coverage.*, glyph_coverage);
+    }
+}
+
+test "synthetic italic run keeps maximum overlapping coverage" {
+    const first_bitmap = [_]u8{ 40, 180 };
+    const second_bitmap = [_]u8{ 120, 90 };
+    const first: Font.Glyph = .{
+        .bitmap = @constCast(&first_bitmap),
+        .format = .alpha,
+        .fully_opaque = false,
+        .width = 2,
+        .height = 1,
+        .bearing_x = 0,
+        .bearing_y = 0,
+    };
+    const second: Font.Glyph = .{
+        .bitmap = @constCast(&second_bitmap),
+        .format = .alpha,
+        .fully_opaque = false,
+        .width = 2,
+        .height = 1,
+        .bearing_x = 0,
+        .bearing_y = 0,
+    };
+    var mask = [_]u8{0} ** 3;
+    maxGlyphCoverage(&mask, 3, 1, 0, 3, &first, 0, 0);
+    maxGlyphCoverage(&mask, 3, 1, 0, 3, &second, 1, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 40, 180, 90 }, &mask);
+
+    @memset(&mask, 0);
+    maxGlyphCoverage(&mask, 3, 1, 1, 2, &first, 0, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 180, 0 }, &mask);
+}
+
+fn textRunRasterEnd(raws: []const vt.Cell, start: u31, end: u31, cols: u31) u31 {
+    std.debug.assert(start < end and end <= cols);
+    var raster_end = end;
+    for (start..end) |x| {
+        const constraint_end: u31 = @intCast(
+            x + @as(usize, glyph_constraints.constraintWidth(raws, x, cols)),
+        );
+        raster_end = @max(raster_end, @min(cols, constraint_end));
+    }
+    return raster_end;
+}
+
+test "synthetic italic raster span includes glyph spill" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term: vt.Terminal = try .init(testing.io, alloc, .{ .cols = 4, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("界");
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    var raws = state.row_data.get(0).cells.items(.raw);
+    try testing.expectEqual(.wide, raws[0].wide);
+    try testing.expectEqual(.spacer_tail, raws[1].wide);
+    try testing.expectEqual(@as(u31, 2), textRunRasterEnd(raws, 0, 1, 4));
+
+    term.fullReset();
+    stream.nextSlice("→");
+    try state.update(alloc, &term);
+    raws = state.row_data.get(0).cells.items(.raw);
+    try testing.expectEqual(@as(u21, 0), glyph_constraints.cellCodepoint(raws[1]));
+    try testing.expectEqual(@as(u31, 2), textRunRasterEnd(raws, 0, 1, 4));
+}
+
+fn blitItalicMask(
+    self: *Renderer,
+    mask: []const u8,
+    run_width: u31,
+    start: u31,
+    end: u31,
+    y: u31,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) void {
+    const font = self.font;
+    const row_top = y * font.cell_height;
+    if (row_top >= height) return;
+    const rows = @min(font.cell_height, height - row_top);
+    const clip_start: u31 = if (self.glyph_clip_x) |clip| @intCast(@max(0, clip.start)) else 0;
+    const clip_end: u31 = if (self.glyph_clip_x) |clip| @intCast(@min(width, clip.end)) else width;
+    const stride = self.pixelStride(width);
+
+    for (start..end) |cell| {
+        const cell_left = cell * font.cell_width;
+        const x_start = @max(cell_left, clip_start);
+        const x_end = @min(cell_left + font.cell_width, clip_end);
+        if (x_start >= x_end) continue;
+        const span_len: usize = x_end - x_start;
+        const mask_x: usize = (cell - start) * font.cell_width + (x_start - cell_left);
+        for (0..rows) |row| {
+            const coverage = mask[row * run_width + mask_x ..][0..span_len];
+            const destination = pixels[(row_top + row) * stride + x_start ..][0..span_len];
+            blendAlphaSpan(destination, coverage, argb(self.fg_scratch.items[cell]));
+        }
+    }
+}
+
 /// Shape cells [start, end) as one HarfBuzz run and blit the glyphs.
 /// The run's face is the one resolved for its first cell.
 fn drawRun(
@@ -1776,15 +1929,24 @@ fn drawRun(
     if (!non_space) return;
 
     const shaped = try self.text_shaper.shape(face_index, face_style, end - start);
+    const synthetic_run = font.face(face_index).synthetic_italic;
+    const raster_end = if (synthetic_run) textRunRasterEnd(raws, start, end, cols) else end;
+    const run_width = (raster_end - start) * font.cell_width;
+    if (synthetic_run) {
+        try self.italic_mask_scratch.resize(self.alloc, run_width * font.cell_height);
+        @memset(self.italic_mask_scratch.items, 0);
+    }
 
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
     var pen_x: i64 = 0; // 26.6 physical pixels, including the grid anchor.
     var cluster: u32 = std.math.maxInt(u32);
+    var cluster_glyph_index: usize = 0;
     for (shaped) |sg| {
         const abs_cluster: u32 = start + sg.cluster;
-        // Snap each new cluster to its cell so the grid stays aligned.
+        // KiTTY renders each ordinary cluster in its own cell-sized group.
         if (abs_cluster != cluster) {
             cluster = abs_cluster;
+            cluster_glyph_index = 0;
             pen_x = @as(i64, cluster) * font.cell_width * 64;
         }
         const cluster_x: usize = @intCast(cluster);
@@ -1811,21 +1973,61 @@ fn drawRun(
             },
             else => |e| return e,
         };
-        self.noteOverhang(@as(i32, font.baseline) + origin_y.pixel - g.bearing_y, g.height);
-        blitGlyph(
-            pixels,
-            self.pixelStride(width),
-            width,
-            height,
-            g,
-            origin_x.pixel + g.bearing_x,
-            baseline_y + origin_y.pixel - g.bearing_y,
-            argb(self.fg_scratch.items[cluster]),
-            self.reverse_scratch.items[cluster],
-            self.glyph_clip_x,
-        );
+        const glyph_y = @as(i32, font.baseline) + origin_y.pixel - g.bearing_y;
+        if (!synthetic_run) self.noteOverhang(glyph_y, g.height);
+        const glyph_x = origin_x.pixel + g.bearing_x;
+        const group_left: u31 = @intCast(cluster * font.cell_width);
+        const group_right: u31 = group_left + @as(u31, constraint_width) * font.cell_width;
+        const draw_x = if (font.face(sg.face).synthetic_italic)
+            kittyItalicX(
+                @intCast(group_left),
+                @intCast(group_right),
+                cluster_glyph_index,
+                glyph_x,
+                g.width,
+            )
+        else
+            glyph_x;
+        if (synthetic_run) {
+            std.debug.assert(g.format == .alpha);
+            const run_left = start * font.cell_width;
+            maxGlyphCoverage(
+                self.italic_mask_scratch.items,
+                run_width,
+                font.cell_height,
+                group_left - run_left,
+                group_right - run_left,
+                g,
+                draw_x - @as(i32, @intCast(run_left)),
+                glyph_y,
+            );
+        } else {
+            blitGlyph(
+                pixels,
+                self.pixelStride(width),
+                width,
+                height,
+                g,
+                draw_x,
+                baseline_y + origin_y.pixel - g.bearing_y,
+                argb(self.fg_scratch.items[cluster]),
+                self.reverse_scratch.items[cluster],
+                self.glyph_clip_x,
+            );
+        }
         pen_x += sg.x_advance;
+        cluster_glyph_index += 1;
     }
+    if (synthetic_run) self.blitItalicMask(
+        self.italic_mask_scratch.items,
+        run_width,
+        start,
+        raster_end,
+        y,
+        pixels,
+        width,
+        height,
+    );
 }
 
 fn overlayCodepoints(self: *Renderer, text: []const u8) ![]const u21 {

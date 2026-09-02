@@ -116,6 +116,17 @@ Bold faces continue to request the bold weight.
 The default is
 .BR default .
 .TP
+.BI synthetic-italic " = true|false"
+Apply Fontconfig synthetic italic transforms when a font has no italic face.
+The setting also uses KiTTY-compatible placement for transformed glyphs.
+The default is
+.BR false .
+.TP
+.BI synthetic-italic-weight " = regular|bold"
+Set the source weight for a synthetic italic face.
+The default is
+.BR regular .
+.TP
 .BI font-size " = size[pt|px]"
 Set the font size.
 Bare values and
