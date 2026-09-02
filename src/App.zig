@@ -4256,7 +4256,7 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
         // Keys held across a focus change must not keep repeating.
         .leave => {
             self.cancelRepeat();
-            self.keyboard.resetCompose();
+            self.keyboard.resetTransientState();
             self.setFocus(false);
         },
         .enter => |enter| {

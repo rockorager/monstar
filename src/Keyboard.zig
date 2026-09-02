@@ -121,8 +121,7 @@ fn installKeymap(self: *Keyboard, keymap: *c.xkb_keymap) !void {
     if (self.keymap) |old| c.xkb_keymap_unref(old);
     self.keymap = keymap;
     self.state = state;
-    self.resetCompose();
-    self.mod_sides = .{};
+    self.resetTransientState();
     self.mod_indices = .{
         .shift = c.xkb_keymap_mod_get_index(keymap, c.XKB_MOD_NAME_SHIFT),
         .ctrl = c.xkb_keymap_mod_get_index(keymap, c.XKB_MOD_NAME_CTRL),
@@ -145,8 +144,10 @@ pub fn updateMods(self: *Keyboard, depressed: u32, latched: u32, locked: u32, gr
     _ = c.xkb_state_update_mask(state, depressed, latched, locked, 0, 0, group);
 }
 
-pub fn resetCompose(self: *Keyboard) void {
+/// Clear input state that cannot survive a keymap or keyboard-focus boundary.
+pub fn resetTransientState(self: *Keyboard) void {
     if (self.compose_state) |state| c.xkb_compose_state_reset(state);
+    self.mod_sides = .{};
 }
 
 /// Translate a wl_keyboard.key event into a ghostty-vt KeyEvent.
@@ -265,36 +266,36 @@ fn currentModsForKey(self: *Keyboard, key: vt.input.Key, action: vt.input.KeyAct
     const pressed = action != .release;
     switch (key) {
         .shift_left => {
-            mods.shift = pressed;
-            mods.sides.shift = .left;
+            mods.shift = pressed or self.mod_sides.shift_right;
+            mods.sides.shift = if (pressed) .left else .right;
         },
         .shift_right => {
-            mods.shift = pressed;
-            mods.sides.shift = .right;
+            mods.shift = pressed or self.mod_sides.shift_left;
+            mods.sides.shift = if (pressed) .right else .left;
         },
         .control_left => {
-            mods.ctrl = pressed;
-            mods.sides.ctrl = .left;
+            mods.ctrl = pressed or self.mod_sides.ctrl_right;
+            mods.sides.ctrl = if (pressed) .left else .right;
         },
         .control_right => {
-            mods.ctrl = pressed;
-            mods.sides.ctrl = .right;
+            mods.ctrl = pressed or self.mod_sides.ctrl_left;
+            mods.sides.ctrl = if (pressed) .right else .left;
         },
         .alt_left => {
-            mods.alt = pressed;
-            mods.sides.alt = .left;
+            mods.alt = pressed or self.mod_sides.alt_right;
+            mods.sides.alt = if (pressed) .left else .right;
         },
         .alt_right => {
-            mods.alt = pressed;
-            mods.sides.alt = .right;
+            mods.alt = pressed or self.mod_sides.alt_left;
+            mods.sides.alt = if (pressed) .right else .left;
         },
         .meta_left => {
-            mods.super = pressed;
-            mods.sides.super = .left;
+            mods.super = pressed or self.mod_sides.super_right;
+            mods.sides.super = if (pressed) .left else .right;
         },
         .meta_right => {
-            mods.super = pressed;
-            mods.sides.super = .right;
+            mods.super = pressed or self.mod_sides.super_left;
+            mods.sides.super = if (pressed) .right else .left;
         },
         else => {},
     }
@@ -1015,6 +1016,23 @@ test "translate and encode: plain, shifted, control" {
         try vt_input.encodeKey(&writer, event, .{});
         try std.testing.expectEqualStrings("\x1b[A", writer.buffered());
     }
+}
+
+test "releasing one modifier side preserves the other side" {
+    var kb = testKeyboard() catch return error.SkipZigTest;
+    defer kb.deinit();
+
+    var utf8_buf: [16]u8 = undefined;
+    _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_DOWN);
+    _ = kb.translate(&utf8_buf, 42, .press).?;
+    _ = c.xkb_state_update_key(kb.state.?, 54 + 8, c.XKB_KEY_DOWN);
+    _ = kb.translate(&utf8_buf, 54, .press).?;
+
+    _ = c.xkb_state_update_key(kb.state.?, 54 + 8, c.XKB_KEY_UP);
+    const release = kb.translate(&utf8_buf, 54, .release).?;
+    try std.testing.expectEqual(vt.input.Key.shift_right, release.key);
+    try std.testing.expect(release.mods.shift);
+    try std.testing.expectEqual(.left, release.mods.sides.shift);
 }
 
 test "translate and encode: ctrl punctuation and shifted ctrl" {
