@@ -88,9 +88,14 @@ pub const MetricModifier = union(enum) {
     }
 };
 
+pub const FontWeight = enum {
+    default,
+    medium,
+};
 /// Wayland app-id and desktop-entry hint for desktop integration.
 app_id: [:0]const u8 = default_app_id,
 font_family: [:0]const u8 = "monospace",
+font_weight: FontWeight = .default,
 /// Bare and `pt` values are typographic points; `px` values are logical
 /// pixels. Both apply the output's fractional scale during rasterization.
 font_size: FontSize = .{ .points = 12 },
@@ -235,6 +240,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.app_id = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "font-family")) {
         self.font_family = try arena.dupeZ(u8, value);
+    } else if (std.mem.eql(u8, key, "font-weight")) {
+        self.font_weight = std.meta.stringToEnum(FontWeight, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "font-size")) {
         self.font_size = try parseFontSize(value);
     } else if (std.mem.eql(u8, key, "adjust-cell-height")) {
@@ -536,6 +543,7 @@ test "defaults" {
     const config: Config = .{};
     try std.testing.expectEqualStrings(default_app_id, config.app_id);
     try std.testing.expectEqualStrings("monospace", config.font_family);
+    try std.testing.expectEqual(FontWeight.default, config.font_weight);
     try std.testing.expectEqual(FontSize{ .points = 12 }, config.font_size);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
@@ -586,6 +594,7 @@ test "parse config" {
         \\# a comment
         \\app-id = com.example.scratchpad
         \\font-family = Fira Code
+        \\font-weight = medium
         \\font-size = 14.5
         \\window-padding-x = 4
         \\window-padding-y = 6, 10
@@ -621,6 +630,7 @@ test "parse config" {
 
     try std.testing.expectEqualStrings("com.example.scratchpad", config.app_id);
     try std.testing.expectEqualStrings("Fira Code", config.font_family);
+    try std.testing.expectEqual(FontWeight.medium, config.font_weight);
     // invalid re-assignment keeps the previous valid value
     try std.testing.expectEqual(FontSize{ .points = 14.5 }, config.font_size);
     try std.testing.expectEqual(WindowPadding{ .first = 4, .second = 4 }, config.window_padding_x);

@@ -106,6 +106,16 @@ Define a virtual family in the user's Fontconfig configuration to provide
 ordered primary, styled, and fallback fonts specific to Monstar, then select it
 with this setting.
 .TP
+.BI font-weight " = weight"
+Set the requested weight for regular and italic faces.
+.B default
+lets Fontconfig select the weight.
+.B medium
+requests the Fontconfig medium weight.
+Bold faces continue to request the bold weight.
+The default is
+.BR default .
+.TP
 .BI font-size " = size[pt|px]"
 Set the font size.
 Bare values and

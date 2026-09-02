@@ -467,6 +467,10 @@ fn tmpDirPath(environ: std.process.Environ) []const u8 {
 /// `argv`/`envp` must stay valid for the lifetime of the call (the child
 /// copies them via execve). `config` strings must remain valid until the
 /// first successful reload or App teardown.
+fn fontOptions(config: Config) Font.Options {
+    return .{ .weight = config.font_weight };
+}
+
 pub fn init(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -478,11 +482,12 @@ pub fn init(
     options: InitOptions,
 ) !*App {
     const font_size_px = Config.fontSizePixels(config.font_size, 120);
-    var font: Font = try .init(
+    var font: Font = try .initOptions(
         alloc,
         config.font_family,
         font_size_px,
         config.adjust_cell_height,
+        fontOptions(config),
     );
     errdefer font.deinit(alloc);
 
@@ -838,11 +843,12 @@ fn scaleChanged(ctx: *anyopaque, scale120: u32) anyerror!void {
     const size_px = Config.fontSizePixels(self.effectiveFontSize(), scale120);
     if (size_px == 0 or size_px == self.font_size_px) return;
 
-    const new_font: Font = try .init(
+    const new_font: Font = try .initOptions(
         self.alloc,
         self.config.font_family,
         size_px,
         self.config.adjust_cell_height,
+        fontOptions(self.config),
     );
     self.font.deinit(self.alloc);
     self.font = new_font;
@@ -2231,11 +2237,12 @@ fn spawnEnvp(
 
 fn applyConfig(self: *App, new_config: Config) !void {
     const desired_font_size = Config.fontSizePixels(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
-    const new_font: Font = try .init(
+    const new_font: Font = try .initOptions(
         self.alloc,
         new_config.font_family,
         desired_font_size,
         new_config.adjust_cell_height,
+        fontOptions(new_config),
     );
 
     self.applyColorDefaultsForConfig(new_config);
@@ -2322,11 +2329,12 @@ fn effectiveFontSize(self: *const App) Config.FontSize {
 fn setRuntimeFontSize(self: *App, configured_size: ?Config.FontSize) void {
     const next_size = configured_size orelse self.config.font_size;
     const size_px = Config.fontSizePixels(next_size, self.window.scale120);
-    const new_font: Font = Font.init(
+    const new_font: Font = Font.initOptions(
         self.alloc,
         self.config.font_family,
         size_px,
         self.config.adjust_cell_height,
+        fontOptions(self.config),
     ) catch |err| {
         log.warn("font size change failed: {}", .{err});
         return;

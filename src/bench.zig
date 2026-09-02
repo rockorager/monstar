@@ -23,11 +23,12 @@ pub fn run(init: std.process.Init) !void {
     try config.resolveThemes(init.io, arena, init.minimal.environ);
 
     const font_size_px = Config.fontSizePixels(config.font_size, 120);
-    var font: Font = try .init(
+    var font: Font = try .initOptions(
         alloc,
         config.font_family,
         font_size_px,
         config.adjust_cell_height,
+        .{ .weight = config.font_weight },
     );
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});

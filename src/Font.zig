@@ -86,9 +86,12 @@ pub const FaceStyle = enum(u2) {
         else if (italic) .italic else .regular;
     }
 
-    fn weight(self: FaceStyle) ?c_int {
+    fn weight(self: FaceStyle, configured: Config.FontWeight) ?c_int {
         return switch (self) {
-            .regular, .italic => null,
+            .regular, .italic => switch (configured) {
+                .default => null,
+                .medium => c.FC_WEIGHT_MEDIUM,
+            },
             .bold, .bold_italic => c.FC_WEIGHT_BOLD,
         };
     }
@@ -101,7 +104,19 @@ pub const FaceStyle = enum(u2) {
     }
 };
 
+test "select configured regular and bold emphasized weights" {
+    try std.testing.expectEqual(null, FaceStyle.regular.weight(.default));
+    try std.testing.expectEqual(c.FC_WEIGHT_MEDIUM, FaceStyle.regular.weight(.medium).?);
+    try std.testing.expectEqual(c.FC_WEIGHT_MEDIUM, FaceStyle.italic.weight(.medium).?);
+    try std.testing.expectEqual(c.FC_WEIGHT_BOLD, FaceStyle.bold.weight(.default).?);
+    try std.testing.expectEqual(c.FC_WEIGHT_BOLD, FaceStyle.bold_italic.weight(.default).?);
+}
+
 const style_count = std.meta.fields(FaceStyle).len;
+
+pub const Options = struct {
+    weight: Config.FontWeight = .default,
+};
 
 /// Immutable Fontconfig results. Rasterizers need independent FreeType,
 /// HarfBuzz, and glyph-cache state, but can safely share these read-only
@@ -111,12 +126,14 @@ pub const Discovery = struct {
     family: [:0]u8,
     size_px: f64,
     adjust_cell_height: ?Config.MetricModifier,
+    options: Options,
     sort_sets: [style_count]*c.FcFontSet,
 
     fn init(
         family: [:0]const u8,
         size_px: f64,
         adjust_cell_height: ?Config.MetricModifier,
+        options: Options,
     ) Error!*Discovery {
         if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
 
@@ -128,7 +145,7 @@ pub const Discovery = struct {
         }
         inline for (std.meta.fields(FaceStyle)) |field| {
             const style: FaceStyle = @enumFromInt(field.value);
-            sort_sets_opt[field.value] = try fontSort(family, size_px, style);
+            sort_sets_opt[field.value] = try fontSort(family, size_px, style, options);
         }
         var sort_sets: [style_count]*c.FcFontSet = undefined;
         for (sort_sets_opt, 0..) |sort_set, i| sort_sets[i] = sort_set.?;
@@ -142,6 +159,7 @@ pub const Discovery = struct {
             .family = family_copy,
             .size_px = size_px,
             .adjust_cell_height = adjust_cell_height,
+            .options = options,
             .sort_sets = sort_sets,
         };
         return self;
@@ -741,13 +759,13 @@ fn bitmapRow(bitmap: c.FT_Bitmap, height: u31, y: usize) usize {
     return if (bitmap.pitch < 0) height - 1 - y else y;
 }
 
-fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle) Error!*c.FcFontSet {
+fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle, options: Options) Error!*c.FcFontSet {
     const pattern = c.FcPatternCreate() orelse return error.FontLoadFailed;
     defer c.FcPatternDestroy(pattern);
     _ = c.FcPatternAddString(pattern, c.FC_FAMILY, family.ptr);
     _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, size_px);
     _ = c.FcPatternAddInteger(pattern, c.FC_SPACING, c.FC_MONO);
-    if (style.weight()) |weight| _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
+    if (style.weight(options.weight)) |weight| _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
     if (style.slant()) |slant| _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, slant);
     if (c.FcConfigSubstitute(null, pattern, c.FcMatchPattern) != c.FcTrue)
         return error.FontLoadFailed;
@@ -804,9 +822,19 @@ pub fn init(
     size_px: f64,
     adjust_cell_height: ?Config.MetricModifier,
 ) Error!Font {
+    return initOptions(alloc, family, size_px, adjust_cell_height, .{});
+}
+
+pub fn initOptions(
+    alloc: std.mem.Allocator,
+    family: [:0]const u8,
+    size_px: u31,
+    adjust_cell_height: ?Config.MetricModifier,
+    options: Options,
+) Error!Font {
     std.debug.assert(size_px > 0);
 
-    const discovery_data = try Discovery.init(family, size_px, adjust_cell_height);
+    const discovery_data = try Discovery.init(family, size_px, adjust_cell_height, options);
     defer discovery_data.unref();
     return initWithDiscovery(alloc, discovery_data);
 }
