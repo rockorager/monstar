@@ -384,6 +384,7 @@ test {
     _ = @import("config_theme.zig");
     _ = @import("glyph_constraints.zig");
     _ = @import("Keyboard.zig");
+    _ = @import("KittyGraphicsReplay.zig");
     _ = @import("KittyImageCache.zig");
     _ = @import("kitty_graphics.zig");
     _ = Link;
