@@ -349,10 +349,12 @@ fn buildEnvp(
         const e = entry orelse continue;
         const value = std.mem.span(e);
         if (std.mem.startsWith(u8, value, "TERM=")) continue;
+        if (std.mem.startsWith(u8, value, "COLORTERM=")) continue;
         if (std.mem.startsWith(u8, value, "TERMINFO=")) has_terminfo = true;
         try list.append(arena, e);
     }
     try list.append(arena, "TERM=monstar");
+    try list.append(arena, "COLORTERM=truecolor");
     if (!has_terminfo) {
         var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (std.process.executableDirPath(io, &exe_dir_buf)) |len| {
