@@ -149,7 +149,7 @@ fn trimEnd(text: []const u8, payload_start: usize, end_: usize) usize {
     var end = end_;
     while (end > payload_start) {
         switch (text[end - 1]) {
-            '.', ',' => end -= 1,
+            '.', ',', ';', '!' => end -= 1,
             ')' => if (close_parens > open_parens) {
                 end -= 1;
                 close_parens -= 1;
@@ -200,6 +200,8 @@ test "automatic link schemes" {
 test "automatic links trim prose punctuation and unmatched brackets" {
     try expectMatch("see https://example.com.", "https://example.com");
     try expectMatch("see (https://example.com), now", "https://example.com");
+    try expectMatch("visit https://example.com/docs!", "https://example.com/docs");
+    try expectMatch("first https://example.com/a; then continue", "https://example.com/a");
     try expectMatch(
         "https://en.wikipedia.org/wiki/Rust_(video_game)",
         "https://en.wikipedia.org/wiki/Rust_(video_game)",
