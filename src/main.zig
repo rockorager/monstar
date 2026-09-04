@@ -329,12 +329,15 @@ fn buildCommand(
 fn validateWorkingDirectory(path: [:0]const u8) !void {
     const linux = std.os.linux;
     const rc = linux.openat(linux.AT.FDCWD, path, .{
-        .ACCMODE = .RDONLY,
         .CLOEXEC = true,
         .DIRECTORY = true,
+        .PATH = true,
     }, 0);
     if (linux.errno(rc) != .SUCCESS) return error.InvalidCli;
-    _ = linux.close(@intCast(rc));
+    const fd: std.posix.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    if (linux.errno(linux.faccessat(fd, "", linux.X_OK, linux.AT.EMPTY_PATH)) != .SUCCESS)
+        return error.InvalidCli;
 }
 
 /// Build an envp block for the child with Monstar's terminal definition.
@@ -508,6 +511,23 @@ test "parse CLI rejects invalid dimensions" {
 
     const args = [_][:0]const u8{ "--window-size-pixels", "80x0" };
     try std.testing.expectError(error.InvalidCli, parseCli(arena_state.allocator(), &args));
+}
+
+test "working directory needs search permission but not read permission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.testing.allocator.dupeZ(u8, path_buf[0..path_len]);
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.chmod(path, 0o111)));
+    defer _ = std.os.linux.chmod(path, 0o700);
+    try validateWorkingDirectory(path);
+
+    try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.chmod(path, 0o600)));
+    try std.testing.expectError(error.InvalidCli, validateWorkingDirectory(path));
 }
 
 test "terminal emulation of simple output" {
