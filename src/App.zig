@@ -59,6 +59,26 @@ const LinkPress = struct {
     action: LinkAction,
 };
 
+const PendingDbus = struct {
+    serial: u32,
+    deadline_ns: i96,
+    kind: Kind,
+
+    const Kind = union(enum) {
+        notification,
+        color_scheme,
+        reduced_motion,
+        open_uri: struct { uri: []u8, token: ?[:0]u8 },
+
+        fn deinit(kind: Kind, alloc: std.mem.Allocator) void {
+            if (kind == .open_uri) {
+                alloc.free(kind.open_uri.uri);
+                if (kind.open_uri.token) |token| alloc.free(token);
+            }
+        }
+    };
+};
+
 alloc: std.mem.Allocator,
 io: std.Io,
 config_arena: std.heap.ArenaAllocator,
@@ -150,6 +170,7 @@ hold: bool,
 /// `void` when built with `-Ddbus=false`.
 dbus: DbusHandle,
 dbus_fd: posix.fd_t,
+pending_dbus: std.ArrayList(PendingDbus) = .empty,
 /// URI held while the compositor creates a token for activating its handler.
 pending_open_uri: ?[]u8,
 /// A null value means the notification is awaiting its activation token.
@@ -379,7 +400,12 @@ const AppStreamHandler = struct {
             .clipboard_contents => self.app.setOsc52Clipboard(value.kind, value.data),
             .kitty_clipboard => {
                 self.app.kitty_clipboard.handle(value) catch |err| {
-                    log.warn("failed to handle OSC 5522 command: {}", .{err});
+                    if (err == error.QueueFull) {
+                        const response = self.app.kitty_clipboard.rejection();
+                        self.app.writeKittyClipboardStatus(response.op, response.id, response.terminator, .EBUSY);
+                    } else {
+                        log.warn("failed to handle OSC 5522 command: {}", .{err});
+                    }
                 };
                 self.app.pumpKittyClipboard();
             },
@@ -973,6 +999,8 @@ fn initDbus(self: *App) void {
 
 fn deinitDbus(self: *App) void {
     self.sendTaskbarProgress(.{ .state = .remove }) catch {};
+    for (self.pending_dbus.items) |pending| pending.kind.deinit(self.alloc);
+    self.pending_dbus.deinit(self.alloc);
     var it = self.notifications.valueIterator();
     while (it.next()) |token| {
         if (token.*) |value| self.alloc.free(value);
@@ -990,11 +1018,12 @@ fn deinitDbus(self: *App) void {
 fn dispatchDbus(self: *App) void {
     if (!build_options.enable_dbus) return;
     const connection = if (self.dbus != null) &self.dbus.? else return;
+    connection.flushWrites() catch |err| {
+        self.disconnectDbus(err);
+        return;
+    };
     while (connection.nextMessage() catch |err| {
-        log.warn("session dbus disconnected: {}", .{err});
-        connection.deinit();
-        self.dbus = null;
-        self.dbus_fd = -1;
+        self.disconnectDbus(err);
         return;
     }) |message_value| {
         var message = message_value;
@@ -1003,44 +1032,136 @@ fn dispatchDbus(self: *App) void {
     }
 }
 
+fn disconnectDbus(self: *App, err: anyerror) void {
+    if (!build_options.enable_dbus) return;
+    log.warn("session dbus disconnected: {}", .{err});
+    if (self.dbus) |*connection| connection.deinit();
+    self.dbus = null;
+    self.dbus_fd = -1;
+    for (self.pending_dbus.items) |pending| pending.kind.deinit(self.alloc);
+    self.pending_dbus.clearRetainingCapacity();
+}
+
+/// Takes ownership of kind only after the complete request is accepted.
+fn sendDbusMethod(
+    self: *App,
+    kind: PendingDbus.Kind,
+    method: DbusConnection.Method,
+    signature: []const u8,
+    body: []const u8,
+    fds: []const posix.fd_t,
+) !void {
+    if (!build_options.enable_dbus) return error.DBusUnavailable;
+    const connection = if (self.dbus != null) &self.dbus.? else return error.DBusUnavailable;
+    if (self.pending_dbus.items.len >= 64) return error.OutgoingQueueFull;
+    try self.pending_dbus.ensureUnusedCapacity(self.alloc, 1);
+    const serial = try connection.sendMethod(method, signature, body, fds);
+    self.pending_dbus.appendAssumeCapacity(.{
+        .serial = serial,
+        .deadline_ns = std.Io.Clock.awake.now(self.io).nanoseconds + std.time.ns_per_s,
+        .kind = kind,
+    });
+}
+
+fn dbusPollTimeoutMs(self: *const App) i32 {
+    const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+    var timeout: i32 = -1;
+    for (self.pending_dbus.items) |pending| {
+        const remaining = @max(0, pending.deadline_ns - now);
+        const ms: i32 = @intCast(@min(std.math.maxInt(i32), @divTrunc(remaining + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        timeout = if (timeout < 0) ms else @min(timeout, ms);
+    }
+    return timeout;
+}
+
+fn expireDbusRequests(self: *App) void {
+    const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+    var i: usize = 0;
+    while (i < self.pending_dbus.items.len) {
+        if (self.pending_dbus.items[i].deadline_ns > now) {
+            i += 1;
+            continue;
+        }
+        // A timed-out portal may still open the URI. Never launch a second
+        // handler unless an explicit unavailable-service reply was received.
+        const pending = self.pending_dbus.orderedRemove(i);
+        pending.kind.deinit(self.alloc);
+    }
+}
+
+test "desktop calls return before replies and correlate delayed notifications" {
+    if (!build_options.enable_dbus) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var sockets: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &sockets,
+    )));
+    defer _ = linux.close(sockets[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.io = std.testing.io;
+    app.config = .{};
+    app.pending_dbus = .empty;
+    app.notifications = .empty;
+    app.dbus = .{ .allocator = alloc, .io = std.testing.io, .fd = sockets[0] };
+    defer app.deinitDbus();
+
+    try app.sendDesktopNotification("test", "delayed reply");
+    try std.testing.expectEqual(@as(usize, 1), app.pending_dbus.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.notifications.count());
+    const serial = app.pending_dbus.items[0].serial;
+    const wire = @import("dbus/wire.zig");
+    var body: DbusConnection.Encoder = .init(alloc);
+    defer body.deinit();
+    try body.uint32(42);
+    const data = try wire.encodeMessage(alloc, .{
+        .message_type = .method_return,
+        .reply_serial = serial,
+        .signature = "u",
+    }, 1, body.bytes(), 0);
+    var reply = try wire.parseMessage(alloc, data, try alloc.alloc(posix.fd_t, 0));
+    defer reply.deinit();
+    app.handleDbusMessage(&reply);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_dbus.items.len);
+    try std.testing.expect(app.notifications.contains(42));
+
+    // No portal reply: expire owned fallback data, never open a second handler.
+    try app.openUriPortal("https://example.com", "activation-token");
+    try std.testing.expectEqual(@as(usize, 1), app.pending_dbus.items.len);
+    app.pending_dbus.items[0].deadline_ns = 0;
+    try std.testing.expectEqual(@as(i32, 0), app.dbusPollTimeoutMs());
+    app.expireDbusRequests();
+    try std.testing.expectEqual(@as(usize, 0), app.pending_dbus.items.len);
+    try std.testing.expectEqual(@as(i32, -1), app.dbusPollTimeoutMs());
+}
+
 fn hasQueuedDbusMessages(self: *const App) bool {
     if (!build_options.enable_dbus) return false;
     return if (self.dbus) |*connection| connection.hasQueuedMessages() else false;
 }
 
 fn readPortalAppearance(self: *App) void {
-    if (self.readPortalAppearanceUint32("color-scheme")) |value| {
-        self.setColorScheme(portalColorScheme(value), false);
-    }
-    if (self.readPortalAppearanceUint32("reduced-motion")) |value| {
-        self.reduced_motion = portalReducedMotion(value);
-    }
+    self.readPortalAppearanceUint32("color-scheme", .color_scheme);
+    self.readPortalAppearanceUint32("reduced-motion", .reduced_motion);
 }
 
-fn readPortalAppearanceUint32(self: *App, key: [*:0]const u8) ?u32 {
-    if (!build_options.enable_dbus) return null;
-    const connection = if (self.dbus != null) &self.dbus.? else return null;
-
+fn readPortalAppearanceUint32(self: *App, key: []const u8, kind: PendingDbus.Kind) void {
     var body: DbusConnection.Encoder = .init(self.alloc);
     defer body.deinit();
-    body.string("org.freedesktop.appearance") catch return null;
-    body.string(std.mem.span(key)) catch return null;
+    body.string("org.freedesktop.appearance") catch return;
+    body.string(key) catch return;
 
-    var reply = connection.call(.{
+    self.sendDbusMethod(kind, .{
         .destination = "org.freedesktop.portal.Desktop",
         .path = "/org/freedesktop/portal/desktop",
         .interface = "org.freedesktop.portal.Settings",
         .member = "ReadOne",
-    }, "ss", body.bytes(), &.{}, 1000) catch return null;
-    defer reply.deinit();
-    if (reply.messageType() != .method_return or
-        !std.mem.eql(u8, reply.bodySignature(), "v")) return null;
-    var decoder = reply.bodyDecoder();
-    const signature = decoder.variantSignature() catch return null;
-    if (!std.mem.eql(u8, signature, "u")) return null;
-    const value = decoder.uint32() catch return null;
-    decoder.end() catch return null;
-    return value;
+    }, "ss", body.bytes(), &.{}) catch {};
 }
 
 fn portalColorScheme(value: u32) vt.device_status.ColorScheme {
@@ -1056,7 +1177,6 @@ fn portalReducedMotion(value: u32) bool {
 
 fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !void {
     if (!build_options.enable_dbus) return error.DBusUnavailable;
-    const connection = if (self.dbus != null) &self.dbus.? else return error.DBusUnavailable;
 
     var encoded: DbusConnection.Encoder = .init(self.alloc);
     defer encoded.deinit();
@@ -1076,22 +1196,12 @@ fn sendDesktopNotification(self: *App, title: []const u8, body: []const u8) !voi
     try encoded.endArray(hints);
     try encoded.int32(-1); // server default expiration
 
-    var reply = connection.call(.{
+    try self.sendDbusMethod(.notification, .{
         .destination = "org.freedesktop.Notifications",
         .path = "/org/freedesktop/Notifications",
         .interface = "org.freedesktop.Notifications",
         .member = "Notify",
-    }, "susssasa{sv}i", encoded.bytes(), &.{}, 1000) catch
-        return error.DBusUnavailable;
-    defer reply.deinit();
-    if (reply.messageType() != .method_return or
-        !std.mem.eql(u8, reply.bodySignature(), "u")) return;
-    var decoder = reply.bodyDecoder();
-    const notification_id = decoder.uint32() catch return;
-    decoder.end() catch return;
-    if (try self.notifications.fetchPut(self.alloc, notification_id, null)) |old| {
-        if (old.value) |token| self.alloc.free(token);
-    }
+    }, "susssasa{sv}i", encoded.bytes(), &.{});
 }
 
 fn sendTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) !void {
@@ -1131,14 +1241,19 @@ fn taskbarProgressValue(report: vt.osc.Command.ProgressReport) f64 {
 
 fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !void {
     if (!build_options.enable_dbus) return error.PortalUnavailable;
-    const connection = if (self.dbus != null) &self.dbus.? else return error.PortalUnavailable;
+    if (self.dbus == null) return error.PortalUnavailable;
+    const owned_uri = try self.alloc.dupe(u8, uri);
+    errdefer self.alloc.free(owned_uri);
+    const owned_token = if (activation_token) |token| try self.alloc.dupeZ(u8, token) else null;
+    errdefer if (owned_token) |token| self.alloc.free(token);
+    const kind: PendingDbus.Kind = .{ .open_uri = .{ .uri = owned_uri, .token = owned_token } };
 
     // The portal's OpenURI method rejects file:// URIs by design; local
     // paths go through the fd-passing OpenFile/OpenDirectory methods.
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
     if (try clipboard_format.osc7Path(arena_state.allocator(), uri)) |path| {
-        return openFilePortal(self.alloc, connection, path, activation_token);
+        return self.openFilePortal(path, activation_token, kind);
     }
 
     var encoded: DbusConnection.Encoder = .init(self.alloc);
@@ -1149,16 +1264,16 @@ fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !
     if (activation_token) |token| try dbusAppendStringVariant(&encoded, "activation_token", token);
     try encoded.endArray(options);
 
-    try sendPortalCall(connection, "OpenURI", "ssa{sv}", encoded.bytes(), &.{});
+    try self.sendPortalCall(kind, "OpenURI", "ssa{sv}", encoded.bytes(), &.{});
 }
 
 /// Open a local file or directory through the portal by passing an fd:
 /// files open with the default handler, directories in the file manager.
 fn openFilePortal(
-    alloc: std.mem.Allocator,
-    connection: *DbusConnection,
+    self: *App,
     path: [:0]const u8,
     activation_token: ?[:0]const u8,
+    kind: PendingDbus.Kind,
 ) !void {
     const linux = std.os.linux;
 
@@ -1182,10 +1297,10 @@ fn openFilePortal(
     }
     if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
     const fd: posix.fd_t = @intCast(rc);
-    // The descriptor stays open until sendmsg transfers it to the bus.
+    // The connection duplicates the descriptor before returning.
     defer _ = linux.close(fd);
 
-    var encoded: DbusConnection.Encoder = .init(alloc);
+    var encoded: DbusConnection.Encoder = .init(self.alloc);
     defer encoded.deinit();
     try encoded.string(""); // parent window
     try encoded.unixFd(0);
@@ -1193,8 +1308,8 @@ fn openFilePortal(
     if (activation_token) |token| try dbusAppendStringVariant(&encoded, "activation_token", token);
     try encoded.endArray(options);
 
-    try sendPortalCall(
-        connection,
+    try self.sendPortalCall(
+        kind,
         if (is_dir) "OpenDirectory" else "OpenFile",
         "sha{sv}",
         encoded.bytes(),
@@ -1202,29 +1317,21 @@ fn openFilePortal(
     );
 }
 
-/// Send a portal request while preserving the distinction between a portal
-/// that is absent and a request whose outcome is ambiguous. Falling back after
-/// a timeout could open the URI twice if the portal handles the request late.
+/// Takes ownership of kind on success; the eventual reply decides fallback.
 fn sendPortalCall(
-    connection: *DbusConnection,
+    self: *App,
+    kind: PendingDbus.Kind,
     member: []const u8,
     signature: []const u8,
     body: []const u8,
     fds: []const posix.fd_t,
 ) !void {
-    var reply = connection.call(.{
+    try self.sendDbusMethod(kind, .{
         .destination = "org.freedesktop.portal.Desktop",
         .path = "/org/freedesktop/portal/desktop",
         .interface = "org.freedesktop.portal.OpenURI",
         .member = member,
-    }, signature, body, fds, 1000) catch return error.DBusUnavailable;
-    defer reply.deinit();
-
-    if (reply.messageType() != .error_reply) return;
-    if (reply.header.error_name) |name| if (isPortalUnavailableErrorName(name)) {
-        return error.PortalUnavailable;
-    };
-    return error.DBusUnavailable;
+    }, signature, body, fds);
 }
 
 fn isPortalUnavailableErrorName(name: []const u8) bool {
@@ -1290,6 +1397,17 @@ fn dbusAppendDoubleVariant(
 }
 
 fn handleDbusMessage(self: *App, message: *const DbusConnection.Message) void {
+    if (message.messageType() == .method_return or message.messageType() == .error_reply) {
+        const serial = message.header.reply_serial orelse return;
+        for (self.pending_dbus.items, 0..) |pending, i| {
+            if (pending.serial != serial) continue;
+            _ = self.pending_dbus.orderedRemove(i);
+            defer pending.kind.deinit(self.alloc);
+            self.handleDbusReply(pending.kind, message);
+            return;
+        }
+        return;
+    }
     if (message.messageType() != .signal) return;
     const interface = message.header.interface orelse return;
     const member = message.header.member orelse return;
@@ -1303,6 +1421,42 @@ fn handleDbusMessage(self: *App, message: *const DbusConnection.Message) void {
         std.mem.eql(u8, member, "SettingChanged"))
     {
         self.handlePortalSettingChanged(message);
+    }
+}
+
+fn handleDbusReply(self: *App, kind: PendingDbus.Kind, message: *const DbusConnection.Message) void {
+    if (kind == .open_uri) {
+        if (message.messageType() == .error_reply) {
+            if (message.header.error_name) |name| if (isPortalUnavailableErrorName(name)) {
+                self.openUriXdg(kind.open_uri.uri, kind.open_uri.token) catch |err| {
+                    log.warn("failed to open hyperlink with xdg-open: {}", .{err});
+                };
+            };
+        }
+        return;
+    }
+    if (message.messageType() != .method_return) return;
+    var decoder = message.bodyDecoder();
+    switch (kind) {
+        .notification => {
+            if (!std.mem.eql(u8, message.bodySignature(), "u")) return;
+            const id = decoder.uint32() catch return;
+            decoder.end() catch return;
+            const old = self.notifications.fetchPut(self.alloc, id, null) catch return;
+            if (old) |entry| if (entry.value) |token| self.alloc.free(token);
+        },
+        .color_scheme, .reduced_motion => {
+            if (!std.mem.eql(u8, message.bodySignature(), "v")) return;
+            const signature = decoder.variantSignature() catch return;
+            if (!std.mem.eql(u8, signature, "u")) return;
+            const value = decoder.uint32() catch return;
+            decoder.end() catch return;
+            if (kind == .color_scheme)
+                self.setColorScheme(portalColorScheme(value), true)
+            else
+                self.setReducedMotion(portalReducedMotion(value));
+        },
+        .open_uri => unreachable,
     }
 }
 
@@ -1465,7 +1619,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
-    };
+    } ++ [_]posix.pollfd{.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }} ** Clipboard.max_outgoing_transfers;
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
     const pty_write_fd = &fds[2];
@@ -1483,8 +1637,11 @@ pub fn run(self: *App) !void {
     const scrollbar_fd = &fds[14];
     const kitty_animation_fd = &fds[15];
     const compression_fd = &fds[16];
+    const outgoing_clipboard_fds = fds[17..][0..Clipboard.max_outgoing_transfers];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
+        self.expireDbusRequests();
+        self.expireClipboardTransfers();
         self.syncScrollbackCompression();
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
@@ -1530,8 +1687,17 @@ pub fn run(self: *App) !void {
         // POLLOUT would make every poll return immediately.
         pty_write_fd.fd = if (self.write_queue.items.len > 0) self.pty.master else -1;
         paste_fd.fd = self.clipboard.transferFd();
-
-        const ready = posix.poll(&fds, -1) catch {
+        self.clipboard.pollOutgoing(outgoing_clipboard_fds);
+        dbus_fd.events = posix.POLL.IN;
+        if (build_options.enable_dbus) {
+            if (self.dbus) |*connection| {
+                if (connection.hasPendingWrites()) dbus_fd.events |= posix.POLL.OUT;
+            }
+        }
+        const clipboard_timeout = self.clipboard.pollTimeoutMs();
+        const dbus_timeout = self.dbusPollTimeoutMs();
+        const timeout = if (clipboard_timeout < 0) dbus_timeout else if (dbus_timeout < 0) clipboard_timeout else @min(clipboard_timeout, dbus_timeout);
+        const ready = posix.poll(&fds, timeout) catch {
             display.cancelRead();
             return error.PollFailed;
         };
@@ -1597,7 +1763,7 @@ pub fn run(self: *App) !void {
             self.fireTaskbarProgressTimeout();
         }
 
-        if (dbus_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0 or
+        if (dbus_fd.revents & (posix.POLL.IN | posix.POLL.OUT | posix.POLL.HUP | posix.POLL.ERR) != 0 or
             self.hasQueuedDbusMessages())
         {
             self.dispatchDbus();
@@ -1610,7 +1776,10 @@ pub fn run(self: *App) !void {
                 self.finishAsyncRender();
         }
 
-        if (self.clipboard.transferFd() >= 0 and paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
+        self.clipboard.dispatchOutgoing(outgoing_clipboard_fds);
+        if (self.clipboard.transferFd() >= 0 and paste_fd.fd == self.clipboard.transferFd() and
+            paste_fd.revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR) != 0)
+        {
             self.readClipboardTransfer();
         }
 
@@ -3536,9 +3705,57 @@ fn beginPaste(self: *App, target: Clipboard.Target) void {
     _ = self.clipboard.request(target, .{ .terminal = target });
 }
 
+fn expireClipboardTransfers(self: *App) void {
+    const osc52_kind = self.clipboard.osc52ReadKind();
+    if (!self.clipboard.expireTransfers()) return;
+    if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
+    self.failStartedKittyRead(.EIO);
+    self.pumpKittyClipboard();
+}
+
+test "expired Kitty read fails and unblocks the next queued request" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var incoming: [2]posix.fd_t = undefined;
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&incoming, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(incoming[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.clipboard = .init(alloc, null, null);
+    defer app.clipboard.deinit();
+    app.kitty_clipboard = .init(alloc);
+    defer app.kitty_clipboard.deinit();
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+    app.clipboard.transfer_fd = incoming[0];
+    app.clipboard.transfer_deadline_ms = 0;
+    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=first", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
+    app.kitty_clipboard.front().?.read.started = true;
+    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=second", .payload = "Lg==", .terminator = .st });
+
+    app.expireClipboardTransfers();
+    try std.testing.expectEqual(@as(posix.fd_t, -1), app.clipboard.transferFd());
+    try std.testing.expect(app.kitty_clipboard.front() == null);
+    try std.testing.expectEqual(@as(usize, 0), app.kitty_clipboard.retained_bytes);
+    var buf: [1024]u8 = undefined;
+    const n = try posix.read(output[0], &buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "status=EIO") != null);
+    const first = std.mem.indexOf(u8, buf[0..n], "id=first").?;
+    const second = std.mem.indexOf(u8, buf[0..n], "id=second").?;
+    try std.testing.expect(first < second);
+}
+
 fn readClipboardTransfer(self: *App) void {
+    const osc52_kind = self.clipboard.osc52ReadKind();
     const event = self.clipboard.readTransfer() catch |err| {
         log.warn("clipboard transfer failed: {}", .{err});
+        if (osc52_kind) |kind| self.writeOsc52ClipboardReport(kind, "");
         self.failStartedKittyRead(.EIO);
         self.pumpKittyClipboard();
         return;
@@ -4849,16 +5066,27 @@ fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {
     return true;
 }
 
-/// Write to the PTY without ever blocking: whatever the kernel won't
-/// take right now is queued and flushed when the master polls writable.
+// Includes headroom for base64 framing of a maximum-sized clipboard read.
+const max_pty_write_queue = 4 * 1024 * 1024;
+
+/// Accept the entire write or drop it before emitting any bytes. Reserve the
+/// possible backlog first so neither backpressure nor OOM truncates a reply.
 fn writePty(self: *App, bytes: []const u8) void {
+    if (bytes.len > max_pty_write_queue -| self.write_queue.items.len) {
+        log.warn("pty write queue full; dropping complete write ({d} bytes)", .{bytes.len});
+        return;
+    }
+    self.write_queue.ensureUnusedCapacity(self.alloc, bytes.len) catch |err| {
+        log.warn("pty write queue reserve failed: {}", .{err});
+        return;
+    };
     // A backlog exists; keep ordering by appending behind it.
     if (self.write_queue.items.len > 0) {
-        self.queuePtyWrite(bytes);
+        self.write_queue.appendSliceAssumeCapacity(bytes);
         return;
     }
     const written = self.tryPtyWrite(bytes);
-    if (written < bytes.len) self.queuePtyWrite(bytes[written..]);
+    self.write_queue.appendSliceAssumeCapacity(bytes[written..]);
 }
 
 /// Drain the backlog after the master polled writable.
@@ -4889,18 +5117,70 @@ fn tryPtyWrite(self: *App, bytes: []const u8) usize {
     return offset;
 }
 
-fn queuePtyWrite(self: *App, bytes: []const u8) void {
-    // Cap the backlog: a child that never reads again must not grow the
-    // queue without bound. Dropping input is safe; dropping responses
-    // only affects an unresponsive client.
-    const max_queue = 1024 * 1024;
-    if (self.write_queue.items.len + bytes.len > max_queue) {
-        log.warn("pty write queue full; dropping {d} bytes", .{bytes.len});
-        return;
+test "maximum clipboard response survives write backpressure in order" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+
+    const clipboard = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(clipboard);
+    @memset(clipboard, 'x');
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    try formatOsc52ClipboardReport(&expected.writer, 'c', clipboard);
+    try expected.writer.writeAll("following input");
+
+    app.writeOsc52ClipboardReport('c', clipboard);
+    try std.testing.expect(app.write_queue.items.len > 1024 * 1024);
+    app.writePty("following input");
+    var received: usize = 0;
+    var buf: [16 * 1024]u8 = undefined;
+    while (received < expected.written().len) {
+        const n = try posix.read(fds[0], &buf);
+        try std.testing.expect(n > 0);
+        try std.testing.expectEqualSlices(u8, expected.written()[received..][0..n], buf[0..n]);
+        received += n;
+        app.flushWriteQueue();
     }
-    self.write_queue.appendSlice(self.alloc, bytes) catch |err| {
-        log.err("pty write queue append failed: {}", .{err});
-    };
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+}
+
+test "PTY limit and allocation failure reject before writing a prefix" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+    const oversized = try alloc.alloc(u8, max_pty_write_queue + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
+    app.writePty(oversized);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &byte));
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    app.writePty("reply");
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &byte));
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
 }
 
 fn searchRangeForRender(self: *App) ?Renderer.LinkRange {

@@ -17,6 +17,7 @@ pub const Message = wire.Message;
 pub const MessageType = wire.MessageType;
 
 const max_queued_messages = 256;
+const max_queued_bytes = 4 * 1024 * 1024;
 const max_message_fds = 16;
 const receive_buffer_size = 16 * 1024;
 const auth_line_max = 1024;
@@ -29,6 +30,7 @@ pub const Error = error{
     AuthenticationFailed,
     ConnectionClosed,
     InvalidAddress,
+    OutgoingQueueFull,
     ProtocolError,
     RemoteError,
     Timeout,
@@ -58,6 +60,20 @@ broken: bool = false,
 receive_buffer: std.ArrayList(u8) = .empty,
 received_fds: std.ArrayList(posix.fd_t) = .empty,
 messages: std.ArrayList(Message) = .empty,
+outgoing: std.ArrayList(OutgoingMessage) = .empty,
+outgoing_bytes: usize = 0,
+
+const OutgoingMessage = struct {
+    data: []u8,
+    fds: []posix.fd_t,
+    offset: usize = 0,
+
+    fn deinit(message: *OutgoingMessage, allocator: std.mem.Allocator) void {
+        for (message.fds) |fd| _ = linux.close(fd);
+        allocator.free(message.fds);
+        allocator.free(message.data);
+    }
+};
 
 /// Connect, authenticate, and register with the session bus. The caller owns
 /// the returned connection and must call `deinit`. Only Unix socket addresses
@@ -106,6 +122,8 @@ pub fn connectSession(
 }
 
 pub fn deinit(self: *Connection) void {
+    for (self.outgoing.items) |*message| message.deinit(self.allocator);
+    self.outgoing.deinit(self.allocator);
     for (self.messages.items) |*message| message.deinit();
     self.messages.deinit(self.allocator);
     for (self.received_fds.items) |fd| _ = linux.close(fd);
@@ -121,6 +139,10 @@ pub fn getFd(self: *const Connection) posix.fd_t {
 
 pub fn hasQueuedMessages(self: *const Connection) bool {
     return self.messages.items.len != 0;
+}
+
+pub fn hasPendingWrites(self: *const Connection) bool {
+    return self.outgoing.items.len != 0;
 }
 
 /// Send a method call and return its nonzero serial number.
@@ -201,13 +223,16 @@ pub fn waitForReply(self: *Connection, serial: u32, timeout_ms: u32) !Message {
             @as(i96, std.math.maxInt(i32)),
             @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms),
         ));
+        var events: i16 = posix.POLL.IN;
+        if (self.hasPendingWrites()) events |= posix.POLL.OUT;
         var poll_fd = [_]posix.pollfd{.{
             .fd = self.fd,
-            .events = posix.POLL.IN,
+            .events = events,
             .revents = 0,
         }};
         if (try posix.poll(&poll_fd, remaining_ms) == 0) return error.Timeout;
         if (poll_fd[0].revents & posix.POLL.NVAL != 0) return error.ConnectionClosed;
+        if (poll_fd[0].revents & posix.POLL.OUT != 0) try self.flushWrites();
     }
 }
 
@@ -244,8 +269,6 @@ fn sendMessage(
     if (fds.len > max_message_fds) return error.ProtocolError;
     if (fds.len != 0 and !self.unix_fd_enabled) return error.UnixFdUnsupported;
     const serial = self.next_serial;
-    self.next_serial +%= 1;
-    if (self.next_serial == 0) self.next_serial = 1;
 
     const data = try wire.encodeMessage(
         self.allocator,
@@ -254,65 +277,80 @@ fn sendMessage(
         body,
         @intCast(fds.len),
     );
-    defer self.allocator.free(data);
-    try self.writeMessage(data, fds);
+    var accepted = false;
+    errdefer if (!accepted) self.allocator.free(data);
+    if (self.outgoing.items.len >= max_queued_messages or
+        data.len > max_queued_bytes -| self.outgoing_bytes) return error.OutgoingQueueFull;
+    try self.outgoing.ensureUnusedCapacity(self.allocator, 1);
+    const owned_fds = try self.allocator.alloc(posix.fd_t, fds.len);
+    errdefer if (!accepted) self.allocator.free(owned_fds);
+    var duplicated: usize = 0;
+    errdefer if (!accepted) {
+        for (owned_fds[0..duplicated]) |fd| _ = linux.close(fd);
+    };
+    for (fds, 0..) |fd, index| {
+        const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0);
+        if (linux.errno(rc) != .SUCCESS) return error.WriteFailed;
+        owned_fds[index] = @intCast(rc);
+        duplicated += 1;
+    }
+    self.outgoing.appendAssumeCapacity(.{ .data = data, .fds = owned_fds });
+    accepted = true;
+    self.outgoing_bytes += data.len;
+    self.next_serial +%= 1;
+    if (self.next_serial == 0) self.next_serial = 1;
+    try self.flushWrites();
     return serial;
 }
 
-fn writeMessage(self: *Connection, data: []const u8, fds: []const posix.fd_t) !void {
+/// Attempt to drain queued messages without blocking. Call again after POLLOUT.
+pub fn flushWrites(self: *Connection) !void {
+    if (self.broken) return error.ConnectionClosed;
     errdefer self.broken = true;
-    var offset: usize = 0;
-    var send_fds = fds.len != 0;
-    var control: [receive_control_size]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
-    const control_len = if (send_fds) cmsgLength(fds.len * @sizeOf(posix.fd_t)) else 0;
-    if (send_fds) {
-        const header: *linux.cmsghdr = @ptrCast(&control);
-        header.* = .{
-            .len = control_len,
-            .level = linux.SOL.SOCKET,
-            .type = linux.SCM.RIGHTS,
-        };
-        @memcpy(control[cmsg_header_size..][0 .. fds.len * @sizeOf(posix.fd_t)], std.mem.sliceAsBytes(fds));
-    }
-
-    while (offset < data.len) {
+    while (self.outgoing.items.len != 0) {
+        const queued = &self.outgoing.items[0];
+        var control: [receive_control_size]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+        if (queued.fds.len != 0) {
+            const header: *linux.cmsghdr = @ptrCast(&control);
+            header.* = .{ .len = cmsgLength(queued.fds.len * @sizeOf(posix.fd_t)), .level = linux.SOL.SOCKET, .type = linux.SCM.RIGHTS };
+            @memcpy(control[cmsg_header_size..][0 .. queued.fds.len * @sizeOf(posix.fd_t)], std.mem.sliceAsBytes(queued.fds));
+        }
         var iov = [_]posix.iovec_const{.{
-            .base = data[offset..].ptr,
-            .len = data.len - offset,
+            .base = queued.data[queued.offset..].ptr,
+            .len = queued.data.len - queued.offset,
         }};
         const message: linux.msghdr_const = .{
             .name = null,
             .namelen = 0,
             .iov = &iov,
             .iovlen = 1,
-            .control = if (send_fds) &control else null,
-            .controllen = if (send_fds) cmsgSpace(fds.len * @sizeOf(posix.fd_t)) else 0,
+            .control = if (queued.fds.len != 0) &control else null,
+            .controllen = if (queued.fds.len != 0) cmsgSpace(queued.fds.len * @sizeOf(posix.fd_t)) else 0,
             .flags = 0,
         };
-        const rc = linux.sendmsg(self.fd, &message, linux.MSG.NOSIGNAL);
+        const rc = linux.sendmsg(self.fd, &message, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 if (rc == 0) return error.ConnectionClosed;
-                offset += rc;
-                send_fds = false;
+                queued.offset += rc;
+                if (queued.fds.len != 0) {
+                    for (queued.fds) |fd| _ = linux.close(fd);
+                    self.allocator.free(queued.fds);
+                    queued.fds = &.{};
+                }
+                if (queued.offset == queued.data.len) {
+                    self.outgoing_bytes -= queued.data.len;
+                    self.allocator.free(queued.data);
+                    self.allocator.free(queued.fds);
+                    _ = self.outgoing.orderedRemove(0);
+                }
             },
             .INTR => continue,
-            .AGAIN => try self.waitWritable(),
+            .AGAIN => return,
             .PIPE, .CONNRESET, .NOTCONN => return error.ConnectionClosed,
             else => return error.WriteFailed,
         }
     }
-}
-
-fn waitWritable(self: *Connection) !void {
-    var poll_fd = [_]posix.pollfd{.{
-        .fd = self.fd,
-        .events = posix.POLL.OUT,
-        .revents = 0,
-    }};
-    if (try posix.poll(&poll_fd, 1000) == 0) return error.Timeout;
-    if (poll_fd[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0)
-        return error.ConnectionClosed;
 }
 
 fn readAvailable(self: *Connection) !void {
@@ -614,6 +652,85 @@ test "session address unescaping" {
     defer allocator.free(value);
     try std.testing.expectEqualStrings("/run/user/1000/dbus-bus", value);
     try std.testing.expectError(error.InvalidAddress, unescapeAddress(allocator, "%2"));
+}
+
+fn testSocketConnection(allocator: std.mem.Allocator) !struct { Connection, posix.fd_t } {
+    var sockets: [2]posix.fd_t = undefined;
+    const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0, &sockets);
+    if (linux.errno(rc) != .SUCCESS) return error.SocketFailed;
+    return .{ .{ .allocator = allocator, .io = std.testing.io, .fd = sockets[0], .unix_fd_enabled = true }, sockets[1] };
+}
+
+test "backpressure preserves queued order and duplicated fd ownership" {
+    const pair = try testSocketConnection(std.testing.allocator);
+    var connection = pair[0];
+    defer connection.deinit();
+    var receiver: Connection = .{ .allocator = std.testing.allocator, .io = std.testing.io, .fd = pair[1] };
+    defer receiver.deinit();
+
+    var fill: [4096]u8 = @splat(0xaa);
+    while (true) {
+        const rc = linux.write(connection.fd, &fill, fill.len);
+        if (linux.errno(rc) == .AGAIN) break;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    }
+
+    const opened = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    const original: posix.fd_t = @intCast(opened);
+    var body: Encoder = .init(std.testing.allocator);
+    defer body.deinit();
+    try body.unixFd(0);
+    _ = try connection.sendMessage(.{ .message_type = .signal, .path = "/a", .interface = "a.b", .member = "First", .signature = "h" }, body.bytes(), &.{original});
+    _ = linux.close(original);
+    _ = try connection.sendSignal(.{ .path = "/a", .interface = "a.b", .member = "Second" }, "", &.{});
+
+    try std.testing.expect(connection.hasPendingWrites());
+    try std.testing.expectEqual(@as(usize, 2), connection.outgoing.items.len);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, connection.outgoing.items[0].data[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, connection.outgoing.items[1].data[8..12], .little));
+    const duplicate = connection.outgoing.items[0].fds[0];
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(duplicate, linux.F.GETFD, 0)));
+    try std.testing.expect(linux.fcntl(duplicate, linux.F.GETFD, 0) & linux.FD_CLOEXEC != 0);
+
+    // Drain the artificial backpressure before letting the framed messages
+    // through. The caller's original FD has already been closed.
+    while (true) {
+        const rc = linux.read(receiver.fd, &fill, fill.len);
+        if (linux.errno(rc) == .AGAIN) break;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        try std.testing.expect(rc > 0);
+    }
+    try connection.flushWrites();
+    try std.testing.expect(!connection.hasPendingWrites());
+    try std.testing.expectEqual(@as(usize, 0), connection.outgoing_bytes);
+    var first = (try receiver.nextMessage()).?;
+    defer first.deinit();
+    try std.testing.expectEqualStrings("First", first.header.member.?);
+    try std.testing.expectEqual(@as(usize, 1), first.fds.len);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(first.fds[0], linux.F.GETFD, 0)));
+    var second = (try receiver.nextMessage()).?;
+    defer second.deinit();
+    try std.testing.expectEqualStrings("Second", second.header.member.?);
+    try std.testing.expectEqual(@as(usize, 0), second.fds.len);
+}
+
+test "queue rejection is atomic and does not break connection" {
+    const pair = try testSocketConnection(std.testing.allocator);
+    var connection = pair[0];
+    defer connection.deinit();
+    defer _ = linux.close(pair[1]);
+    connection.outgoing_bytes = max_queued_bytes;
+
+    const opened = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+    const original: posix.fd_t = @intCast(opened);
+    defer _ = linux.close(original);
+    try std.testing.expectError(error.OutgoingQueueFull, connection.sendMessage(.{ .message_type = .signal, .path = "/a", .interface = "a.b", .member = "Rejected" }, &.{}, &.{original}));
+    try std.testing.expect(!connection.broken);
+    try std.testing.expect(!connection.hasPendingWrites());
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(original, linux.F.GETFD, 0)));
+    connection.outgoing_bytes = 0;
 }
 
 test "live session bus accepts a Unix fd" {

@@ -13,8 +13,15 @@ alloc: std.mem.Allocator,
 queue: std.ArrayList(Request) = .empty,
 write_state: ?*clipboard.WriteState = null,
 paste_grants: std.ArrayList(PasteGrant) = .empty,
+retained_bytes: usize = 0,
+rejection_id: [clipboard.max_id_len]u8 = undefined,
+rejection_id_len: usize = 0,
+rejection_op: clipboard.Operation = .read,
+rejection_terminator: vt.osc.Terminator = .st,
 
 const max_paste_grants = 32;
+pub const max_requests = 64;
+pub const max_retained_bytes = 16 * 1024 * 1024;
 
 pub const Target = enum { clipboard, primary };
 
@@ -30,6 +37,14 @@ pub const Request = union(enum) {
             .status => |status| alloc.free(status.id),
         }
     }
+
+    fn retainedBytes(self: *const Request) usize {
+        return switch (self.*) {
+            .read => |read| read.retained_bytes,
+            .write => |write| write.retained_bytes,
+            .status => |status| status.retained_bytes,
+        };
+    }
 };
 
 pub const Read = struct {
@@ -43,6 +58,7 @@ pub const Read = struct {
     paste: ?vt.clipboard.Content,
     grant_checked: bool = false,
     started: bool = false,
+    retained_bytes: usize,
 
     fn deinit(self: *Read) void {
         self.arena.deinit();
@@ -88,6 +104,7 @@ pub const Write = struct {
     state: *clipboard.WriteState,
     committed: clipboard.WriteState.Committed,
     terminator: vt.osc.Terminator,
+    retained_bytes: usize,
 
     fn deinit(self: *Write, alloc: std.mem.Allocator) void {
         self.committed.deinit(alloc);
@@ -101,6 +118,7 @@ pub const Status = struct {
     status: clipboard.Status,
     id: []const u8,
     terminator: vt.osc.Terminator,
+    retained_bytes: usize,
 
     pub fn encode(self: *const Status, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try (clipboard.Response{
@@ -146,7 +164,8 @@ pub fn reset(self: *KittyClipboard) void {
 pub fn handle(
     self: *KittyClipboard,
     command: vt.osc.Command.KittyClipboardProtocol,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, QueueFull }!void {
+    self.rejection_id_len = 0;
     var arena: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena.deinit();
     const meta = (clipboard.Metadata.parse(arena.allocator(), command.metadata) catch |err| switch (err) {
@@ -170,6 +189,17 @@ pub fn handle(
     }
 }
 
+/// Returns the EBUSY response prepared by the most recent QueueFull result.
+/// Its id borrows internal storage and remains valid until the next handle.
+pub fn rejection(self: *const KittyClipboard) clipboard.Response {
+    return .{
+        .op = self.rejection_op,
+        .status = .EBUSY,
+        .id = self.rejection_id[0..self.rejection_id_len],
+        .terminator = self.rejection_terminator,
+    };
+}
+
 pub fn front(self: *KittyClipboard) ?*Request {
     if (self.queue.items.len == 0) return null;
     return &self.queue.items[0];
@@ -177,6 +207,7 @@ pub fn front(self: *KittyClipboard) ?*Request {
 
 pub fn pop(self: *KittyClipboard) void {
     var request = self.queue.orderedRemove(0);
+    self.retained_bytes -= request.retainedBytes();
     request.deinit(self.alloc);
 }
 
@@ -257,9 +288,10 @@ fn enqueueRead(
     meta: *const clipboard.Metadata,
     payload: []const u8,
     terminator: vt.osc.Terminator,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, QueueFull }!void {
     var arena: std.heap.ArenaAllocator = .init(self.alloc);
-    errdefer arena.deinit();
+    var transferred = false;
+    defer if (!transferred) arena.deinit();
     const alloc = arena.allocator();
     const decoded = clipboard.Payload.init(alloc, payload) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -287,6 +319,11 @@ fn enqueueRead(
     const effective_pw = if (meta.name.len > 0) meta.pw else "";
     const id = try alloc.dupe(u8, meta.id);
     const pw = try alloc.dupe(u8, effective_pw);
+    const retained_bytes = @sizeOf(Read) + arena.queryCapacity();
+    self.ensureQueueCapacity(retained_bytes) catch |err| {
+        self.setRejection(.read, meta.id, terminator);
+        return err;
+    };
     try self.queue.append(self.alloc, .{
         .read = .{
             .target = target,
@@ -296,17 +333,20 @@ fn enqueueRead(
             .pw = pw,
             .terminator = terminator,
             .paste = null,
+            .retained_bytes = retained_bytes,
             // Copy the arena last so it includes every allocation above.
             .arena = arena,
         },
     });
+    self.retained_bytes += retained_bytes;
+    transferred = true;
 }
 
 fn beginWrite(self: *KittyClipboard, meta: *const clipboard.Metadata) error{OutOfMemory}!void {
     self.abortWrite();
     const state = try self.alloc.create(clipboard.WriteState);
     errdefer self.alloc.destroy(state);
-    state.* = try .init(self.alloc, meta, .{});
+    state.* = try .init(self.alloc, meta, .{ .max_size = max_retained_bytes });
     self.write_state = state;
 }
 
@@ -315,7 +355,7 @@ fn writeData(
     meta: *const clipboard.Metadata,
     payload: []const u8,
     terminator: vt.osc.Terminator,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, QueueFull }!void {
     const state = self.write_state orelse return;
     if (meta.mime.len == 0) return self.commitWrite(state, terminator);
     state.data(self.alloc, meta, payload) catch |err| switch (err) {
@@ -332,7 +372,7 @@ fn writeAlias(
     meta: *const clipboard.Metadata,
     payload: []const u8,
     terminator: vt.osc.Terminator,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, QueueFull }!void {
     const state = self.write_state orelse return;
     if (meta.mime.len == 0) return self.finishWriteStatus(state, .EINVAL, terminator);
     state.alias(self.alloc, meta, payload) catch |err| switch (err) {
@@ -348,7 +388,7 @@ fn commitWrite(
     self: *KittyClipboard,
     state: *clipboard.WriteState,
     terminator: vt.osc.Terminator,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, QueueFull }!void {
     const committed = state.commit(self.alloc) catch |err| switch (err) {
         error.OutOfMemory => {
             try self.finishWriteStatus(state, .EIO, terminator);
@@ -356,11 +396,26 @@ fn commitWrite(
         },
     };
     errdefer committed.deinit(self.alloc);
-    try self.queue.append(self.alloc, .{ .write = .{
+    const retained_bytes = @sizeOf(Write) + @sizeOf(clipboard.WriteState) +
+        state.arena.queryCapacity() + state.spool.capacity +
+        std.mem.sliceAsBytes(state.entries.allocatedSlice()).len +
+        std.mem.sliceAsBytes(state.aliases.allocatedSlice()).len +
+        std.mem.sliceAsBytes(committed.contents).len;
+    self.ensureQueueCapacity(retained_bytes) catch |err| {
+        self.setRejection(.write, state.id, terminator);
+        self.abortWrite();
+        return err;
+    };
+    self.queue.append(self.alloc, .{ .write = .{
         .state = state,
         .committed = committed,
         .terminator = terminator,
-    } });
+        .retained_bytes = retained_bytes,
+    } }) catch |err| {
+        self.abortWrite();
+        return err;
+    };
+    self.retained_bytes += retained_bytes;
     self.write_state = null;
 }
 
@@ -369,16 +424,44 @@ fn finishWriteStatus(
     state: *clipboard.WriteState,
     status: clipboard.Status,
     terminator: vt.osc.Terminator,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, QueueFull }!void {
+    defer self.abortWrite();
     const id = try self.alloc.dupe(u8, state.id);
     errdefer self.alloc.free(id);
+    const retained_bytes = @sizeOf(Status) + id.len;
+    self.ensureQueueCapacity(retained_bytes) catch |err| {
+        self.setRejection(.write, state.id, terminator);
+        return err;
+    };
     try self.queue.append(self.alloc, .{ .status = .{
         .op = .write,
         .status = status,
         .id = id,
         .terminator = terminator,
+        .retained_bytes = retained_bytes,
     } });
-    self.abortWrite();
+    self.retained_bytes += retained_bytes;
+}
+
+fn ensureQueueCapacity(self: *const KittyClipboard, retained_bytes: usize) error{QueueFull}!void {
+    if (self.queue.items.len >= max_requests or
+        retained_bytes > max_retained_bytes -| self.retained_bytes)
+    {
+        return error.QueueFull;
+    }
+}
+
+fn setRejection(
+    self: *KittyClipboard,
+    op: clipboard.Operation,
+    id: []const u8,
+    terminator: vt.osc.Terminator,
+) void {
+    std.debug.assert(id.len <= self.rejection_id.len);
+    @memcpy(self.rejection_id[0..id.len], id);
+    self.rejection_id_len = id.len;
+    self.rejection_op = op;
+    self.rejection_terminator = terminator;
 }
 
 fn abortWrite(self: *KittyClipboard) void {
@@ -526,4 +609,90 @@ test "paste event write failure discards its grant" {
         state.paste(std.testing.io, .clipboard, "text/plain", "snapshot", &writer),
     );
     try std.testing.expectEqual(@as(usize, 0), state.paste_grants.items.len);
+}
+
+test "rejected malformed reads release their arenas" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.handle(.{ .metadata = "type=read", .payload = "%%%", .terminator = .st });
+    try state.handle(.{ .metadata = "type=read", .payload = "/w==", .terminator = .st });
+    try std.testing.expectEqual(@as(usize, 0), state.queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.retained_bytes);
+}
+
+test "request count limit recovers after pop" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    for (0..max_requests) |_| try state.handle(.{
+        .metadata = "type=read",
+        .payload = "dGV4dC9wbGFpbg==",
+        .terminator = .st,
+    });
+    try std.testing.expectError(error.QueueFull, state.handle(.{
+        .metadata = "type=read",
+        .payload = "dGV4dC9wbGFpbg==",
+        .terminator = .st,
+    }));
+    const response = state.rejection();
+    try std.testing.expectEqual(clipboard.Operation.read, response.op);
+    try std.testing.expectEqual(clipboard.Status.EBUSY, response.status);
+    state.pop();
+    try state.handle(.{
+        .metadata = "type=read",
+        .payload = "dGV4dC9wbGFpbg==",
+        .terminator = .st,
+    });
+    try std.testing.expectEqual(max_requests, state.queue.items.len);
+}
+
+test "retained byte limit rejects and recovers" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    state.retained_bytes = max_retained_bytes;
+    try std.testing.expectError(error.QueueFull, state.handle(.{
+        .metadata = "type=read:id=busy-read",
+        .payload = "dGV4dC9wbGFpbg==",
+        .terminator = .bel,
+    }));
+    const response = state.rejection();
+    try std.testing.expectEqual(clipboard.Operation.read, response.op);
+    try std.testing.expectEqual(clipboard.Status.EBUSY, response.status);
+    try std.testing.expectEqualStrings("busy-read", response.id);
+    try std.testing.expectEqual(vt.osc.Terminator.bel, response.terminator);
+    state.retained_bytes = 0;
+    try state.handle(.{
+        .metadata = "type=read",
+        .payload = "dGV4dC9wbGFpbg==",
+        .terminator = .st,
+    });
+    try std.testing.expect(state.retained_bytes > 0);
+    state.pop();
+    try std.testing.expectEqual(@as(usize, 0), state.retained_bytes);
+}
+
+test "rejected write commit cleans up live state" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.handle(.{ .metadata = "type=write:id=w", .payload = null, .terminator = .st });
+    try state.handle(.{
+        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
+        .payload = "eA==",
+        .terminator = .st,
+    });
+    state.retained_bytes = max_retained_bytes;
+    try std.testing.expectError(error.QueueFull, state.handle(.{
+        .metadata = "type=wdata",
+        .payload = null,
+        .terminator = .st,
+    }));
+    try std.testing.expect(state.write_state == null);
+    const response = state.rejection();
+    try std.testing.expectEqual(clipboard.Operation.write, response.op);
+    try std.testing.expectEqual(clipboard.Status.EBUSY, response.status);
+    try std.testing.expectEqualStrings("w", response.id);
+    state.retained_bytes = 0;
 }

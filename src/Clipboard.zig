@@ -1,5 +1,6 @@
 //! Owns Wayland clipboard, primary-selection, drag-and-drop, and their
-//! single in-flight transfer transport. Application policy remains with App.
+//! bounded, nonblocking transfers: one incoming pipe and a small outgoing
+//! pool, all with deadlines. Application policy remains with App.
 
 const Clipboard = @This();
 
@@ -16,6 +17,10 @@ const log = std.log.scoped(.app);
 // clipboard owner that never closes its pipe can grow this process without
 // limit while the event loop continues draining it.
 const max_transfer_size = 1024 * 1024;
+pub const max_outgoing_transfers = 8;
+const max_outgoing_bytes = 16 * 1024 * 1024;
+const transfer_timeout_ms: i64 = 10 * 1000;
+const max_write_per_dispatch = 64 * 1024;
 
 pub const Target = enum { clipboard, primary };
 
@@ -80,6 +85,9 @@ primary_source: ?*Source,
 transfer_fd: posix.fd_t,
 transfer_buf: std.ArrayList(u8),
 transfer_action: TransferAction,
+transfer_deadline_ms: i64,
+outgoing: [max_outgoing_transfers]?OutgoingTransfer,
+outgoing_bytes: usize,
 dnd_ctx: ?*anyopaque,
 dnd_fn: ?DndFn,
 
@@ -91,6 +99,13 @@ const TransferAction = union(enum) {
     osc52_read: u8,
     kitty_read: [*:0]const u8,
     dnd: *DataOffer,
+};
+
+const OutgoingTransfer = struct {
+    fd: posix.fd_t,
+    data: []u8,
+    offset: usize,
+    deadline_ms: i64,
 };
 
 const TransferOffer = union(enum) {
@@ -188,55 +203,9 @@ const Source = struct {
     }
 
     fn send(self: *Source, fd: i32) void {
-        sendSelection(self.text, fd);
+        self.clipboard.sendSelection(self.text, fd);
     }
 };
-
-/// Wayland dispatch must not block on a clipboard consumer. The compositor
-/// supplies a blocking pipe, which can fill before the consumer starts
-/// reading, so each transfer owns a copy of the selection on a detached
-/// writer thread.
-fn sendSelection(text: []const u8, fd: posix.fd_t) void {
-    // A detached transfer may outlive Clipboard teardown, so its memory must
-    // not borrow the application's allocator lifetime.
-    const alloc = std.heap.page_allocator;
-    const owned = alloc.dupe(u8, text) catch {
-        _ = std.os.linux.close(fd);
-        return;
-    };
-    const thread = std.Thread.spawn(.{}, writeSelection, .{ alloc, owned, fd }) catch |err| {
-        log.err("failed to start clipboard writer: {}", .{err});
-        alloc.free(owned);
-        _ = std.os.linux.close(fd);
-        return;
-    };
-    thread.detach();
-}
-
-fn writeSelection(alloc: std.mem.Allocator, text: []u8, fd: posix.fd_t) void {
-    const linux = std.os.linux;
-    defer _ = linux.close(fd);
-    // Free before closing so pipe EOF also synchronizes tests and teardown
-    // with the transfer's allocator use.
-    defer alloc.free(text);
-
-    // A clipboard consumer may close its pipe before reading the selection.
-    // Keep that routine cancellation local to this detached writer instead of
-    // letting SIGPIPE terminate the entire terminal process.
-    var signal_mask = posix.sigemptyset();
-    posix.sigaddset(&signal_mask, .PIPE);
-    posix.sigprocmask(linux.SIG.BLOCK, &signal_mask, null);
-
-    var offset: usize = 0;
-    while (offset < text.len) {
-        const rc = linux.write(fd, text.ptr + offset, text.len - offset);
-        switch (linux.errno(rc)) {
-            .SUCCESS => offset += rc,
-            .INTR => continue,
-            else => return,
-        }
-    }
-}
 
 pub fn init(
     alloc: std.mem.Allocator,
@@ -262,6 +231,9 @@ pub fn init(
             .target = .clipboard,
             .mime = clipboard_format.paste_mime_preference[0].ptr,
         } },
+        .transfer_deadline_ms = 0,
+        .outgoing = @splat(null),
+        .outgoing_bytes = 0,
         .dnd_ctx = null,
         .dnd_fn = null,
     };
@@ -269,6 +241,7 @@ pub fn init(
 
 pub fn deinit(self: *Clipboard) void {
     self.abortTransfer();
+    for (0..max_outgoing_transfers) |i| self.closeOutgoing(i);
     self.transfer_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
     if (self.clip_pending_offer) |offer| offer.destroy();
@@ -277,6 +250,102 @@ pub fn deinit(self: *Clipboard) void {
     if (self.dnd_offer) |offer| offer.destroy();
     if (self.clip_source) |source| source.destroy();
     if (self.primary_source) |source| source.destroy();
+}
+
+fn sendSelection(self: *Clipboard, text: []const u8, fd: posix.fd_t) void {
+    const slot = for (&self.outgoing, 0..) |transfer, i| {
+        if (transfer == null) break i;
+    } else {
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    if (text.len > max_outgoing_bytes -| self.outgoing_bytes) {
+        _ = std.os.linux.close(fd);
+        return;
+    }
+    const owned = self.alloc.dupe(u8, text) catch {
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    setNonblocking(fd) catch {
+        self.alloc.free(owned);
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    self.outgoing[slot] = .{
+        .fd = fd,
+        .data = owned,
+        .offset = 0,
+        .deadline_ms = monotonicMs() + transfer_timeout_ms,
+    };
+    self.outgoing_bytes += owned.len;
+}
+
+pub fn pollOutgoing(self: *Clipboard, fds: *[max_outgoing_transfers]posix.pollfd) void {
+    for (self.outgoing, 0..) |transfer, i| fds[i] = if (transfer) |item|
+        .{ .fd = item.fd, .events = posix.POLL.OUT, .revents = 0 }
+    else
+        .{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 };
+}
+
+pub fn dispatchOutgoing(self: *Clipboard, fds: *const [max_outgoing_transfers]posix.pollfd) void {
+    for (fds, 0..) |poll_fd, i| {
+        const transfer = &(self.outgoing[i] orelse continue);
+        if (poll_fd.fd != transfer.fd or poll_fd.revents == 0) continue;
+        if (poll_fd.revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
+            self.closeOutgoing(i);
+            continue;
+        }
+        if (poll_fd.revents & posix.POLL.OUT == 0) continue;
+        const remaining = transfer.data[transfer.offset..];
+        const amount = @min(remaining.len, max_write_per_dispatch);
+        const rc = writeWithoutSigpipe(transfer.fd, remaining[0..amount]);
+        switch (std.os.linux.errno(rc)) {
+            .SUCCESS => {
+                transfer.offset += rc;
+                if (transfer.offset == transfer.data.len) self.closeOutgoing(i);
+            },
+            .INTR, .AGAIN => {},
+            else => self.closeOutgoing(i),
+        }
+    }
+}
+
+pub fn pollTimeoutMs(self: *const Clipboard) i32 {
+    var deadline: ?i64 = if (self.transfer_fd >= 0) self.transfer_deadline_ms else null;
+    for (self.outgoing) |transfer| if (transfer) |item| {
+        if (deadline == null or item.deadline_ms < deadline.?) deadline = item.deadline_ms;
+    };
+    const end = deadline orelse return -1;
+    return @intCast(@min(@max(end - monotonicMs(), 0), std.math.maxInt(i32)));
+}
+
+/// Expires stale transfers. True means an incoming transfer was aborted.
+pub fn expireTransfers(self: *Clipboard) bool {
+    const now = monotonicMs();
+    const incoming_expired = self.transfer_fd >= 0 and self.transfer_deadline_ms <= now;
+    if (incoming_expired) self.abortTransfer();
+    for (self.outgoing, 0..) |transfer, i| {
+        if (transfer) |item| if (item.deadline_ms <= now) self.closeOutgoing(i);
+    }
+    return incoming_expired;
+}
+
+pub fn osc52ReadKind(self: *const Clipboard) ?u8 {
+    if (self.transfer_fd < 0) return null;
+    return switch (self.transfer_action) {
+        .osc52_read => |kind| kind,
+        else => null,
+    };
+}
+
+fn closeOutgoing(self: *Clipboard, i: usize) void {
+    if (self.outgoing[i]) |transfer| {
+        _ = std.os.linux.close(transfer.fd);
+        self.outgoing_bytes -= transfer.data.len;
+        self.alloc.free(transfer.data);
+        self.outgoing[i] = null;
+    }
 }
 
 pub fn setDevices(
@@ -532,10 +601,11 @@ fn beginTransfer(
     errdefer _ = std.os.linux.close(fds[0]);
     errdefer _ = std.os.linux.close(fds[1]);
 
+    try setNonblocking(fds[0]);
     offer.receive(mime, fds[1]);
     _ = std.os.linux.close(fds[1]);
-    setNonblocking(fds[0]);
     self.transfer_fd = fds[0];
+    self.transfer_deadline_ms = monotonicMs() + transfer_timeout_ms;
     self.transfer_buf.clearRetainingCapacity();
     self.transfer_action = action;
 }
@@ -745,12 +815,68 @@ fn primaryDeviceListener(
     }
 }
 
-fn setNonblocking(fd: posix.fd_t) void {
+fn setNonblocking(fd: posix.fd_t) !void {
     const linux = std.os.linux;
     const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
     const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-    if (linux.errno(flags) != .SUCCESS) return;
-    _ = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
+    if (linux.errno(flags) != .SUCCESS) return error.FcntlFailed;
+    if (linux.errno(linux.fcntl(fd, linux.F.SETFL, flags | nonblock)) != .SUCCESS)
+        return error.FcntlFailed;
+}
+
+fn monotonicMs() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
+
+fn sigpipePending() bool {
+    const linux = std.os.linux;
+    var pending = posix.sigemptyset();
+    const rc = linux.syscall2(.rt_sigpending, @intFromPtr(&pending), linux.NSIG / 8);
+    return linux.errno(rc) == .SUCCESS and posix.sigismember(&pending, .PIPE);
+}
+
+fn writeWithoutSigpipe(fd: posix.fd_t, data: []const u8) usize {
+    const linux = std.os.linux;
+    var pipe_mask = posix.sigemptyset();
+    posix.sigaddset(&pipe_mask, .PIPE);
+    var old_mask: posix.sigset_t = undefined;
+    posix.sigprocmask(linux.SIG.BLOCK, &pipe_mask, &old_mask);
+    const was_pending = sigpipePending();
+    const rc = linux.write(fd, data.ptr, data.len);
+    // Consume only the signal generated by this failed write, preserving a
+    // SIGPIPE that was already pending for the caller.
+    if (linux.errno(rc) == .PIPE and !was_pending) {
+        const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+        while (true) {
+            const waited = linux.syscall4(
+                .rt_sigtimedwait,
+                @intFromPtr(&pipe_mask),
+                0,
+                @intFromPtr(&zero),
+                linux.NSIG / 8,
+            );
+            if (linux.errno(waited) != .INTR) break;
+        }
+    }
+    posix.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
+    return rc;
+}
+
+test "closed clipboard writer consumes its own SIGPIPE and restores the mask" {
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var before: posix.sigset_t = undefined;
+    posix.sigprocmask(linux.SIG.BLOCK, null, &before);
+    try std.testing.expectEqual(.PIPE, linux.errno(writeWithoutSigpipe(fds[1], "x")));
+    try std.testing.expect(!sigpipePending());
+    var after: posix.sigset_t = undefined;
+    posix.sigprocmask(linux.SIG.BLOCK, null, &after);
+    try std.testing.expectEqual(posix.sigismember(&before, .PIPE), posix.sigismember(&after, .PIPE));
 }
 
 test "transfer read failure discards partial data" {
@@ -795,10 +921,12 @@ test "oversized transfer is aborted before growing past the paste backlog" {
 
 test "selection send does not block while the consumer is idle" {
     const linux = std.os.linux;
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+    defer clipboard.deinit();
     var pipe_fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(
         .SUCCESS,
-        linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })),
+        linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true, .NONBLOCK = true })),
     );
     defer _ = linux.close(pipe_fds[0]);
 
@@ -806,36 +934,80 @@ test "selection send does not block while the consumer is idle" {
     defer std.testing.allocator.free(text);
     for (text, 0..) |*byte, i| byte.* = @truncate(i);
 
-    // This returns before anyone reads. A synchronous send blocks once the
-    // payload exceeds the pipe capacity and never reaches the read loop.
-    sendSelection(text, pipe_fds[1]);
+    clipboard.sendSelection(text, pipe_fds[1]);
+    @memset(text, 0); // The transfer retains the selection's original bytes.
 
     var received: usize = 0;
     var buf: [16 * 1024]u8 = undefined;
-    while (true) {
-        const n = try posix.read(pipe_fds[0], &buf);
-        if (n == 0) break;
-        try std.testing.expectEqualSlices(u8, text[received .. received + n], buf[0..n]);
-        received += n;
+    while (clipboard.outgoing_bytes != 0) {
+        var polls: [max_outgoing_transfers]posix.pollfd = undefined;
+        clipboard.pollOutgoing(&polls);
+        _ = try posix.poll(&polls, 0);
+        clipboard.dispatchOutgoing(&polls);
+        while (posix.read(pipe_fds[0], &buf)) |n| {
+            if (n == 0) break;
+            for (buf[0..n], received..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i)), byte);
+            received += n;
+        } else |err| try std.testing.expectEqual(error.WouldBlock, err);
     }
     try std.testing.expectEqual(text.len, received);
 }
 
 test "selection writer survives a consumer closing early" {
     const linux = std.os.linux;
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+    defer clipboard.deinit();
     var pipe_fds: [2]posix.fd_t = undefined;
     try std.testing.expectEqual(
         .SUCCESS,
         linux.errno(linux.pipe2(&pipe_fds, .{ .CLOEXEC = true })),
     );
     _ = linux.close(pipe_fds[0]);
-    errdefer _ = linux.close(pipe_fds[1]);
+    clipboard.sendSelection("selection", pipe_fds[1]);
+    var polls: [max_outgoing_transfers]posix.pollfd = undefined;
+    clipboard.pollOutgoing(&polls);
+    _ = try posix.poll(&polls, 0);
+    clipboard.dispatchOutgoing(&polls);
+    try std.testing.expectEqual(@as(usize, 0), clipboard.outgoing_bytes);
+}
 
-    const alloc = std.heap.page_allocator;
-    const text = try alloc.dupe(u8, "selection");
-    errdefer alloc.free(text);
-    const thread = try std.Thread.spawn(.{}, writeSelection, .{ alloc, text, pipe_fds[1] });
-    thread.join();
+test "outgoing limits, timeout, and teardown close transfers" {
+    const linux = std.os.linux;
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+
+    var readers: [max_outgoing_transfers + 1]posix.fd_t = undefined;
+    for (0..max_outgoing_transfers + 1) |i| {
+        var fds: [2]posix.fd_t = undefined;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+        readers[i] = fds[0];
+        clipboard.sendSelection("x", fds[1]);
+    }
+    // The ninth writer was rejected and its reader observes EOF.
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(readers[max_outgoing_transfers], &byte));
+    _ = linux.close(readers[max_outgoing_transfers]);
+
+    clipboard.outgoing[0].?.deadline_ms = monotonicMs() - 1;
+    try std.testing.expect(!clipboard.expireTransfers());
+    try std.testing.expect(clipboard.outgoing[0] == null);
+    for (readers[0..max_outgoing_transfers]) |fd| _ = linux.close(fd);
+    clipboard.deinit();
+}
+
+test "incoming deadline preserves OSC 52 kind until expiry" {
+    const linux = std.os.linux;
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+    defer clipboard.deinit();
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
+    defer _ = linux.close(fds[1]);
+    clipboard.transfer_fd = fds[0];
+    clipboard.transfer_action = .{ .osc52_read = 'c' };
+    clipboard.transfer_deadline_ms = monotonicMs() - 1;
+    try std.testing.expectEqual(@as(?u8, 'c'), clipboard.osc52ReadKind());
+    try std.testing.expectEqual(@as(i32, 0), clipboard.pollTimeoutMs());
+    try std.testing.expect(clipboard.expireTransfers());
+    try std.testing.expectEqual(@as(?u8, null), clipboard.osc52ReadKind());
 }
 
 test "drag negotiation prefers a supported source action" {
