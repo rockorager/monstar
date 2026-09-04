@@ -238,11 +238,17 @@ pub fn paste(
         removed.deinit();
     }
 
-    const available = [_][]const u8{mime};
+    var available_buf: [2][]const u8 = undefined;
+    available_buf[0] = mime;
+    var available_len: usize = 1;
+    if (vt.clipboard.isTextMime(mime) and !std.mem.eql(u8, mime, "text/plain")) {
+        available_buf[available_len] = "text/plain";
+        available_len += 1;
+    }
     try (clipboard.PasteEvent{
         .primary = target == .primary,
         .pw = &pw,
-        .available = &available,
+        .available = available_buf[0..available_len],
     }).encode(writer);
 }
 
@@ -486,6 +492,27 @@ test "targets listing does not consume a paste grant" {
     try state.prepareRead(&state.front().?.read);
     try std.testing.expectEqual(@as(usize, 0), state.paste_grants.items.len);
     try std.testing.expectEqualStrings("snapshot", state.front().?.read.paste.?.data);
+}
+
+test "paste event advertises canonical plain text alias" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    var output: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&output);
+    try state.paste(
+        std.testing.io,
+        .clipboard,
+        "text/plain;charset=utf-8",
+        "hello",
+        &writer,
+    );
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        writer.buffered(),
+        "dGV4dC9wbGFpbjtjaGFyc2V0PXV0Zi04IHRleHQvcGxhaW4K",
+    ) != null);
 }
 
 test "paste event write failure discards its grant" {
