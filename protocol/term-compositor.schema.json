@@ -1,0 +1,1243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/rockorager/monstar/main/protocol/term-compositor.schema.json",
+  "title": "Open Terminal Compositing Protocol (OTCP) Schema",
+  "description": "Formal protocol schema defining interfaces, requests, events, surfaces, layers, and capabilities for out-of-band terminal compositors.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "object"
+  ],
+  "oneOf": [
+    {
+      "$ref": "#/$defs/RequestEnvelope"
+    },
+    {
+      "$ref": "#/$defs/EventEnvelope"
+    }
+  ],
+  "interfaces": {
+    "tc_display": {
+      "description": "Core singleton connection endpoint representing the terminal display server, session properties, and capability negotiation.",
+      "requests": {
+        "hello": {
+          "description": "Initial connection handshake sent by the client.",
+          "args": {
+            "type": "object",
+            "required": [
+              "client_name"
+            ],
+            "properties": {
+              "client_name": {
+                "type": "string",
+                "description": "Identifying name of the client (e.g. fzf, monstar-ui, git-tool)"
+              },
+              "client_version": {
+                "type": "string",
+                "description": "Client semantic version string"
+              },
+              "requested_interfaces": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Map of interface names to client-supported max versions"
+              }
+            }
+          }
+        },
+        "sync": {
+          "description": "Requests a roundtrip synchronization point.",
+          "args": {
+            "type": "object",
+            "required": [
+              "callback_id"
+            ],
+            "properties": {
+              "callback_id": {
+                "type": "string",
+                "description": "Client-allocated ID for the tc_callback object"
+              }
+            }
+          }
+        },
+        "get_capabilities": {
+          "description": "Queries supported emulator capabilities, advertised interfaces, and security permissions.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "property_get": {
+          "description": "Queries active terminal/window/theme properties or feature flags.",
+          "args": {
+            "type": "object",
+            "required": [
+              "keys"
+            ],
+            "properties": {
+              "keys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "List of property keys to query (e.g. [\"window.title\", \"features.clipboard_read\"])"
+              }
+            }
+          }
+        },
+        "property_set": {
+          "description": "Mutates writable terminal/window/theme properties.",
+          "args": {
+            "type": "object",
+            "required": [
+              "values"
+            ],
+            "properties": {
+              "values": {
+                "type": "object",
+                "description": "Key-value dictionary of properties to set"
+              }
+            }
+          }
+        },
+        "property_watch": {
+          "description": "Subscribes to real-time asynchronous change notifications for specified properties or features.",
+          "args": {
+            "type": "object",
+            "required": [
+              "keys"
+            ],
+            "properties": {
+              "keys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Properties or feature flags to watch"
+              }
+            }
+          }
+        },
+        "clipboard_get": {
+          "description": "Reads system clipboard or primary selection.",
+          "args": {
+            "type": "object",
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/$defs/ClipboardTarget"
+              },
+              "mime": {
+                "type": "string",
+                "default": "text/plain",
+                "description": "Preferred MIME type"
+              }
+            }
+          }
+        },
+        "clipboard_set": {
+          "description": "Writes data to system clipboard or primary selection.",
+          "args": {
+            "type": "object",
+            "required": [
+              "target",
+              "content"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/$defs/ClipboardTarget"
+              },
+              "mime": {
+                "type": "string",
+                "default": "text/plain",
+                "description": "Data MIME type"
+              },
+              "content": {
+                "type": "string",
+                "description": "Content string"
+              }
+            }
+          }
+        },
+        "system_bell": {
+          "description": "Triggers a system/visual terminal bell.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "system_notify": {
+          "description": "Posts a native desktop notification.",
+          "args": {
+            "type": "object",
+            "required": [
+              "title",
+              "body"
+            ],
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              },
+              "urgency": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "normal",
+                  "critical"
+                ],
+                "default": "normal"
+              }
+            }
+          }
+        }
+      },
+      "events": {
+        "capabilities": {
+          "description": "Response to hello / get_capabilities, broadcasting emulator metadata, active interface versions, and enabled feature flags.",
+          "args": {
+            "$ref": "#/$defs/Capabilities"
+          }
+        },
+        "property_values": {
+          "description": "Response containing queried property values.",
+          "args": {
+            "type": "object",
+            "required": [
+              "values"
+            ],
+            "properties": {
+              "values": {
+                "type": "object",
+                "description": "Key-value dictionary of resolved properties"
+              }
+            }
+          }
+        },
+        "property_changed": {
+          "description": "Asynchronous notification when a watched property or feature mutates.",
+          "args": {
+            "type": "object",
+            "required": [
+              "key",
+              "value"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "value": {}
+            }
+          }
+        },
+        "clipboard_data": {
+          "description": "Response containing requested clipboard data.",
+          "args": {
+            "type": "object",
+            "required": [
+              "target",
+              "content"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/$defs/ClipboardTarget"
+              },
+              "mime": {
+                "type": "string",
+                "default": "text/plain"
+              },
+              "content": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "error": {
+          "description": "Error notification on invalid requests or permission rejection.",
+          "args": {
+            "type": "object",
+            "required": [
+              "code",
+              "name",
+              "message"
+            ],
+            "properties": {
+              "object_id": {
+                "type": "string",
+                "description": "Target object ID that generated the error"
+              },
+              "code": {
+                "type": "integer",
+                "description": "Standardized numeric error code"
+              },
+              "name": {
+                "type": "string",
+                "description": "Symbolic error identifier (e.g. PERMISSION_DENIED)"
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable error description"
+              }
+            }
+          }
+        }
+      }
+    },
+    "tc_compositor": {
+      "description": "Factory interface for creating composited surfaces and overlay layers.",
+      "requests": {
+        "create_surface": {
+          "description": "Instantiates a new independent display surface (for multiplexer panes, standalone streams, programmatic grids, or raster pixel graphics).",
+          "args": {
+            "type": "object",
+            "required": [
+              "surface_id"
+            ],
+            "properties": {
+              "surface_id": {
+                "type": "string",
+                "description": "Unique client-allocated surface identifier"
+              },
+              "type": {
+                "$ref": "#/$defs/SurfaceType",
+                "default": "pty"
+              },
+              "cols": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Initial surface width in character cells"
+              },
+              "rows": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Initial surface height in character cells"
+              },
+              "scrollback_max_lines": {
+                "type": "integer",
+                "default": 10000,
+                "description": "Max capacity of the scrollback ring buffer (0 to disable)"
+              },
+              "title": {
+                "type": "string",
+                "description": "Initial surface title"
+              }
+            }
+          }
+        },
+        "create_layer": {
+          "description": "Instantiates a new overlay layer shell.",
+          "args": {
+            "type": "object",
+            "required": [
+              "layer_id"
+            ],
+            "properties": {
+              "layer_id": {
+                "type": "string",
+                "description": "Unique client-allocated layer identifier"
+              },
+              "type": {
+                "$ref": "#/$defs/LayerType",
+                "default": "modal"
+              },
+              "parent_surface": {
+                "type": "string",
+                "description": "Optional parent tc_surface ID to scope positioning and clipping to"
+              }
+            }
+          }
+        }
+      },
+      "events": {}
+    },
+    "tc_surface": {
+      "description": "Represents an independent rendering surface (sandboxed legacy PTY, text stream, 2D grid matrix, or pixel graphic).",
+      "requests": {
+        "resize": {
+          "description": "Requests geometry resizing for this surface.",
+          "args": {
+            "type": "object",
+            "required": [
+              "cols",
+              "rows"
+            ],
+            "properties": {
+              "cols": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "rows": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "set_title": {
+          "description": "Sets the surface or tab title.",
+          "args": {
+            "type": "object",
+            "required": [
+              "title"
+            ],
+            "properties": {
+              "title": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "clear_scrollback": {
+          "description": "Clears the scrollback history buffer for this surface without disturbing active cell contents.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "put_buffer": {
+          "description": "Updates character cells directly in a grid surface using a binary buffer ABI payload.",
+          "args": {
+            "type": "object",
+            "required": [
+              "cols",
+              "rows",
+              "format",
+              "data"
+            ],
+            "properties": {
+              "x": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Starting column offset (0-based)"
+              },
+              "y": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Starting row offset (0-based)"
+              },
+              "cols": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Width of the cell buffer region in character cells"
+              },
+              "rows": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Height of the cell buffer region in character cells"
+              },
+              "format": {
+                "$ref": "#/$defs/BufferFormat"
+              },
+              "data": {
+                "type": "string",
+                "description": "Base64-encoded contiguous binary cell buffer conforming to the specified format ABI"
+              }
+            }
+          }
+        },
+        "write_text": {
+          "description": "Appends text lines to a stream surface.",
+          "args": {
+            "type": "object",
+            "required": [
+              "text"
+            ],
+            "properties": {
+              "text": {
+                "type": "string",
+                "description": "Text payload to append"
+              }
+            }
+          }
+        },
+        "set_buffer": {
+          "description": "Uploads raster image or bitmap data to a pixel surface.",
+          "args": {
+            "type": "object",
+            "required": [
+              "format",
+              "data"
+            ],
+            "properties": {
+              "format": {
+                "type": "string",
+                "enum": [
+                  "png",
+                  "jpeg",
+                  "webp",
+                  "rgba32",
+                  "shm"
+                ],
+                "description": "Image encoding format or shm buffer reference"
+              },
+              "data": {
+                "type": "string",
+                "description": "Base64-encoded image data or shm segment token"
+              },
+              "width_px": {
+                "type": "integer",
+                "description": "Pixel width (required for raw rgba32)"
+              },
+              "height_px": {
+                "type": "integer",
+                "description": "Pixel height (required for raw rgba32)"
+              },
+              "stride_bytes": {
+                "type": "integer",
+                "description": "Row stride in bytes for raw pixel formats"
+              }
+            }
+          }
+        },
+        "set_anchor": {
+          "description": "Anchors this surface as a subsurface of another surface (e.g. pinning a pixel image to a parent grid cell or stream line).",
+          "args": {
+            "type": "object",
+            "required": [
+              "parent_surface",
+              "mode"
+            ],
+            "properties": {
+              "parent_surface": {
+                "type": "string",
+                "description": "Target parent tc_surface ID"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "cell_relative",
+                  "stream_line",
+                  "cursor_relative",
+                  "absolute_cells"
+                ],
+                "description": "Positioning anchor coordinate mode"
+              },
+              "col": {
+                "type": "integer",
+                "default": 0,
+                "description": "0-indexed character column offset"
+              },
+              "row": {
+                "type": "integer",
+                "default": 0,
+                "description": "0-indexed character row offset"
+              },
+              "line_id": {
+                "type": [
+                  "string",
+                  "integer"
+                ],
+                "description": "Logical line ID or index within a stream surface"
+              },
+              "z_index": {
+                "type": "integer",
+                "default": 0,
+                "description": "Relative stacking order above/below parent content"
+              },
+              "offset_x_px": {
+                "type": "integer",
+                "default": 0,
+                "description": "Subpixel fine-tuning X offset in physical pixels"
+              },
+              "offset_y_px": {
+                "type": "integer",
+                "default": 0,
+                "description": "Subpixel fine-tuning Y offset in physical pixels"
+              }
+            }
+          }
+        },
+        "set_scaling": {
+          "description": "Configures scaling and aspect ratio preservation for pixel surfaces.",
+          "args": {
+            "type": "object",
+            "properties": {
+              "scale_mode": {
+                "type": "string",
+                "enum": [
+                  "fit",
+                  "fill",
+                  "stretch",
+                  "pixel_exact"
+                ],
+                "default": "fit",
+                "description": "Image scaling behavior within allocated cell bounds"
+              },
+              "width_cells": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Target bounding width in character cells"
+              },
+              "height_cells": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Target bounding height in character cells"
+              }
+            }
+          }
+        },
+        "set_a11y": {
+          "description": "Configures accessibility metadata and plain-text fallback representations for graphical surfaces.",
+          "args": {
+            "type": "object",
+            "required": [
+              "alt_text"
+            ],
+            "properties": {
+              "alt_text": {
+                "type": "string",
+                "description": "Mandatory spoken description announced by screen readers"
+              },
+              "fallback_text": {
+                "type": "string",
+                "description": "Plain text representation copied when text selections intersect this surface (e.g. [Image: plot.png])"
+              },
+              "role": {
+                "type": "string",
+                "default": "image",
+                "description": "Accessibility role (e.g. image, chart, graphic)"
+              }
+            }
+          }
+        },
+        "destroy": {
+          "description": "Destroys the surface, closes any associated child PTY file descriptors, and releases compositor resources.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      },
+      "events": {
+        "configure": {
+          "description": "Emitted when the surface viewport geometry or cell size changes.",
+          "args": {
+            "type": "object",
+            "required": [
+              "grid_cols",
+              "grid_rows",
+              "cell_width_px",
+              "cell_height_px"
+            ],
+            "properties": {
+              "grid_cols": {
+                "type": "integer"
+              },
+              "grid_rows": {
+                "type": "integer"
+              },
+              "cell_width_px": {
+                "type": "integer"
+              },
+              "cell_height_px": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "cursor_position": {
+          "description": "Emitted when the surface's active text cursor position moves.",
+          "args": {
+            "type": "object",
+            "required": [
+              "x",
+              "y",
+              "visible",
+              "shape"
+            ],
+            "properties": {
+              "x": {
+                "type": "integer"
+              },
+              "y": {
+                "type": "integer"
+              },
+              "visible": {
+                "type": "boolean"
+              },
+              "shape": {
+                "$ref": "#/$defs/CursorShape"
+              }
+            }
+          }
+        },
+        "buffer_swapped": {
+          "description": "Emitted when a pty surface transitions between primary and alternate buffers.",
+          "args": {
+            "type": "object",
+            "required": [
+              "active_buffer"
+            ],
+            "properties": {
+              "active_buffer": {
+                "$ref": "#/$defs/BufferType"
+              }
+            }
+          }
+        },
+        "title_changed": {
+          "description": "Emitted when an in-band control sequence changes the surface title.",
+          "args": {
+            "type": "object",
+            "required": [
+              "title"
+            ],
+            "properties": {
+              "title": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "tc_layer": {
+      "description": "Represents an active or staging overlay layer shell.",
+      "requests": {
+        "set_anchor": {
+          "description": "Defines positioning strategy relative to parent surface or terminal layout.",
+          "args": {
+            "type": "object",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "$ref": "#/$defs/AnchorMode"
+              },
+              "parent_surface": {
+                "type": "string",
+                "description": "Optional parent tc_surface ID to scope positioning and clipping to"
+              },
+              "offset_x": {
+                "type": "integer",
+                "default": 0,
+                "description": "Character cell offset"
+              },
+              "offset_y": {
+                "type": "integer",
+                "default": 0,
+                "description": "Character cell offset"
+              }
+            }
+          }
+        },
+        "set_size": {
+          "description": "Specifies bounding box dimensions in character grid units.",
+          "args": {
+            "type": "object",
+            "required": [
+              "cols",
+              "rows"
+            ],
+            "properties": {
+              "cols": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "rows": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "set_style": {
+          "description": "Configures compositor-level decorative visual properties.",
+          "args": {
+            "$ref": "#/$defs/LayerStyle"
+          }
+        },
+        "set_surface": {
+          "description": "Attaches a tc_surface (grid, pixel) as the layer's visual content.",
+          "args": {
+            "type": "object",
+            "required": [
+              "surface_id"
+            ],
+            "properties": {
+              "surface_id": {
+                "type": "string",
+                "description": "Target tc_surface ID"
+              }
+            }
+          }
+        },
+        "set_grab": {
+          "description": "Requests modal input grabbing for this layer.",
+          "args": {
+            "type": "object",
+            "required": [
+              "grab"
+            ],
+            "properties": {
+              "grab": {
+                "type": "boolean",
+                "default": false,
+                "description": "Whether to exclusively route input events to this layer"
+              }
+            }
+          }
+        },
+        "set_visible": {
+          "description": "Toggles layer visibility.",
+          "args": {
+            "type": "object",
+            "required": [
+              "visible"
+            ],
+            "properties": {
+              "visible": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "seal_to_stream": {
+          "description": "Freezes/flattens the layer's current visual state into static scrollback text/cells in the target surface and releases the active layer.",
+          "args": {
+            "type": "object",
+            "properties": {
+              "target_surface": {
+                "type": "string",
+                "description": "Target tc_surface ID stream"
+              },
+              "fallback_text": {
+                "type": "string",
+                "description": "Plain text fallback representation to append"
+              }
+            }
+          }
+        },
+        "commit": {
+          "description": "Atomically commits all staged changes on this layer to the compositor scene graph.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "destroy": {
+          "description": "Destroys the layer and frees server-side compositor resources.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      },
+      "events": {
+        "dismiss": {
+          "description": "Emitted when the layer is dismissed by user interaction.",
+          "args": {
+            "type": "object",
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "escape_key",
+                  "backdrop_click"
+                ]
+              }
+            }
+          }
+        },
+        "configure": {
+          "description": "Emitted when the terminal viewport geometry or cell size changes.",
+          "args": {
+            "type": "object",
+            "required": [
+              "grid_cols",
+              "grid_rows",
+              "cell_width_px",
+              "cell_height_px"
+            ],
+            "properties": {
+              "grid_cols": {
+                "type": "integer"
+              },
+              "grid_rows": {
+                "type": "integer"
+              },
+              "cell_width_px": {
+                "type": "integer"
+              },
+              "cell_height_px": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "key": {
+          "description": "Emitted when a keyboard event is routed to this layer.",
+          "args": {
+            "type": "object",
+            "required": [
+              "key"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "Key identifier symbol (e.g. Enter, Escape, Tab, ArrowDown, a)"
+              },
+              "text": {
+                "type": "string",
+                "description": "Printable UTF-8 string payload"
+              },
+              "modifiers": {
+                "$ref": "#/$defs/KeyModifiers"
+              }
+            }
+          }
+        },
+        "mouse": {
+          "description": "Emitted when a mouse event occurs over this layer.",
+          "args": {
+            "type": "object",
+            "required": [
+              "action",
+              "col",
+              "row"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "press",
+                  "release",
+                  "move",
+                  "scroll"
+                ]
+              },
+              "col": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "row": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "button": {
+                "type": "string",
+                "enum": [
+                  "left",
+                  "middle",
+                  "right"
+                ]
+              },
+              "modifiers": {
+                "$ref": "#/$defs/KeyModifiers"
+              }
+            }
+          }
+        },
+        "focus": {
+          "description": "Emitted when this layer gains keyboard focus.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "blur": {
+          "description": "Emitted when this layer loses keyboard focus.",
+          "args": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "RequestEnvelope": {
+      "type": "object",
+      "required": [
+        "object",
+        "request"
+      ],
+      "properties": {
+        "object": {
+          "type": "string",
+          "description": "Target interface singleton (tc_display, tc_compositor) or allocated object ID"
+        },
+        "request": {
+          "type": "string",
+          "description": "Name of request method"
+        },
+        "args": {
+          "type": "object",
+          "default": {},
+          "description": "Method argument payload"
+        }
+      }
+    },
+    "EventEnvelope": {
+      "type": "object",
+      "required": [
+        "object",
+        "event"
+      ],
+      "properties": {
+        "object": {
+          "type": "string",
+          "description": "Target interface singleton or originating object ID"
+        },
+        "event": {
+          "type": "string",
+          "description": "Name of event notification"
+        },
+        "args": {
+          "type": "object",
+          "default": {},
+          "description": "Event argument payload"
+        }
+      }
+    },
+    "ClipboardTarget": {
+      "type": "string",
+      "enum": [
+        "clipboard",
+        "primary"
+      ],
+      "default": "clipboard",
+      "description": "System clipboard or primary selection (middle-click)"
+    },
+    "SurfaceType": {
+      "type": "string",
+      "enum": [
+        "pty",
+        "stream",
+        "grid",
+        "pixel"
+      ],
+      "default": "pty",
+      "description": "Surface archetype: pty (isolated VT sandbox with dual buffers), stream (pure text append stream + scrollback), grid (programmatic 2D cell matrix), pixel (raster graphics and image buffer)"
+    },
+    "BufferType": {
+      "type": "string",
+      "enum": [
+        "primary",
+        "alternate"
+      ],
+      "description": "Active display buffer within a PTY surface"
+    },
+    "CursorShape": {
+      "type": "string",
+      "enum": [
+        "block",
+        "beam",
+        "underline"
+      ],
+      "default": "block",
+      "description": "Text cursor rendering shape"
+    },
+    "LayerType": {
+      "type": "string",
+      "enum": [
+        "modal",
+        "popup",
+        "drawer",
+        "toast",
+        "custom"
+      ],
+      "description": "Semantic layer category"
+    },
+    "AnchorMode": {
+      "type": "string",
+      "enum": [
+        "center",
+        "top_left",
+        "top_right",
+        "bottom_left",
+        "bottom_right",
+        "cursor_relative",
+        "stream_inline",
+        "flex"
+      ],
+      "description": "Viewport, surface, or VT cursor anchor placement"
+    },
+    "BorderType": {
+      "type": "string",
+      "enum": [
+        "none",
+        "single",
+        "double",
+        "rounded",
+        "heavy"
+      ],
+      "default": "none",
+      "description": "Border drawing style"
+    },
+    "LayerStyle": {
+      "type": "object",
+      "properties": {
+        "border": {
+          "$ref": "#/$defs/BorderType"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Header cutout title string"
+        },
+        "border_fg": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Border foreground hex or semantic theme token"
+        },
+        "border_bg": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Border background hex or semantic theme token"
+        },
+        "bg": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Background fill hex or semantic theme token"
+        },
+        "fg": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Default foreground hex or semantic theme token"
+        },
+        "shadow": {
+          "type": "boolean",
+          "default": false,
+          "description": "Render 2D drop shadow"
+        },
+        "backdrop_dim": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "description": "Screen luminance dimming ratio"
+        },
+        "backdrop_blur": {
+          "type": "boolean",
+          "default": false,
+          "description": "Apply hardware/software blur"
+        }
+      }
+    },
+    "KeyModifiers": {
+      "type": "object",
+      "properties": {
+        "ctrl": { "type": "boolean", "default": false },
+        "alt": { "type": "boolean", "default": false },
+        "shift": { "type": "boolean", "default": false },
+        "meta": { "type": "boolean", "default": false }
+      }
+    },
+    "BufferFormat": {
+      "type": "string",
+      "enum": [
+        "compact_v1",
+        "rich_v1"
+      ],
+      "description": "Binary buffer ABI format: compact_v1 (8 bytes/cell, 256 colors/styles) or rich_v1 (32 bytes/cell, 32-bit TrueColor RGBA, undercurl, hyperlinks, grapheme pool)"
+    },
+    "UnderlineStyle": {
+      "type": "string",
+      "enum": [
+        "none",
+        "straight",
+        "double",
+        "curly",
+        "dotted",
+        "dashed"
+      ],
+      "default": "none",
+      "description": "Typographic underline styling"
+    },
+    "FeatureFlags": {
+      "type": "object",
+      "properties": {
+        "window_title_mutation": {
+          "type": "boolean",
+          "default": true
+        },
+        "theme_customization": {
+          "type": "boolean",
+          "default": true
+        },
+        "clipboard_read": {
+          "type": "boolean",
+          "default": true
+        },
+        "clipboard_write": {
+          "type": "boolean",
+          "default": true
+        },
+        "system_notifications": {
+          "type": "boolean",
+          "default": true
+        },
+        "backdrop_blur": {
+          "type": "boolean",
+          "default": false
+        },
+        "accessibility_tree": {
+          "type": "boolean",
+          "default": true
+        },
+        "pixel_surfaces": {
+          "type": "boolean",
+          "default": true
+        },
+        "shm_zero_copy": {
+          "type": "boolean",
+          "default": false
+        }
+      }
+    },
+    "Capabilities": {
+      "type": "object",
+      "required": [
+        "protocol_version",
+        "emulator",
+        "interfaces",
+        "features"
+      ],
+      "properties": {
+        "protocol_version": {
+          "type": "integer",
+          "default": 1
+        },
+        "emulator": {
+          "type": "string",
+          "description": "Emulator name and version"
+        },
+        "interfaces": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "description": "Advertised interfaces and max version numbers"
+        },
+        "features": {
+          "$ref": "#/$defs/FeatureFlags"
+        }
+      }
+    }
+  }
+}
