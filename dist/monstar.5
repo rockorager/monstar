@@ -194,6 +194,34 @@ The defaults are
 and
 .BR discrete:3 .
 .TP
+.BI scroll-line-up-key " = shortcut"
+Set the shortcut that scrolls up by one terminal line.
+The default is
+.BR shift+up .
+.TP
+.BI scroll-line-down-key " = shortcut"
+Set the shortcut that scrolls down by one terminal line.
+The default is
+.BR shift+down .
+.PP
+A shortcut accepts
+.BR shift ,
+.BR ctrl ,
+.BR alt ,
+or
+.B super
+modifiers and one key.
+Use one ASCII key or a named navigation key:
+.BR up ,
+.BR down ,
+.BR left ,
+.BR right ,
+.BR page-up ,
+.BR page-down ,
+.BR home ,
+or
+.BR end .
+.TP
 .BI scrollback-limit " = bytes"
 Set the terminal page-storage limit, including the active screen.
 The default is 50000000 bytes.

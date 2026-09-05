@@ -5009,6 +5009,8 @@ fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
 }
 
 const ScrollbackKeyAction = enum {
+    line_up,
+    line_down,
     page_up,
     page_down,
     top,
@@ -5016,12 +5018,15 @@ const ScrollbackKeyAction = enum {
 };
 
 fn scrollbackKeyAction(
+    config: *const Config,
     active_screen: vt.ScreenSet.Key,
     event: vt.input.KeyEvent,
 ) ?ScrollbackKeyAction {
     // Like foot, leave scrollback shortcuts to full-screen applications.
-    if (active_screen != .primary or !event.mods.shift or
-        event.mods.ctrl or event.mods.alt or event.mods.super) return null;
+    if (active_screen != .primary) return null;
+    if (config.scroll_line_up_key.matches(event)) return .line_up;
+    if (config.scroll_line_down_key.matches(event)) return .line_down;
+    if (!event.mods.shift or event.mods.ctrl or event.mods.alt or event.mods.super) return null;
 
     return switch (event.key) {
         .page_up => .page_up,
@@ -5033,13 +5038,15 @@ fn scrollbackKeyAction(
 }
 
 fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent) bool {
-    const scroll = scrollbackKeyAction(self.term.screens.active_key, event) orelse return false;
+    const scroll = scrollbackKeyAction(&self.config, self.term.screens.active_key, event) orelse return false;
     // Consume the matching release too, but move only on press/repeat.
     if (event.action == .release) return true;
 
     self.stopFling();
     const rows: isize = @intCast(self.term.rows);
     switch (scroll) {
+        .line_up => self.term.screens.active.pages.scroll(.{ .delta_row = -1 }),
+        .line_down => self.term.screens.active.pages.scroll(.{ .delta_row = 1 }),
         .page_up => self.term.screens.active.pages.scroll(.{ .delta_row = -rows }),
         .page_down => self.term.screens.active.pages.scroll(.{ .delta_row = rows }),
         .top => self.term.screens.active.pages.scroll(.top),
@@ -6069,39 +6076,63 @@ test "search backspace removes one UTF-8 codepoint" {
     try std.testing.expect(!truncateLastUtf8(&query));
 }
 
-test "scrollback keys require shift on the primary screen" {
+test "scrollback keys require supported modifiers on the primary screen" {
+    var config: Config = .{};
     const shifted: vt.input.KeyMods = .{ .shift = true };
+    const ctrl_shifted: vt.input.KeyMods = .{ .shift = true, .ctrl = true };
+    try std.testing.expectEqual(
+        ScrollbackKeyAction.line_up,
+        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
+    );
+    try std.testing.expectEqual(
+        ScrollbackKeyAction.line_down,
+        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_down, .mods = shifted }).?,
+    );
     try std.testing.expectEqual(
         ScrollbackKeyAction.page_up,
-        scrollbackKeyAction(.primary, .{ .key = .page_up, .mods = shifted }).?,
+        scrollbackKeyAction(&config, .primary, .{ .key = .page_up, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
         ScrollbackKeyAction.page_down,
-        scrollbackKeyAction(.primary, .{ .key = .page_down, .mods = shifted }).?,
+        scrollbackKeyAction(&config, .primary, .{ .key = .page_down, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
         ScrollbackKeyAction.top,
-        scrollbackKeyAction(.primary, .{ .key = .home, .mods = shifted }).?,
+        scrollbackKeyAction(&config, .primary, .{ .key = .home, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
         ScrollbackKeyAction.bottom,
-        scrollbackKeyAction(.primary, .{ .key = .end, .mods = shifted }).?,
+        scrollbackKeyAction(&config, .primary, .{ .key = .end, .mods = shifted }).?,
     );
 
     try std.testing.expectEqual(
         null,
-        scrollbackKeyAction(.alternate, .{ .key = .page_up, .mods = shifted }),
+        scrollbackKeyAction(&config, .alternate, .{ .key = .arrow_up, .mods = shifted }),
     );
     try std.testing.expectEqual(
         null,
-        scrollbackKeyAction(.primary, .{ .key = .page_up }),
+        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }),
     );
     try std.testing.expectEqual(
         null,
-        scrollbackKeyAction(.primary, .{
+        scrollbackKeyAction(&config, .primary, .{ .key = .page_up }),
+    );
+    try std.testing.expectEqual(
+        null,
+        scrollbackKeyAction(&config, .primary, .{
             .key = .page_up,
-            .mods = .{ .shift = true, .ctrl = true },
+            .mods = ctrl_shifted,
         }),
+    );
+
+    config.scroll_line_up_key.mods.ctrl = true;
+    try std.testing.expectEqual(
+        ScrollbackKeyAction.line_up,
+        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }).?,
+    );
+    try std.testing.expectEqual(
+        null,
+        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }),
     );
 }
 

@@ -133,6 +133,10 @@ Other settings:
   motion after release (default `true`).
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
   `0` disables the flash (default `200`).
+- **scroll-line-up-key / scroll-line-down-key** — Shortcuts that move the
+  scrollback viewport by one line. The defaults are `shift+up` and
+  `shift+down`. Combine `shift`, `ctrl`, `alt`, or `super` with one ASCII key
+  or a named navigation key.
 - **background / foreground / cursor-color / cursor-text** — Terminal colors
   as `#RRGGBB` or `RRGGBB`; explicit colors override the theme.
   `cursor-color` and `cursor-text` also accept `cell-foreground` and
@@ -159,6 +163,7 @@ settings apply to new windows.
 | `Ctrl+Shift+F` | Search scrollback |
 | `Ctrl+Shift+N` | Open a new window in the current directory |
 | `Ctrl+Shift+,` | Reload configuration |
+| `Shift+Up` / `Shift+Down` | Scroll up / down one line |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll back / forward one page |
 | `Shift+Home` / `Shift+End` | Scroll to the top / bottom of scrollback |
 | `Ctrl++` / `Ctrl+=` / `Ctrl+-` | Adjust the font size |
