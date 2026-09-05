@@ -104,8 +104,9 @@ codepoint_scratch: std.ArrayList(u21),
 cluster_scratch: std.ArrayList(u21),
 /// Final RGBA bytes for scaled Kitty variants. Unlike the terminal-owned
 /// source data, these remain valid across renders of the long-lived worker.
-kitty_scale_cache: std.AutoHashMapUnmanaged(KittyScaleKey, []u8),
+kitty_scale_cache: std.AutoHashMapUnmanaged(KittyScaleKey, KittyScaleValue),
 kitty_scale_cache_bytes: usize = 0,
+kitty_frame: usize = 0,
 /// Private observable for the focused cache test and profiling.
 kitty_scale_count: usize = 0,
 /// Physical framebuffer row stride. Zero means the visible width, which is
@@ -127,6 +128,11 @@ const KittyScaleKey = struct {
     source_height: u32,
     dest_width: u32,
     dest_height: u32,
+};
+
+const KittyScaleValue = struct {
+    bytes: []u8,
+    last_used_frame: usize,
 };
 
 pub const InitOptions = struct {
@@ -215,7 +221,7 @@ pub fn deinit(self: *Renderer) void {
 
 fn clearKittyScaleCache(self: *Renderer) void {
     var it = self.kitty_scale_cache.valueIterator();
-    while (it.next()) |bytes| self.alloc.free(bytes.*);
+    while (it.next()) |value| self.alloc.free(value.bytes);
     self.kitty_scale_cache.clearRetainingCapacity();
     self.kitty_scale_cache_bytes = 0;
 }
@@ -310,6 +316,7 @@ pub fn renderWithKittyItems(
     height: u31,
 ) !void {
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
+    self.kitty_frame +%= 1;
 
     // An opaque above-text image covering the framebuffer determines
     // every output pixel. Video players send exactly this shape, so do
@@ -922,15 +929,13 @@ fn scaledKittyRgba(
         .dest_width = viewport.pixel_width,
         .dest_height = viewport.pixel_height,
     };
-    if (self.kitty_scale_cache.get(key)) |bytes| return .{ .bytes = bytes, .cached = true };
+    if (self.kitty_scale_cache.getPtr(key)) |value| {
+        value.last_used_frame = self.kitty_frame;
+        return .{ .bytes = value.bytes, .cached = true };
+    }
 
     const scaled_len = @as(usize, viewport.pixel_width) * viewport.pixel_height * 4;
-    const cacheable = scaled_len <= kitty_scale_cache_max_bytes;
-    if (cacheable and (self.kitty_scale_cache.count() >= kitty_scale_cache_max_entries or
-        self.kitty_scale_cache_bytes + scaled_len > kitty_scale_cache_max_bytes))
-    {
-        self.clearKittyScaleCache();
-    }
+    const cacheable = self.makeKittyScaleRoom(scaled_len);
 
     var source = try self.alloc.alloc(u8, @as(usize, viewport.source_width) * viewport.source_height * 4);
     defer self.alloc.free(source);
@@ -942,9 +947,38 @@ fn scaledKittyRgba(
     self.kitty_scale_count += 1;
     if (!cacheable) return .{ .bytes = scaled, .cached = false };
 
-    try self.kitty_scale_cache.put(self.alloc, key, scaled);
+    try self.kitty_scale_cache.put(self.alloc, key, .{
+        .bytes = scaled,
+        .last_used_frame = self.kitty_frame,
+    });
     self.kitty_scale_cache_bytes += scaled.len;
     return .{ .bytes = scaled, .cached = true };
+}
+
+fn makeKittyScaleRoom(self: *Renderer, new_bytes: usize) bool {
+    if (new_bytes > kitty_scale_cache_max_bytes) return false;
+    while (self.kitty_scale_cache.count() >= kitty_scale_cache_max_entries or
+        self.kitty_scale_cache_bytes + new_bytes > kitty_scale_cache_max_bytes)
+    {
+        var oldest_key: ?KittyScaleKey = null;
+        var oldest_age: usize = 0;
+        var it = self.kitty_scale_cache.iterator();
+        while (it.next()) |entry| {
+            const age = self.kitty_frame -% entry.value_ptr.last_used_frame;
+            // Protect this frame and the previous one: a miss early in the
+            // draw order must not evict reusable images encountered later.
+            if (age > 1 and (oldest_key == null or age > oldest_age)) {
+                oldest_key = entry.key_ptr.*;
+                oldest_age = age;
+            }
+        }
+
+        const key = oldest_key orelse return false;
+        const removed = self.kitty_scale_cache.fetchRemove(key).?;
+        self.kitty_scale_cache_bytes -= removed.value.bytes.len;
+        self.alloc.free(removed.value.bytes);
+    }
+    return true;
 }
 
 /// Draw an unscaled placement directly from the terminal-owned image
@@ -1927,6 +1961,82 @@ test "scaled kitty placement reuses cached rgba variant" {
     try std.testing.expectEqualSlices(u32, &first, &pixels);
     try std.testing.expectEqual(@as(usize, 1), renderer.kitty_scale_count);
     try std.testing.expectEqual(@as(u32, 1), renderer.kitty_scale_cache.count());
+}
+
+test "scaled kitty cache protects a stable working set of 33 across frames" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const viewport: KittyPlacementViewport = .{
+        .viewport_col = 0,
+        .viewport_row = 0,
+        .visible = true,
+        .offset_x = 0,
+        .offset_y = 0,
+        .pixel_width = 2,
+        .pixel_height = 2,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 1,
+        .source_height = 1,
+    };
+    const expected = [_]u8{ 23, 47, 89, 255 } ** 4;
+
+    for (1..4) |frame| {
+        renderer.kitty_frame = frame;
+        for (0..33) |i| {
+            // Put the uncached image first on alternate frames, before hits
+            // have refreshed the cached entries' last-used frame.
+            const id = (i + (if (frame % 2 == 0) @as(usize, 32) else 0)) % 33;
+            const image: KittyImage = .{
+                .id = @intCast(id + 1),
+                .width = 1,
+                .height = 1,
+                .format = .rgb,
+                .data = .{ .complete = &.{ 23, 47, 89 } },
+            };
+            const scaled = (try renderer.scaledKittyRgba(image, viewport)).?;
+            try std.testing.expectEqualSlices(u8, &expected, scaled.bytes);
+            if (!scaled.cached) alloc.free(scaled.bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 33 + frame - 1), renderer.kitty_scale_count);
+    }
+    try std.testing.expectEqual(@as(u32, 32), renderer.kitty_scale_cache.count());
+}
+
+test "scaled kitty cache evicts only the stale bytes needed" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const keys = [_]KittyScaleKey{
+        .{ .image_id = 1, .generation = 0, .format = .rgb, .image_width = 1, .image_height = 1, .source_x = 0, .source_y = 0, .source_width = 1, .source_height = 1, .dest_width = 1, .dest_height = 1 },
+        .{ .image_id = 2, .generation = 0, .format = .rgb, .image_width = 1, .image_height = 1, .source_x = 0, .source_y = 0, .source_width = 1, .source_height = 1, .dest_width = 1, .dest_height = 1 },
+        .{ .image_id = 3, .generation = 0, .format = .rgb, .image_width = 1, .image_height = 1, .source_x = 0, .source_y = 0, .source_width = 1, .source_height = 1, .dest_width = 1, .dest_height = 1 },
+    };
+    renderer.kitty_frame = 10;
+    const entry_bytes = kitty_scale_cache_max_bytes / 3;
+    for (keys, 0..) |key, i| {
+        const bytes = try alloc.alloc(u8, entry_bytes);
+        try renderer.kitty_scale_cache.put(alloc, key, .{
+            .bytes = bytes,
+            .last_used_frame = if (i == 0) 8 else 9,
+        });
+        renderer.kitty_scale_cache_bytes += bytes.len;
+    }
+
+    try std.testing.expect(!renderer.makeKittyScaleRoom(kitty_scale_cache_max_bytes + 1));
+    try std.testing.expectEqual(@as(u32, 3), renderer.kitty_scale_cache.count());
+    try std.testing.expect(renderer.makeKittyScaleRoom(entry_bytes));
+    try std.testing.expect(!renderer.kitty_scale_cache.contains(keys[0]));
+    try std.testing.expect(renderer.kitty_scale_cache.contains(keys[1]));
+    try std.testing.expect(renderer.kitty_scale_cache.contains(keys[2]));
+    try std.testing.expectEqual(@as(usize, 2 * entry_bytes), renderer.kitty_scale_cache_bytes);
 }
 
 test "copyOpaqueRgbSpan matches scalar conversion across vector boundaries" {

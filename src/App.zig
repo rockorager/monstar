@@ -162,6 +162,8 @@ sync_output: bool,
 /// avoid deadlocking against a child that has stopped reading while
 /// flooding output). Flushed when the master polls writable.
 write_queue: std.ArrayList(u8),
+/// Consumed prefix, reclaimed on drain or amortized compaction at enqueue.
+write_queue_offset: usize = 0,
 /// The child has exited and been reaped (via SIGCHLD).
 child_exited: bool,
 /// Keep the window open after the child exits.
@@ -3731,6 +3733,7 @@ test "expired Kitty read fails and unblocks the next queued request" {
     app.kitty_clipboard = .init(alloc);
     defer app.kitty_clipboard.deinit();
     app.write_queue = .empty;
+    app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
     app.pty.master = output[1];
     app.clipboard.transfer_fd = incoming[0];
@@ -5072,16 +5075,27 @@ const max_pty_write_queue = 4 * 1024 * 1024;
 /// Accept the entire write or drop it before emitting any bytes. Reserve the
 /// possible backlog first so neither backpressure nor OOM truncates a reply.
 fn writePty(self: *App, bytes: []const u8) void {
-    if (bytes.len > max_pty_write_queue -| self.write_queue.items.len) {
+    std.debug.assert(self.write_queue_offset <= self.write_queue.items.len);
+    const pending = self.write_queue.items.len - self.write_queue_offset;
+    if (bytes.len > max_pty_write_queue -| pending) {
         log.warn("pty write queue full; dropping complete write ({d} bytes)", .{bytes.len});
         return;
+    }
+    // Only move the tail when at least as many bytes have been consumed.
+    // Otherwise grow: compacting after every small drain would be quadratic.
+    if (self.write_queue.capacity - self.write_queue.items.len < bytes.len and
+        self.write_queue_offset >= pending)
+    {
+        std.mem.copyForwards(u8, self.write_queue.items[0..pending], self.write_queue.items[self.write_queue_offset..]);
+        self.write_queue.items.len = pending;
+        self.write_queue_offset = 0;
     }
     self.write_queue.ensureUnusedCapacity(self.alloc, bytes.len) catch |err| {
         log.warn("pty write queue reserve failed: {}", .{err});
         return;
     };
     // A backlog exists; keep ordering by appending behind it.
-    if (self.write_queue.items.len > 0) {
+    if (pending > 0) {
         self.write_queue.appendSliceAssumeCapacity(bytes);
         return;
     }
@@ -5091,8 +5105,11 @@ fn writePty(self: *App, bytes: []const u8) void {
 
 /// Drain the backlog after the master polled writable.
 fn flushWriteQueue(self: *App) void {
-    const written = self.tryPtyWrite(self.write_queue.items);
-    self.write_queue.replaceRange(self.alloc, 0, written, &.{}) catch unreachable; // shrinking
+    self.write_queue_offset += self.tryPtyWrite(self.write_queue.items[self.write_queue_offset..]);
+    if (self.write_queue_offset == self.write_queue.items.len) {
+        self.write_queue.clearRetainingCapacity();
+        self.write_queue_offset = 0;
+    }
 }
 
 /// Write as much as the kernel accepts; returns the number of bytes
@@ -5129,6 +5146,7 @@ test "maximum clipboard response survives write backpressure in order" {
     app.alloc = alloc;
     app.pty.master = fds[1];
     app.write_queue = .empty;
+    app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
 
     const clipboard = try alloc.alloc(u8, 1024 * 1024);
@@ -5149,9 +5167,16 @@ test "maximum clipboard response survives write backpressure in order" {
         try std.testing.expect(n > 0);
         try std.testing.expectEqualSlices(u8, expected.written()[received..][0..n], buf[0..n]);
         received += n;
+        const queued_len = app.write_queue.items.len;
+        const queued_offset = app.write_queue_offset;
         app.flushWriteQueue();
+        if (app.write_queue.items.len > 0) {
+            try std.testing.expectEqual(queued_len, app.write_queue.items.len);
+            try std.testing.expect(app.write_queue_offset > queued_offset);
+        }
     }
     try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue_offset);
 }
 
 test "PTY limit and allocation failure reject before writing a prefix" {
@@ -5166,6 +5191,7 @@ test "PTY limit and allocation failure reject before writing a prefix" {
     app.alloc = alloc;
     app.pty.master = fds[1];
     app.write_queue = .empty;
+    app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
     const oversized = try alloc.alloc(u8, max_pty_write_queue + 1);
     defer alloc.free(oversized);
@@ -5181,6 +5207,45 @@ test "PTY limit and allocation failure reject before writing a prefix" {
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectError(error.WouldBlock, posix.read(fds[0], &byte));
     try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+}
+
+test "PTY enqueue counts unread bytes and amortizes compaction" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.write_queue = try .initCapacity(alloc, max_pty_write_queue);
+    defer app.write_queue.deinit(alloc);
+    app.write_queue.items.len = max_pty_write_queue;
+    for (app.write_queue.items, 0..) |*byte, i| byte.* = @truncate(i);
+
+    // A small consumed prefix doesn't trigger a large tail copy, and does
+    // not count against the logical cap. Reserve failure keeps it intact.
+    app.write_queue_offset = 1;
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0, .resize_fail_index = 0 });
+    app.alloc = failing.allocator();
+    app.writePty("x");
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), app.write_queue_offset);
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue), app.write_queue.items.len);
+    app.alloc = alloc;
+    app.writePty("x");
+    try std.testing.expectEqual(@as(usize, 1), app.write_queue_offset);
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), app.write_queue.items.len);
+    app.writePty("rejected");
+    try std.testing.expectEqual(@as(usize, max_pty_write_queue + 1), app.write_queue.items.len);
+    try std.testing.expectEqual(@as(u8, 'x'), app.write_queue.items[max_pty_write_queue]);
+
+    // With enough consumed bytes, reclaim the prefix instead of growing.
+    app.write_queue.items.len = app.write_queue.capacity;
+    @memset(app.write_queue.items, 0);
+    app.write_queue_offset = app.write_queue.items.len - 4;
+    @memcpy(app.write_queue.items[app.write_queue_offset..], "tail");
+    const capacity = app.write_queue.capacity;
+    app.writePty("next");
+    try std.testing.expectEqual(capacity, app.write_queue.capacity);
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue_offset);
+    try std.testing.expectEqualStrings("tailnext", app.write_queue.items);
 }
 
 fn searchRangeForRender(self: *App) ?Renderer.LinkRange {

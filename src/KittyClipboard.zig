@@ -363,8 +363,12 @@ fn writeData(
             try self.finishWriteStatus(state, .EIO, terminator);
             return error.OutOfMemory;
         },
-        error.TooLarge => try self.finishWriteStatus(state, .EFBIG, terminator),
+        error.TooLarge => {
+            try self.finishWriteStatus(state, .EFBIG, terminator);
+            return;
+        },
     };
+    try self.enforceLiveWriteLimit(state, terminator);
 }
 
 fn writeAlias(
@@ -380,8 +384,28 @@ fn writeAlias(
             try self.finishWriteStatus(state, .EIO, terminator);
             return error.OutOfMemory;
         },
-        error.Invalid => try self.finishWriteStatus(state, .EINVAL, terminator),
+        error.Invalid => {
+            try self.finishWriteStatus(state, .EINVAL, terminator);
+            return;
+        },
     };
+    try self.enforceLiveWriteLimit(state, terminator);
+}
+
+fn liveWriteRetainedBytes(state: *const clipboard.WriteState) usize {
+    return @sizeOf(clipboard.WriteState) +
+        state.arena.queryCapacity() + state.spool.capacity +
+        std.mem.sliceAsBytes(state.entries.allocatedSlice()).len +
+        std.mem.sliceAsBytes(state.aliases.allocatedSlice()).len;
+}
+
+fn enforceLiveWriteLimit(
+    self: *KittyClipboard,
+    state: *clipboard.WriteState,
+    terminator: vt.osc.Terminator,
+) error{ OutOfMemory, QueueFull }!void {
+    if (liveWriteRetainedBytes(state) <= max_retained_bytes) return;
+    try self.finishWriteStatus(state, .EFBIG, terminator);
 }
 
 fn commitWrite(
@@ -396,10 +420,7 @@ fn commitWrite(
         },
     };
     errdefer committed.deinit(self.alloc);
-    const retained_bytes = @sizeOf(Write) + @sizeOf(clipboard.WriteState) +
-        state.arena.queryCapacity() + state.spool.capacity +
-        std.mem.sliceAsBytes(state.entries.allocatedSlice()).len +
-        std.mem.sliceAsBytes(state.aliases.allocatedSlice()).len +
+    const retained_bytes = @sizeOf(Write) + liveWriteRetainedBytes(state) +
         std.mem.sliceAsBytes(committed.contents).len;
     self.ensureQueueCapacity(retained_bytes) catch |err| {
         self.setRejection(.write, state.id, terminator);
@@ -695,4 +716,89 @@ test "rejected write commit cleans up live state" {
     try std.testing.expectEqual(clipboard.Status.EBUSY, response.status);
     try std.testing.expectEqualStrings("w", response.id);
     state.retained_bytes = 0;
+}
+
+test "repeated aliases abort live write storage at retained byte limit" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.handle(.{
+        .metadata = "type=write:id=alias-limit",
+        .payload = null,
+        .terminator = .st,
+    });
+
+    const mime = "m" ** clipboard.max_mime_len;
+    var encoded_mime: [std.base64.standard.Encoder.calcSize(mime.len)]u8 = undefined;
+    const metadata = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "type=walias:mime={s}",
+        .{std.base64.standard.Encoder.encode(&encoded_mime, mime)},
+    );
+    defer std.testing.allocator.free(metadata);
+
+    const max_commands = max_retained_bytes / clipboard.max_mime_len + 1024;
+    for (0..max_commands) |_| {
+        try state.handle(.{ .metadata = metadata, .payload = "eA==", .terminator = .bel });
+        if (state.write_state == null) break;
+        try std.testing.expect(liveWriteRetainedBytes(state.write_state.?) <= max_retained_bytes);
+    } else return error.TestExpectedEqual;
+
+    try std.testing.expectEqual(@as(usize, 1), state.queue.items.len);
+    try std.testing.expectEqual(clipboard.Status.EFBIG, state.front().?.status.status);
+    try std.testing.expectEqualStrings("alias-limit", state.front().?.status.id);
+    try std.testing.expectEqual(vt.osc.Terminator.bel, state.front().?.status.terminator);
+
+    // Commands for the aborted transaction are ignored, and a fresh write works.
+    try state.handle(.{
+        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
+        .payload = "cmVqZWN0ZWQ=",
+        .terminator = .st,
+    });
+    try std.testing.expectEqual(@as(usize, 1), state.queue.items.len);
+    try state.handle(.{ .metadata = "type=write:id=next", .payload = null, .terminator = .st });
+    try state.handle(.{
+        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
+        .payload = "b2s=",
+        .terminator = .st,
+    });
+    try state.handle(.{ .metadata = "type=wdata", .payload = null, .terminator = .st });
+    try std.testing.expectEqual(@as(usize, 2), state.queue.items.len);
+    try std.testing.expectEqualStrings("next", state.queue.items[1].write.committed.id);
+    try std.testing.expectEqualStrings("ok", state.queue.items[1].write.committed.contents[0].data);
+}
+
+test "live and committed write accounting includes retained capacities" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.handle(.{ .metadata = "type=write:id=account", .payload = null, .terminator = .st });
+    try state.handle(.{
+        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
+        .payload = "aGVsbG8=",
+        .terminator = .st,
+    });
+    try state.handle(.{
+        .metadata = "type=walias:mime=dGV4dC9wbGFpbg==",
+        .payload = "dGV4dC94LWFsaWFz",
+        .terminator = .st,
+    });
+    const write_state = state.write_state.?;
+    const live_bytes = liveWriteRetainedBytes(write_state);
+    try std.testing.expectEqual(
+        @sizeOf(clipboard.WriteState) + write_state.arena.queryCapacity() +
+            write_state.spool.capacity +
+            std.mem.sliceAsBytes(write_state.entries.allocatedSlice()).len +
+            std.mem.sliceAsBytes(write_state.aliases.allocatedSlice()).len,
+        live_bytes,
+    );
+
+    try state.handle(.{ .metadata = "type=wdata", .payload = null, .terminator = .st });
+    const write = &state.front().?.write;
+    try std.testing.expectEqual(
+        @sizeOf(Write) + live_bytes + std.mem.sliceAsBytes(write.committed.contents).len,
+        write.retained_bytes,
+    );
+    try std.testing.expectEqual(write.retained_bytes, state.retained_bytes);
+    try std.testing.expect(write.retained_bytes <= max_retained_bytes);
 }
