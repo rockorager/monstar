@@ -2547,8 +2547,8 @@ fn beginOsc52Read(self: *App, kind: u8) void {
         .primary => .primary,
     };
     switch (self.clipboard.request(target, .{ .osc52_read = kind })) {
-        .started, .busy => {},
-        .unavailable => self.writeOsc52ClipboardReport(kind, ""),
+        .started => {},
+        .busy, .unavailable => self.writeOsc52ClipboardReport(kind, ""),
     }
 }
 
@@ -2589,10 +2589,7 @@ fn decodeOsc52ClipboardData(alloc: std.mem.Allocator, data: []const u8) ![:0]con
     const size = try dec.calcSizeForSlice(data);
     const buf = try alloc.allocSentinel(u8, size, 0);
     errdefer alloc.free(buf);
-    dec.decode(buf, data) catch |err| switch (err) {
-        error.InvalidPadding => {},
-        else => return err,
-    };
+    try dec.decode(buf, data);
     return buf;
 }
 
@@ -2812,11 +2809,59 @@ test "OSC 52 set decodes clipboard payload" {
     try std.testing.expectEqual(.clipboard, osc52Target('7'));
 }
 
+test "OSC 52 set rejects invalid base64 padding" {
+    // Early padding can leave part or all of the destination unwritten.
+    for ([_][]const u8{ "=AAA", "AA=A", "A===", "aGVsbG9=" }) |payload| {
+        try std.testing.expectError(error.InvalidPadding, decodeOsc52ClipboardData(std.testing.allocator, payload));
+    }
+    try std.testing.expectError(error.InvalidCharacter, decodeOsc52ClipboardData(std.testing.allocator, "!!!!"));
+}
+
 test "OSC 52 read reports base64 clipboard payload" {
     var buf: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try formatOsc52ClipboardReport(&writer, 'c', "hello");
     try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", writer.buffered());
+}
+
+test "busy OSC 52 read replies empty without disturbing the active transfer" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var incoming: [2]posix.fd_t = undefined;
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&incoming, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    try std.testing.expectEqual(@as(usize, 5), linux.write(incoming[1], "hello", 5));
+    _ = linux.close(incoming[1]);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.clipboard = .init(alloc, null, null);
+    defer app.clipboard.deinit();
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+    app.clipboard.transfer_fd = incoming[0];
+    app.clipboard.transfer_action = .{ .osc52_read = 'c' };
+
+    app.beginOsc52Read('p');
+    var buf: [64]u8 = undefined;
+    const busy_len = try posix.read(output[0], &buf);
+    try std.testing.expectEqualStrings("\x1b]52;p;\x07", buf[0..busy_len]);
+    try std.testing.expectEqual(incoming[0], app.clipboard.transferFd());
+    try std.testing.expectEqual(@as(?u8, 'c'), app.clipboard.osc52ReadKind());
+
+    const event = (try app.clipboard.readTransfer()).?;
+    try std.testing.expectEqual(@as(u8, 'c'), event.osc52_read.kind);
+    try std.testing.expectEqualStrings("hello", event.osc52_read.data);
+    app.writeOsc52ClipboardReport(event.osc52_read.kind, event.osc52_read.data);
+    app.clipboard.finishEvent();
+    const completed_len = try posix.read(output[0], &buf);
+    try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", buf[0..completed_len]);
+    try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
 }
 
 test "PNG decode rejects oversized dimensions before rasterization" {
