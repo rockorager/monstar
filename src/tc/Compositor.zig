@@ -13,6 +13,7 @@ const CompactCell = abi.CompactCell;
 const RichCell = abi.RichCell;
 const Buffer = @import("Buffer.zig");
 const Surface = @import("Surface.zig");
+const Client = @import("Client.zig");
 
 pub const CanvasCell = struct {
     codepoint: u32 = ' ',
@@ -23,10 +24,20 @@ pub const CanvasCell = struct {
     underline: bool = false,
 };
 
+pub const DragState = struct {
+    surface: ?*Surface = null,
+    grab_offset_x: i32 = 0,
+    grab_offset_y: i32 = 0,
+    dragging: bool = false,
+};
+
 allocator: std.mem.Allocator,
 display: *server.wl.Server,
 loop: *server.wl.EventLoop,
-socket_path: [:0]const u8,
+socket_path: ?[:0]const u8 = null,
+server_thread: ?std.Thread = null,
+running: std.atomic.Value(bool) = .init(false),
+mutex: std.atomic.Mutex = .unlocked,
 
 // Screen geometry
 cols: u32,
@@ -41,6 +52,7 @@ global_zterm_compositor: *server.wl.Global,
 global_buffer_factory: *server.wl.Global,
 global_keyboard: *server.wl.Global,
 global_theme_manager: *server.wl.Global,
+global_xpty: *server.wl.Global,
 
 // Object mappings
 surfaces: std.ArrayList(*Surface) = .empty,
@@ -56,13 +68,22 @@ theme_bg_rgba: u32 = 0x181825FF,
 theme_fg_rgba: u32 = 0xCDD6F4FF,
 theme_cursor_rgba: u32 = 0xF5E0DCFF,
 theme_palette: [16]u32 = [_]u32{
-    0x45475AFF, 0xF38BA8FF, 0xA6E3A1FF, 0xF9E2AFFF,
+    0x181825FF, 0xF38BA8FF, 0xA6E3A1FF, 0xF9E2AFFF,
     0x89B4FAFF, 0xF5C2E7FF, 0x94E2D5FF, 0xBAC2DEFF,
     0x585B70FF, 0xF38BA8FF, 0xA6E3A1FF, 0xF9E2AFFF,
     0x89B4FAFF, 0xF5C2E7FF, 0x94E2D5FF, 0xA6ADC8FF,
 },
 
 dirty: bool = true,
+drag_state: DragState = .{},
+
+pub fn lock(self: *Compositor) void {
+    while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+}
+
+pub fn unlock(self: *Compositor) void {
+    self.mutex.unlock();
+}
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -75,16 +96,28 @@ pub fn init(
 
     const loop = display.getEventLoop();
 
-    var socket_owned: [:0]const u8 = undefined;
+    var socket_owned: ?[:0]const u8 = null;
     if (socket_name) |name| {
-        try display.addSocket(name);
-        socket_owned = try allocator.dupeZ(u8, std.mem.sliceTo(name, 0));
+        display.addSocket(name) catch |err| {
+            std.log.warn("Failed to bind Wayland socket '{s}': {s}", .{ name, @errorName(err) });
+        };
+        socket_owned = allocator.dupeZ(u8, std.mem.sliceTo(name, 0)) catch null;
     } else {
-        var buf: [11]u8 = undefined;
-        const auto_name = try display.addSocketAuto(&buf);
-        socket_owned = try allocator.dupeZ(u8, auto_name);
+        // Never call addSocketAuto() as it iterates wayland-0, wayland-1 and collides
+        // with desktop compositors (Sway, GNOME, Hyprland, etc.).
+        // Instead, try to bind to a unique private socket name: monstar-tc-<pid>.
+        var name_buf: [64]u8 = undefined;
+        const pid = std.os.linux.getpid();
+        const priv_name = std.fmt.bufPrintZ(&name_buf, "monstar-tc-{d}", .{pid}) catch "monstar-tc";
+        if (display.addSocket(priv_name)) {
+            socket_owned = allocator.dupeZ(u8, priv_name) catch null;
+        } else |_| {
+            // If adding filesystem socket fails, continue gracefully.
+            // Direct internal clients connect via socketpair.
+            socket_owned = null;
+        }
     }
-    errdefer allocator.free(socket_owned);
+    errdefer if (socket_owned) |s| allocator.free(s);
 
     const self = try allocator.create(Compositor);
     errdefer allocator.destroy(self);
@@ -106,6 +139,7 @@ pub fn init(
         .global_buffer_factory = undefined,
         .global_keyboard = undefined,
         .global_theme_manager = undefined,
+        .global_xpty = undefined,
     };
 
     self.global_compositor = try server.wl.Global.create(
@@ -148,11 +182,21 @@ pub fn init(
         self,
         bindThemeManager,
     );
+    self.global_xpty = try server.wl.Global.create(
+        display,
+        server.zterm.XptyV1,
+        1,
+        *Compositor,
+        self,
+        bindXpty,
+    );
 
     return self;
 }
 
 pub fn deinit(self: *Compositor) void {
+    self.stop();
+
     for (self.surfaces.items) |surf| {
         surf.deinit();
     }
@@ -172,20 +216,85 @@ pub fn deinit(self: *Compositor) void {
     self.global_buffer_factory.destroy();
     self.global_keyboard.destroy();
     self.global_theme_manager.destroy();
+    self.global_xpty.destroy();
 
     self.allocator.free(self.canvas);
-    self.allocator.free(self.socket_path);
+    if (self.socket_path) |p| {
+        self.allocator.free(p);
+    }
     self.display.destroy();
     self.allocator.destroy(self);
 }
 
-pub fn dispatch(self: *Compositor, timeout_ms: c_int) !void {
-    try self.loop.dispatch(timeout_ms);
-    self.display.flushClients();
+pub fn resize(self: *Compositor, new_cols: u32, new_rows: u32) !void {
+    self.lock();
+    defer self.unlock();
+
+    if (self.cols == new_cols and self.rows == new_rows) return;
+
+    const new_canvas = try self.allocator.alloc(CanvasCell, @as(usize, new_cols) * new_rows);
+    for (new_canvas) |*c| {
+        c.* = .{
+            .codepoint = ' ',
+            .fg_rgba = self.theme_fg_rgba,
+            .bg_rgba = self.theme_bg_rgba,
+        };
+    }
+    self.allocator.free(self.canvas);
+    self.canvas = new_canvas;
+    self.cols = new_cols;
+    self.rows = new_rows;
+    self.dirty = true;
+}
+
+pub fn createClientSocket(self: *Compositor) !std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0, &fds) != 0) {
+        return error.SocketPairFailed;
+    }
+    errdefer {
+        _ = std.os.linux.close(fds[0]);
+        _ = std.os.linux.close(fds[1]);
+    }
+
+    const s_client = server.wl.Client.create(self.display, fds[0]) orelse {
+        return error.ServerClientCreateFailed;
+    };
+    _ = s_client;
+    return fds[1];
+}
+
+pub fn createDirectClient(self: *Compositor) !*Client {
+    const client_fd = try self.createClientSocket();
+    if (!self.running.load(.acquire)) {
+        try self.start();
+    }
+    return try Client.connectFd(self.allocator, client_fd);
+}
+
+pub fn start(self: *Compositor) !void {
+    if (self.running.load(.acquire)) return;
+    self.running.store(true, .release);
+    self.server_thread = try std.Thread.spawn(.{}, serverLoop, .{self});
+}
+
+fn serverLoop(self: *Compositor) void {
+    self.display.run();
 }
 
 pub fn stop(self: *Compositor) void {
+    if (!self.running.swap(false, .acq_rel)) return;
     self.display.terminate();
+    if (self.server_thread) |t| {
+        t.join();
+        self.server_thread = null;
+    }
+}
+
+pub fn dispatch(self: *Compositor, timeout_ms: c_int) !void {
+    if (self.running.load(.acquire)) return;
+    try self.loop.dispatch(timeout_ms);
+    self.display.flushClients();
 }
 
 // -----------------------------------------------------------------------------
@@ -203,6 +312,8 @@ fn handleCompositorRequest(res: *server.wl.Compositor, req: server.wl.Compositor
             const client = res.getClient();
             const surf_res = server.wl.Surface.create(client, res.getVersion(), args.id) catch return;
             const surf = Surface.init(self.allocator, surf_res) catch return;
+            self.lock();
+            defer self.unlock();
             self.surfaces.append(self.allocator, surf) catch return;
             self.surface_map.put(self.allocator, surf_res, surf) catch return;
             surf_res.setHandler(*Compositor, handleSurfaceRequest, handleSurfaceDestroy, self);
@@ -213,13 +324,15 @@ fn handleCompositorRequest(res: *server.wl.Compositor, req: server.wl.Compositor
 }
 
 fn handleSurfaceRequest(res: *server.wl.Surface, req: server.wl.Surface.Request, self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
     const surf = self.surface_map.get(res) orelse return;
     switch (req) {
         .destroy => {},
         .attach => |args| {
             if (args.buffer) |buf_res| {
                 if (self.buffer_map.get(buf_res)) |buf| {
-                    const copy = Buffer.init(self.allocator, buf.cols, buf.rows, buf.format, buf.data) catch return;
+                    const copy = buf.clone(self.allocator) catch return;
                     surf.attach(copy);
                 }
             } else {
@@ -238,6 +351,8 @@ fn handleSurfaceRequest(res: *server.wl.Surface, req: server.wl.Surface.Request,
 }
 
 fn handleSurfaceDestroy(res: *server.wl.Surface, self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
     if (self.surface_map.fetchRemove(res)) |kv| {
         const surf = kv.value;
         for (self.surfaces.items, 0..) |s, i| {
@@ -286,6 +401,8 @@ fn handleZtermCompositorRequest(res: *server.zterm.CompositorV1, req: server.zte
 }
 
 fn handleGridSurfaceRequest(res: *server.zterm.GridSurfaceV1, req: server.zterm.GridSurfaceV1.Request, self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
     const surf = self.grid_map.get(res) orelse return;
     switch (req) {
         .destroy => {},
@@ -296,10 +413,17 @@ fn handleGridSurfaceRequest(res: *server.zterm.GridSurfaceV1, req: server.zterm.
         .set_scrollback_max_lines => {},
         .clear_scrollback => {},
         .ack_configure => {},
+        .set_position => |args| {
+            surf.x = args.x;
+            surf.y = args.y;
+            self.dirty = true;
+        },
     }
 }
 
 fn handleGridSurfaceDestroy(res: *server.zterm.GridSurfaceV1, self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
     _ = self.grid_map.remove(res);
 }
 
@@ -321,6 +445,21 @@ fn handleBufferFactoryRequest(res: *server.zterm.BufferFactoryV1, req: server.zt
                 else => return,
             };
             const buf = Buffer.init(self.allocator, args.cols, args.rows, fmt, raw_slice) catch return;
+            self.lock();
+            defer self.unlock();
+            self.buffer_map.put(self.allocator, buf_res, buf) catch return;
+            buf_res.setHandler(*Compositor, handleBufferRequest, handleBufferDestroy, self);
+        },
+        .create_fd_cell_buffer => |args| {
+            const buf_res = server.wl.Buffer.create(client, 1, args.id) catch return;
+            const fmt: Buffer.Format = switch (args.format) {
+                .compact_v1 => .compact_v1,
+                .rich_v1 => .rich_v1,
+                else => return,
+            };
+            const buf = Buffer.initMmap(args.cols, args.rows, fmt, args.fd) catch return;
+            self.lock();
+            defer self.unlock();
             self.buffer_map.put(self.allocator, buf_res, buf) catch return;
             buf_res.setHandler(*Compositor, handleBufferRequest, handleBufferDestroy, self);
         },
@@ -337,6 +476,8 @@ fn handleBufferRequest(res: *server.wl.Buffer, req: server.wl.Buffer.Request, se
 }
 
 fn handleBufferDestroy(res: *server.wl.Buffer, self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
     if (self.buffer_map.fetchRemove(res)) |kv| {
         var b = kv.value;
         b.deinit();
@@ -395,6 +536,22 @@ fn sendTheme(self: *Compositor, res: *server.zterm.ThemeManagerV1) void {
     );
 }
 
+fn bindXpty(client: *server.wl.Client, data: *Compositor, version: u32, id: u32) void {
+    const res = server.zterm.XptyV1.create(client, version, id) catch return;
+    res.setHandler(*Compositor, handleXptyRequest, null, data);
+}
+
+fn handleXptyRequest(res: *server.zterm.XptyV1, req: server.zterm.XptyV1.Request, self: *Compositor) void {
+    _ = res;
+    _ = self;
+    switch (req) {
+        .destroy => {},
+        .attach_pty => |args| {
+            _ = std.os.linux.close(args.pty_slave_fd);
+        },
+    }
+}
+
 pub fn sendKey(
     self: *Compositor,
     key_name: [:0]const u8,
@@ -411,11 +568,87 @@ pub fn sendKey(
     self.display.flushClients();
 }
 
+/// Handles pointer click/release events.
+/// If clicking the header or border of a floating surface, begins interactive click+drag.
+pub fn pointerButton(self: *Compositor, x: i32, y: i32, pressed: bool) bool {
+    self.lock();
+    defer self.unlock();
+    if (!pressed) {
+        if (self.drag_state.dragging) {
+            self.drag_state.dragging = false;
+            self.drag_state.surface = null;
+            return true;
+        }
+        return false;
+    }
+
+    // Search surfaces in reverse z-order (topmost first)
+    var i = self.surfaces.items.len;
+    while (i > 0) {
+        i -= 1;
+        // Never drag the root background terminal surface (index 0)
+        if (i == 0) continue;
+
+        const surf = self.surfaces.items[i];
+        if (!surf.visible) continue;
+        const buf = surf.current_buffer orelse continue;
+
+        const left = surf.x;
+        const right = surf.x + @as(i32, @intCast(buf.cols));
+        const top = surf.y;
+        const bottom = surf.y + @as(i32, @intCast(buf.rows));
+
+        // Check if click lands on surface title bar (top rows) or border
+        if (x >= left and x < right and y >= top and y < bottom) {
+            if (y <= top + 2 or x == left or x == right - 1) {
+                self.drag_state = .{
+                    .surface = surf,
+                    .grab_offset_x = x - surf.x,
+                    .grab_offset_y = y - surf.y,
+                    .dragging = true,
+                };
+                return true;
+            }
+            break;
+        }
+    }
+    return false;
+}
+
+/// Handles pointer motion. If currently dragging a surface, repositions it live.
+pub fn pointerMotion(self: *Compositor, x: i32, y: i32) bool {
+    self.lock();
+    defer self.unlock();
+    if (!self.drag_state.dragging) return false;
+    const surf = self.drag_state.surface orelse return false;
+
+    var new_x = x - self.drag_state.grab_offset_x;
+    var new_y = y - self.drag_state.grab_offset_y;
+
+    const surf_w = if (surf.current_buffer) |b| @as(i32, @intCast(b.cols)) else 10;
+    const surf_h = if (surf.current_buffer) |b| @as(i32, @intCast(b.rows)) else 5;
+    const max_x = @max(0, @as(i32, @intCast(self.cols)) - surf_w);
+    const max_y = @max(0, @as(i32, @intCast(self.rows)) - surf_h);
+    new_x = std.math.clamp(new_x, 0, max_x);
+    new_y = std.math.clamp(new_y, 0, max_y);
+
+    if (surf.x != new_x or surf.y != new_y) {
+        surf.x = new_x;
+        surf.y = new_y;
+        self.dirty = true;
+        return true;
+    }
+    return false;
+}
+
 // -----------------------------------------------------------------------------
 // 2D Compositing Pass
 // -----------------------------------------------------------------------------
 
 pub fn composite(self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
+
     // Clear canvas
     for (self.canvas) |*c| {
         c.* = .{
@@ -425,78 +658,84 @@ pub fn composite(self: *Compositor) void {
         };
     }
 
-    // Blit surfaces in z-order
-    for (self.surfaces.items) |surf| {
-        const buf = surf.current_buffer orelse continue;
+    // Blit surfaces in z-order: pass 0 for normal surfaces (z_index <= 0), pass 1 for overlay/popup surfaces (z_index > 0)
+    var pass: u32 = 0;
+    while (pass < 2) : (pass += 1) {
+        for (self.surfaces.items) |surf| {
+            if (!surf.visible) continue;
+            if (pass == 0 and surf.z_index > 0) continue;
+            if (pass == 1 and surf.z_index <= 0) continue;
+            const buf = surf.current_buffer orelse continue;
 
-        var origin_x = surf.x;
-        var origin_y = surf.y;
+            var origin_x = surf.x;
+            var origin_y = surf.y;
 
-        if (surf.anchor) |anc| {
-            origin_x = anc.target.x + anc.target.cursor.col + anc.col_offset;
-            origin_y = anc.target.y + anc.target.cursor.row + anc.row_offset;
-        }
+            if (surf.anchor) |anc| {
+                origin_x = anc.target.x + anc.target.cursor.col + anc.col_offset;
+                origin_y = anc.target.y + anc.target.cursor.row + anc.row_offset;
+            }
 
-        switch (buf.format) {
-            .compact_v1 => {
-                const cells = buf.asCompactSlice();
-                var r: u32 = 0;
-                while (r < buf.rows) : (r += 1) {
-                    const target_y = origin_y + @as(i32, @intCast(r));
-                    if (target_y < 0 or target_y >= self.rows) continue;
+            switch (buf.format) {
+                .compact_v1 => {
+                    const cells = buf.asCompactSlice();
+                    var r: u32 = 0;
+                    while (r < buf.rows) : (r += 1) {
+                        const target_y = origin_y + @as(i32, @intCast(r));
+                        if (target_y < 0 or target_y >= self.rows) continue;
 
-                    var c: u32 = 0;
-                    while (c < buf.cols) : (c += 1) {
-                        const target_x = origin_x + @as(i32, @intCast(c));
-                        if (target_x < 0 or target_x >= self.cols) continue;
+                        var c: u32 = 0;
+                        while (c < buf.cols) : (c += 1) {
+                            const target_x = origin_x + @as(i32, @intCast(c));
+                            if (target_x < 0 or target_x >= self.cols) continue;
 
-                        const src_cell = cells[r * buf.cols + c];
-                        const dst_idx = @as(usize, @intCast(target_y)) * self.cols + @as(usize, @intCast(target_x));
+                            const src_cell = cells[r * buf.cols + c];
+                            const dst_idx = @as(usize, @intCast(target_y)) * self.cols + @as(usize, @intCast(target_x));
 
-                        const fg = if (src_cell.flags.fg_is_palette and src_cell.fg_color < 16)
-                            self.theme_palette[src_cell.fg_color]
-                        else
-                            self.theme_fg_rgba;
+                            const fg = if (src_cell.flags.fg_is_palette and src_cell.fg_color < 16)
+                                self.theme_palette[src_cell.fg_color]
+                            else
+                                self.theme_fg_rgba;
 
-                        const bg = if (src_cell.flags.bg_is_palette and src_cell.bg_color < 16)
-                            self.theme_palette[src_cell.bg_color]
-                        else
-                            self.theme_bg_rgba;
+                            const bg = if (src_cell.flags.bg_is_palette and src_cell.bg_color > 0 and src_cell.bg_color < 16)
+                                self.theme_palette[src_cell.bg_color]
+                            else
+                                self.theme_bg_rgba;
 
-                        self.canvas[dst_idx] = .{
-                            .codepoint = if (src_cell.codepoint == 0) ' ' else src_cell.codepoint,
-                            .fg_rgba = fg,
-                            .bg_rgba = bg,
-                            .bold = src_cell.flags.bold,
-                            .italic = src_cell.flags.italic,
-                            .underline = src_cell.flags.underline,
-                        };
+                            self.canvas[dst_idx] = .{
+                                .codepoint = if (src_cell.codepoint == 0) ' ' else src_cell.codepoint,
+                                .fg_rgba = fg,
+                                .bg_rgba = bg,
+                                .bold = src_cell.flags.bold,
+                                .italic = src_cell.flags.italic,
+                                .underline = src_cell.flags.underline,
+                            };
+                        }
                     }
-                }
-            },
-            .rich_v1 => {
-                const cells = buf.asRichSlice();
-                var r: u32 = 0;
-                while (r < buf.rows) : (r += 1) {
-                    const target_y = origin_y + @as(i32, @intCast(r));
-                    if (target_y < 0 or target_y >= self.rows) continue;
+                },
+                .rich_v1 => {
+                    const cells = buf.asRichSlice();
+                    var r: u32 = 0;
+                    while (r < buf.rows) : (r += 1) {
+                        const target_y = origin_y + @as(i32, @intCast(r));
+                        if (target_y < 0 or target_y >= self.rows) continue;
 
-                    var c: u32 = 0;
-                    while (c < buf.cols) : (c += 1) {
-                        const target_x = origin_x + @as(i32, @intCast(c));
-                        if (target_x < 0 or target_x >= self.cols) continue;
+                        var c: u32 = 0;
+                        while (c < buf.cols) : (c += 1) {
+                            const target_x = origin_x + @as(i32, @intCast(c));
+                            if (target_x < 0 or target_x >= self.cols) continue;
 
-                        const src_cell = cells[r * buf.cols + c];
-                        const dst_idx = @as(usize, @intCast(target_y)) * self.cols + @as(usize, @intCast(target_x));
+                            const src_cell = cells[r * buf.cols + c];
+                            const dst_idx = @as(usize, @intCast(target_y)) * self.cols + @as(usize, @intCast(target_x));
 
-                        self.canvas[dst_idx] = .{
-                            .codepoint = if (src_cell.codepoint == 0) ' ' else src_cell.codepoint,
-                            .fg_rgba = src_cell.fg_rgba,
-                            .bg_rgba = src_cell.bg_rgba,
-                        };
+                            self.canvas[dst_idx] = .{
+                                .codepoint = if (src_cell.codepoint == 0) ' ' else src_cell.codepoint,
+                                .fg_rgba = src_cell.fg_rgba,
+                                .bg_rgba = src_cell.bg_rgba,
+                            };
+                        }
                     }
-                }
-            },
+                },
+            }
         }
     }
     self.dirty = false;

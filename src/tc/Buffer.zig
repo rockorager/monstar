@@ -19,6 +19,9 @@ rows: u32,
 format: Format,
 data: []u8,
 allocator: ?std.mem.Allocator = null,
+mmap_len: ?usize = null,
+fd: ?std.posix.fd_t = null,
+is_borrowed: bool = false,
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -45,11 +48,61 @@ pub fn init(
     };
 }
 
+pub fn initMmap(
+    cols: u32,
+    rows: u32,
+    format: Format,
+    fd: std.posix.fd_t,
+) !Buffer {
+    const expected_size = switch (format) {
+        .compact_v1 => @as(usize, cols) * rows * @sizeOf(CompactCell),
+        .rich_v1 => @as(usize, cols) * rows * @sizeOf(RichCell),
+    };
+    const ptr = try std.posix.mmap(
+        null,
+        expected_size,
+        std.posix.PROT{ .READ = true },
+        .{ .TYPE = .SHARED },
+        fd,
+        0,
+    );
+    return .{
+        .cols = cols,
+        .rows = rows,
+        .format = format,
+        .data = ptr,
+        .mmap_len = expected_size,
+        .fd = fd,
+    };
+}
+
+pub fn clone(self: Buffer, allocator: std.mem.Allocator) !Buffer {
+    if (self.mmap_len != null) {
+        // For mmapped buffers, borrow the underlying shared memory slice directly
+        return .{
+            .cols = self.cols,
+            .rows = self.rows,
+            .format = self.format,
+            .data = self.data,
+            .is_borrowed = true,
+        };
+    }
+    return try init(allocator, self.cols, self.rows, self.format, self.data);
+}
+
 pub fn deinit(self: *Buffer) void {
-    if (self.allocator) |alloc| {
+    if (self.is_borrowed) {
+        // Borrowed view into shared memory; do not munmap or free
+    } else if (self.mmap_len) |len| {
+        const aligned_slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.data[0..len]);
+        std.posix.munmap(aligned_slice);
+        if (self.fd) |f| _ = std.os.linux.close(f);
+    } else if (self.allocator) |alloc| {
         alloc.free(self.data);
     }
-    self.* = undefined;
+    self.data = &.{};
+    self.cols = 0;
+    self.rows = 0;
 }
 
 pub fn asCompactSlice(self: Buffer) []const CompactCell {

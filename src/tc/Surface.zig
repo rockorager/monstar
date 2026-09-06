@@ -49,11 +49,14 @@ role: Role = .none,
 // Surface positioning
 x: i32 = 0,
 y: i32 = 0,
+z_index: i32 = 0,
+visible: bool = true,
 anchor: ?CursorAnchor = null,
 
 // Double-buffered state
 current_buffer: ?Buffer = null,
 pending_buffer: ?Buffer = null,
+has_pending_buffer: bool = false,
 buffer_damaged: bool = false,
 
 // Grid specific state
@@ -82,17 +85,19 @@ pub fn attach(self: *Surface, buf: ?Buffer) void {
         b.deinit();
     }
     self.pending_buffer = buf;
+    self.has_pending_buffer = true;
     self.buffer_damaged = true;
 }
 
 pub fn commit(self: *Surface) bool {
     var changed = false;
-    if (self.pending_buffer) |new_buf| {
+    if (self.has_pending_buffer) {
         if (self.current_buffer) |*old_buf| {
             old_buf.deinit();
         }
-        self.current_buffer = new_buf;
+        self.current_buffer = self.pending_buffer;
         self.pending_buffer = null;
+        self.has_pending_buffer = false;
         changed = true;
     }
     if (self.buffer_damaged) {
@@ -105,4 +110,10 @@ pub fn commit(self: *Surface) bool {
 pub fn setTitle(self: *Surface, title_str: []const u8) !void {
     if (self.title) |t| self.allocator.free(t);
     self.title = try self.allocator.dupe(u8, title_str);
+    if (std.mem.indexOf(u8, title_str, "Palette") != null or
+        std.mem.indexOf(u8, title_str, "Overlay") != null or
+        std.mem.indexOf(u8, title_str, "Popup") != null)
+    {
+        self.z_index = 100;
+    }
 }

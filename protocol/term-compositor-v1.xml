@@ -122,6 +122,18 @@
       <arg name="data" type="array" summary="contiguous raw cell binary data in row-major order"/>
     </request>
 
+    <request name="create_fd_cell_buffer">
+      <description summary="create a shared memory cell buffer from an fd (zero-copy)">
+        Creates a wl_buffer backed by an open file descriptor (such as memfd or shm)
+        for zero-copy performance on arbitrary grid sizes without message size limits.
+      </description>
+      <arg name="id" type="new_id" interface="wl_buffer" summary="new buffer object"/>
+      <arg name="fd" type="fd" summary="file descriptor containing cell data"/>
+      <arg name="cols" type="uint" summary="buffer width in character cells"/>
+      <arg name="rows" type="uint" summary="buffer height in character cells"/>
+      <arg name="format" type="uint" enum="cell_format" summary="binary cell ABI format"/>
+    </request>
+
     <request name="create_shm_cell_buffer">
       <description summary="create a shared memory cell buffer (local zero-copy)">
         Creates a wl_buffer backed by an existing wl_shm_pool object for zero-copy
@@ -187,6 +199,14 @@
         event with the specified serial.
       </description>
       <arg name="serial" type="uint" summary="serial of the configure event"/>
+    </request>
+
+    <request name="set_position">
+      <description summary="explicitly set surface canvas offset">
+        Sets the top-left (col, row) offset of this grid surface on the compositor canvas.
+      </description>
+      <arg name="x" type="int" summary="column coordinate"/>
+      <arg name="y" type="int" summary="row coordinate"/>
     </request>
 
     <event name="configure">
@@ -468,27 +488,27 @@
   </interface>
 
   <!-- ===================================================================== -->
-  <!-- Legacy PTY Bridge: zterm_pty_bridge_v1                                -->
+  <!-- Legacy PTY Bridge: zterm_xpty_v1 ('xpty')                             -->
   <!-- ===================================================================== -->
 
-  <interface name="zterm_pty_bridge_v1" version="1">
-    <description summary="legacy VT100 / PTY bridge factory ('XWayland for Terminals')">
+  <interface name="zterm_xpty_v1" version="1">
+    <description summary="legacy VT100 / PTY bridge factory ('xpty', analogous to Xwayland)">
       Allows the terminal compositor or helper processes to wrap legacy VT
       processes (bash, zsh, vim, htop) into an isolated grid surface backed
       by an existing slave PTY descriptor.
     </description>
 
     <request name="destroy" type="destructor">
-      <description summary="destroy PTY bridge">
-        Destroys the PTY bridge factory.
+      <description summary="destroy xpty bridge">
+        Destroys the xpty bridge factory.
       </description>
     </request>
 
     <request name="attach_pty">
       <description summary="attach a slave PTY to a grid surface">
-        Attaches a slave PTY file descriptor to an existing grid surface. The bridge
-        parses the PTY stream in complete isolation, clamping all escapes to
-        the surface bounds.
+        Attaches a slave PTY file descriptor to an existing grid surface. The xpty
+        bridge parses the PTY stream in complete isolation, clamping all escapes to
+        the surface bounds and emitting cell buffer commits.
       </description>
       <arg name="grid_surface" type="object" interface="zterm_grid_surface_v1" summary="target grid surface"/>
       <arg name="pty_slave_fd" type="fd" summary="slave PTY descriptor to sandbox"/>

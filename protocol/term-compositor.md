@@ -60,7 +60,7 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 │  │ • zterm_keyboard_v1        : Resolved terminal keys & modifiers  │  │
 │  │ • zterm_theme_manager_v1   : Live color palettes & RGBA tokens   │  │
 │  │ • zterm_property_manager_v1: Getters, setters, desktop notifies  │  │
-│  │ • zterm_pty_bridge_v1      : Sandboxed legacy PTY container      │  │
+│  │ • zterm_xpty_v1            : Sandboxed legacy PTY container      │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                   │                                    │
 │                                   ▼                                    │
@@ -91,7 +91,7 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 | **Structured Terminal Keys** | `zterm_keyboard_v1` | **Missing in Wayland**: Delivers resolved key names and UTF-8 strings without requiring `libxkbcommon` over SSH. |
 | **Palettes & Theming** | `zterm_theme_manager_v1` | **Missing in Wayland**: Broadcasts terminal 16-color ANSI palettes and dynamic RGBA theme tokens. |
 | **Getters / Setters / Notify**| `zterm_property_manager_v1` | **Missing in Wayland**: Structured session property queries, window title mutation, and notifications. |
-| **Legacy PTY Sandboxing** | `zterm_pty_bridge_v1` | **Missing in Wayland**: The "XWayland for Terminals" bridge running legacy VT100 applications. |
+| **Legacy PTY Sandboxing (xpty)** | `zterm_xpty_v1` | **Missing in Wayland**: The "xpty" bridge running legacy VT100 applications (analogous to Xwayland). |
 
 ---
 
@@ -306,9 +306,9 @@ Provides structured getters, setters, and change watchers for terminal metadata:
 
 ---
 
-## 8. Legacy PTY Bridge ("XWayland for Terminals")
+## 8. Legacy PTY Bridge: xpty ("Xwayland for Terminals")
 
-To guarantee 100% backward compatibility with existing software (`bash`, `zsh`, `vim`, `htop`, `curl`), Monstar incorporates a **PTY Bridge** (`zterm_pty_bridge_v1`):
+To guarantee 100% backward compatibility with existing software (`bash`, `zsh`, `vim`, `htop`, `curl`), Monstar incorporates **xpty** (`zterm_xpty_v1`), analogous to Xwayland for desktop compositors:
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -322,7 +322,7 @@ To guarantee 100% backward compatibility with existing software (`bash`, `zsh`, 
                             │ Raw ANSI Bytes
                             ▼
 ┌────────────────────────────────────────────────────────┐
-│ PTY-WAYLAND BRIDGE ("XWayland for Terminals")          │
+│ xpty BRIDGE ("Xwayland for Terminals")                 │
 │                                                        │
 │  1. Owns master PTY descriptor.                        │
 │  2. Houses legacy VT100 / xterm parser state machine.  │
@@ -340,7 +340,7 @@ To guarantee 100% backward compatibility with existing software (`bash`, `zsh`, 
 └────────────────────────────────────────────────────────┘
 ```
 
-### Invariants of the PTY Bridge:
+### Invariants of xpty:
 1. **Zero Upward Escapes**: The bridge never leaks ANSI escapes into the compositor. It outputs only clean cell rectangles.
 2. **Spatial Clamping**: Escapes like `\x1b[2J` (clear screen) or rogue cursor coordinates are strictly clamped to the surface's bounding box. They physically cannot damage adjacent panes or overlays.
 3. **Pristine Compositor Core**: The compositor code does not need legacy VT state machines. It operates purely on Wayland surfaces and cell buffers.

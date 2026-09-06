@@ -57,6 +57,41 @@ last_configure: ?ConfigureEvent = null,
 last_theme: ?ThemeEvent = null,
 received_keys: std.ArrayList(KeyEvent) = .empty,
 
+pub fn connectFd(allocator: std.mem.Allocator, fd: std.posix.fd_t) !*Client {
+    const display = try wl.Display.connectToFd(fd);
+    errdefer display.disconnect();
+
+    const registry = try display.getRegistry();
+    errdefer registry.destroy();
+
+    const self = try allocator.create(Client);
+    errdefer allocator.destroy(self);
+
+    self.* = .{
+        .allocator = allocator,
+        .display = display,
+        .registry = registry,
+    };
+
+    registry.setListener(*Client, registryListener, self);
+    if (display.roundtrip() != .SUCCESS) {
+        return error.RoundtripFailed;
+    }
+
+    if (self.keyboard) |kb| {
+        kb.setListener(*Client, keyboardListener, self);
+    }
+    if (self.theme_manager) |tm| {
+        tm.setListener(*Client, themeListener, self);
+        tm.getTheme();
+        if (display.roundtrip() != .SUCCESS) {
+            return error.RoundtripFailed;
+        }
+    }
+
+    return self;
+}
+
 pub fn connect(allocator: std.mem.Allocator, socket_name: ?[*:0]const u8) !*Client {
     const display = try wl.Display.connect(socket_name);
     errdefer display.disconnect();
@@ -120,8 +155,18 @@ pub fn roundtrip(self: *Client) !void {
     if (self.display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
 }
 
+pub fn getFd(self: *Client) std.posix.fd_t {
+    return self.display.getFd();
+}
+
 pub fn dispatch(self: *Client) !void {
+    _ = self.display.flush();
     if (self.display.dispatch() != .SUCCESS) return error.DispatchFailed;
+}
+
+pub fn dispatchPending(self: *Client) void {
+    _ = self.display.flush();
+    _ = self.display.dispatchPending();
 }
 
 pub fn createGridSurface(self: *Client) !*zterm.GridSurfaceV1 {
@@ -147,6 +192,19 @@ pub fn createCellBuffer(
     cell_bytes: []const u8,
 ) !*wl.Buffer {
     const factory = self.buffer_factory orelse return error.NoBufferFactory;
+
+    // If payload exceeds 3000 bytes, pass it via memfd to avoid libwayland wire limit (4096 bytes)
+    if (cell_bytes.len > 3000) {
+        if (std.posix.memfd_create("tc-client-cell-buffer", 0)) |fd| {
+            errdefer _ = std.os.linux.close(fd);
+            if (std.c.ftruncate(fd, @intCast(cell_bytes.len)) == 0) {
+                _ = std.c.write(fd, cell_bytes.ptr, cell_bytes.len);
+                return try self.createFdCellBuffer(fd, cols, rows, format);
+            }
+            _ = std.os.linux.close(fd);
+        } else |_| {}
+    }
+
     var array = wl.Array{
         .size = cell_bytes.len,
         .alloc = cell_bytes.len,
@@ -159,6 +217,21 @@ pub fn createCellBuffer(
     };
 
     return try factory.createCellBuffer(cols, rows, wire_fmt, &array);
+}
+
+pub fn createFdCellBuffer(
+    self: *Client,
+    fd: std.posix.fd_t,
+    cols: u32,
+    rows: u32,
+    format: Buffer.Format,
+) !*wl.Buffer {
+    const factory = self.buffer_factory orelse return error.NoBufferFactory;
+    const wire_fmt: zterm.BufferFactoryV1.CellFormat = switch (format) {
+        .compact_v1 => .compact_v1,
+        .rich_v1 => .rich_v1,
+    };
+    return try factory.createFdCellBuffer(fd, cols, rows, wire_fmt);
 }
 
 pub fn commitBuffer(self: *Client, buffer: *wl.Buffer, cols: u32, rows: u32) !void {
