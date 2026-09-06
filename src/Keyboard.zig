@@ -736,6 +736,38 @@ test "Dvorak writing key exposes its logical shortcut codepoint" {
     try std.testing.expectEqual(@as(u21, 'c'), event.unshifted_codepoint);
 }
 
+test "configured Unicode and physical bindings on US and Dvorak keyboards" {
+    const keybind = @import("keybind.zig");
+    var bindings: std.ArrayList(keybind.Binding) = .empty;
+    defer bindings.deinit(std.testing.allocator);
+    try keybind.put(&bindings, std.testing.allocator, "ctrl+shift+k=scroll_page_lines:-5");
+    try keybind.put(&bindings, std.testing.allocator, "alt+j=scroll_page_lines:1");
+    for ([_]?[*:0]const u8{ null, "dvorak" }) |variant| {
+        var kb = try testKeyboardWithLayout("us", variant);
+        defer kb.deinit();
+        var buf: [16]u8 = undefined;
+        _ = c.xkb_state_update_key(kb.state.?, 29 + 8, c.XKB_KEY_DOWN);
+        _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_DOWN);
+        // Dvorak K is at the physical V position; J is at physical C.
+        const k: u32 = if (variant == null) 37 else 47;
+        const j: u32 = if (variant == null) 36 else 46;
+        for ([_]vt.input.KeyAction{ .press, .repeat, .release }) |action| {
+            const event = kb.translate(&buf, k, action).?;
+            try std.testing.expectEqual(@as(u21, 'k'), event.unshifted_codepoint);
+            try std.testing.expectEqual(@as(i16, -5), keybind.getEvent(bindings.items, event).?.scroll_page_lines);
+        }
+        _ = c.xkb_state_update_key(kb.state.?, 29 + 8, c.XKB_KEY_UP);
+        _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_UP);
+        _ = c.xkb_state_update_key(kb.state.?, 56 + 8, c.XKB_KEY_DOWN);
+        try std.testing.expectEqual(@as(i16, 1), keybind.getEvent(bindings.items, kb.translate(&buf, j, .press).?).?.scroll_page_lines);
+        if (variant != null) {
+            try std.testing.expectEqual(null, keybind.getEvent(bindings.items, kb.translate(&buf, 36, .press).?));
+            try keybind.put(&bindings, std.testing.allocator, "alt+KeyJ=scroll_page_lines:3");
+            try std.testing.expectEqual(@as(i16, 3), keybind.getEvent(bindings.items, kb.translate(&buf, 36, .press).?).?.scroll_page_lines);
+        }
+    }
+}
+
 test "virtual keyboard text on a non-writing keycode ignores the physical key" {
     // wtype assigns keycodes by first appearance, so text lands on evdev 29 (ctrl), 15 (tab), 14 (backspace), 59 (f1), 96 (kp enter), 103 (up), ...
     try std.testing.expectEqual(vt.input.Key.unidentified, remapKey(.control_left, c.XKB_KEY_Cyrillic_sha));

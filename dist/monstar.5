@@ -194,33 +194,61 @@ The defaults are
 and
 .BR discrete:3 .
 .TP
-.BI scroll-line-up-key " = shortcut"
-Set the shortcut that scrolls up by one terminal line.
-The default is
-.BR shift+up .
-.TP
-.BI scroll-line-down-key " = shortcut"
-Set the shortcut that scrolls down by one terminal line.
-The default is
-.BR shift+down .
+.BI keybind " = trigger=action"
+Add or replace a Ghostty-style single-key binding. Repeat this setting to bind
+multiple triggers. Repeating the same trigger replaces its previous binding;
+an invalid entry leaves previous bindings unchanged.
+.B scroll_page_lines:N
+scrolls by N terminal lines: negative values scroll up, positive values scroll
+down, and zero consumes the key without moving. N must be between -32768 and
+32767.
+.B unbind
+removes a shortcut and passes its input to the application.
 .PP
-A shortcut accepts
+The default line-scrolling bindings are:
+.nf
+keybind = shift+up=scroll_page_lines:-1
+keybind = shift+down=scroll_page_lines:1
+.fi
+.PP
+For example, add a five-line shortcut and remove the default up shortcut:
+.nf
+keybind = ctrl+shift+k=scroll_page_lines:-5
+keybind = shift+up=unbind
+.fi
+.PP
+Triggers accept lowercase
 .BR shift ,
-.BR ctrl ,
-.BR alt ,
+.B ctrl
+(alias
+.BR control ),
+.B alt
+(aliases
+.BR opt ", " option ),
 or
 .B super
-modifiers and one key.
-Use one ASCII key or a named navigation key:
-.BR up ,
-.BR down ,
-.BR left ,
-.BR right ,
-.BR page-up ,
-.BR page-down ,
-.BR home ,
-or
-.BR end .
+(aliases
+.BR cmd ", " command )
+with one key. A single Unicode character follows the keyboard layout;
+key names such as
+.BR KeyK ", " arrow_up ", " PageUp ", " equal
+select physical keys. The aliases
+.BR up ", " down ", " left ", " right
+are also accepted. Modifiers match exactly, ignoring lock keys and modifier
+sides. Include Shift when held to produce punctuation; on a US keyboard,
+.B ctrl+shift++=scroll_page_lines:-5
+binds Ctrl+Shift+Plus. Use
+.B ctrl+==scroll_page_lines:-5
+to bind Ctrl+Equals.
+.PP
+Configured bindings take priority over fixed shortcuts and apply immediately
+on configuration reload. Scroll actions pass through on the alternate screen.
+Search mode retains its own controls. Only
+.B scroll_page_lines
+and
+.B unbind
+actions are supported; sequences, binding flags and other Ghostty actions are
+not supported.
 .TP
 .BI scrollback-limit " = bytes"
 Set the terminal page-storage limit, including the active screen.

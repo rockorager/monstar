@@ -19,6 +19,7 @@ const vt = @import("ghostty-vt");
 const Clipboard = @import("Clipboard.zig");
 const KittyClipboard = @import("KittyClipboard.zig");
 const Config = @import("Config.zig");
+const keybind = @import("keybind.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
 const Link = @import("Link.zig");
@@ -5008,13 +5009,13 @@ fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
     }
 }
 
-const ScrollbackKeyAction = enum {
-    line_up,
-    line_down,
+const ScrollbackKeyAction = union(enum) {
+    lines: isize,
     page_up,
     page_down,
     top,
     bottom,
+    passthrough,
 };
 
 fn scrollbackKeyAction(
@@ -5022,10 +5023,16 @@ fn scrollbackKeyAction(
     active_screen: vt.ScreenSet.Key,
     event: vt.input.KeyEvent,
 ) ?ScrollbackKeyAction {
-    // Like foot, leave scrollback shortcuts to full-screen applications.
+    if (keybind.getEvent(config.keybinds.items, event)) |action| {
+        // Explicit bindings override fixed shortcuts even when unbound or
+        // passed through to an alternate-screen application.
+        return switch (action) {
+            .unbind => .passthrough,
+            .scroll_page_lines => |lines| if (active_screen == .primary) .{ .lines = lines } else .passthrough,
+        };
+    }
+    // Leave scrollback shortcuts to full-screen applications.
     if (active_screen != .primary) return null;
-    if (config.scroll_line_up_key.matches(event)) return .line_up;
-    if (config.scroll_line_down_key.matches(event)) return .line_down;
     if (!event.mods.shift or event.mods.ctrl or event.mods.alt or event.mods.super) return null;
 
     return switch (event.key) {
@@ -5037,25 +5044,24 @@ fn scrollbackKeyAction(
     };
 }
 
-fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent) bool {
-    const scroll = scrollbackKeyAction(&self.config, self.term.screens.active_key, event) orelse return false;
+fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: ScrollbackKeyAction) void {
+    std.debug.assert(scroll != .passthrough);
     // Consume the matching release too, but move only on press/repeat.
-    if (event.action == .release) return true;
+    if (event.action == .release) return;
 
     self.stopFling();
     const rows: isize = @intCast(self.term.rows);
     switch (scroll) {
-        .line_up => self.term.screens.active.pages.scroll(.{ .delta_row = -1 }),
-        .line_down => self.term.screens.active.pages.scroll(.{ .delta_row = 1 }),
+        .lines => |lines| self.term.screens.active.pages.scroll(.{ .delta_row = lines }),
         .page_up => self.term.screens.active.pages.scroll(.{ .delta_row = -rows }),
         .page_down => self.term.screens.active.pages.scroll(.{ .delta_row = rows }),
         .top => self.term.screens.active.pages.scroll(.top),
         .bottom => self.term.screens.active.pages.scroll(.active),
+        .passthrough => unreachable,
     }
     self.revealScrollbar();
     self.needs_redraw = true;
     self.syncHoveredLink(true);
-    return true;
 }
 
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
@@ -5064,32 +5070,34 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 
     if (self.search != null) return self.handleSearchKey(event);
 
-    // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
-    if (action == .press and event.mods.ctrl) {
-        switch (event.unshifted_codepoint) {
-            '=' => return self.adjustRuntimeFontSize(1),
-            '-' => if (!event.mods.shift) return self.adjustRuntimeFontSize(-1),
-            '0' => if (!event.mods.shift) return self.resetRuntimeFontSize(),
-            else => {},
+    if (scrollbackKeyAction(&self.config, self.term.screens.active_key, event)) |scroll| {
+        if (scroll != .passthrough) return self.handleScrollbackKey(event, scroll);
+    } else {
+        // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
+        if (action == .press and event.mods.ctrl) {
+            switch (event.unshifted_codepoint) {
+                '=' => return self.adjustRuntimeFontSize(1),
+                '-' => if (!event.mods.shift) return self.adjustRuntimeFontSize(-1),
+                '0' => if (!event.mods.shift) return self.resetRuntimeFontSize(),
+                else => {},
+            }
+        }
+
+        // Copy/paste bindings take priority over the application.
+        if (action == .press and event.mods.ctrl and event.mods.shift) {
+            switch (event.unshifted_codepoint) {
+                'c' => return self.copyToClipboard(),
+                'f' => return self.startSearch(),
+                'g' => return self.pipeCommandOutput(),
+                'n' => return self.spawnNewWindow(),
+                'v' => return self.beginPaste(.clipboard),
+                'x' => return self.jumpPrompt(1),
+                'z' => return self.jumpPrompt(-1),
+                ',' => return self.reloadConfig(),
+                else => {},
+            }
         }
     }
-
-    // Copy/paste bindings take priority over the application.
-    if (action == .press and event.mods.ctrl and event.mods.shift) {
-        switch (event.unshifted_codepoint) {
-            'c' => return self.copyToClipboard(),
-            'f' => return self.startSearch(),
-            'g' => return self.pipeCommandOutput(),
-            'n' => return self.spawnNewWindow(),
-            'v' => return self.beginPaste(.clipboard),
-            'x' => return self.jumpPrompt(1),
-            'z' => return self.jumpPrompt(-1),
-            ',' => return self.reloadConfig(),
-            else => {},
-        }
-    }
-
-    if (self.handleScrollbackKey(event)) return;
 
     const wrote = self.encodeAndWriteKey(event);
 
@@ -6078,14 +6086,15 @@ test "search backspace removes one UTF-8 codepoint" {
 
 test "scrollback keys require supported modifiers on the primary screen" {
     var config: Config = .{};
+    defer config.keybinds.deinit(std.testing.allocator);
     const shifted: vt.input.KeyMods = .{ .shift = true };
     const ctrl_shifted: vt.input.KeyMods = .{ .shift = true, .ctrl = true };
     try std.testing.expectEqual(
-        ScrollbackKeyAction.line_up,
+        ScrollbackKeyAction{ .lines = -1 },
         scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
-        ScrollbackKeyAction.line_down,
+        ScrollbackKeyAction{ .lines = 1 },
         scrollbackKeyAction(&config, .primary, .{ .key = .arrow_down, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
@@ -6106,8 +6115,8 @@ test "scrollback keys require supported modifiers on the primary screen" {
     );
 
     try std.testing.expectEqual(
-        null,
-        scrollbackKeyAction(&config, .alternate, .{ .key = .arrow_up, .mods = shifted }),
+        ScrollbackKeyAction.passthrough,
+        scrollbackKeyAction(&config, .alternate, .{ .key = .arrow_up, .mods = shifted }).?,
     );
     try std.testing.expectEqual(
         null,
@@ -6125,15 +6134,37 @@ test "scrollback keys require supported modifiers on the primary screen" {
         }),
     );
 
-    config.scroll_line_up_key.mods.ctrl = true;
+    try config.set(std.testing.allocator, "keybind", "ctrl+shift+up=scroll_page_lines:-5");
+    try config.set(std.testing.allocator, "keybind", "shift+up=unbind");
     try std.testing.expectEqual(
-        ScrollbackKeyAction.line_up,
+        ScrollbackKeyAction{ .lines = -5 },
         scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = ctrl_shifted }).?,
     );
     try std.testing.expectEqual(
-        null,
-        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }),
+        ScrollbackKeyAction.passthrough,
+        scrollbackKeyAction(&config, .primary, .{ .key = .arrow_up, .mods = shifted }).?,
     );
+}
+
+test "custom scrolling overrides fixed chords and passes through on the alternate screen" {
+    var config: Config = .{};
+    defer config.keybinds.deinit(std.testing.allocator);
+    const cases = [_]struct { binding: []const u8, event: vt.input.KeyEvent }{
+        .{ .binding = "ctrl+shift+c=scroll_page_lines:-3", .event = .{ .key = .key_c, .unshifted_codepoint = 'c', .mods = .{ .ctrl = true, .shift = true } } },
+        .{ .binding = "ctrl+==scroll_page_lines:-3", .event = .{ .key = .equal, .unshifted_codepoint = '=', .mods = .{ .ctrl = true } } },
+        .{ .binding = "shift+PageUp=scroll_page_lines:-3", .event = .{ .key = .page_up, .mods = .{ .shift = true } } },
+    };
+    for (cases) |case| {
+        try config.set(std.testing.allocator, "keybind", case.binding);
+        for ([_]vt.input.KeyAction{ .press, .repeat, .release }) |action| {
+            var event = case.event;
+            event.action = action;
+            try std.testing.expectEqual(ScrollbackKeyAction{ .lines = -3 }, scrollbackKeyAction(&config, .primary, event).?);
+            try std.testing.expectEqual(ScrollbackKeyAction.passthrough, scrollbackKeyAction(&config, .alternate, event).?);
+        }
+    }
+    try config.set(std.testing.allocator, "keybind", "ctrl+shift+c=unbind");
+    try std.testing.expectEqual(ScrollbackKeyAction.passthrough, scrollbackKeyAction(&config, .primary, cases[0].event).?);
 }
 
 test "scrollback search scrolls a history match into the viewport" {

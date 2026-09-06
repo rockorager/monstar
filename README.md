@@ -133,10 +133,8 @@ Other settings:
   motion after release (default `true`).
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
   `0` disables the flash (default `200`).
-- **scroll-line-up-key / scroll-line-down-key** — Shortcuts that move the
-  scrollback viewport by one line. The defaults are `shift+up` and
-  `shift+down`. Combine `shift`, `ctrl`, `alt`, or `super` with one ASCII key
-  or a named navigation key.
+- **keybind** — Repeatable Ghostty-style `trigger=action` bindings for line
+  scrolling. See [Keybindings](#keybindings) below.
 - **background / foreground / cursor-color / cursor-text** — Terminal colors
   as `#RRGGBB` or `RRGGBB`; explicit colors override the theme.
   `cursor-color` and `cursor-text` also accept `cell-foreground` and
@@ -156,6 +154,37 @@ Visual and interaction settings apply immediately. Process and storage
 settings apply to new windows.
 
 ## Keybindings
+
+Configure line scrolling with repeatable `keybind` entries:
+
+```conf
+# Default line-scrolling bindings:
+keybind = shift+up=scroll_page_lines:-1
+keybind = shift+down=scroll_page_lines:1
+# Additional shortcuts, with independent line counts:
+keybind = ctrl+shift+k=scroll_page_lines:-5
+keybind = alt+j=scroll_page_lines:5
+# Remove a default shortcut:
+keybind = shift+up=unbind
+```
+
+Negative counts scroll up; positive counts scroll down. Counts range from
+`-32768` to `32767`. Multiple triggers can invoke the same action; repeating a
+trigger replaces its previous binding. Invalid entries leave previous bindings
+unchanged. Bindings reload with the configuration.
+
+Triggers combine lowercase `shift`, `ctrl` (`control`), `alt` (`opt`, `option`),
+or `super` (`cmd`, `command`) with one key. A single Unicode character such as
+`k` or `ö` follows the keyboard layout; names such as `KeyK`, `arrow_up`,
+`PageUp`, or `equal` select physical keys. `up`, `down`, `left`, and `right`
+are also accepted. Modifiers match exactly (ignoring Caps Lock and Num Lock).
+Include Shift when it is held to produce punctuation, for example
+`keybind = ctrl+shift++=scroll_page_lines:-5` on a US keyboard.
+
+Configured bindings take precedence over fixed shortcuts below; `unbind`
+passes the key to the application instead. Only `scroll_page_lines` and
+`unbind` are currently supported actions. Ghostty sequences, binding flags,
+and other actions are not yet supported. Search mode retains its own controls.
 
 | Shortcut | Action |
 | --- | --- |

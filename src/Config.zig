@@ -1,7 +1,7 @@
 //! Configuration: a flat `key = value` file, one entry per line, with
 //! `#` comments. Located at $XDG_CONFIG_HOME/monstar/config (falling
 //! back to ~/.config/monstar/config). Missing file means defaults;
-//! invalid lines warn and keep their default.
+//! invalid lines warn and leave previous settings unchanged.
 
 const Config = @This();
 
@@ -9,6 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const config_theme = @import("config_theme.zig");
+const keybind = @import("keybind.zig");
 
 const log = std.log.scoped(.config);
 const baseline_dpi = 96.0;
@@ -33,19 +34,6 @@ pub const Command = union(enum) {
 pub const MouseScrollMultiplier = struct {
     precision: f64 = 1,
     discrete: f64 = 3,
-};
-
-pub const Shortcut = struct {
-    key: vt.input.Key,
-    mods: vt.input.KeyMods = .{},
-
-    pub fn matches(self: Shortcut, event: vt.input.KeyEvent) bool {
-        return self.key == event.key and
-            self.mods.shift == event.mods.shift and
-            self.mods.ctrl == event.mods.ctrl and
-            self.mods.alt == event.mods.alt and
-            self.mods.super == event.mods.super;
-    }
 };
 
 pub const Theme = config_theme.Theme;
@@ -131,9 +119,8 @@ image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
 /// Whether finger scrolling continues with inertial motion after release.
 inertial_scrolling: bool = true,
-/// Shortcuts that move the primary-screen scrollback viewport by one line.
-scroll_line_up_key: Shortcut = .{ .key = .arrow_up, .mods = .{ .shift = true } },
-scroll_line_down_key: Shortcut = .{ .key = .arrow_down, .mods = .{ .shift = true } },
+/// User keybindings, backed by the config arena. Defaults are resolved separately.
+keybinds: std.ArrayList(keybind.Binding) = .empty,
 /// Duration of the post-copy selection flash in milliseconds; 0 disables it.
 copy_highlight_duration: u32 = 200,
 /// Effective alpha of the default terminal background. Keeping this as an
@@ -269,10 +256,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.image_storage_limit = limit;
     } else if (std.mem.eql(u8, key, "mouse-scroll-multiplier")) {
         self.mouse_scroll_multiplier = try parseMouseScrollMultiplier(self.mouse_scroll_multiplier, value);
-    } else if (std.mem.eql(u8, key, "scroll-line-up-key")) {
-        self.scroll_line_up_key = try parseShortcut(value);
-    } else if (std.mem.eql(u8, key, "scroll-line-down-key")) {
-        self.scroll_line_down_key = try parseShortcut(value);
+    } else if (std.mem.eql(u8, key, "keybind")) {
+        try keybind.put(&self.keybinds, arena, value);
     } else if (std.mem.eql(u8, key, "inertial-scrolling")) {
         self.inertial_scrolling = if (std.mem.eql(u8, value, "true"))
             true
@@ -355,51 +340,6 @@ fn parseMetricModifier(value: []const u8) error{InvalidValue}!MetricModifier {
     return .{
         .absolute = std.fmt.parseInt(i32, trimmed, 10) catch return error.InvalidValue,
     };
-}
-
-fn parseShortcut(value: []const u8) error{InvalidValue}!Shortcut {
-    var key: ?vt.input.Key = null;
-    var mods: vt.input.KeyMods = .{};
-    var tokens = std.mem.splitScalar(u8, value, '+');
-    while (tokens.next()) |raw_token| {
-        const token = std.mem.trim(u8, raw_token, " \t");
-        if (token.len == 0) return error.InvalidValue;
-
-        if (std.ascii.eqlIgnoreCase(token, "shift")) {
-            if (mods.shift) return error.InvalidValue;
-            mods.shift = true;
-        } else if (std.ascii.eqlIgnoreCase(token, "ctrl") or
-            std.ascii.eqlIgnoreCase(token, "control"))
-        {
-            if (mods.ctrl) return error.InvalidValue;
-            mods.ctrl = true;
-        } else if (std.ascii.eqlIgnoreCase(token, "alt")) {
-            if (mods.alt) return error.InvalidValue;
-            mods.alt = true;
-        } else if (std.ascii.eqlIgnoreCase(token, "super")) {
-            if (mods.super) return error.InvalidValue;
-            mods.super = true;
-        } else {
-            if (key != null) return error.InvalidValue;
-            key = try parseShortcutKey(token);
-        }
-    }
-    return .{ .key = key orelse return error.InvalidValue, .mods = mods };
-}
-
-fn parseShortcutKey(value: []const u8) error{InvalidValue}!vt.input.Key {
-    if (value.len == 1) {
-        return vt.input.Key.fromASCII(std.ascii.toLower(value[0])) orelse error.InvalidValue;
-    }
-    if (std.ascii.eqlIgnoreCase(value, "up")) return .arrow_up;
-    if (std.ascii.eqlIgnoreCase(value, "down")) return .arrow_down;
-    if (std.ascii.eqlIgnoreCase(value, "left")) return .arrow_left;
-    if (std.ascii.eqlIgnoreCase(value, "right")) return .arrow_right;
-    if (std.ascii.eqlIgnoreCase(value, "page-up")) return .page_up;
-    if (std.ascii.eqlIgnoreCase(value, "page-down")) return .page_down;
-    if (std.ascii.eqlIgnoreCase(value, "home")) return .home;
-    if (std.ascii.eqlIgnoreCase(value, "end")) return .end;
-    return vt.input.Key.fromW3C(value) orelse error.InvalidValue;
 }
 
 fn parseCommand(arena: std.mem.Allocator, value: []const u8) SetError!Command {
@@ -603,14 +543,14 @@ test "defaults" {
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 3), config.mouse_scroll_multiplier.discrete);
     try std.testing.expect(config.inertial_scrolling);
-    try std.testing.expect(config.scroll_line_up_key.matches(.{
+    try std.testing.expectEqual(@as(i16, -1), keybind.getEvent(config.keybinds.items, .{
         .key = .arrow_up,
         .mods = .{ .shift = true },
-    }));
-    try std.testing.expect(config.scroll_line_down_key.matches(.{
+    }).?.scroll_page_lines);
+    try std.testing.expectEqual(@as(i16, 1), keybind.getEvent(config.keybinds.items, .{
         .key = .arrow_down,
         .mods = .{ .shift = true },
-    }));
+    }).?.scroll_page_lines);
     try std.testing.expectEqual(@as(u32, 200), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
     try std.testing.expect(config.background_blur);
@@ -651,9 +591,10 @@ test "parse config" {
         \\scrollback-limit = 50000000
         \\image-storage-limit = 50000000
         \\mouse-scroll-multiplier = precision:1.5,discrete:5
-        \\scroll-line-up-key = ctrl+shift+k
-        \\scroll-line-down-key = alt+j
-        \\scroll-line-up-key = shift+not-a-key
+        \\keybind = ctrl+shift+k=scroll_page_lines:-1
+        \\keybind = alt+j=scroll_page_lines:1
+        \\keybind = ctrl+shift+k=scroll_page_lines:-5
+        \\keybind = ctrl+shift+k=scroll_page_lines:invalid
         \\inertial-scrolling = false
         \\copy-highlight-duration = 250
         \\background-opacity = 0.8
@@ -687,14 +628,16 @@ test "parse config" {
     try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1.5), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 5), config.mouse_scroll_multiplier.discrete);
-    try std.testing.expect(config.scroll_line_up_key.matches(.{
+    try std.testing.expectEqual(@as(i16, -5), keybind.getEvent(config.keybinds.items, .{
         .key = .key_k,
+        .unshifted_codepoint = 'k',
         .mods = .{ .ctrl = true, .shift = true },
-    }));
-    try std.testing.expect(config.scroll_line_down_key.matches(.{
+    }).?.scroll_page_lines);
+    try std.testing.expectEqual(@as(i16, 1), keybind.getEvent(config.keybinds.items, .{
         .key = .key_j,
+        .unshifted_codepoint = 'j',
         .mods = .{ .alt = true },
-    }));
+    }).?.scroll_page_lines);
     try std.testing.expect(!config.inertial_scrolling);
     try std.testing.expectEqual(@as(u32, 250), config.copy_highlight_duration);
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
@@ -719,6 +662,25 @@ test "unknown override is rejected" {
         error.UnknownKey,
         config.applyOverride(std.testing.allocator, "font-famly=monospace"),
     );
+}
+
+test "keybind overrides and reloading start from defaults" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var config = parse(arena,
+        \\keybind = alt+j=scroll_page_lines:1
+        \\keybind = shift+up=unbind
+    );
+    try config.applyOverride(arena, "keybind=alt+j=scroll_page_lines:5");
+    try config.applyOverride(arena, "keybind=ctrl+==scroll_page_lines:-2");
+    try std.testing.expectEqual(@as(usize, 3), config.keybinds.items.len);
+    try std.testing.expectEqual(@as(i16, 5), keybind.getEvent(config.keybinds.items, .{ .unshifted_codepoint = 'j', .mods = .{ .alt = true } }).?.scroll_page_lines);
+    try std.testing.expectEqual(@as(i16, -2), keybind.getEvent(config.keybinds.items, .{ .unshifted_codepoint = '=', .mods = .{ .ctrl = true } }).?.scroll_page_lines);
+
+    config = parse(arena, "");
+    try std.testing.expectEqual(null, keybind.getEvent(config.keybinds.items, .{ .unshifted_codepoint = 'j', .mods = .{ .alt = true } }));
+    try std.testing.expectEqual(@as(i16, -1), keybind.getEvent(config.keybinds.items, .{ .key = .arrow_up, .mods = .{ .shift = true } }).?.scroll_page_lines);
 }
 
 test "direct command parsing" {
