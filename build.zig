@@ -51,6 +51,13 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_data_device_manager", 4);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);
     scanner.generate("zwp_text_input_manager_v3", 1);
+    scanner.addCustomProtocol(b.path("protocol/term-compositor-v1.xml"));
+    scanner.generate("zterm_compositor_v1", 1);
+    scanner.generate("zterm_buffer_factory_v1", 1);
+    scanner.generate("zterm_theme_manager_v1", 1);
+    scanner.generate("zterm_property_manager_v1", 1);
+    scanner.generate("zterm_keyboard_v1", 1);
+    scanner.generate("zterm_pty_bridge_v1", 1);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
     const root_module = b.createModule(.{
@@ -70,6 +77,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("wayland-cursor", .{});
+    root_module.linkSystemLibrary("wayland-server", .{});
 
     const ghostty_dep = b.lazyDependency("ghostty", .{
         .target = target,
@@ -176,6 +184,25 @@ pub fn build(b: *std.Build) void {
             .exclude_extensions = &.{".md"},
         });
     }
+
+    const tc_demo_exe = b.addExecutable(.{
+        .name = "monstar-tc-demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tc/demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    tc_demo_exe.root_module.addImport("wayland", wayland_mod);
+    tc_demo_exe.root_module.linkSystemLibrary("wayland-client", .{});
+    tc_demo_exe.root_module.linkSystemLibrary("wayland-server", .{});
+    b.installArtifact(tc_demo_exe);
+
+    const tc_demo_step = b.step("tc-demo", "Run the TC-Wayland compositor prototype demo");
+    const run_tc_demo = b.addRunArtifact(tc_demo_exe);
+    tc_demo_step.dependOn(&run_tc_demo.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

@@ -484,14 +484,13 @@
       </description>
     </request>
 
-    <request name="create_pty_surface">
-      <description summary="create grid surface connected to a PTY">
-        Attaches a slave PTY file descriptor to a new grid surface. The bridge
+    <request name="attach_pty">
+      <description summary="attach a slave PTY to a grid surface">
+        Attaches a slave PTY file descriptor to an existing grid surface. The bridge
         parses the PTY stream in complete isolation, clamping all escapes to
         the surface bounds.
       </description>
-      <arg name="id" type="new_id" interface="zterm_grid_surface_v1" summary="new grid surface"/>
-      <arg name="surface" type="object" interface="wl_surface" summary="underlying wayland surface"/>
+      <arg name="grid_surface" type="object" interface="zterm_grid_surface_v1" summary="target grid surface"/>
       <arg name="pty_slave_fd" type="fd" summary="slave PTY descriptor to sandbox"/>
     </request>
   </interface>
