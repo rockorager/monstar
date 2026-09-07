@@ -111,6 +111,8 @@ pub fn init(allocator: std.mem.Allocator) !*TcGuiApp {
     // 1. Initialize TC-Wayland Compositor
     var comp = try Compositor.init(allocator, null, cols, rows);
     errdefer comp.deinit();
+    comp.cell_width_px = font.cell_width;
+    comp.cell_height_px = font.cell_height;
 
     // 2. Connect client helper (anonymous socketpair)
     var cl = try comp.createDirectClient();
@@ -128,8 +130,11 @@ pub fn init(allocator: std.mem.Allocator) !*TcGuiApp {
     var palette_inst = try CommandPalette.init(allocator, cl, palette_cols, palette_rows);
     errdefer palette_inst.deinit();
 
-    const pal_x = @as(i32, @intCast(if (cols > palette_cols) (cols - palette_cols) / 2 else 0));
-    palette_inst.setPosition(pal_x, 2);
+    const pal_w_px = @as(i32, @intCast(palette_cols * font.cell_width));
+    const win_w_px = @as(i32, @intCast(initial_w));
+    const pal_x = if (win_w_px > pal_w_px) @divFloor(win_w_px - pal_w_px, 2) else 0;
+    const pal_y = @as(i32, @intCast(2 * font.cell_height));
+    palette_inst.setPosition(pal_x, pal_y);
     palette_inst.hide();
 
     const self = try allocator.create(TcGuiApp);
@@ -183,8 +188,11 @@ pub fn togglePalette(self: *TcGuiApp) void {
     if (self.palette.active) {
         self.palette.hide();
     } else {
-        const pal_x = @as(i32, @intCast(if (self.cols > self.palette.cols) (self.cols - self.palette.cols) / 2 else 0));
-        self.palette.setPosition(pal_x, 2);
+        const pal_w_px = @as(i32, @intCast(self.palette.cols * self.font.cell_width));
+        const win_w_px = @as(i32, @intCast(self.window.width));
+        const pal_x = if (win_w_px > pal_w_px) @divFloor(win_w_px - pal_w_px, 2) else 0;
+        const pal_y = @as(i32, @intCast(2 * self.font.cell_height));
+        self.palette.setPosition(pal_x, pal_y);
         self.palette.show();
     }
     self.needs_render = true;
@@ -249,7 +257,7 @@ pub fn getActiveXpty(self: *TcGuiApp) *Xpty {
 }
 
 pub fn render(self: *TcGuiApp) void {
-    if (self.window.width == 0 or self.window.suspended or self.window.rendering_pending) return;
+    if (self.window.width == 0 or self.window.suspended or self.window.rendering_pending or self.window.frame_pending) return;
 
     self.compositor.composite();
 
@@ -286,6 +294,26 @@ pub fn render(self: *TcGuiApp) void {
             null,
         self.compositor.theme_cursor_rgba,
     );
+
+    // Render floating layer surfaces at exact pixel positions
+    self.compositor.lock();
+    for (self.compositor.surfaces.items) |surf| {
+        if (surf.visible and surf.pixel_x != null) {
+            TcOverlayRenderer.renderSurfaceAtPixel(
+                self.allocator,
+                &self.font,
+                surf,
+                target.pixels,
+                stride,
+                target.width,
+                target.height,
+                &self.compositor.theme_palette,
+                self.compositor.theme_fg_rgba,
+                self.compositor.theme_bg_rgba,
+            );
+        }
+    }
+    self.compositor.unlock();
 
     self.window.commitRender(target.buffer, .full) catch {
         self.window.cancelRender(target.buffer);
@@ -581,17 +609,18 @@ fn onPointer(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
-            const col = @as(i32, @intFromFloat(self.pointer_x / @as(f64, @floatFromInt(self.font.cell_width))));
-            const row = @as(i32, @intFromFloat(self.pointer_y / @as(f64, @floatFromInt(self.font.cell_height))));
-            if (self.compositor.pointerMotion(col, row)) {
+            const px = @as(i32, @intFromFloat(self.pointer_x));
+            const py = @as(i32, @intFromFloat(self.pointer_y));
+            if (self.compositor.pointerMotion(px, py)) {
                 self.needs_render = true;
             }
         },
         .button => |btn| {
             self.last_serial = btn.serial;
             const pressed = btn.state == .pressed;
+            const px = @as(i32, @intFromFloat(self.pointer_x));
+            const py = @as(i32, @intFromFloat(self.pointer_y));
             const col = @as(i32, @intFromFloat(self.pointer_x / @as(f64, @floatFromInt(self.font.cell_width))));
-            const row = @as(i32, @intFromFloat(self.pointer_y / @as(f64, @floatFromInt(self.font.cell_height))));
             if (pressed and self.split_xpty != null and self.split_direction != null) {
                 const left_cols = @as(i32, @intCast(self.cols / 2));
                 const clicked_left = (col < left_cols);
@@ -603,7 +632,7 @@ fn onPointer(ctx: *anyopaque, event: wl.Pointer.Event) void {
                 }
                 self.needs_render = true;
             }
-            if (self.compositor.pointerButton(col, row, pressed)) {
+            if (self.compositor.pointerButton(px, py, pressed)) {
                 self.needs_render = true;
             }
         },

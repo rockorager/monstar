@@ -8,6 +8,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zterm = wayland.client.zterm;
+const zwlr = wayland.client.zwlr;
 
 const abi = @import("abi.zig");
 const CompactCell = abi.CompactCell;
@@ -47,6 +48,7 @@ zterm_compositor: ?*zterm.CompositorV1 = null,
 buffer_factory: ?*zterm.BufferFactoryV1 = null,
 keyboard: ?*zterm.KeyboardV1 = null,
 theme_manager: ?*zterm.ThemeManagerV1 = null,
+layer_shell: ?*zwlr.LayerShellV1 = null,
 
 // Client surfaces
 surface: ?*wl.Surface = null,
@@ -140,6 +142,7 @@ pub fn deinit(self: *Client) void {
 
     if (self.grid_surface) |gs| gs.destroy();
     if (self.surface) |s| s.destroy();
+    if (self.layer_shell) |ls| ls.destroy();
     if (self.theme_manager) |tm| tm.destroy();
     if (self.keyboard) |kb| kb.release();
     if (self.buffer_factory) |bf| bf.destroy();
@@ -258,6 +261,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Cli
                 self.keyboard = registry.bind(g.name, zterm.KeyboardV1, 1) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zterm.ThemeManagerV1.interface.name) == .eq) {
                 self.theme_manager = registry.bind(g.name, zterm.ThemeManagerV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, g.interface, zwlr.LayerShellV1.interface.name) == .eq) {
+                self.layer_shell = registry.bind(g.name, zwlr.LayerShellV1, 4) catch return;
             }
         },
         .global_remove => {},

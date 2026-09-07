@@ -8,6 +8,7 @@ const c = @import("c");
 const Font = @import("../Font.zig");
 const pixel_raster = @import("../pixel_raster.zig");
 const Compositor = @import("Compositor.zig");
+const Surface = @import("Surface.zig");
 
 pub fn rgbaToArgb(rgba: u32) u32 {
     const a = rgba & 0xFF;
@@ -142,5 +143,128 @@ pub fn renderCanvas(
                 } else |_| {}
             }
         }
+    }
+}
+
+pub fn renderSurfaceAtPixel(
+    allocator: std.mem.Allocator,
+    font: *Font,
+    surf: *const Surface,
+    pixels: []u32,
+    stride: u31,
+    buf_width: u31,
+    buf_height: u31,
+    theme_palette: []const u32,
+    default_fg: u32,
+    default_bg: u32,
+) void {
+    const origin_x = surf.pixel_x orelse return;
+    const origin_y = surf.pixel_y orelse return;
+    const buf = surf.current_buffer orelse return;
+
+    const surf_w_px = @as(i32, @intCast(buf.cols * font.cell_width));
+    const surf_h_px = @as(i32, @intCast(buf.rows * font.cell_height));
+    _ = surf_w_px;
+    _ = surf_h_px;
+
+    switch (buf.format) {
+        .compact_v1 => {
+            const cells = buf.asCompactSlice();
+            var r: u32 = 0;
+            while (r < buf.rows) : (r += 1) {
+                const y_px = origin_y + @as(i32, @intCast(r * font.cell_height));
+                if (y_px + @as(i32, @intCast(font.cell_height)) <= 0 or y_px >= buf_height) continue;
+                const baseline_y = y_px + font.baseline;
+
+                var c_idx: u32 = 0;
+                while (c_idx < buf.cols) : (c_idx += 1) {
+                    const x_px = origin_x + @as(i32, @intCast(c_idx * font.cell_width));
+                    if (x_px + @as(i32, @intCast(font.cell_width)) <= 0 or x_px >= buf_width) continue;
+
+                    const cell = cells[r * buf.cols + c_idx];
+                    const fg = if (cell.flags.fg_is_palette and cell.fg_color < 16)
+                        theme_palette[cell.fg_color]
+                    else
+                        default_fg;
+
+                    const bg = if (cell.flags.bg_is_palette and cell.bg_color > 0 and cell.bg_color < 16)
+                        theme_palette[cell.bg_color]
+                    else
+                        default_bg;
+
+                    pixel_raster.fillRect(
+                        pixels,
+                        stride,
+                        buf_width,
+                        buf_height,
+                        @intCast(@max(0, x_px)),
+                        @intCast(@max(0, y_px)),
+                        font.cell_width,
+                        font.cell_height,
+                        rgbaToArgb(bg),
+                    );
+
+                    if (cell.codepoint != ' ' and cell.codepoint != 0) {
+                        const style = Font.FaceStyle.init(cell.flags.bold, cell.flags.italic);
+                        const cp: u21 = @truncate(cell.codepoint);
+                        const face_idx = font.faceForCluster(allocator, &.{cp}, style);
+
+                        if (face_idx == Font.sprite_face_index) {
+                            if (font.spriteGlyph(allocator, cp, 1)) |g| {
+                                pixel_raster.blitGlyph(
+                                    pixels,
+                                    stride,
+                                    buf_width,
+                                    buf_height,
+                                    g,
+                                    x_px + g.bearing_x,
+                                    baseline_y - g.bearing_y,
+                                    rgbaToArgb(fg),
+                                    false,
+                                    null,
+                                );
+                            } else |_| {}
+                        } else {
+                            const face = font.face(face_idx);
+                            const g_idx = c.FT_Get_Char_Index(face.ft_face, cp);
+                            if (g_idx != 0) {
+                                if (face.glyph(allocator, g_idx, 0, false)) |g| {
+                                    pixel_raster.blitGlyph(
+                                        pixels,
+                                        stride,
+                                        buf_width,
+                                        buf_height,
+                                        g,
+                                        x_px + g.bearing_x,
+                                        baseline_y - g.bearing_y,
+                                        rgbaToArgb(fg),
+                                        false,
+                                        null,
+                                    );
+                                } else |_| {}
+                            }
+                        }
+                    }
+
+                    if (cell.flags.underline) {
+                        if (font.decorationGlyph(allocator, .underline)) |deco| {
+                            pixel_raster.blitGlyph(
+                                pixels,
+                                stride,
+                                buf_width,
+                                buf_height,
+                                deco,
+                                x_px + deco.bearing_x,
+                                baseline_y - deco.bearing_y,
+                                rgbaToArgb(fg),
+                                false,
+                                null,
+                            );
+                        } else |_| {}
+                    }
+                }
+            }
+        },
+        .rich_v1 => {},
     }
 }

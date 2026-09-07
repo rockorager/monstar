@@ -248,10 +248,11 @@ Designed for modern graphical TUIs, 24-bit TrueColor RGBA blending, dedicated un
 
 ### 5.1 Leveraging `zwlr_layer_shell_v1`
 For modals, dialogs, status bars, and floating palettes, applications assign the layer surface role to their `wl_surface` using `zwlr_layer_shell_v1.get_layer_surface()`:
-- **`ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY`**: Window-wide modal dialogs, search finders, toasts.
+- **`ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY`**: Window-wide modal dialogs, search finders, command palettes, toasts.
 - **`ZWLR_LAYER_SHELL_V1_LAYER_TOP`**: Terminal tab bars and headers.
 - **`ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM`**: Persistent status lines, mode indicators.
 - **`set_keyboard_interactivity(EXCLUSIVE)`**: Grabs keyboard input for modal dialogs.
+- **Pixel-Smooth Positioning & Margins**: Layer surfaces use `set_margin(top, right, bottom, left)` and `set_anchor(...)` for exact pixel offsets `(pixel_x, pixel_y)` within the terminal window. Unlike cell-grid-constrained panes, floating layer surfaces support fluid 1-pixel dragging, sub-cell centering, and composited drop shadows while continuing to attach lightweight character-cell buffers.
 
 ### 5.2 Cursor-Anchored Overlays (`zterm_cursor_anchor_v1`)
 When an autocomplete dropdown, hover documentation card, or inline diagnostic card is spawned, it must follow the prompt's active text cursor.

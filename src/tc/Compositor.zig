@@ -53,11 +53,13 @@ global_buffer_factory: *server.wl.Global,
 global_keyboard: *server.wl.Global,
 global_theme_manager: *server.wl.Global,
 global_xpty: *server.wl.Global,
+global_layer_shell: *server.wl.Global,
 
 // Object mappings
 surfaces: std.ArrayList(*Surface) = .empty,
 surface_map: std.AutoHashMapUnmanaged(*server.wl.Surface, *Surface) = .empty,
 grid_map: std.AutoHashMapUnmanaged(*server.zterm.GridSurfaceV1, *Surface) = .empty,
+layer_map: std.AutoHashMapUnmanaged(*server.zwlr.LayerSurfaceV1, *Surface) = .empty,
 buffer_map: std.AutoHashMapUnmanaged(*server.wl.Buffer, Buffer) = .empty,
 keyboard_clients: std.ArrayList(*server.zterm.KeyboardV1) = .empty,
 
@@ -140,6 +142,7 @@ pub fn init(
         .global_keyboard = undefined,
         .global_theme_manager = undefined,
         .global_xpty = undefined,
+        .global_layer_shell = undefined,
     };
 
     self.global_compositor = try server.wl.Global.create(
@@ -190,6 +193,14 @@ pub fn init(
         self,
         bindXpty,
     );
+    self.global_layer_shell = try server.wl.Global.create(
+        display,
+        server.zwlr.LayerShellV1,
+        4,
+        *Compositor,
+        self,
+        bindLayerShell,
+    );
 
     return self;
 }
@@ -209,6 +220,7 @@ pub fn deinit(self: *Compositor) void {
     self.buffer_map.deinit(self.allocator);
     self.surface_map.deinit(self.allocator);
     self.grid_map.deinit(self.allocator);
+    self.layer_map.deinit(self.allocator);
     self.keyboard_clients.deinit(self.allocator);
 
     self.global_compositor.destroy();
@@ -217,6 +229,7 @@ pub fn deinit(self: *Compositor) void {
     self.global_keyboard.destroy();
     self.global_theme_manager.destroy();
     self.global_xpty.destroy();
+    self.global_layer_shell.destroy();
 
     self.allocator.free(self.canvas);
     if (self.socket_path) |p| {
@@ -427,6 +440,78 @@ fn handleGridSurfaceDestroy(res: *server.zterm.GridSurfaceV1, self: *Compositor)
     _ = self.grid_map.remove(res);
 }
 
+fn bindLayerShell(client: *server.wl.Client, data: *Compositor, version: u32, id: u32) void {
+    const res = server.zwlr.LayerShellV1.create(client, version, id) catch return;
+    res.setHandler(*Compositor, handleLayerShellRequest, null, data);
+}
+
+fn handleLayerShellRequest(res: *server.zwlr.LayerShellV1, req: server.zwlr.LayerShellV1.Request, self: *Compositor) void {
+    const client = res.getClient();
+    switch (req) {
+        .destroy => {},
+        .get_layer_surface => |args| {
+            self.lock();
+            defer self.unlock();
+            const surf = self.surface_map.get(args.surface) orelse return;
+            surf.role = .layer;
+            surf.layer = args.layer;
+            surf.z_index = switch (args.layer) {
+                .background => -10,
+                .bottom => -1,
+                .top => 10,
+                .overlay => 100,
+                _ => 100,
+            };
+            const layer_res = server.zwlr.LayerSurfaceV1.create(client, res.getVersion(), args.id) catch return;
+            surf.layer_resource = layer_res;
+            self.layer_map.put(self.allocator, layer_res, surf) catch return;
+            layer_res.setHandler(*Compositor, handleLayerSurfaceRequest, handleLayerSurfaceDestroy, self);
+
+            layer_res.sendConfigure(1, 0, 0);
+        },
+    }
+}
+
+fn handleLayerSurfaceRequest(res: *server.zwlr.LayerSurfaceV1, req: server.zwlr.LayerSurfaceV1.Request, self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
+    const surf = self.layer_map.get(res) orelse return;
+    switch (req) {
+        .destroy => {},
+        .set_size => {},
+        .set_anchor => {},
+        .set_exclusive_zone => {},
+        .set_margin => |args| {
+            surf.pixel_x = args.left;
+            surf.pixel_y = args.top;
+            surf.x = @divFloor(args.left, @as(i32, @intCast(self.cell_width_px)));
+            surf.y = @divFloor(args.top, @as(i32, @intCast(self.cell_height_px)));
+            self.dirty = true;
+        },
+        .set_keyboard_interactivity => |args| {
+            surf.exclusive_keyboard = (args.keyboard_interactivity == .exclusive);
+        },
+        .get_popup => {},
+        .ack_configure => {},
+        .set_layer => |args| {
+            surf.layer = args.layer;
+            surf.z_index = switch (args.layer) {
+                .background => -10,
+                .bottom => -1,
+                .top => 10,
+                .overlay => 100,
+                _ => 100,
+            };
+        },
+    }
+}
+
+fn handleLayerSurfaceDestroy(res: *server.zwlr.LayerSurfaceV1, self: *Compositor) void {
+    self.lock();
+    defer self.unlock();
+    _ = self.layer_map.remove(res);
+}
+
 fn bindBufferFactory(client: *server.wl.Client, data: *Compositor, version: u32, id: u32) void {
     const res = server.zterm.BufferFactoryV1.create(client, version, id) catch return;
     res.setHandler(*Compositor, handleBufferFactoryRequest, null, data);
@@ -568,9 +653,9 @@ pub fn sendKey(
     self.display.flushClients();
 }
 
-/// Handles pointer click/release events.
+/// Handles pointer click/release events in pixels.
 /// If clicking the header or border of a floating surface, begins interactive click+drag.
-pub fn pointerButton(self: *Compositor, x: i32, y: i32, pressed: bool) bool {
+pub fn pointerButton(self: *Compositor, px: i32, py: i32, pressed: bool) bool {
     self.lock();
     defer self.unlock();
     if (!pressed) {
@@ -593,18 +678,22 @@ pub fn pointerButton(self: *Compositor, x: i32, y: i32, pressed: bool) bool {
         if (!surf.visible) continue;
         const buf = surf.current_buffer orelse continue;
 
-        const left = surf.x;
-        const right = surf.x + @as(i32, @intCast(buf.cols));
-        const top = surf.y;
-        const bottom = surf.y + @as(i32, @intCast(buf.rows));
+        const left_px = surf.pixel_x orelse (surf.x * @as(i32, @intCast(self.cell_width_px)));
+        const top_px = surf.pixel_y orelse (surf.y * @as(i32, @intCast(self.cell_height_px)));
+        const w_px = @as(i32, @intCast(buf.cols * self.cell_width_px));
+        const h_px = @as(i32, @intCast(buf.rows * self.cell_height_px));
+        const right_px = left_px + w_px;
+        const bottom_px = top_px + h_px;
 
         // Check if click lands on surface title bar (top rows) or border
-        if (x >= left and x < right and y >= top and y < bottom) {
-            if (y <= top + 2 or x == left or x == right - 1) {
+        if (px >= left_px and px < right_px and py >= top_px and py < bottom_px) {
+            const header_h = @as(i32, @intCast(2 * self.cell_height_px));
+            const border_w = @as(i32, @intCast(self.cell_width_px));
+            if (py <= top_px + header_h or px <= left_px + border_w or px >= right_px - border_w) {
                 self.drag_state = .{
                     .surface = surf,
-                    .grab_offset_x = x - surf.x,
-                    .grab_offset_y = y - surf.y,
+                    .grab_offset_x = px - left_px,
+                    .grab_offset_y = py - top_px,
                     .dragging = true,
                 };
                 return true;
@@ -615,28 +704,43 @@ pub fn pointerButton(self: *Compositor, x: i32, y: i32, pressed: bool) bool {
     return false;
 }
 
-/// Handles pointer motion. If currently dragging a surface, repositions it live.
-pub fn pointerMotion(self: *Compositor, x: i32, y: i32) bool {
+/// Handles pointer motion in pixels. If currently dragging a surface, repositions it live.
+pub fn pointerMotion(self: *Compositor, px: i32, py: i32) bool {
     self.lock();
     defer self.unlock();
     if (!self.drag_state.dragging) return false;
     const surf = self.drag_state.surface orelse return false;
 
-    var new_x = x - self.drag_state.grab_offset_x;
-    var new_y = y - self.drag_state.grab_offset_y;
+    var new_px = px - self.drag_state.grab_offset_x;
+    var new_py = py - self.drag_state.grab_offset_y;
 
-    const surf_w = if (surf.current_buffer) |b| @as(i32, @intCast(b.cols)) else 10;
-    const surf_h = if (surf.current_buffer) |b| @as(i32, @intCast(b.rows)) else 5;
-    const max_x = @max(0, @as(i32, @intCast(self.cols)) - surf_w);
-    const max_y = @max(0, @as(i32, @intCast(self.rows)) - surf_h);
-    new_x = std.math.clamp(new_x, 0, max_x);
-    new_y = std.math.clamp(new_y, 0, max_y);
+    const surf_w = if (surf.current_buffer) |b| @as(i32, @intCast(b.cols * self.cell_width_px)) else 100;
+    const surf_h = if (surf.current_buffer) |b| @as(i32, @intCast(b.rows * self.cell_height_px)) else 50;
+    const screen_w = @as(i32, @intCast(self.cols * self.cell_width_px));
+    const screen_h = @as(i32, @intCast(self.rows * self.cell_height_px));
+    const max_x = @max(0, screen_w - surf_w);
+    const max_y = @max(0, screen_h - surf_h);
+    new_px = std.math.clamp(new_px, 0, max_x);
+    new_py = std.math.clamp(new_py, 0, max_y);
 
-    if (surf.x != new_x or surf.y != new_y) {
-        surf.x = new_x;
-        surf.y = new_y;
-        self.dirty = true;
-        return true;
+    if (surf.role == .layer or surf.pixel_x != null) {
+        if (surf.pixel_x != new_px or surf.pixel_y != new_py) {
+            surf.pixel_x = new_px;
+            surf.pixel_y = new_py;
+            surf.x = @divFloor(new_px, @as(i32, @intCast(self.cell_width_px)));
+            surf.y = @divFloor(new_py, @as(i32, @intCast(self.cell_height_px)));
+            self.dirty = true;
+            return true;
+        }
+    } else {
+        const new_col = @divFloor(new_px, @as(i32, @intCast(self.cell_width_px)));
+        const new_row = @divFloor(new_py, @as(i32, @intCast(self.cell_height_px)));
+        if (surf.x != new_col or surf.y != new_row) {
+            surf.x = new_col;
+            surf.y = new_row;
+            self.dirty = true;
+            return true;
+        }
     }
     return false;
 }
@@ -663,6 +767,7 @@ pub fn composite(self: *Compositor) void {
     while (pass < 2) : (pass += 1) {
         for (self.surfaces.items) |surf| {
             if (!surf.visible) continue;
+            if (surf.pixel_x != null) continue;
             if (pass == 0 and surf.z_index > 0) continue;
             if (pass == 1 and surf.z_index <= 0) continue;
             const buf = surf.current_buffer orelse continue;

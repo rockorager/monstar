@@ -13,6 +13,7 @@ pub const Role = enum {
     none,
     grid,
     stream,
+    layer,
 };
 
 pub const CursorShape = enum(u32) {
@@ -49,6 +50,8 @@ role: Role = .none,
 // Surface positioning
 x: i32 = 0,
 y: i32 = 0,
+pixel_x: ?i32 = null,
+pixel_y: ?i32 = null,
 z_index: i32 = 0,
 visible: bool = true,
 anchor: ?CursorAnchor = null,
@@ -59,10 +62,13 @@ pending_buffer: ?Buffer = null,
 has_pending_buffer: bool = false,
 buffer_damaged: bool = false,
 
-// Grid specific state
+// Grid & Layer specific state
 title: ?[]const u8 = null,
 cursor: CursorState = .{},
 grid_resource: ?*server.zterm.GridSurfaceV1 = null,
+layer_resource: ?*server.zwlr.LayerSurfaceV1 = null,
+layer: ?server.zwlr.LayerShellV1.Layer = null,
+exclusive_keyboard: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, resource: *server.wl.Surface) !*Surface {
     const self = try allocator.create(Surface);

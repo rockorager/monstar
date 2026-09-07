@@ -9,6 +9,7 @@ const wayland = @import("wayland");
 const wl_client = wayland.client;
 const wl = wl_client.wl;
 const zterm = wl_client.zterm;
+const zwlr = wl_client.zwlr;
 const abi = @import("abi.zig");
 const CompactCell = abi.CompactCell;
 const CompactFlags = abi.CompactFlags;
@@ -46,7 +47,10 @@ const menu_items = [_]MenuItem{
 allocator: std.mem.Allocator,
 client: *Client,
 surface: *wl.Surface,
+layer_surface: ?*zwlr.LayerSurfaceV1 = null,
 grid_surface: *zterm.GridSurfaceV1,
+pixel_x: i32 = 0,
+pixel_y: i32 = 0,
 
 cols: u32,
 rows: u32,
@@ -76,6 +80,15 @@ pub fn init(
     const surf = try comp.createSurface();
     errdefer surf.destroy();
 
+    var layer_surf: ?*zwlr.LayerSurfaceV1 = null;
+    if (c.layer_shell) |ls| {
+        layer_surf = ls.getLayerSurface(surf, null, .overlay, "command-palette") catch null;
+        if (layer_surf) |lsurf| {
+            lsurf.setAnchor(.{ .top = true, .left = true });
+            lsurf.setKeyboardInteractivity(.exclusive);
+        }
+    }
+
     const grid = try zcomp.getGridSurface(surf);
     grid.setTitle(" Command Palette ");
 
@@ -92,6 +105,7 @@ pub fn init(
         .allocator = allocator,
         .client = c,
         .surface = surf,
+        .layer_surface = layer_surf,
         .grid_surface = grid,
         .cols = cols,
         .rows = rows,
@@ -130,6 +144,7 @@ pub fn deinit(self: *CommandPalette) void {
     self.clearGrepList();
     self.grep_list.deinit(self.allocator);
     self.allocator.free(self.cells);
+    if (self.layer_surface) |ls| ls.destroy();
     self.grid_surface.destroy();
     self.surface.destroy();
     self.allocator.destroy(self);
@@ -154,8 +169,18 @@ pub fn hide(self: *CommandPalette) void {
     _ = self.client.display.flush();
 }
 
-pub fn setPosition(self: *CommandPalette, x: i32, y: i32) void {
-    self.grid_surface.setPosition(x, y);
+pub fn setPosition(self: *CommandPalette, px: i32, py: i32) void {
+    self.pixel_x = px;
+    self.pixel_y = py;
+    if (self.layer_surface) |ls| {
+        ls.setMargin(py, 0, 0, px);
+        self.surface.commit();
+        _ = self.client.display.flush();
+    } else {
+        const col = @divFloor(px, 9);
+        const row = @divFloor(py, 18);
+        self.grid_surface.setPosition(col, row);
+    }
 }
 
 pub fn populateWorkspaceFiles(self: *CommandPalette) !void {

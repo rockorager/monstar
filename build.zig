@@ -58,6 +58,8 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zterm_property_manager_v1", 1);
     scanner.generate("zterm_keyboard_v1", 1);
     scanner.generate("zterm_xpty_v1", 1);
+    scanner.addCustomProtocol(b.path("protocol/wlr-layer-shell-unstable-v1.xml"));
+    scanner.generate("zwlr_layer_shell_v1", 4);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
     const root_module = b.createModule(.{
