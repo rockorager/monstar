@@ -10,18 +10,46 @@ const CompactCell = abi.CompactCell;
 const RichCell = abi.RichCell;
 
 pub const Format = enum(u32) {
-    compact_v1 = 1,
-    rich_v1 = 2,
+    argb8888 = 0,
+    xrgb8888 = 1,
+    compact_v1 = 0x54433143, // 'TC1C'
+    rich_v1 = 0x54433152, // 'TC1R'
+
+    pub fn toShmFormat(self: Format) u32 {
+        return @intFromEnum(self);
+    }
+
+    pub fn fromShmFormat(val: u32) ?Format {
+        return switch (val) {
+            0 => .argb8888,
+            1 => .xrgb8888,
+            0x54433143 => .compact_v1,
+            0x54433152 => .rich_v1,
+            3 => .argb8888,
+            4 => .xrgb8888,
+            else => null,
+        };
+    }
+
+    pub fn isPixel(self: Format) bool {
+        return self == .argb8888 or self == .xrgb8888;
+    }
 };
 
 cols: u32,
 rows: u32,
+stride: u32 = 0,
 format: Format,
 data: []u8,
 allocator: ?std.mem.Allocator = null,
-mmap_len: ?usize = null,
-fd: ?std.posix.fd_t = null,
-is_borrowed: bool = false,
+
+pub fn expectedByteSize(format: Format, cols: u32, rows: u32, stride: u32) usize {
+    return switch (format) {
+        .compact_v1 => if (stride > 0) @as(usize, stride) * rows else @as(usize, cols) * rows * @sizeOf(CompactCell),
+        .rich_v1 => if (stride > 0) @as(usize, stride) * rows else @as(usize, cols) * rows * @sizeOf(RichCell),
+        .argb8888, .xrgb8888 => if (stride > 0) @as(usize, stride) * rows else @as(usize, cols) * rows * 4,
+    };
+}
 
 pub fn init(
     allocator: std.mem.Allocator,
@@ -30,10 +58,19 @@ pub fn init(
     format: Format,
     raw_bytes: []const u8,
 ) !Buffer {
-    const expected_size = switch (format) {
-        .compact_v1 => @as(usize, cols) * rows * @sizeOf(CompactCell),
-        .rich_v1 => @as(usize, cols) * rows * @sizeOf(RichCell),
-    };
+    const stride = if (format == .argb8888 or format == .xrgb8888) cols * 4 else 0;
+    return initWithStride(allocator, cols, rows, stride, format, raw_bytes);
+}
+
+pub fn initWithStride(
+    allocator: std.mem.Allocator,
+    cols: u32,
+    rows: u32,
+    stride: u32,
+    format: Format,
+    raw_bytes: []const u8,
+) !Buffer {
+    const expected_size = expectedByteSize(format, cols, rows, stride);
     if (raw_bytes.len < expected_size) {
         return error.BufferTruncated;
     }
@@ -42,67 +79,25 @@ pub fn init(
     return .{
         .cols = cols,
         .rows = rows,
+        .stride = stride,
         .format = format,
         .data = copy,
         .allocator = allocator,
     };
 }
 
-pub fn initMmap(
-    cols: u32,
-    rows: u32,
-    format: Format,
-    fd: std.posix.fd_t,
-) !Buffer {
-    const expected_size = switch (format) {
-        .compact_v1 => @as(usize, cols) * rows * @sizeOf(CompactCell),
-        .rich_v1 => @as(usize, cols) * rows * @sizeOf(RichCell),
-    };
-    const ptr = try std.posix.mmap(
-        null,
-        expected_size,
-        std.posix.PROT{ .READ = true },
-        .{ .TYPE = .SHARED },
-        fd,
-        0,
-    );
-    return .{
-        .cols = cols,
-        .rows = rows,
-        .format = format,
-        .data = ptr,
-        .mmap_len = expected_size,
-        .fd = fd,
-    };
-}
-
-pub fn clone(self: Buffer, allocator: std.mem.Allocator) !Buffer {
-    if (self.mmap_len != null) {
-        // For mmapped buffers, borrow the underlying shared memory slice directly
-        return .{
-            .cols = self.cols,
-            .rows = self.rows,
-            .format = self.format,
-            .data = self.data,
-            .is_borrowed = true,
-        };
-    }
-    return try init(allocator, self.cols, self.rows, self.format, self.data);
-}
-
 pub fn deinit(self: *Buffer) void {
-    if (self.is_borrowed) {
-        // Borrowed view into shared memory; do not munmap or free
-    } else if (self.mmap_len) |len| {
-        const aligned_slice: []align(std.heap.page_size_min) const u8 = @alignCast(self.data[0..len]);
-        std.posix.munmap(aligned_slice);
-        if (self.fd) |f| _ = std.os.linux.close(f);
-    } else if (self.allocator) |alloc| {
+    if (self.allocator) |alloc| {
         alloc.free(self.data);
     }
     self.data = &.{};
     self.cols = 0;
     self.rows = 0;
+    self.stride = 0;
+}
+
+pub fn isPixel(self: Buffer) bool {
+    return self.format == .argb8888 or self.format == .xrgb8888;
 }
 
 pub fn asCompactSlice(self: Buffer) []const CompactCell {
@@ -116,6 +111,13 @@ pub fn asRichSlice(self: Buffer) []const RichCell {
     std.debug.assert(self.format == .rich_v1);
     const count = @as(usize, self.cols) * self.rows;
     const ptr: [*]const RichCell = @ptrCast(@alignCast(self.data.ptr));
+    return ptr[0..count];
+}
+
+pub fn asPixelSlice(self: Buffer) []const u32 {
+    std.debug.assert(self.isPixel());
+    const count = self.data.len / @sizeOf(u32);
+    const ptr: [*]const u32 = @ptrCast(@alignCast(self.data.ptr));
     return ptr[0..count];
 }
 

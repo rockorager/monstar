@@ -44,6 +44,7 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 │  │ CORE WAYLAND PROTOCOLS (Off-the-shelf)                           │  │
 │  │ • wl_display / wl_registry : Connection, Globals, Versioning     │  │
 │  │ • wl_compositor / wl_surface: Canvas primitives, atomic commits   │  │
+│  │ • wl_shm                    : Buffers (compact_v1, rich_v1, ARGB)│  │
 │  │ • wl_subcompositor         : Child surface attachment & z-order  │  │
 │  │ • zwlr_layer_shell_v1      : Background, Top, Overlay tiers      │  │
 │  │ • wl_data_device_manager   : MIME clipboard & selection          │  │
@@ -53,7 +54,6 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 │  ┌────────────────────────────────┴─────────────────────────────────┐  │
 │  │ TERMINAL COMPOSITOR EXTENSION (term-compositor-v1.xml)           │  │
 │  │ • zterm_compositor_v1      : Surface role & positioner factory   │  │
-│  │ • zterm_buffer_factory_v1  : Cell buffers (SSH-safe & SHM)       │  │
 │  │ • zterm_grid_surface_v1    : 2D cell grid (panes, popups, TUIs)  │  │
 │  │ • zterm_stream_surface_v1  : Structured append-only text logs    │  │
 │  │ • zterm_cursor_anchor_v1   : Pins overlays to text cursor        │  │
@@ -85,7 +85,7 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 | **Overlay Stacking** | `zwlr_layer_shell_v1` | Defines canonical `background`, `bottom`, `top`, and `overlay` tiers and input grabs. |
 | **Subsurface Anchoring** | `wl_subcompositor` | Anchors child surfaces (inline graphics, badges) to parent surfaces. |
 | **Clipboard Exchange** | `wl_data_device_manager` | Out-of-band clipboard read/write with MIME type negotiation. |
-| **Cell Memory Buffers** | `zterm_buffer_factory_v1` | **Missing in Wayland**: Allows attaching character cell arrays (`compact_v1`, `rich_v1`) to `wl_surface`. |
+| **Cell & Pixel Buffers** | `wl_shm` | Standard Wayland shared memory with registered cell formats (`compact_v1`, `rich_v1`) and pixel formats. |
 | **Grid Geometry Negotiation** | `zterm_grid_surface_v1` | **Missing in Wayland**: Negotiates character columns/rows and pixel font metrics. |
 | **Cursor-Relative Placement** | `zterm_cursor_anchor_v1` | **Missing in Wayland**: Positions overlays relative to prompt text cursor coordinates. |
 | **Structured Terminal Keys** | `zterm_keyboard_v1` | **Missing in Wayland**: Delivers resolved key names and UTF-8 strings without requiring `libxkbcommon` over SSH. |
@@ -95,87 +95,57 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 
 ---
 
-## 3. SSH Compatibility & The Dual-Path Buffer Strategy
+## 3. Unified Buffer Transport Architecture: Standard `wl_shm` + `waypipe`
 
-Wayland desktop compositors historically struggled over SSH because `wl_shm` and DRM pass file descriptors using Unix domain socket ancillary data (`SCM_RIGHTS`), which standard TCP or SSH socket forwarding drops.
-
-TC-Wayland completely resolves this by supporting **two distinct buffer creation mechanisms** in `zterm_buffer_factory_v1`:
+To eliminate fragmented buffer APIs, transport confusion, and subtle remote failure modes, TC-Wayland standardizes 100% on **standard Wayland shared memory (`wl_shm`)** for all content types:
+- 2D character cell matrices (`compact_v1`, `rich_v1`)
+- Pixel graphics, charts, and image overlays (`argb8888`, `xrgb8888`)
 
 ```
                            ┌────────────────────────────────────────┐
-                           │       zterm_buffer_factory_v1          │
+                           │            Standard wl_shm             │
+                           │       (wl_shm_pool.create_buffer)      │
                            └───────────────────┬────────────────────┘
                                                │
                       ┌────────────────────────┴────────────────────────┐
                       ▼                                                 ▼
-        create_cell_buffer (Stream Path)               create_shm_cell_buffer (SHM Path)
-        ────────────────────────────────               ─────────────────────────────────
-        • Uses Wayland <arg type="array"/>             • Uses standard wl_shm_pool
-        • Transmitted on the byte stream socket        • Zero-copy memory mapping
-        • Zero file descriptors (no SCM_RIGHTS)        • Passes memfd via SCM_RIGHTS
-        • 100% SSH Socket Forwarding Safe              • Maximum speed for local high-FPS
+               Local Execution                               Remote Over SSH (waypipe)
+         ─────────────────────────────                    ──────────────────────────────
+         • Direct zero-copy memfd mmap                    • waypipe proxy intercepts memfd
+         • OS-level zero allocation                       • Computes dirty damage bounding boxes
+         • High-FPS local compositing                     • LZ4/ZSTD compression over network
+         • Universal Wayland client API                   • Reconstructs local memfd on compositor
 ```
 
-### 3.1 Transparent SSH Socket Forwarding
-Because `create_cell_buffer` sends raw binary cell arrays inline over the stream socket, remote CLI tools running over SSH require only standard OpenSSH Unix socket forwarding:
+### 3.1 Transparent Remote Execution via `waypipe`
+Wayland compositors and clients pass shared memory file descriptors using Unix domain socket ancillary data (`SCM_RIGHTS`). While raw OpenSSH Unix socket forwarding (`ssh -R`) drops `SCM_RIGHTS`, the established standard in the Wayland ecosystem is **[waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe)**.
 
-```ssh_config
-# ~/.ssh/config snippet
-Host *
-    RemoteForward /tmp/tc-%u.sock %d/tc-wayland-0
-    StreamLocalBindUnlink yes
-```
+Running remote TC-Wayland tools over SSH with full shared-memory zero-copy performance and compression is as simple as:
 
-When connecting to the remote host:
 ```bash
-export TC_WAYLAND_DISPLAY=/tmp/tc-$USER.sock
-lazygit  # Launches as a native Wayland client directly over SSH!
+waypipe ssh user@remote-host my-terminal-app
 ```
 
-### 3.2 Path Selection: How Client & Compositor Decide
-
-The protocol cleanly decouples client transport selection from compositor dispatch:
-
-#### A. Compositor: Automatic Dispatch via Opcode
-The compositor does not need heuristic guessing. The client's request choice explicitly dictates the backing storage:
-- `create_cell_buffer`: Compositor allocates an internal `wl_buffer` referencing the inline stream array bytes.
-- `create_shm_cell_buffer`: Compositor allocates an internal `wl_buffer` referencing the mmap'd `wl_shm_pool`.
-
-When the client commits the surface (`wl_surface.commit()`), the compositor's renderer inspects the buffer's variant tag (`inline_array` vs `shm_pool`) and blits accordingly.
-
-#### B. Client: Transport Selection Heuristics
-Client libraries (e.g. `monstar-ui`, `ratatui`) decide which factory method to call at startup:
-
-```
-┌────────────────────────────────────────────────────────┐
-│ Client Startup                                         │
-│  ├─ 1. Explicit override? ($TC_BUFFER_MODE=stream|shm) │
-│  ├─ 2. Remote SSH detected? ($SSH_CONNECTION set)      │
-│  │     └─► Use create_cell_buffer (inline array)       │
-│  └─ 3. Local Unix socket + wl_shm available?           │
-│        └─► Use create_shm_cell_buffer (zero-copy SHM)  │
-└────────────────────────────────────────────────────────┘
+Or when running an interactive remote session:
+```bash
+waypipe --login-shell ssh user@remote-host
 ```
 
-```zig
-pub fn selectBufferMethod() enum { inline_array, shm_pool } {
-    // Overrides take precedence
-    if (std.posix.getenv("TC_BUFFER_MODE")) |m| {
-        if (std.mem.eql(u8, m, "stream")) return .inline_array;
-        if (std.mem.eql(u8, m, "shm")) return .shm_pool;
-    }
-    // Remote SSH sessions cannot pass file descriptors
-    if (std.posix.getenv("SSH_CONNECTION") != null or
-        std.posix.getenv("SSH_CLIENT") != null)
-    {
-        return .inline_array;
-    }
-    // Default to zero-copy SHM for local clients
-    return .shm_pool;
-}
-```
+Inside that session:
+1. Applications allocate buffers via standard `wl_shm_pool`.
+2. `waypipe` intercepts buffer attachments, computes damage diffs, compresses them with LZ4 or Zstandard, and streams them over SSH.
+3. Monstar's compositor receives standard `wl_shm` buffers locally with zero custom transport glue.
 
-*Note on Safe Defaults:* For small surfaces (such as autocomplete popups and dialogs under 50 KB), clients may always safely use `create_cell_buffer`, as inline socket transfers complete in a few microseconds even locally.
+### 3.2 Registered `wl_shm` Formats
+
+The compositor initializes `wl_shm` and advertises the following 32-bit format identifiers:
+
+| Format Name | Identifier (FourCC / Enum) | Memory Layout | Usage |
+| :--- | :--- | :--- | :--- |
+| **`argb8888`** | `0x00000000` (0) | 4 bytes/pixel, 32-bit ARGB8888 | Charts, images, visual overlays with alpha blending |
+| **`xrgb8888`** | `0x00000001` (1) | 4 bytes/pixel, 32-bit XRGB8888 | Opaque pixel buffers |
+| **`compact_v1`** | `0x54433143` ('TC1C') | 8 bytes/cell (u32 codepoint, u8 fg, u8 bg, u16 flags) | High-throughput terminal panes, logs, text TUIs |
+| **`rich_v1`** | `0x54433152` ('TC1R') | 32 bytes/cell (u32 codepoint, RGBA colors, flags, width) | TrueColor rich text, hyperlinks, graphemes |
 
 ---
 
@@ -241,6 +211,19 @@ Designed for modern graphical TUIs, 24-bit TrueColor RGBA blending, dedicated un
 | Width |                   Reserved (7 bytes)                  |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
+
+### 4.3 Pixel Graphics Buffers: `argb8888` and `xrgb8888` (4 Bytes per Pixel)
+While text-oriented surfaces use character cells, modern developer tools frequently display inline charts, image previews, canvas graphics, and smooth pixel-drawn UI components.
+
+TC-Wayland supports attaching pixel buffers directly to any `wl_surface`:
+- **`argb8888`**: 32-bit ARGB (8 bits per channel) supporting alpha transparency and smooth Porter-Duff blending over terminal backgrounds and text.
+- **`xrgb8888`**: 32-bit XRGB (8 bits per channel) opaque pixel buffer.
+
+Pixel buffers are created via standard Wayland `wl_shm`:
+- The compositor advertises `wl_shm` supporting `WL_SHM_FORMAT_ARGB8888`, `WL_SHM_FORMAT_XRGB8888`, and custom cell formats (`compact_v1`, `rich_v1`).
+- Applications allocate shared memory pools (`wl_shm_pool.create_buffer`) with zero custom protocol glue.
+
+Pixel-buffer surfaces blend onto destination pixels during the overlay rendering pass, supporting exact pixel positioning (`pixel_x`, `pixel_y`), cursor anchors (`zterm_cursor_anchor_v1`), or grid coordinates (`x * cell_width`, `y * cell_height`).
 
 ---
 
@@ -397,7 +380,7 @@ pub fn main() !void {
     fillDialogContent(cells, cols, rows);
 
     const cell_bytes = std.mem.sliceAsBytes(cells);
-    const buffer = try ctx.buffer_factory.createCellBuffer(
+    const buffer = try ctx.createCellBuffer(
         cols,
         rows,
         .compact_v1,
@@ -423,5 +406,5 @@ pub fn main() !void {
 By refactoring the Terminal Compositor proposal around standard Wayland architecture and the `term-compositor-v1.xml` extension:
 1. **Zero Reinvention**: `wl_surface`, `zwlr_layer_shell_v1`, `wl_subsurface`, and `wl_data_device` are reused as-is.
 2. **Standard Tooling**: Client and server code are generated with standard tools (`wayland-scanner`, `zig-wayland`).
-3. **100% SSH Compatibility**: Inline array cell buffers eliminate `SCM_RIGHTS` dependencies over remote connections.
+3. **100% SSH & Remote Compatibility**: Standard `wl_shm` integrates transparently with `waypipe` for zero-copy, LZ4/Zstandard-compressed SSH tunnels without custom buffer transport protocols.
 4. **Clean Backward Compatibility**: The PTY Bridge sandboxes legacy command-line applications without polluting the compositor.

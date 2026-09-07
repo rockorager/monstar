@@ -295,10 +295,10 @@ pub fn render(self: *TcGuiApp) void {
         self.compositor.theme_cursor_rgba,
     );
 
-    // Render floating layer surfaces at exact pixel positions
+    // Render floating layer surfaces or pixel buffer surfaces at exact pixel positions
     self.compositor.lock();
     for (self.compositor.surfaces.items) |surf| {
-        if (surf.visible and surf.pixel_x != null) {
+        if (surf.visible and (surf.pixel_x != null or (surf.current_buffer != null and surf.current_buffer.?.isPixel()))) {
             TcOverlayRenderer.renderSurfaceAtPixel(
                 self.allocator,
                 &self.font,

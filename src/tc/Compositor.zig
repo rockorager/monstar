@@ -49,7 +49,6 @@ canvas: []CanvasCell,
 // Globals
 global_compositor: *server.wl.Global,
 global_zterm_compositor: *server.wl.Global,
-global_buffer_factory: *server.wl.Global,
 global_keyboard: *server.wl.Global,
 global_theme_manager: *server.wl.Global,
 global_xpty: *server.wl.Global,
@@ -60,7 +59,6 @@ surfaces: std.ArrayList(*Surface) = .empty,
 surface_map: std.AutoHashMapUnmanaged(*server.wl.Surface, *Surface) = .empty,
 grid_map: std.AutoHashMapUnmanaged(*server.zterm.GridSurfaceV1, *Surface) = .empty,
 layer_map: std.AutoHashMapUnmanaged(*server.zwlr.LayerSurfaceV1, *Surface) = .empty,
-buffer_map: std.AutoHashMapUnmanaged(*server.wl.Buffer, Buffer) = .empty,
 keyboard_clients: std.ArrayList(*server.zterm.KeyboardV1) = .empty,
 
 // Active Theme State
@@ -138,12 +136,15 @@ pub fn init(
         .canvas = canvas,
         .global_compositor = undefined,
         .global_zterm_compositor = undefined,
-        .global_buffer_factory = undefined,
         .global_keyboard = undefined,
         .global_theme_manager = undefined,
         .global_xpty = undefined,
         .global_layer_shell = undefined,
     };
+
+    try display.initShm();
+    _ = try display.addShmFormat(Buffer.Format.compact_v1.toShmFormat());
+    _ = try display.addShmFormat(Buffer.Format.rich_v1.toShmFormat());
 
     self.global_compositor = try server.wl.Global.create(
         display,
@@ -160,14 +161,6 @@ pub fn init(
         *Compositor,
         self,
         bindZtermCompositor,
-    );
-    self.global_buffer_factory = try server.wl.Global.create(
-        display,
-        server.zterm.BufferFactoryV1,
-        1,
-        *Compositor,
-        self,
-        bindBufferFactory,
     );
     self.global_keyboard = try server.wl.Global.create(
         display,
@@ -213,11 +206,6 @@ pub fn deinit(self: *Compositor) void {
     }
     self.surfaces.deinit(self.allocator);
 
-    var buf_iter = self.buffer_map.valueIterator();
-    while (buf_iter.next()) |buf| {
-        buf.deinit();
-    }
-    self.buffer_map.deinit(self.allocator);
     self.surface_map.deinit(self.allocator);
     self.grid_map.deinit(self.allocator);
     self.layer_map.deinit(self.allocator);
@@ -225,7 +213,6 @@ pub fn deinit(self: *Compositor) void {
 
     self.global_compositor.destroy();
     self.global_zterm_compositor.destroy();
-    self.global_buffer_factory.destroy();
     self.global_keyboard.destroy();
     self.global_theme_manager.destroy();
     self.global_xpty.destroy();
@@ -344,9 +331,20 @@ fn handleSurfaceRequest(res: *server.wl.Surface, req: server.wl.Surface.Request,
         .destroy => {},
         .attach => |args| {
             if (args.buffer) |buf_res| {
-                if (self.buffer_map.get(buf_res)) |buf| {
-                    const copy = buf.clone(self.allocator) catch return;
-                    surf.attach(copy);
+                if (server.wl.shm.Buffer.get(@ptrCast(buf_res))) |shm_buf| {
+                    const width: u32 = @intCast(@max(0, shm_buf.getWidth()));
+                    const height: u32 = @intCast(@max(0, shm_buf.getHeight()));
+                    const stride: u32 = @intCast(@max(0, shm_buf.getStride()));
+                    const format = Buffer.Format.fromShmFormat(shm_buf.getFormat()) orelse .compact_v1;
+                    shm_buf.beginAccess();
+                    defer shm_buf.endAccess();
+                    if (shm_buf.getData()) |raw_ptr| {
+                        const total_bytes = Buffer.expectedByteSize(format, width, height, stride);
+                        const slice: []const u8 = @as([*]const u8, @ptrCast(raw_ptr))[0..total_bytes];
+                        const buf = Buffer.initWithStride(self.allocator, width, height, stride, format, slice) catch return;
+                        surf.attach(buf);
+                    }
+                    buf_res.sendRelease();
                 }
             } else {
                 surf.attach(null);
@@ -510,63 +508,6 @@ fn handleLayerSurfaceDestroy(res: *server.zwlr.LayerSurfaceV1, self: *Compositor
     self.lock();
     defer self.unlock();
     _ = self.layer_map.remove(res);
-}
-
-fn bindBufferFactory(client: *server.wl.Client, data: *Compositor, version: u32, id: u32) void {
-    const res = server.zterm.BufferFactoryV1.create(client, version, id) catch return;
-    res.setHandler(*Compositor, handleBufferFactoryRequest, null, data);
-}
-
-fn handleBufferFactoryRequest(res: *server.zterm.BufferFactoryV1, req: server.zterm.BufferFactoryV1.Request, self: *Compositor) void {
-    const client = res.getClient();
-    switch (req) {
-        .destroy => {},
-        .create_cell_buffer => |args| {
-            const buf_res = server.wl.Buffer.create(client, 1, args.id) catch return;
-            const raw_slice = args.data.slice(u8);
-            const fmt: Buffer.Format = switch (args.format) {
-                .compact_v1 => .compact_v1,
-                .rich_v1 => .rich_v1,
-                else => return,
-            };
-            const buf = Buffer.init(self.allocator, args.cols, args.rows, fmt, raw_slice) catch return;
-            self.lock();
-            defer self.unlock();
-            self.buffer_map.put(self.allocator, buf_res, buf) catch return;
-            buf_res.setHandler(*Compositor, handleBufferRequest, handleBufferDestroy, self);
-        },
-        .create_fd_cell_buffer => |args| {
-            const buf_res = server.wl.Buffer.create(client, 1, args.id) catch return;
-            const fmt: Buffer.Format = switch (args.format) {
-                .compact_v1 => .compact_v1,
-                .rich_v1 => .rich_v1,
-                else => return,
-            };
-            const buf = Buffer.initMmap(args.cols, args.rows, fmt, args.fd) catch return;
-            self.lock();
-            defer self.unlock();
-            self.buffer_map.put(self.allocator, buf_res, buf) catch return;
-            buf_res.setHandler(*Compositor, handleBufferRequest, handleBufferDestroy, self);
-        },
-        .create_shm_cell_buffer => {},
-    }
-}
-
-fn handleBufferRequest(res: *server.wl.Buffer, req: server.wl.Buffer.Request, self: *Compositor) void {
-    _ = res;
-    _ = self;
-    switch (req) {
-        .destroy => {},
-    }
-}
-
-fn handleBufferDestroy(res: *server.wl.Buffer, self: *Compositor) void {
-    self.lock();
-    defer self.unlock();
-    if (self.buffer_map.fetchRemove(res)) |kv| {
-        var b = kv.value;
-        b.deinit();
-    }
 }
 
 fn bindKeyboard(client: *server.wl.Client, data: *Compositor, version: u32, id: u32) void {
@@ -771,6 +712,7 @@ pub fn composite(self: *Compositor) void {
             if (pass == 0 and surf.z_index > 0) continue;
             if (pass == 1 and surf.z_index <= 0) continue;
             const buf = surf.current_buffer orelse continue;
+            if (buf.isPixel()) continue;
 
             var origin_x = surf.x;
             var origin_y = surf.y;
@@ -840,6 +782,7 @@ pub fn composite(self: *Compositor) void {
                         }
                     }
                 },
+                .argb8888, .xrgb8888 => {},
             }
         }
     }

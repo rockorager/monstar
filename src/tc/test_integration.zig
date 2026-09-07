@@ -261,3 +261,103 @@ test "TC-Wayland split terminal panes, resizing, and overlay z-index" {
     try std.testing.expectEqual(@as(u32, 30), primary_xpty.rows);
     try std.testing.expectEqual(@as(u32, 30), split_xpty.rows);
 }
+
+test "TC-Wayland pixel buffer creation, wl_shm, and overlay rendering" {
+    const allocator = std.testing.allocator;
+
+    const test_socket = "tc-test-pixel-0";
+    var comp = try tc.Compositor.init(allocator, test_socket, 40, 10);
+    defer comp.deinit();
+
+    var running: std.atomic.Value(bool) = .init(true);
+    const ServerRunner = struct {
+        fn run(c: *tc.Compositor, r: *std.atomic.Value(bool)) void {
+            while (r.load(.acquire)) {
+                c.dispatch(10) catch break;
+            }
+        }
+    };
+
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{ comp, &running });
+    defer {
+        running.store(false, .release);
+        comp.stop();
+        server_thread.join();
+    }
+
+    sleepMs(10);
+
+    var client = try tc.Client.connect(allocator, test_socket);
+    defer client.deinit();
+
+    // 1. Create grid surface
+    _ = try client.createGridSurface();
+    try client.roundtrip();
+
+    // 2. Create ARGB8888 pixel buffer via createPixelBuffer
+    const width: u32 = 8;
+    const height: u32 = 8;
+    var pixel_data: [width * height]u32 = undefined;
+    // 50% transparent red
+    for (&pixel_data) |*p| p.* = 0x80800000;
+    const pixel_bytes = std.mem.sliceAsBytes(&pixel_data);
+
+    const pixel_buf = try client.createPixelBuffer(width, height, .argb8888, pixel_bytes);
+    try client.commitBuffer(pixel_buf, width, height);
+    try client.roundtrip();
+    sleepMs(20);
+
+    // Verify compositor received pixel buffer
+    comp.lock();
+    var found_pixel_buf = false;
+    for (comp.surfaces.items) |s| {
+        if (s.current_buffer) |b| {
+            if (b.isPixel()) {
+                try std.testing.expectEqual(tc.Buffer.Format.argb8888, b.format);
+                try std.testing.expectEqual(@as(u32, 8), b.cols);
+                try std.testing.expectEqual(@as(u32, 8), b.rows);
+                found_pixel_buf = true;
+            }
+        }
+    }
+    comp.unlock();
+    try std.testing.expect(found_pixel_buf);
+
+    // 3. Test standard Wayland wl_shm pixel buffer
+    const shm_fd = try std.posix.memfd_create("tc-test-shm", 0);
+    defer _ = std.os.linux.close(shm_fd);
+    const shm_size: usize = width * height * 4;
+    _ = std.c.ftruncate(shm_fd, @intCast(shm_size));
+    var shm_pixels: [width * height]u32 = undefined;
+    for (&shm_pixels) |*p| p.* = 0xFF00FF00; // opaque green
+    _ = std.c.write(shm_fd, std.mem.sliceAsBytes(&shm_pixels).ptr, shm_size);
+
+    const wayland_shm_buf = try client.createShmPixelBuffer(
+        shm_fd,
+        shm_size,
+        @intCast(width),
+        @intCast(height),
+        @intCast(width * 4),
+        .argb8888,
+    );
+    try client.commitBuffer(wayland_shm_buf, width, height);
+    try client.roundtrip();
+    sleepMs(20);
+
+    comp.lock();
+    var found_shm_buf = false;
+    for (comp.surfaces.items) |s| {
+        if (s.current_buffer) |b| {
+            if (b.isPixel()) {
+                try std.testing.expectEqual(tc.Buffer.Format.argb8888, b.format);
+                try std.testing.expectEqual(@as(u32, 8), b.cols);
+                try std.testing.expectEqual(@as(u32, 8), b.rows);
+                const slice = b.asPixelSlice();
+                try std.testing.expectEqual(@as(u32, 0xFF00FF00), slice[0]);
+                found_shm_buf = true;
+            }
+        }
+    }
+    comp.unlock();
+    try std.testing.expect(found_shm_buf);
+}

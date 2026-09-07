@@ -146,6 +146,37 @@ pub fn renderCanvas(
     }
 }
 
+pub fn blendPixel(src: u32, dst: u32) u32 {
+    const a: u32 = (src >> 24) & 0xFF;
+    if (a == 255) return src;
+    if (a == 0) return dst;
+    const inv_a: u32 = 255 - a;
+    const dst_r: u32 = (dst >> 16) & 0xFF;
+    const dst_g: u32 = (dst >> 8) & 0xFF;
+    const dst_b: u32 = dst & 0xFF;
+
+    const src_r: u32 = (src >> 16) & 0xFF;
+    const src_g: u32 = (src >> 8) & 0xFF;
+    const src_b: u32 = src & 0xFF;
+
+    // Support both premultiplied (Wayland standard) and straight alpha
+    const is_straight = (src_r > a or src_g > a or src_b > a);
+    const r = if (is_straight)
+        (src_r * a + dst_r * inv_a + 127) / 255
+    else
+        @min(255, src_r + (dst_r * inv_a + 127) / 255);
+    const g = if (is_straight)
+        (src_g * a + dst_g * inv_a + 127) / 255
+    else
+        @min(255, src_g + (dst_g * inv_a + 127) / 255);
+    const b = if (is_straight)
+        (src_b * a + dst_b * inv_a + 127) / 255
+    else
+        @min(255, src_b + (dst_b * inv_a + 127) / 255);
+
+    return (0xFF << 24) | (r << 16) | (g << 8) | b;
+}
+
 pub fn renderSurfaceAtPixel(
     allocator: std.mem.Allocator,
     font: *Font,
@@ -158,14 +189,16 @@ pub fn renderSurfaceAtPixel(
     default_fg: u32,
     default_bg: u32,
 ) void {
-    const origin_x = surf.pixel_x orelse return;
-    const origin_y = surf.pixel_y orelse return;
-    const buf = surf.current_buffer orelse return;
+    var origin_x = surf.pixel_x orelse (surf.x * @as(i32, @intCast(font.cell_width)));
+    var origin_y = surf.pixel_y orelse (surf.y * @as(i32, @intCast(font.cell_height)));
+    if (surf.anchor) |anc| {
+        const target_x = anc.target.pixel_x orelse (anc.target.x * @as(i32, @intCast(font.cell_width)));
+        const target_y = anc.target.pixel_y orelse (anc.target.y * @as(i32, @intCast(font.cell_height)));
+        origin_x = target_x + (anc.target.cursor.col + anc.col_offset) * @as(i32, @intCast(font.cell_width));
+        origin_y = target_y + (anc.target.cursor.row + anc.row_offset) * @as(i32, @intCast(font.cell_height));
+    }
 
-    const surf_w_px = @as(i32, @intCast(buf.cols * font.cell_width));
-    const surf_h_px = @as(i32, @intCast(buf.rows * font.cell_height));
-    _ = surf_w_px;
-    _ = surf_h_px;
+    const buf = surf.current_buffer orelse return;
 
     switch (buf.format) {
         .compact_v1 => {
@@ -266,5 +299,59 @@ pub fn renderSurfaceAtPixel(
             }
         },
         .rich_v1 => {},
+        .argb8888, .xrgb8888 => {
+            const is_opaque = (buf.format == .xrgb8888);
+            const stride_u32 = if (buf.stride > 0) buf.stride / 4 else buf.cols;
+            const src_pixels = buf.asPixelSlice();
+
+            var r: u32 = 0;
+            while (r < buf.rows) : (r += 1) {
+                const dst_y = origin_y + @as(i32, @intCast(r));
+                if (dst_y < 0 or dst_y >= buf_height) continue;
+                const src_row_offset = r * stride_u32;
+                const dst_row_offset = @as(usize, @intCast(dst_y)) * stride;
+
+                var c_idx: u32 = 0;
+                while (c_idx < buf.cols) : (c_idx += 1) {
+                    const dst_x = origin_x + @as(i32, @intCast(c_idx));
+                    if (dst_x < 0 or dst_x >= buf_width) continue;
+
+                    const src_idx = src_row_offset + c_idx;
+                    if (src_idx >= src_pixels.len) break;
+                    const src_pix = src_pixels[src_idx];
+                    const dst_idx = dst_row_offset + @as(usize, @intCast(dst_x));
+
+                    if (is_opaque) {
+                        pixels[dst_idx] = 0xFF000000 | (src_pix & 0x00FFFFFF);
+                    } else {
+                        pixels[dst_idx] = blendPixel(src_pix, pixels[dst_idx]);
+                    }
+                }
+            }
+        },
     }
+}
+
+test "blendPixel handles transparent, opaque, and blend" {
+    // Fully transparent source returns destination
+    try std.testing.expectEqual(@as(u32, 0xFF112233), blendPixel(0x00FFFFFF, 0xFF112233));
+    // Fully opaque source returns source
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), blendPixel(0xFFFF0000, 0xFF00FF00));
+    // Premultiplied blend (50% red over white)
+    const premul_result = blendPixel(0x80800000, 0xFFFFFFFF);
+    const pr_r = (premul_result >> 16) & 0xFF;
+    const pr_g = (premul_result >> 8) & 0xFF;
+    const pr_b = premul_result & 0xFF;
+    try std.testing.expect(pr_r >= 254);
+    try std.testing.expect(pr_g >= 126 and pr_g <= 128);
+    try std.testing.expect(pr_b >= 126 and pr_b <= 128);
+
+    // Straight alpha blend (50% red over white)
+    const straight_result = blendPixel(0x80FF0000, 0xFFFFFFFF);
+    const st_r = (straight_result >> 16) & 0xFF;
+    const st_g = (straight_result >> 8) & 0xFF;
+    const st_b = straight_result & 0xFF;
+    try std.testing.expect(st_r >= 254);
+    try std.testing.expect(st_g >= 126 and st_g <= 128);
+    try std.testing.expect(st_b >= 126 and st_b <= 128);
 }

@@ -53,7 +53,6 @@ pub fn build(b: *std.Build) void {
     scanner.generate("zwp_text_input_manager_v3", 1);
     scanner.addCustomProtocol(b.path("protocol/term-compositor-v1.xml"));
     scanner.generate("zterm_compositor_v1", 1);
-    scanner.generate("zterm_buffer_factory_v1", 1);
     scanner.generate("zterm_theme_manager_v1", 1);
     scanner.generate("zterm_property_manager_v1", 1);
     scanner.generate("zterm_keyboard_v1", 1);

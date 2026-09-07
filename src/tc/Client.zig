@@ -45,10 +45,10 @@ registry: *wl.Registry,
 // Bound globals
 compositor: ?*wl.Compositor = null,
 zterm_compositor: ?*zterm.CompositorV1 = null,
-buffer_factory: ?*zterm.BufferFactoryV1 = null,
 keyboard: ?*zterm.KeyboardV1 = null,
 theme_manager: ?*zterm.ThemeManagerV1 = null,
 layer_shell: ?*zwlr.LayerShellV1 = null,
+shm: ?*wl.Shm = null,
 
 // Client surfaces
 surface: ?*wl.Surface = null,
@@ -145,8 +145,8 @@ pub fn deinit(self: *Client) void {
     if (self.layer_shell) |ls| ls.destroy();
     if (self.theme_manager) |tm| tm.destroy();
     if (self.keyboard) |kb| kb.release();
-    if (self.buffer_factory) |bf| bf.destroy();
     if (self.zterm_compositor) |zc| zc.destroy();
+    if (self.shm) |s| s.destroy();
     if (self.compositor) |c| c.destroy();
 
     self.registry.destroy();
@@ -187,6 +187,32 @@ pub fn createGridSurface(self: *Client) !*zterm.GridSurfaceV1 {
     return grid;
 }
 
+pub fn createBuffer(
+    self: *Client,
+    cols: u32,
+    rows: u32,
+    format: Buffer.Format,
+    bytes: []const u8,
+) !*wl.Buffer {
+    const shm = self.shm orelse return error.NoShm;
+    const stride: i32 = switch (format) {
+        .compact_v1 => @intCast(cols * @sizeOf(CompactCell)),
+        .rich_v1 => @intCast(cols * @sizeOf(RichCell)),
+        .argb8888, .xrgb8888 => @intCast(cols * 4),
+    };
+    const fd = try std.posix.memfd_create("tc-shm-buffer", std.os.linux.MFD.CLOEXEC);
+    errdefer _ = std.os.linux.close(fd);
+    if (std.os.linux.ftruncate(fd, @intCast(bytes.len)) != 0) return error.ShmFailed;
+    _ = std.c.write(fd, bytes.ptr, bytes.len);
+
+    const pool = try shm.createPool(fd, @intCast(bytes.len));
+    defer pool.destroy();
+    _ = std.os.linux.close(fd);
+
+    const shm_fmt: wl.Shm.Format = @enumFromInt(format.toShmFormat());
+    return try pool.createBuffer(0, @intCast(cols), @intCast(rows), stride, shm_fmt);
+}
+
 pub fn createCellBuffer(
     self: *Client,
     cols: u32,
@@ -194,47 +220,45 @@ pub fn createCellBuffer(
     format: Buffer.Format,
     cell_bytes: []const u8,
 ) !*wl.Buffer {
-    const factory = self.buffer_factory orelse return error.NoBufferFactory;
-
-    // If payload exceeds 3000 bytes, pass it via memfd to avoid libwayland wire limit (4096 bytes)
-    if (cell_bytes.len > 3000) {
-        if (std.posix.memfd_create("tc-client-cell-buffer", 0)) |fd| {
-            errdefer _ = std.os.linux.close(fd);
-            if (std.c.ftruncate(fd, @intCast(cell_bytes.len)) == 0) {
-                _ = std.c.write(fd, cell_bytes.ptr, cell_bytes.len);
-                return try self.createFdCellBuffer(fd, cols, rows, format);
-            }
-            _ = std.os.linux.close(fd);
-        } else |_| {}
-    }
-
-    var array = wl.Array{
-        .size = cell_bytes.len,
-        .alloc = cell_bytes.len,
-        .data = @ptrCast(@constCast(cell_bytes.ptr)),
-    };
-
-    const wire_fmt: zterm.BufferFactoryV1.CellFormat = switch (format) {
-        .compact_v1 => .compact_v1,
-        .rich_v1 => .rich_v1,
-    };
-
-    return try factory.createCellBuffer(cols, rows, wire_fmt, &array);
+    return self.createBuffer(cols, rows, format, cell_bytes);
 }
 
-pub fn createFdCellBuffer(
+pub fn createPixelBuffer(
+    self: *Client,
+    width: u32,
+    height: u32,
+    format: Buffer.Format,
+    pixel_bytes: []const u8,
+) !*wl.Buffer {
+    std.debug.assert(format.isPixel());
+    return self.createBuffer(width, height, format, pixel_bytes);
+}
+
+pub fn createShmBuffer(
     self: *Client,
     fd: std.posix.fd_t,
-    cols: u32,
-    rows: u32,
-    format: Buffer.Format,
+    size: usize,
+    width: i32,
+    height: i32,
+    stride: i32,
+    format: wl.Shm.Format,
 ) !*wl.Buffer {
-    const factory = self.buffer_factory orelse return error.NoBufferFactory;
-    const wire_fmt: zterm.BufferFactoryV1.CellFormat = switch (format) {
-        .compact_v1 => .compact_v1,
-        .rich_v1 => .rich_v1,
-    };
-    return try factory.createFdCellBuffer(fd, cols, rows, wire_fmt);
+    const shm = self.shm orelse return error.NoShm;
+    const pool = try shm.createPool(fd, @intCast(size));
+    defer pool.destroy();
+    return try pool.createBuffer(0, width, height, stride, format);
+}
+
+pub fn createShmPixelBuffer(
+    self: *Client,
+    fd: std.posix.fd_t,
+    size: usize,
+    width: i32,
+    height: i32,
+    stride: i32,
+    format: wl.Shm.Format,
+) !*wl.Buffer {
+    return self.createShmBuffer(fd, size, width, height, stride, format);
 }
 
 pub fn commitBuffer(self: *Client, buffer: *wl.Buffer, cols: u32, rows: u32) !void {
@@ -255,14 +279,14 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Cli
                 self.compositor = registry.bind(g.name, wl.Compositor, 4) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zterm.CompositorV1.interface.name) == .eq) {
                 self.zterm_compositor = registry.bind(g.name, zterm.CompositorV1, 1) catch return;
-            } else if (std.mem.orderZ(u8, g.interface, zterm.BufferFactoryV1.interface.name) == .eq) {
-                self.buffer_factory = registry.bind(g.name, zterm.BufferFactoryV1, 1) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zterm.KeyboardV1.interface.name) == .eq) {
                 self.keyboard = registry.bind(g.name, zterm.KeyboardV1, 1) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zterm.ThemeManagerV1.interface.name) == .eq) {
                 self.theme_manager = registry.bind(g.name, zterm.ThemeManagerV1, 1) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zwlr.LayerShellV1.interface.name) == .eq) {
                 self.layer_shell = registry.bind(g.name, zwlr.LayerShellV1, 4) catch return;
+            } else if (std.mem.orderZ(u8, g.interface, wl.Shm.interface.name) == .eq) {
+                self.shm = registry.bind(g.name, wl.Shm, 1) catch return;
             }
         },
         .global_remove => {},

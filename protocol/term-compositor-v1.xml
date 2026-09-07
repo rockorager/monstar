@@ -81,82 +81,13 @@
   </interface>
 
   <!-- ===================================================================== -->
-  <!-- Buffer Factory: zterm_buffer_factory_v1                               -->
-  <!-- ===================================================================== -->
-
-  <interface name="zterm_buffer_factory_v1" version="1">
-    <description summary="factory for cell-grid wl_buffer objects">
-      Creates wl_buffer instances backed by character cell matrices.
-
-      Supports both inline stream arrays (which require no file descriptor passing,
-      enabling 100% transparent OpenSSH Unix socket forwarding) and local shared
-      memory pools (wl_shm_pool) for zero-copy local performance.
-    </description>
-
-    <enum name="cell_format">
-      <description summary="supported cell memory binary layouts">
-        Defines the ABI format of cell memory in the buffer.
-      </description>
-      <entry name="compact_v1" value="1" summary="8 bytes per cell: u32 codepoint, u8 fg, u8 bg, u16 flags"/>
-      <entry name="rich_v1" value="2" summary="32 bytes per cell: u32 codepoint, u32 fg_rgba, u32 bg_rgba, u32 ul_rgba, u32 hyperlink_id, u32 flags, u8 width"/>
-    </enum>
-
-    <request name="destroy" type="destructor">
-      <description summary="destroy buffer factory">
-        Destroys the factory. Existing buffers remain valid until destroyed.
-      </description>
-    </request>
-
-    <request name="create_cell_buffer">
-      <description summary="create an inline cell buffer (SSH and stream safe)">
-        Creates a wl_buffer containing raw binary cell data passed directly in
-        an array payload on the socket stream.
-
-        Because this request does not pass file descriptors (SCM_RIGHTS), it works
-        transparently across standard OpenSSH socket forwarding and remote tunnels.
-      </description>
-      <arg name="id" type="new_id" interface="wl_buffer" summary="new buffer object"/>
-      <arg name="cols" type="uint" summary="buffer width in character cells"/>
-      <arg name="rows" type="uint" summary="buffer height in character cells"/>
-      <arg name="format" type="uint" enum="cell_format" summary="binary cell ABI format"/>
-      <arg name="data" type="array" summary="contiguous raw cell binary data in row-major order"/>
-    </request>
-
-    <request name="create_fd_cell_buffer">
-      <description summary="create a shared memory cell buffer from an fd (zero-copy)">
-        Creates a wl_buffer backed by an open file descriptor (such as memfd or shm)
-        for zero-copy performance on arbitrary grid sizes without message size limits.
-      </description>
-      <arg name="id" type="new_id" interface="wl_buffer" summary="new buffer object"/>
-      <arg name="fd" type="fd" summary="file descriptor containing cell data"/>
-      <arg name="cols" type="uint" summary="buffer width in character cells"/>
-      <arg name="rows" type="uint" summary="buffer height in character cells"/>
-      <arg name="format" type="uint" enum="cell_format" summary="binary cell ABI format"/>
-    </request>
-
-    <request name="create_shm_cell_buffer">
-      <description summary="create a shared memory cell buffer (local zero-copy)">
-        Creates a wl_buffer backed by an existing wl_shm_pool object for zero-copy
-        local performance on large screens or high-throughput TUIs.
-      </description>
-      <arg name="id" type="new_id" interface="wl_buffer" summary="new buffer object"/>
-      <arg name="pool" type="object" interface="wl_shm_pool" summary="backing shared memory pool"/>
-      <arg name="offset" type="int" summary="byte offset within pool"/>
-      <arg name="cols" type="uint" summary="buffer width in character cells"/>
-      <arg name="rows" type="uint" summary="buffer height in character cells"/>
-      <arg name="stride" type="uint" summary="byte stride per row"/>
-      <arg name="format" type="uint" enum="cell_format" summary="binary cell ABI format"/>
-    </request>
-  </interface>
-
-  <!-- ===================================================================== -->
   <!-- Grid Surface Role: zterm_grid_surface_v1                              -->
   <!-- ===================================================================== -->
 
   <interface name="zterm_grid_surface_v1" version="1">
     <description summary="2D character grid surface interface">
       Represents a 2D character cell canvas. The client attaches cell wl_buffers
-      created by zterm_buffer_factory_v1 to the underlying wl_surface, damages
+      created via standard wl_shm to the underlying wl_surface, damages
       cell regions, and commits atomically.
     </description>
 

@@ -40,10 +40,6 @@ current_underline: bool = false,
 saved_cursor_col: u32 = 0,
 saved_cursor_row: u32 = 0,
 
-// Shared memory backing for large grids
-memfd: ?std.posix.fd_t = null,
-shm_buffer: ?*wl.Buffer = null,
-
 // PTY State (optional when running simulated shell)
 pty: ?Pty = null,
 child_pid: ?std.posix.pid_t = null,
@@ -73,40 +69,11 @@ pub fn init(
     grid.setTitle(" xpty terminal ");
 
     const cell_count = cols * rows;
-    const byte_size = cell_count * @sizeOf(CompactCell);
-
-    var memfd: ?std.posix.fd_t = null;
-    var shm_buffer: ?*wl.Buffer = null;
-    var cells: []CompactCell = undefined;
-
-    if (byte_size > 3000) {
-        if (std.posix.memfd_create("tc-xpty-grid", 0)) |fd| {
-            if (std.c.ftruncate(fd, @intCast(byte_size)) == 0) {
-                if (std.posix.mmap(null, byte_size, std.posix.PROT{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0)) |map| {
-                    const ptr: [*]CompactCell = @ptrCast(@alignCast(map.ptr));
-                    cells = ptr[0..cell_count];
-                    memfd = fd;
-                    if (c.createFdCellBuffer(fd, cols, rows, .compact_v1)) |buf| {
-                        shm_buffer = buf;
-                        surf.attach(buf, 0, 0);
-                    } else |_| {}
-                } else |_| {}
-            }
-        } else |_| {}
-    }
-
-    if (memfd == null) {
-        cells = try allocator.alloc(CompactCell, cell_count);
-    }
+    const cells = try allocator.alloc(CompactCell, cell_count);
+    errdefer allocator.free(cells);
 
     for (cells) |*cell| {
         cell.* = CompactCell.ascii(' ', 7, 0);
-    }
-
-    if (shm_buffer) |b| {
-        surf.attach(b, 0, 0);
-        surf.damage(0, 0, @intCast(cols), @intCast(rows));
-        surf.commit();
     }
 
     const self = try allocator.create(Xpty);
@@ -118,8 +85,6 @@ pub fn init(
         .cols = cols,
         .rows = rows,
         .cells = cells,
-        .memfd = memfd,
-        .shm_buffer = shm_buffer,
     };
 
     return self;
@@ -129,14 +94,7 @@ pub fn deinit(self: *Xpty) void {
     if (self.pty) |*p| {
         p.deinit();
     }
-    if (self.memfd) |fd| {
-        const byte_size = self.cols * self.rows * @sizeOf(CompactCell);
-        const aligned_slice: []align(std.heap.page_size_min) const u8 = @alignCast(std.mem.sliceAsBytes(self.cells)[0..byte_size]);
-        std.posix.munmap(aligned_slice);
-        _ = std.os.linux.close(fd);
-    } else {
-        self.allocator.free(self.cells);
-    }
+    self.allocator.free(self.cells);
     self.grid_surface.destroy();
     self.surface.destroy();
     self.allocator.destroy(self);
@@ -162,48 +120,8 @@ pub fn resize(self: *Xpty, new_cols: u32, new_rows: u32) !void {
         @memcpy(new_cells[r * new_cols .. r * new_cols + copy_cols], self.cells[r * self.cols .. r * self.cols + copy_cols]);
     }
 
-    if (self.memfd) |fd| {
-        const old_byte_size = self.cols * self.rows * @sizeOf(CompactCell);
-        const aligned_slice: []align(std.heap.page_size_min) const u8 = @alignCast(std.mem.sliceAsBytes(self.cells)[0..old_byte_size]);
-        std.posix.munmap(aligned_slice);
-        _ = std.os.linux.close(fd);
-        self.memfd = null;
-    } else {
-        self.allocator.free(self.cells);
-    }
-
-    if (self.shm_buffer) |b| {
-        b.destroy();
-        self.shm_buffer = null;
-    }
-
-    var new_memfd: ?std.posix.fd_t = null;
-    var new_shm_buffer: ?*wl.Buffer = null;
-    var final_cells: []CompactCell = new_cells;
-
-    const new_byte_size = new_count * @sizeOf(CompactCell);
-    if (new_byte_size > 3000) {
-        if (std.posix.memfd_create("tc-xpty-grid", 0)) |fd| {
-            if (std.c.ftruncate(fd, @intCast(new_byte_size)) == 0) {
-                if (std.posix.mmap(null, new_byte_size, std.posix.PROT{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0)) |map| {
-                    const ptr: [*]CompactCell = @ptrCast(@alignCast(map.ptr));
-                    const mapped_cells = ptr[0..new_count];
-                    @memcpy(mapped_cells, new_cells);
-                    self.allocator.free(new_cells);
-                    final_cells = mapped_cells;
-                    new_memfd = fd;
-                    if (self.client.createFdCellBuffer(fd, new_cols, new_rows, .compact_v1)) |buf| {
-                        new_shm_buffer = buf;
-                        self.surface.attach(buf, 0, 0);
-                    } else |_| {}
-                } else |_| {}
-            }
-        } else |_| {}
-    }
-
-    self.cells = final_cells;
-    self.memfd = new_memfd;
-    self.shm_buffer = new_shm_buffer;
+    self.allocator.free(self.cells);
+    self.cells = new_cells;
     self.cols = new_cols;
     self.rows = new_rows;
     if (new_cols > 0) self.cursor_col = @min(self.cursor_col, new_cols - 1);
@@ -976,17 +894,11 @@ fn executeSimCommand(self: *Xpty, cmd: []const u8) void {
 
 /// Commits the current grid cells to the Wayland surface.
 pub fn commit(self: *Xpty) !void {
-    if (self.shm_buffer) |buf| {
-        self.surface.attach(buf, 0, 0);
-        self.surface.damage(0, 0, @intCast(self.cols), @intCast(self.rows));
-        self.surface.commit();
-    } else {
-        const raw_bytes = std.mem.sliceAsBytes(self.cells);
-        const buf = try self.client.createCellBuffer(self.cols, self.rows, .compact_v1, raw_bytes);
-        self.surface.attach(buf, 0, 0);
-        self.surface.damage(0, 0, @intCast(self.cols), @intCast(self.rows));
-        self.surface.commit();
-    }
+    const raw_bytes = std.mem.sliceAsBytes(self.cells);
+    const buf = try self.client.createCellBuffer(self.cols, self.rows, .compact_v1, raw_bytes);
+    self.surface.attach(buf, 0, 0);
+    self.surface.damage(0, 0, @intCast(self.cols), @intCast(self.rows));
+    self.surface.commit();
 }
 
 test "xpty deferred autowrap and prompt-sp" {
