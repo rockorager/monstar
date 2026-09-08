@@ -54,8 +54,9 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 │  ┌────────────────────────────────┴─────────────────────────────────┐  │
 │  │ TERMINAL COMPOSITOR EXTENSION (term-compositor-v1.xml)           │  │
 │  │ • zterm_compositor_v1      : Surface role & positioner factory   │  │
+│  │ • zterm_buffer_factory_v1  : Stream-safe inline cell buffers     │  │
 │  │ • zterm_grid_surface_v1    : 2D cell grid (panes, popups, TUIs)  │  │
-│  │ • zterm_stream_surface_v1  : Structured append-only text logs    │  │
+│  │ • zterm_stream_surface_v1  : Structured append-only text logs & styled text │
 │  │ • zterm_cursor_anchor_v1   : Pins overlays to text cursor        │  │
 │  │ • zterm_keyboard_v1        : Resolved terminal keys & modifiers  │  │
 │  │ • zterm_theme_manager_v1   : Live color palettes & RGBA tokens   │  │
@@ -85,7 +86,8 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 | **Overlay Stacking** | `zwlr_layer_shell_v1` | Defines canonical `background`, `bottom`, `top`, and `overlay` tiers and input grabs. |
 | **Subsurface Anchoring** | `wl_subcompositor` | Anchors child surfaces (inline graphics, badges) to parent surfaces. |
 | **Clipboard Exchange** | `wl_data_device_manager` | Out-of-band clipboard read/write with MIME type negotiation. |
-| **Cell & Pixel Buffers** | `wl_shm` | Standard Wayland shared memory with registered cell formats (`compact_v1`, `rich_v1`) and pixel formats. |
+| **Stream-Safe Cell Buffers** | `zterm_buffer_factory_v1` | **Native SSH (`ssh -R`) Transport**: Allocates and streams cell buffers in wire-safe chunks (<= 3072 bytes) without passing file descriptors (`SCM_RIGHTS`). Works out of the box on macOS and Linux. |
+| **Optional SHM Acceleration** | `wl_shm` | Standard Wayland shared memory for local zero-copy performance on large pixel framebuffers (`argb8888`, `xrgb8888`). |
 | **Grid Geometry Negotiation** | `zterm_grid_surface_v1` | **Missing in Wayland**: Negotiates character columns/rows and pixel font metrics. |
 | **Cursor-Relative Placement** | `zterm_cursor_anchor_v1` | **Missing in Wayland**: Positions overlays relative to prompt text cursor coordinates. |
 | **Structured Terminal Keys** | `zterm_keyboard_v1` | **Missing in Wayland**: Delivers resolved key names and UTF-8 strings without requiring `libxkbcommon` over SSH. |
@@ -95,57 +97,89 @@ Terminal-specific capabilities (character cell grids, text streams, cursor-ancho
 
 ---
 
-## 3. Unified Buffer Transport Architecture: Standard `wl_shm` + `waypipe`
+## 3. Tiered Buffer Transport Architecture: Native SSH Forwarding (`ssh -R`) + Optional `wl_shm`
 
-To eliminate fragmented buffer APIs, transport confusion, and subtle remote failure modes, TC-Wayland standardizes 100% on **standard Wayland shared memory (`wl_shm`)** for all content types:
-- 2D character cell matrices (`compact_v1`, `rich_v1`)
-- Pixel graphics, charts, and image overlays (`argb8888`, `xrgb8888`)
+To ensure full cross-platform compatibility across both **macOS and Linux**, TC-Wayland provides a tiered buffer transport:
+1. **Universal Stream-Safe Buffers (`zterm_buffer_factory_v1`)**: Primary transport for character cell grids. Uses chunked inline binary transfers over the Wayland wire socket. Requires **zero file descriptor passing** (`SCM_RIGHTS`), enabling 100% transparent OpenSSH remote forwarding (`ssh -R`) with **no proxy daemons** (`waypipe`).
+2. **Optional Local SHM Acceleration (`wl_shm`)**: Available for local high-FPS pixel overlays or image rendering where zero-copy shared memory is advantageous.
 
 ```
                            ┌────────────────────────────────────────┐
-                           │            Standard wl_shm             │
-                           │       (wl_shm_pool.create_buffer)      │
+                           │          TC-Wayland Buffers            │
                            └───────────────────┬────────────────────┘
                                                │
                       ┌────────────────────────┴────────────────────────┐
                       ▼                                                 ▼
-               Local Execution                               Remote Over SSH (waypipe)
-         ─────────────────────────────                    ──────────────────────────────
-         • Direct zero-copy memfd mmap                    • waypipe proxy intercepts memfd
-         • OS-level zero allocation                       • Computes dirty damage bounding boxes
-         • High-FPS local compositing                     • LZ4/ZSTD compression over network
-         • Universal Wayland client API                   • Reconstructs local memfd on compositor
+             Stream-Safe Remote / Local                        Local SHM Acceleration
+          (zterm_buffer_factory_v1)                                (Standard wl_shm)
+     ───────────────────────────────────────           ───────────────────────────────────────
+     • 100% SSH Remote Forwarding (ssh -R)             • Direct zero-copy mmap
+     • Zero SCM_RIGHTS / FD-passing required           • Advertises compact_v1, rich_v1, ARGB
+     • Chunks <= 3072 B (WL_MAX_MESSAGE_SIZE safe)     • High-FPS local compositing
+     • Works identically on macOS, Linux, BSD          • Optional local optimization
+     • Produces standard wl_buffer handles             • Produces standard wl_buffer handles
 ```
 
-### 3.1 Transparent Remote Execution via `waypipe`
-Wayland compositors and clients pass shared memory file descriptors using Unix domain socket ancillary data (`SCM_RIGHTS`). While raw OpenSSH Unix socket forwarding (`ssh -R`) drops `SCM_RIGHTS`, the established standard in the Wayland ecosystem is **[waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe)**.
+### 3.1 Transparent SSH Remote Forwarding (`ssh -R`)
+Standard OpenSSH stream forwarding (`ssh -R /tmp/remote.sock:$TC_WAYLAND_DISPLAY` or TCP forwarding `ssh -R 5150:localhost:5150`) forwards pure byte streams, discarding Unix domain socket ancillary data (`SCM_RIGHTS`).
 
-Running remote TC-Wayland tools over SSH with full shared-memory zero-copy performance and compression is as simple as:
+Because `zterm_buffer_factory_v1` allocates buffer handles and streams cell data through chunked array requests:
+- Remote TUIs and CLI tools run directly over an OpenSSH tunnel with **zero helper binaries or proxy daemons** (such as `waypipe`) on the remote server.
+- The protocol works reliably on **macOS** (where native Wayland compositors and upstream `waypipe` are not available out of the box).
 
+#### Remote SSH Workflow:
 ```bash
-waypipe ssh user@remote-host my-terminal-app
+# 1. Forward the terminal compositor socket to the remote host:
+ssh -R /tmp/monstar-$UID.sock:$TC_WAYLAND_DISPLAY user@remote-box
+
+# 2. On the remote host, simply point WAYLAND_DISPLAY at the forwarded socket:
+export WAYLAND_DISPLAY=/tmp/monstar-$UID.sock
+my-tc-tool  # Connects directly to Monstar over SSH!
 ```
 
-Or when running an interactive remote session:
-```bash
-waypipe --login-shell ssh user@remote-host
+### 3.2 Wire Safety: Staying within `WL_MAX_MESSAGE_SIZE`
+In standard `libwayland`, single protocol messages are capped at `WL_MAX_MESSAGE_SIZE = 4096` bytes. Because terminal grids easily exceed 4 KB (an 80x24 screen in `compact_v1` is 15.3 KB; in `rich_v1` it is 61.4 KB), transmitting an entire buffer in one message violates the wire limit.
+
+`zterm_buffer_factory_v1` cleanly resolves this with a two-phase allocation:
+1. `create_cell_buffer(id, cols, rows, format)`: Allocates the compositor-side buffer structure.
+2. `upload_cells(buffer, offset, data)`: Streams cell data in chunks of 3072 bytes or fewer.
+
+```zig
+// Client-side stream upload:
+const wire_fmt: zterm.BufferFactoryV1.CellFormat = switch (format) {
+    .compact_v1 => .compact_v1,
+    .rich_v1 => .rich_v1,
+};
+const buf = try factory.createCellBuffer(cols, rows, wire_fmt);
+
+var offset: u32 = 0;
+while (offset < cell_bytes.len) {
+    const chunk_len: u32 = @intCast(@min(3072, cell_bytes.len - offset));
+    var array = wl.Array{
+        .size = chunk_len,
+        .alloc = chunk_len,
+        .data = @ptrCast(@constCast(cell_bytes.ptr + offset)),
+    };
+    factory.uploadCells(buf, offset, &array);
+    offset += chunk_len;
+}
+
+// Standard Wayland commit
+surface.attach(buf, 0, 0);
+surface.damage(0, 0, cols, rows);
+surface.commit();
 ```
 
-Inside that session:
-1. Applications allocate buffers via standard `wl_shm_pool`.
-2. `waypipe` intercepts buffer attachments, computes damage diffs, compresses them with LZ4 or Zstandard, and streams them over SSH.
-3. Monstar's compositor receives standard `wl_shm` buffers locally with zero custom transport glue.
+### 3.3 Registered Formats
 
-### 3.2 Registered `wl_shm` Formats
-
-The compositor initializes `wl_shm` and advertises the following 32-bit format identifiers:
+Whether created via `zterm_buffer_factory_v1` or `wl_shm`, the compositor supports the following 32-bit format identifiers:
 
 | Format Name | Identifier (FourCC / Enum) | Memory Layout | Usage |
 | :--- | :--- | :--- | :--- |
-| **`argb8888`** | `0x00000000` (0) | 4 bytes/pixel, 32-bit ARGB8888 | Charts, images, visual overlays with alpha blending |
-| **`xrgb8888`** | `0x00000001` (1) | 4 bytes/pixel, 32-bit XRGB8888 | Opaque pixel buffers |
 | **`compact_v1`** | `0x54433143` ('TC1C') | 8 bytes/cell (u32 codepoint, u8 fg, u8 bg, u16 flags) | High-throughput terminal panes, logs, text TUIs |
 | **`rich_v1`** | `0x54433152` ('TC1R') | 32 bytes/cell (u32 codepoint, RGBA colors, flags, width) | TrueColor rich text, hyperlinks, graphemes |
+| **`argb8888`** | `0x00000000` (0) | 4 bytes/pixel, 32-bit ARGB8888 | Charts, images, visual overlays with alpha blending |
+| **`xrgb8888`** | `0x00000001` (1) | 4 bytes/pixel, 32-bit XRGB8888 | Opaque pixel buffers |
 
 ---
 
@@ -406,5 +440,5 @@ pub fn main() !void {
 By refactoring the Terminal Compositor proposal around standard Wayland architecture and the `term-compositor-v1.xml` extension:
 1. **Zero Reinvention**: `wl_surface`, `zwlr_layer_shell_v1`, `wl_subsurface`, and `wl_data_device` are reused as-is.
 2. **Standard Tooling**: Client and server code are generated with standard tools (`wayland-scanner`, `zig-wayland`).
-3. **100% SSH & Remote Compatibility**: Standard `wl_shm` integrates transparently with `waypipe` for zero-copy, LZ4/Zstandard-compressed SSH tunnels without custom buffer transport protocols.
+3. **100% SSH & Remote Compatibility (macOS & Linux)**: `zterm_buffer_factory_v1` provides chunked, stream-safe cell buffers over standard OpenSSH socket forwarding (`ssh -R`), eliminating FD-passing (`SCM_RIGHTS`) and `waypipe` dependencies entirely.
 4. **Clean Backward Compatibility**: The PTY Bridge sandboxes legacy command-line applications without polluting the compositor.

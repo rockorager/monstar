@@ -81,6 +81,54 @@
   </interface>
 
   <!-- ===================================================================== -->
+  <!-- Buffer Factory: zterm_buffer_factory_v1                               -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_buffer_factory_v1" version="1">
+    <description summary="factory for stream-safe and SSH-forwarded cell buffers">
+      Creates wl_buffer instances backed by character cell matrices without
+      requiring file-descriptor passing (SCM_RIGHTS), enabling transparent
+      OpenSSH socket forwarding (ssh -R) on both macOS and Linux.
+    </description>
+
+    <enum name="cell_format">
+      <description summary="supported cell memory binary layouts">
+        Defines the ABI format of cell memory in the buffer.
+      </description>
+      <entry name="compact_v1" value="1" summary="8 bytes per cell: u32 codepoint, u8 fg, u8 bg, u16 flags"/>
+      <entry name="rich_v1" value="2" summary="32 bytes per cell: u32 codepoint, u32 fg_rgba, u32 bg_rgba, u32 ul_rgba, u32 hyperlink_id, u32 flags, u8 width"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy buffer factory">
+        Destroys the factory. Existing buffers remain valid until destroyed.
+      </description>
+    </request>
+
+    <request name="create_cell_buffer">
+      <description summary="allocate an inline cell buffer">
+        Allocates a wl_buffer of the specified dimensions. The client populates
+        the buffer data using upload_cells before attaching and committing to a surface.
+      </description>
+      <arg name="id" type="new_id" interface="wl_buffer" summary="new buffer object"/>
+      <arg name="cols" type="uint" summary="buffer width in character cells"/>
+      <arg name="rows" type="uint" summary="buffer height in character cells"/>
+      <arg name="format" type="uint" enum="cell_format" summary="binary cell ABI format"/>
+    </request>
+
+    <request name="upload_cells">
+      <description summary="upload a chunk of cell binary data">
+        Appends or writes a chunk of row-major cell data at byte offset within the buffer.
+        Chunk sizes MUST NOT exceed 3072 bytes per request to stay safely within
+        the Wayland wire protocol message limit (WL_MAX_MESSAGE_SIZE = 4096).
+      </description>
+      <arg name="buffer" type="object" interface="wl_buffer" summary="target buffer object"/>
+      <arg name="offset" type="uint" summary="byte offset within buffer"/>
+      <arg name="data" type="array" summary="contiguous raw cell binary data"/>
+    </request>
+  </interface>
+
+  <!-- ===================================================================== -->
   <!-- Grid Surface Role: zterm_grid_surface_v1                              -->
   <!-- ===================================================================== -->
 
@@ -181,6 +229,21 @@
       handling 2D cursor positions.
     </description>
 
+    <enum name="style_flags">
+      <description summary="text style attribute flags">
+        Bitmask flags controlling text decoration and attributes.
+      </description>
+      <entry name="bold" value="1" summary="bold or increased intensity"/>
+      <entry name="dim" value="2" summary="dim or decreased intensity"/>
+      <entry name="italic" value="4" summary="italicized text"/>
+      <entry name="underline" value="8" summary="single underline"/>
+      <entry name="blink" value="16" summary="blinking text"/>
+      <entry name="reverse" value="32" summary="swap foreground and background"/>
+      <entry name="strikethrough" value="64" summary="crossed out / strikethrough"/>
+      <entry name="fg_palette" value="128" summary="treat fg as ANSI 16-color palette index"/>
+      <entry name="bg_palette" value="256" summary="treat bg as ANSI 16-color palette index"/>
+    </enum>
+
     <request name="destroy" type="destructor">
       <description summary="destroy stream surface">
         Destroys the stream surface.
@@ -189,9 +252,21 @@
 
     <request name="append_text">
       <description summary="append plain text to stream">
-        Appends UTF-8 text to the end of the stream.
+        Appends UTF-8 text to the end of the stream with default styling.
       </description>
       <arg name="text" type="string" summary="UTF-8 text payload"/>
+    </request>
+
+    <request name="append_styled_text">
+      <description summary="append text with explicit styling without ANSI escapes">
+        Appends UTF-8 text to the end of the stream with explicit colors and style attributes.
+        Colors are packed 32-bit RGBA (0xRRGGBBAA) unless fg_palette / bg_palette flags
+        are specified, in which case the lowest 8 bits specify an ANSI 16-color palette index (0-15).
+      </description>
+      <arg name="text" type="string" summary="UTF-8 text payload"/>
+      <arg name="fg" type="uint" summary="packed 32-bit RGBA foreground color or palette index"/>
+      <arg name="bg" type="uint" summary="packed 32-bit RGBA background color or palette index"/>
+      <arg name="flags" type="uint" enum="style_flags" summary="style attribute bitmask"/>
     </request>
 
     <request name="clear">

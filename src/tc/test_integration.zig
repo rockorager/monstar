@@ -361,3 +361,87 @@ test "TC-Wayland pixel buffer creation, wl_shm, and overlay rendering" {
     comp.unlock();
     try std.testing.expect(found_shm_buf);
 }
+
+test "TC-Wayland stream-safe chunked cell buffer upload over SSH-friendly transport" {
+    const allocator = std.testing.allocator;
+
+    const test_socket = "tc-test-chunked-0";
+    var comp = try tc.Compositor.init(allocator, test_socket, 80, 24);
+    defer comp.deinit();
+
+    var running: std.atomic.Value(bool) = .init(true);
+    const ServerRunner = struct {
+        fn run(c: *tc.Compositor, r: *std.atomic.Value(bool)) void {
+            while (r.load(.acquire)) {
+                c.dispatch(10) catch break;
+            }
+        }
+    };
+
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{ comp, &running });
+    defer {
+        running.store(false, .release);
+        comp.stop();
+        server_thread.join();
+    }
+
+    sleepMs(10);
+
+    var client = try tc.Client.connect(allocator, test_socket);
+    defer client.deinit();
+
+    // Verify buffer_factory global was bound
+    try std.testing.expect(client.buffer_factory != null);
+
+    // Create grid surface
+    _ = try client.createGridSurface();
+    try client.roundtrip();
+
+    // 80 cols x 24 rows = 1920 cells = 15,360 bytes (spans ~5 chunks of 3072 bytes)
+    const cols: u32 = 80;
+    const rows: u32 = 24;
+    const total_cells = cols * rows;
+    const cells = try allocator.alloc(CompactCell, total_cells);
+    defer allocator.free(cells);
+
+    for (cells) |*c| {
+        c.* = CompactCell.ascii(' ', 7, 0);
+    }
+
+    // Write text near start (chunk 1)
+    const text_start = "CHUNK-START";
+    for (text_start, 0..) |ch, i| {
+        cells[i] = CompactCell.ascii(ch, 2, 0);
+    }
+
+    // Write text in the middle (chunk 3, around row 12)
+    const text_mid = "CHUNK-MIDDLE";
+    const mid_idx = 12 * cols + 10;
+    for (text_mid, 0..) |ch, i| {
+        cells[mid_idx + i] = CompactCell.ascii(ch, 3, 0);
+    }
+
+    // Write text near the end (chunk 5, row 23)
+    const text_end = "CHUNK-END";
+    const end_idx = 23 * cols + 20;
+    for (text_end, 0..) |ch, i| {
+        cells[end_idx + i] = CompactCell.ascii(ch, 4, 0);
+    }
+
+    const cell_bytes = std.mem.sliceAsBytes(cells);
+    try std.testing.expect(cell_bytes.len > 4096);
+
+    const buffer = try client.createCellBuffer(cols, rows, .compact_v1, cell_bytes);
+    try client.commitBuffer(buffer, cols, rows);
+    try client.roundtrip();
+
+    sleepMs(20);
+
+    // Verify compositor rendered all chunks across the full 80x24 canvas
+    const rendered = try comp.renderToString(allocator);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "CHUNK-START") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "CHUNK-MIDDLE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "CHUNK-END") != null);
+}

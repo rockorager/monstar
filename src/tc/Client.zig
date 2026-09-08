@@ -45,6 +45,7 @@ registry: *wl.Registry,
 // Bound globals
 compositor: ?*wl.Compositor = null,
 zterm_compositor: ?*zterm.CompositorV1 = null,
+buffer_factory: ?*zterm.BufferFactoryV1 = null,
 keyboard: ?*zterm.KeyboardV1 = null,
 theme_manager: ?*zterm.ThemeManagerV1 = null,
 layer_shell: ?*zwlr.LayerShellV1 = null,
@@ -145,6 +146,7 @@ pub fn deinit(self: *Client) void {
     if (self.layer_shell) |ls| ls.destroy();
     if (self.theme_manager) |tm| tm.destroy();
     if (self.keyboard) |kb| kb.release();
+    if (self.buffer_factory) |bf| bf.destroy();
     if (self.zterm_compositor) |zc| zc.destroy();
     if (self.shm) |s| s.destroy();
     if (self.compositor) |c| c.destroy();
@@ -200,14 +202,14 @@ pub fn createBuffer(
         .rich_v1 => @intCast(cols * @sizeOf(RichCell)),
         .argb8888, .xrgb8888 => @intCast(cols * 4),
     };
-    const fd = try std.posix.memfd_create("tc-shm-buffer", std.os.linux.MFD.CLOEXEC);
-    errdefer _ = std.os.linux.close(fd);
-    if (std.os.linux.ftruncate(fd, @intCast(bytes.len)) != 0) return error.ShmFailed;
+    const fd = try std.posix.memfd_create("tc-shm-buffer", 0);
+    errdefer _ = std.c.close(fd);
+    if (std.c.ftruncate(fd, @intCast(bytes.len)) != 0) return error.ShmFailed;
     _ = std.c.write(fd, bytes.ptr, bytes.len);
 
     const pool = try shm.createPool(fd, @intCast(bytes.len));
     defer pool.destroy();
-    _ = std.os.linux.close(fd);
+    _ = std.c.close(fd);
 
     const shm_fmt: wl.Shm.Format = @enumFromInt(format.toShmFormat());
     return try pool.createBuffer(0, @intCast(cols), @intCast(rows), stride, shm_fmt);
@@ -220,7 +222,30 @@ pub fn createCellBuffer(
     format: Buffer.Format,
     cell_bytes: []const u8,
 ) !*wl.Buffer {
-    return self.createBuffer(cols, rows, format, cell_bytes);
+    if (self.buffer_factory) |factory| {
+        const wire_fmt: zterm.BufferFactoryV1.CellFormat = switch (format) {
+            .compact_v1 => .compact_v1,
+            .rich_v1 => .rich_v1,
+            else => return error.InvalidCellFormat,
+        };
+        const buf = try factory.createCellBuffer(cols, rows, wire_fmt);
+        var offset: u32 = 0;
+        while (offset < cell_bytes.len) {
+            const chunk_len: u32 = @intCast(@min(3072, cell_bytes.len - offset));
+            var array = wl.Array{
+                .size = chunk_len,
+                .alloc = chunk_len,
+                .data = @ptrCast(@constCast(cell_bytes.ptr + offset)),
+            };
+            factory.uploadCells(buf, offset, &array);
+            offset += chunk_len;
+        }
+        return buf;
+    } else if (self.shm != null) {
+        return self.createBuffer(cols, rows, format, cell_bytes);
+    } else {
+        return error.NoBufferFactory;
+    }
 }
 
 pub fn createPixelBuffer(
@@ -279,6 +304,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Cli
                 self.compositor = registry.bind(g.name, wl.Compositor, 4) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zterm.CompositorV1.interface.name) == .eq) {
                 self.zterm_compositor = registry.bind(g.name, zterm.CompositorV1, 1) catch return;
+            } else if (std.mem.orderZ(u8, g.interface, zterm.BufferFactoryV1.interface.name) == .eq) {
+                self.buffer_factory = registry.bind(g.name, zterm.BufferFactoryV1, 1) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zterm.KeyboardV1.interface.name) == .eq) {
                 self.keyboard = registry.bind(g.name, zterm.KeyboardV1, 1) catch return;
             } else if (std.mem.orderZ(u8, g.interface, zterm.ThemeManagerV1.interface.name) == .eq) {

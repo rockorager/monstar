@@ -86,6 +86,45 @@ pub fn initWithStride(
     };
 }
 
+pub fn initEmpty(
+    allocator: std.mem.Allocator,
+    cols: u32,
+    rows: u32,
+    format: Format,
+) !Buffer {
+    const stride = if (format == .argb8888 or format == .xrgb8888) cols * 4 else 0;
+    const total_bytes = expectedByteSize(format, cols, rows, stride);
+    const data = try allocator.alloc(u8, total_bytes);
+    @memset(data, 0);
+    return .{
+        .cols = cols,
+        .rows = rows,
+        .stride = stride,
+        .format = format,
+        .data = data,
+        .allocator = allocator,
+    };
+}
+
+pub fn writeChunk(self: *Buffer, offset: usize, chunk: []const u8) !void {
+    if (offset + chunk.len > self.data.len) {
+        return error.BufferOverflow;
+    }
+    @memcpy(self.data[offset .. offset + chunk.len], chunk);
+}
+
+pub fn clone(self: Buffer, allocator: std.mem.Allocator) !Buffer {
+    const copy = try allocator.dupe(u8, self.data);
+    return .{
+        .cols = self.cols,
+        .rows = self.rows,
+        .stride = self.stride,
+        .format = self.format,
+        .data = copy,
+        .allocator = allocator,
+    };
+}
+
 pub fn deinit(self: *Buffer) void {
     if (self.allocator) |alloc| {
         alloc.free(self.data);
