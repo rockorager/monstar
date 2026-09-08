@@ -515,4 +515,5 @@ test "terminal emulation of simple output" {
 test {
     _ = @import("tc.zig");
     _ = @import("tc/test_integration.zig");
+    _ = @import("shell.zig");
 }

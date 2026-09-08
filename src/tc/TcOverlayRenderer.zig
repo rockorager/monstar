@@ -16,6 +16,12 @@ pub fn rgbaToArgb(rgba: u32) u32 {
     return (@as(u32, a) << 24) | rgb;
 }
 
+pub const Cursor = struct {
+    col: u32,
+    row: u32,
+    visible: bool,
+};
+
 pub fn renderCanvas(
     allocator: std.mem.Allocator,
     font: *Font,
@@ -26,7 +32,7 @@ pub fn renderCanvas(
     stride: u31,
     buf_width: u31,
     buf_height: u31,
-    cursor: ?struct { col: u32, row: u32, visible: bool },
+    cursor: ?Cursor,
     cursor_rgba: u32,
 ) void {
     const grid_w: u31 = @intCast(@min(@as(u64, cols) * font.cell_width, buf_width));
