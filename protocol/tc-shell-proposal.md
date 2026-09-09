@@ -15,14 +15,14 @@ Traditional Unix shells (`sh`, `bash`, `zsh`, `fish`) operate over a serial, sin
 4. History is a flat, unstructured text log of past keystrokes.
 5. Interactive TUI programs (e.g. `vim`, `htop`) hijack the entire viewport using the alternate screen buffer, blowing away context and scrollback.
 
-**`tc-shell`** redesigns the command shell for the **Terminal Compositor via Wayland (TC-Wayland)** era. It bridges modern graphical compositing, notebook-style document ergonomics, and POSIX pipeline utilities:
+**`tc-shell`** redesigns the command shell for the **Terminal Compositor via Wayland (TC-Wayland)** era. It is a text-processing shell that unifies Fish-grade line editing, stateful POSIX pipelines, and Wayland subsurface isolation:
 - **Zero ANSI bytestreams in the shell:** The shell core never parses or emits VT100/xterm escape codes.
-- **Surface-per-invocation:** Every command execution runs in its own isolated Wayland surface.
-- **Dual Execution Models:** 
-  - **Standalone Programs:** Fullscreen or tiled surfaces managed by the window manager or compositor multiplexer.
-  - **Notebook Documents (`notebook` / `doc`):** Linear, collapsible, reproducible blocks of command recipes and pipelines.
+- **Surface-per-command:** Every command execution runs in its own isolated Wayland subsurface (`$1`, `$2`, ..., `$n`).
+- **Prompt-Centric Architecture (Zero Focus Management):** The user never toggles focus or navigates modal UI states. The stationary prompt is the single, persistent point of input.
+- **Command-Driven Block Management:** All operations on past command blocks (`collapse`, `expand`, `fullscreen`, `edit`, `run`, `rm`, `copy`) are executed via regular prompt commands on block tags (`$1`, `$prev`).
+- **First-Class Text Processing & Pipelining:** Subsequent commands reference previous outputs directly (`$1 | grep foo`, `$1 > file.txt`, `diff $1 $2`).
+- **Fish-Grade Line Editor with Overlay Completions:** Real-time syntax highlighting, ghost auto-suggestions, and Tab completions presented as cursor-anchored Wayland overlays (`zterm_cursor_anchor_v1`) that never push canvas content down.
 - **Sandboxed Legacy Tools (`xpty`):** Unmodified VT100 tools run via the compositor’s sandboxed PTY bridge without corrupting adjacent surfaces.
-- **Cross-Platform & Remote (macOS & SSH):** Operates natively under desktop Wayland compositors (Sway, Hyprland) or within Monstar acting as an embedded "desktop-in-a-window" over SSH.
 
 ---
 
@@ -30,18 +30,19 @@ Traditional Unix shells (`sh`, `bash`, `zsh`, `fish`) operate over a serial, sin
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│ USER INTERACTION                                                       │
-│ • Stationary Persistent Prompt (Docks, status bar, or input line)      │
-│ • Standalone Commands (htop, neovim, cargo build)                      │
-│ • Notebook Workflows (`notebook run build.tc`, multi-stage blocks)     │
+│ USER INTERACTION: STATIONARY PROMPT (Always Focused)                   │
+│ • Fish-grade line editor (syntax highlighting, inline auto-suggestions)│
+│ • Floating Tab completion overlay (zterm_cursor_anchor_v1)             │
+│ • Block control commands (collapse $1, expand $1, edit $1, rm $1)      │
+│ • Pipeline references ($1 | grep foo, $1 > file.txt, diff $1 $2)       │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │ tc-shell ENGINE                                                        │
 │ ┌────────────────────────┐ ┌────────────────────┐ ┌──────────────────┐ │
-│ │ POSIX Parser & Pipes   │ │ Surface Controller │ │ Notebook Runtime │ │
-│ │ (fork, exec, pipe(2))  │ │ (Wayland Client)   │ │ (Blocks, Folds)  │ │
+│ │ POSIX Parser & Pipes   │ │ Surface Controller │ │ State Manager    │ │
+│ │ (fork, exec, pipe(2))  │ │ (Wayland Client)   │ │ (cwd, env vars)  │ │
 │ └────────────────────────┘ └────────────────────┘ └──────────────────┘ │
 └───────────────────┬───────────────────────────────────┬────────────────┘
                     │ Standard OS Pipes (Raw Data)      │ Wayland Wire IPC
@@ -49,53 +50,69 @@ Traditional Unix shells (`sh`, `bash`, `zsh`, `fish`) operate over a serial, sin
 ┌───────────────────────────────┐     ┌──────────────────────────────────┐
 │ UNIX DATA PIPELINE            │     │ MONSTAR / WAYLAND COMPOSITOR     │
 │ • Intermediate stages: OS FDs │     │ • Stationary Prompt Surface      │
-│ • Endpoint: zterm_stream or   │     │ • Command Blocks (Subsurfaces)   │
-│   zterm_grid surface          │     │ • Standalone Windows (xdg_shell) │
-│                               │     │ • Sandboxed xpty Bridge (VT100)  │
+│ • Cached outputs (memfd)      │     │ • Command Blocks (Subsurfaces)   │
+│ • Endpoint: zterm_stream or   │     │ • Cursor-Anchored Overlays       │
+│   zterm_grid surface          │     │ • Sandboxed xpty Bridge (VT100)  │
 └───────────────────────────────┘     └──────────────────────────────────┘
 ```
 
 ---
 
-## 3. Surface & Layout Model
+## 3. UX & Interaction Model
 
-### 3.1 The Stationary Prompt
-In `tc-shell`, the prompt does not scroll up into oblivion as lines are printed.
-- The prompt is an independent, pinned Wayland surface (`zwlr_layer_shell_v1` or a dedicated subsurface).
-- It remains anchored (typically at the bottom of the viewport or docked at the top).
-- As commands execute, their visual blocks scroll up into the history canvas above the prompt.
-- Autocomplete menus, documentation hovers, and history search pickers float directly over the prompt using `zterm_cursor_anchor_v1`.
+### 3.1 The Stationary Prompt: The Single Point of Interaction
+In `tc-shell`, the prompt does not scroll away. It remains anchored and persistently focused.
+- **Zero Focus Management:** The user never switches focus between panes, surfaces, or blocks. Keystrokes always target the prompt editor.
+- **Zero Shell Pager / Scroll Modes:** The shell does not implement internal pager modes or modal `j`/`k` navigation. When a user wants to paginate, search, or inspect output, they use standard Unix tools directly from the prompt (`view $1` or `$1 | less`).
+- **Syntax Highlighting:** Real-time tokenization as the user types (valid executables in green, invalid commands in red, flags in cyan, strings in yellow, pipes in purple).
+- **Auto-Suggestions (Ghost Text):** Dimmed inline preview of history matches; press `Right Arrow` or `Ctrl+F` to accept.
+- **Overlay Autocompletions:** Pressing `Tab` opens a floating completion menu positioned via `zterm_cursor_anchor_v1` directly beneath/above the cursor. It never pushes canvas text down or mutates scrollback.
 
-### 3.2 Standalone Execution vs. Notebook Blocks
+### 3.2 Command Blocks & Prompt-Driven Actions
+Every executed command and its output are placed inside an isolated Wayland subsurface tagged with an identifier (`$1`, `$2`, ..., `$n`) and alias `$prev`.
 
-`tc-shell` explicitly differentiates between two execution modes:
+All block manipulations are performed purely through standard prompt commands:
 
-#### 1. Standalone / Full-Screen Programs (Default for Interactive TUIs)
-When running standalone programs (`htop`, `neovim`, `aerc`, `yazi`):
-- `tc-shell` requests a new toplevel window via `xdg_shell` (or a dedicated pane in Monstar).
-- In a **Native Wayland WM (Sway / Hyprland)**: The program opens as a first-class tiled or floating window. The desktop window manager provides multiplexing naturally.
-- In a **Nested Compositor (Monstar on macOS / SSH)**: Monstar acts as the window manager, displaying the program in a tiled pane, tab, or maximizable modal.
-- **Surface Clamping**: The program's alternate screen buffer is restricted to the bounds of its surface. Maximizing the surface expands it to the full window without breaking the rest of the workspace.
+| Command | Action | Example |
+| :--- | :--- | :--- |
+| **`collapse`** | Folds the block's output into a compact 1-line badge. Defaults to `$prev`. | `collapse $1`, `collapse` |
+| **`expand`** | Unfolds a collapsed block's output back to view. | `expand $1`, `expand` |
+| **`fullscreen`** / **`fg`** | Re-expands an xpty interactive tool or zooms a block. | `fullscreen $2`, `fg` |
+| **`edit`** | Populates the prompt input buffer with the block's command text for tweaking. | `edit $1` |
+| **`run`** | Re-executes the command as a new block. | `run $1` |
+| **`rm`** | Deletes the block and its output entirely from the visual canvas. | `rm $1` |
+| **`copy`** | Copies the block's output (or `.cmd`) to the system clipboard. | `copy $1`, `copy $1.cmd` |
+| **`view`** | Streams the block's output into the system pager (`less`). | `view $1` |
 
-#### 2. Notebook / Document Mode (Via `notebook` / `doc` Builtin)
-For exploratory coding, build pipelines, and multi-stage imperative workflows, users work within a **Notebook**:
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│ [▼] WORKFLOW: Build & Test              [Success] [1.4s] [Re-run] [x]  │ ◄ Block Header
-├────────────────────────────────────────────────────────────────────────┤
-│ Scope: cwd = ~/dev/monstar | env = { ZIG_DEBUG: "1" }                  │
-├────────────────────────────────────────────────────────────────────────┤
-│ [✓] 1. cd ~/dev/monstar                                     (0.2ms)    │
-│ [✓] 2. git checkout feat/xpty                               (42ms)     │
-│ [✓] 3. zig build test                                       (1.3s)     │
-│        ├─ [▶] 48 passed, 0 failed (1,240 lines hidden)                 │ ◄ Collapsed Output
-└────────────────────────────────────────────────────────────────────────┘
-```
+### 3.3 Text Processing & Output Referencing
+`tc-shell` treats command outputs as reusable data sources:
+- **Pipes:** `$1 | grep "ERROR" | wc -l`
+- **Redirection:** `$1 > bundle.log`
+- **Arguments / Process Substitution:** `diff $1 $2`
+- Outputs are cached in anonymous `memfd` descriptors, enabling instantaneous re-use without re-running long commands.
 
-- **Collapsible / Expandable**: Large logs automatically collapse with summary badges; click `[▼]` or press hotkeys to inspect.
-- **Isolated Scoping**: Workflows declare their own context (`cwd`, environment variables). Directory changes do not pollute the global shell session unless intended.
-- **Replayability**: Entire command blocks can be re-run with one click or keybinding using their recorded starting conditions.
-- **Exportable**: Workflows can be saved directly to `.tc` runnable recipe files or markdown blocks.
+### 3.4 Interactive Full-Screen Programs (`xpty`)
+When running interactive TUI applications (`nvim`, `htop`, `less`):
+- `tc-shell` runs the tool in an isolated `zterm_xpty_v1` surface that expands to full screen.
+- Standard Unix job suspension (`Ctrl+Z`) drops back to the stationary prompt, leaving the tool running as a minimized block.
+- Typing `fg` or `fullscreen $N` restores the application to full screen.
+- Upon process exit, control returns cleanly to the stationary prompt with no residual escape sequence debris.
+
+### 3.5 The Surface Hierarchy: Document Canvas vs. OS Workspaces
+To avoid window-manager clutter and runaway complexity, `tc-shell` strictly delineates between **internal document blocks** and **external OS window management**:
+
+1. **Subsurfaces (`wl_subsurface`), Not OS Windows:**
+   - Every command block is an internal Wayland `wl_subsurface` anchored inside a parent document canvas.
+   - Command blocks do **not** register as `xdg_toplevel` windows; they do not appear in Alt-Tab switchers or flood tiling trees.
+   - The shell session is presented as **one single application window** to the host desktop window manager (Sway, Niri, Hyprland).
+2. **Monstar as a Document Compositor (Not a Window Manager):**
+   - Monstar GUI does not implement window manager logic (floating window dragging, tiling split trees, focus policies).
+   - Monstar simply calculates a 1D vertical flow layout (`y_offset += block.height`) for subsurfaces. When blocks collapse (`collapse $1`) or are removed (`rm $1`), adjacent blocks slide smoothly into place.
+3. **Translating Terminal Multiplexing to OS Workspaces:**
+   - Traditional multiplexers (`tmux`, `zellij`) build an insulated "OS inside an OS", hiding sessions, tabs, and splits from the host desktop.
+   - Under TC-Wayland, terminal multiplexing delegates directly to native OS workspaces:
+     - New shell workspaces or project sessions are created as first-class `xdg_toplevel` windows or mapped directly to desktop workspaces (via Wayland `ext-workspace-v1` or compositor IPC).
+     - In standalone Monstar (e.g. on macOS without a native Wayland WM), Monstar provides the outer tab/workspace container.
 
 ---
 
@@ -194,12 +211,17 @@ pub fn main() !void {
 1. **Protocol Extension (`term-compositor-v1.xml`)**:
    - [x] Added `style_flags` enum to `zterm_stream_surface_v1`.
    - [x] Added `append_styled_text` request to `zterm_stream_surface_v1`.
-2. **`libtc` SDK**:
-   - Lightweight client library in Zig providing `Stream` and `GridApp` abstractions with auto-detection of `$TC_WAYLAND_DISPLAY`.
-3. **`tc-shell` Prototype**:
-   - REPL with a stationary prompt surface.
-   - Command launcher with `xdg_shell` / `zterm_grid_surface_v1`.
-   - Standard Unix pipeline execution.
-   - `xpty` bridge hand-off for legacy tools.
-4. **`notebook` Builtin**:
-   - Block creation, folding, and workflow re-execution.
+   - [x] Cursor-anchored overlays (`zterm_cursor_anchor_v1`).
+2. **Fish-Grade Prompt Surface (`PromptSurface.zig`)**:
+   - Stationary prompt (always focused, zero focus-state management).
+   - Real-time syntax highlighting (commands, flags, strings, pipes).
+   - Dimmed inline auto-suggestions (accept with `Right Arrow` or `Ctrl+F`).
+   - Floating Tab completion popup overlay anchored via `zterm_cursor_anchor_v1`.
+3. **Stateful Execution Engine & Block Management**:
+   - In-process session state (`cwd`, `export`, `unset`, aliases).
+   - Subsurface command blocks tagged `$1..$n` and `$prev` backed by anonymous `memfd` buffers.
+   - Prompt-driven block built-ins: `collapse`, `expand`, `fullscreen` / `fg`, `edit`, `run`, `rm`, `copy`, `view`.
+   - Output referencing in pipelines (`$1 | grep foo`, `$1 > file.txt`, `diff $1 $2`).
+4. **`xpty` Integration**:
+   - Fullscreen auto-expansion for interactive TUIs (`nvim`, `htop`).
+   - Standard `Ctrl+Z` suspension to background block; re-expansion via `fullscreen $N` or `fg`.
