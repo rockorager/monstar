@@ -48,6 +48,28 @@
             installCheckPhase = ''
               TERMINFO="$out/share/terminfo" infocmp -x monstar >/dev/null
             '';
+
+            passthru.terminfo = pkgs.stdenv.mkDerivation {
+              pname = "monstar-terminfo";
+              inherit (finalAttrs) version;
+              src = finalAttrs.finalPackage;
+
+              dontUnpack = true;
+              dontFixup = true;
+
+              installPhase = ''
+                runHook preInstall
+                install -d "$out/share/terminfo"
+                cp -r "$src/share/terminfo/." "$out/share/terminfo"
+                runHook postInstall
+              '';
+
+              doInstallCheck = true;
+              nativeBuildInputs = [ pkgs.ncurses ];
+              installCheckPhase = ''
+                TERMINFO="$out/share/terminfo" infocmp -x monstar >/dev/null
+              '';
+            };
           });
         });
 
