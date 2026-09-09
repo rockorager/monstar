@@ -5,6 +5,10 @@ const PromptSurface = @import("PromptSurface.zig");
 const CommandBlock = @import("CommandBlock.zig");
 const SessionState = @import("SessionState.zig");
 
+extern "c" fn popen(command: [*:0]const u8, modes: [*:0]const u8) ?*anyopaque;
+extern "c" fn pclose(stream: *anyopaque) c_int;
+extern "c" fn fgets(s: [*]u8, size: c_int, stream: *anyopaque) ?[*]u8;
+
 test "CommandBlock basic lifecycle and status" {
     const allocator = std.testing.allocator;
 
@@ -46,9 +50,30 @@ test "SessionState environment and builtins parsing" {
     session.unsetEnv("TEST_VAR");
     try std.testing.expect(session.getEnv("TEST_VAR") == null);
 
+    // Test changeDirectory
+    const initial_cwd = try allocator.dupe(u8, session.getCwd());
+    defer allocator.free(initial_cwd);
+    try session.changeDirectory("/tmp");
+    try std.testing.expectEqualStrings("/tmp", session.getCwd());
+    try std.testing.expectEqualStrings(initial_cwd, session.old_pwd.?);
+
+    if (popen("pwd", "r")) |p| {
+        var buf: [256]u8 = undefined;
+        if (fgets(&buf, buf.len, p)) |_| {
+            const out = std.mem.sliceTo(&buf, 0);
+            try std.testing.expect(std.mem.startsWith(u8, out, "/tmp"));
+        }
+        _ = pclose(p);
+    }
+
+    try session.changeDirectory(initial_cwd);
+
     // Test parseBuiltin
     const b_cd = SessionState.parseBuiltin("cd /tmp");
     try std.testing.expectEqualStrings("/tmp", b_cd.cd.?);
+
+    const b_pwd = SessionState.parseBuiltin("pwd");
+    try std.testing.expect(b_pwd == .pwd);
 
     const b_collapse = SessionState.parseBuiltin("collapse $2");
     try std.testing.expectEqualStrings("$2", b_collapse.collapse);
@@ -66,6 +91,15 @@ test "SessionState environment and builtins parsing" {
     const b_copy_out = SessionState.parseBuiltin("copy $prev");
     try std.testing.expectEqualStrings("$prev", b_copy_out.copy.target);
     try std.testing.expect(!b_copy_out.copy.is_cmd);
+
+    const b_copy_screen = SessionState.parseBuiltin("copy screen");
+    try std.testing.expect(b_copy_screen.copy.is_screen);
+
+    const b_copy_default = SessionState.parseBuiltin("copy");
+    try std.testing.expect(b_copy_default.copy.is_screen);
+
+    const b_copy_all = SessionState.parseBuiltin("copy all");
+    try std.testing.expect(b_copy_all.copy.is_all);
 
     const b_run = SessionState.parseBuiltin("run $3");
     try std.testing.expectEqualStrings("$3", b_run.run);
@@ -111,4 +145,14 @@ test "SessionState block resolution and pipeline expansion" {
     const expanded_diff = try SessionState.expandPipeline(allocator, &blocks, "diff $1 $2");
     defer allocator.free(expanded_diff);
     try std.testing.expect(std.mem.startsWith(u8, expanded_diff, "diff /proc/self/fd/"));
+}
+
+test "SessionState isAllTarget matching" {
+    try std.testing.expect(SessionState.isAllTarget("all"));
+    try std.testing.expect(SessionState.isAllTarget("$all"));
+    try std.testing.expect(SessionState.isAllTarget("*"));
+    try std.testing.expect(SessionState.isAllTarget("  all  "));
+    try std.testing.expect(!SessionState.isAllTarget("$1"));
+    try std.testing.expect(!SessionState.isAllTarget("$prev"));
+    try std.testing.expect(!SessionState.isAllTarget(""));
 }

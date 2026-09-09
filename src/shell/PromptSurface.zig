@@ -126,6 +126,37 @@ pub fn deinit(self: *PromptSurface) void {
 
 pub fn setSession(self: *PromptSurface, session: *SessionState) void {
     self.session = session;
+    self.updateBanner(session.getCwd()) catch {};
+}
+
+pub fn setPosition(self: *PromptSurface, x: i32, y: i32) void {
+    self.grid_surface.setPosition(x, y);
+}
+
+pub fn updateBanner(self: *PromptSurface, cwd: []const u8) !void {
+    var host_buf: [64]u8 = undefined;
+    const host = std.posix.gethostname(&host_buf) catch "localhost";
+
+    var display_cwd: []const u8 = cwd;
+    var home_prefix: []const u8 = "";
+    if (self.session) |s| {
+        if (s.getEnv("HOME")) |home| {
+            if (std.mem.startsWith(u8, cwd, home)) {
+                home_prefix = "~";
+                display_cwd = cwd[home.len..];
+            }
+        }
+    }
+
+    const new_banner = if (home_prefix.len > 0)
+        try std.fmt.allocPrint(self.allocator, "{s}:{s}{s}:tc> ", .{ host, home_prefix, display_cwd })
+    else
+        try std.fmt.allocPrint(self.allocator, "{s}:{s}:tc> ", .{ host, display_cwd });
+
+    self.allocator.free(self.hostname_banner);
+    self.hostname_banner = new_banner;
+    self.render();
+    try self.commit();
 }
 
 pub fn resize(self: *PromptSurface, new_cols: u32) !void {
@@ -159,9 +190,9 @@ pub fn getCursorScreenCol(self: *const PromptSurface) usize {
 
 fn isBuiltinName(name: []const u8) bool {
     const builtins = [_][]const u8{
-        "cd",   "collapse", "expand", "fullscreen", "fg",    "edit",
-        "run",  "rm",       "copy",   "view",       "clear", "exit",
-        "quit", "export",   "unset",
+        "cd",     "pwd",   "collapse", "expand", "fullscreen", "fg",   "edit",
+        "run",    "rm",    "copy",     "view",   "clear",      "exit", "quit",
+        "export", "unset",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
@@ -335,7 +366,9 @@ pub fn render(self: *PromptSurface) void {
 pub fn commit(self: *PromptSurface) !void {
     const cell_bytes = std.mem.sliceAsBytes(self.cells);
     const buf = try self.client.createCellBuffer(self.cols, self.rows, .compact_v1, cell_bytes);
-    try self.client.commitBuffer(buf, self.cols, self.rows);
+    self.surface.attach(buf, 0, 0);
+    self.surface.damage(0, 0, @as(i32, @intCast(self.cols)), @as(i32, @intCast(self.rows)));
+    self.surface.commit();
     _ = self.client.display.flush();
 }
 
@@ -363,46 +396,117 @@ fn triggerCompletion(self: *PromptSurface) !void {
     const token = input[start..self.cursor_pos];
 
     var matches: std.ArrayList([]const u8) = .empty;
-    defer matches.deinit(self.allocator);
+    errdefer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
 
-    // If starting with '$', match block tags
+    // 1. If starting with '$', match block tags
     if (std.mem.startsWith(u8, token, "$")) {
-        const tags = [_][]const u8{ "$1", "$2", "$3", "$prev" };
+        const tags = [_][]const u8{ "$1", "$2", "$3", "$prev", "$all" };
         for (tags) |t| {
             if (std.mem.startsWith(u8, t, token)) {
                 try matches.append(self.allocator, try self.allocator.dupe(u8, t));
             }
         }
-    } else if (start == 0) {
-        // Builtins
+    } else if (start > 0 and (std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "collapse") or
+        std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "expand") or
+        std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "rm")))
+    {
+        const block_options = [_][]const u8{ "all", "$all", "$prev", "$1", "$2", "$3" };
+        for (block_options) |opt| {
+            if (token.len == 0 or std.mem.startsWith(u8, opt, token)) {
+                try matches.append(self.allocator, try self.allocator.dupe(u8, opt));
+            }
+        }
+    } else if (start == 0 and std.mem.indexOfScalar(u8, token, '/') == null) {
+        // 2. Command name completion (builtins + executables in PATH)
         const builtins = [_][]const u8{
-            "cd",   "collapse", "expand", "fullscreen", "fg",    "edit",
-            "run",  "rm",       "copy",   "view",       "clear", "exit",
-            "quit", "export",   "unset",
+            "cd",     "pwd",   "collapse", "expand", "fullscreen", "fg",   "edit",
+            "run",    "rm",    "copy",     "view",   "clear",      "exit", "quit",
+            "export", "unset",
         };
         for (builtins) |b| {
             if (std.mem.startsWith(u8, b, token)) {
                 try matches.append(self.allocator, try self.allocator.dupe(u8, b));
             }
         }
-    } else {
-        // File / directory completions in cwd
-        const cwd_path = if (self.session) |s| s.getCwd() else ".";
-        const cwd_z = try self.allocator.dupeZ(u8, cwd_path);
-        defer self.allocator.free(cwd_z);
 
-        if (std.c.opendir(cwd_z.ptr)) |dir| {
+        // Also search common path directories for matching executables if token is non-empty
+        if (token.len > 0) {
+            const path_dirs = [_][*:0]const u8{ "/usr/bin", "/bin", "/usr/local/bin" };
+            for (path_dirs) |p| {
+                if (matches.items.len >= 30) break;
+                if (std.c.opendir(p)) |dir| {
+                    defer _ = std.c.closedir(dir);
+                    while (std.c.readdir(dir)) |entry| {
+                        if (matches.items.len >= 30) break;
+                        const name = std.mem.sliceTo(&entry.name, 0);
+                        if (name.len == 0 or name[0] == '.') continue;
+                        if (std.mem.startsWith(u8, name, token)) {
+                            var dup = false;
+                            for (matches.items) |m| {
+                                if (std.mem.eql(u8, m, name)) {
+                                    dup = true;
+                                    break;
+                                }
+                            }
+                            if (!dup) {
+                                try matches.append(self.allocator, try self.allocator.dupe(u8, name));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // 3. File / path completion
+        const cwd_path = if (self.session) |s| s.getCwd() else ".";
+        const last_slash = std.mem.lastIndexOfScalar(u8, token, '/');
+
+        const dir_part = if (last_slash) |idx| token[0 .. idx + 1] else "";
+        const base_part = if (last_slash) |idx| token[idx + 1 ..] else token;
+
+        var target_dir: []const u8 = undefined;
+        var allocated_target_dir: ?[]u8 = null;
+        defer {
+            if (allocated_target_dir) |d| self.allocator.free(d);
+        }
+
+        if (dir_part.len == 0) {
+            target_dir = cwd_path;
+        } else if (std.mem.startsWith(u8, dir_part, "~/")) {
+            const home = if (self.session) |s| s.getEnv("HOME") orelse "/" else "/";
+            allocated_target_dir = try std.fs.path.join(self.allocator, &[_][]const u8{ home, dir_part[2..] });
+            target_dir = allocated_target_dir.?;
+        } else if (std.mem.eql(u8, dir_part, "~")) {
+            target_dir = if (self.session) |s| s.getEnv("HOME") orelse "/" else "/";
+        } else if (std.fs.path.isAbsolute(dir_part)) {
+            target_dir = dir_part;
+        } else {
+            allocated_target_dir = try std.fs.path.join(self.allocator, &[_][]const u8{ cwd_path, dir_part });
+            target_dir = allocated_target_dir.?;
+        }
+
+        const target_dir_z = try self.allocator.dupeZ(u8, target_dir);
+        defer self.allocator.free(target_dir_z);
+
+        if (std.c.opendir(target_dir_z.ptr)) |dir| {
             defer _ = std.c.closedir(dir);
             while (std.c.readdir(dir)) |entry| {
+                if (matches.items.len >= 50) break;
                 const name = std.mem.sliceTo(&entry.name, 0);
                 if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-                if (std.mem.startsWith(u8, name, token)) {
-                    if (entry.type == 4) { // DT_DIR
-                        const with_slash = try std.fmt.allocPrint(self.allocator, "{s}/", .{name});
-                        try matches.append(self.allocator, with_slash);
-                    } else {
-                        try matches.append(self.allocator, try self.allocator.dupe(u8, name));
-                    }
+                if (!std.mem.startsWith(u8, base_part, ".") and name.len > 0 and name[0] == '.') continue;
+
+                if (std.mem.startsWith(u8, name, base_part)) {
+                    const is_dir = entry.type == 4;
+                    const match_str = try std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{
+                        dir_part,
+                        name,
+                        if (is_dir) "/" else "",
+                    });
+                    try matches.append(self.allocator, match_str);
                 }
             }
         }
@@ -412,10 +516,18 @@ fn triggerCompletion(self: *PromptSurface) !void {
         // Single match: complete inline immediately
         const m = matches.items[0];
         defer self.allocator.free(m);
+        matches.deinit(self.allocator);
 
         // Replace current token with match
         try self.input_buf.replaceRange(self.allocator, start, token.len, m);
         self.cursor_pos = start + m.len;
+
+        // If completed word is not a directory, append a space
+        if (!std.mem.endsWith(u8, m, "/")) {
+            try self.input_buf.insertSlice(self.allocator, self.cursor_pos, " ");
+            self.cursor_pos += 1;
+        }
+
         self.render();
         try self.commit();
         return;
@@ -423,11 +535,13 @@ fn triggerCompletion(self: *PromptSurface) !void {
 
     if (matches.items.len > 1) {
         // Multiple matches: show floating completion overlay
-        self.completion_items = matches;
+        self.completion_items = matches; // transfer ownership, do not deinit
         self.completion_active = true;
         self.completion_selected = 0;
         self.render();
         try self.commit();
+    } else {
+        matches.deinit(self.allocator);
     }
 }
 
@@ -437,6 +551,10 @@ pub fn applyCompletion(self: *PromptSurface) !void {
     const old_len = self.cursor_pos - self.completion_token_start;
     try self.input_buf.replaceRange(self.allocator, self.completion_token_start, old_len, item);
     self.cursor_pos = self.completion_token_start + item.len;
+    if (!std.mem.endsWith(u8, item, "/")) {
+        try self.input_buf.insertSlice(self.allocator, self.cursor_pos, " ");
+        self.cursor_pos += 1;
+    }
     self.clearCompletions();
     self.render();
     try self.commit();

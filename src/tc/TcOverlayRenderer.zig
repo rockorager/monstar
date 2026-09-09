@@ -13,7 +13,8 @@ const Surface = @import("Surface.zig");
 pub fn rgbaToArgb(rgba: u32) u32 {
     const a = rgba & 0xFF;
     const rgb = rgba >> 8;
-    return (@as(u32, a) << 24) | rgb;
+    const alpha: u32 = if (a == 0) 0xFF else a;
+    return (alpha << 24) | rgb;
 }
 
 pub const Cursor = struct {

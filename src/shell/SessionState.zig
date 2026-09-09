@@ -12,9 +12,13 @@ const posix = std.posix;
 const linux = std.os.linux;
 const CommandBlock = @import("CommandBlock.zig");
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
 pub const Builtin = union(enum) {
     none,
     cd: ?[]const u8,
+    pwd,
     export_var: struct { key: []const u8, value: []const u8 },
     unset_var: []const u8,
     collapse: []const u8,
@@ -23,7 +27,12 @@ pub const Builtin = union(enum) {
     edit: []const u8,
     run: []const u8,
     rm: []const u8,
-    copy: struct { target: []const u8, is_cmd: bool },
+    copy: struct {
+        target: []const u8,
+        is_cmd: bool,
+        is_all: bool = false,
+        is_screen: bool = false,
+    },
     view: []const u8,
     clear,
     exit,
@@ -117,6 +126,12 @@ pub fn setEnv(self: *SessionState, key: []const u8, value: []const u8) !void {
         errdefer self.allocator.free(duped_val);
         try self.env_map.put(self.allocator, duped_key, duped_val);
     }
+
+    const key_z = try self.allocator.dupeZ(u8, key);
+    defer self.allocator.free(key_z);
+    const val_z = try self.allocator.dupeZ(u8, value);
+    defer self.allocator.free(val_z);
+    _ = setenv(key_z.ptr, val_z.ptr, 1);
 }
 
 pub fn unsetEnv(self: *SessionState, key: []const u8) void {
@@ -124,6 +139,10 @@ pub fn unsetEnv(self: *SessionState, key: []const u8) void {
         self.allocator.free(entry.key);
         self.allocator.free(entry.value);
     }
+    if (self.allocator.dupeZ(u8, key)) |key_z| {
+        defer self.allocator.free(key_z);
+        _ = unsetenv(key_z.ptr);
+    } else |_| {}
 }
 
 pub fn changeDirectory(self: *SessionState, maybe_target: ?[]const u8) !void {
@@ -154,14 +173,14 @@ pub fn changeDirectory(self: *SessionState, maybe_target: ?[]const u8) !void {
     const resolved = try std.fs.path.resolve(self.allocator, &[_][]const u8{new_dest});
     defer self.allocator.free(resolved);
 
-    // Change posix process directory
+    // Change libc and posix process directory
     const resolved_z = try self.allocator.dupeZ(u8, resolved);
     defer self.allocator.free(resolved_z);
 
-    const rc = linux.chdir(resolved_z.ptr);
-    if (linux.errno(rc) != .SUCCESS) {
+    if (std.c.chdir(resolved_z.ptr) != 0) {
         return error.DirectoryChangeFailed;
     }
+    _ = linux.chdir(resolved_z.ptr);
 
     // Update old_pwd and cwd
     if (self.old_pwd) |old| self.allocator.free(old);
@@ -189,6 +208,9 @@ pub fn parseBuiltin(cmd: []const u8) Builtin {
     }
     if (std.mem.eql(u8, first, "cd")) {
         return .{ .cd = if (rest.len > 0) rest else null };
+    }
+    if (std.mem.eql(u8, first, "pwd")) {
+        return .pwd;
     }
     if (std.mem.eql(u8, first, "export")) {
         if (rest.len == 0) return .none;
@@ -225,20 +247,41 @@ pub fn parseBuiltin(cmd: []const u8) Builtin {
         return .{ .view = if (rest.len > 0) rest else "$prev" };
     }
     if (std.mem.eql(u8, first, "copy")) {
-        const target_token = if (rest.len > 0) rest else "$prev";
-        if (std.mem.endsWith(u8, target_token, ".cmd")) {
+        if (rest.len == 0 or std.mem.eql(u8, rest, "screen") or std.mem.eql(u8, rest, "canvas")) {
             return .{ .copy = .{
-                .target = target_token[0 .. target_token.len - 4],
+                .target = "",
+                .is_cmd = false,
+                .is_screen = true,
+            } };
+        }
+        if (std.mem.eql(u8, rest, "all") or std.mem.eql(u8, rest, "session")) {
+            return .{ .copy = .{
+                .target = "",
+                .is_cmd = false,
+                .is_all = true,
+            } };
+        }
+        if (std.mem.endsWith(u8, rest, ".cmd")) {
+            return .{ .copy = .{
+                .target = rest[0 .. rest.len - 4],
                 .is_cmd = true,
             } };
         }
         return .{ .copy = .{
-            .target = target_token,
+            .target = rest,
             .is_cmd = false,
         } };
     }
 
     return .none;
+}
+
+/// Checks if target string represents all blocks ("all", "$all", or "*").
+pub fn isAllTarget(raw_target: []const u8) bool {
+    const target = std.mem.trim(u8, raw_target, " \t");
+    return std.mem.eql(u8, target, "all") or
+        std.mem.eql(u8, target, "$all") or
+        std.mem.eql(u8, target, "*");
 }
 
 /// Resolves a block target string ($1, 1, $prev, prev) to a CommandBlock.
