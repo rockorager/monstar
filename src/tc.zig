@@ -12,9 +12,7 @@ pub const Surface = @import("tc/Surface.zig");
 pub const Compositor = @import("tc/Compositor.zig");
 pub const Client = @import("tc/Client.zig");
 pub const Xpty = @import("tc/Xpty.zig");
-pub const CommandPalette = @import("tc/CommandPalette.zig");
 pub const TcOverlayRenderer = @import("tc/TcOverlayRenderer.zig");
-pub const TcGuiApp = @import("tc/TcGuiApp.zig");
 
 test {
     _ = abi;
@@ -23,7 +21,5 @@ test {
     _ = Compositor;
     _ = Client;
     _ = Xpty;
-    _ = CommandPalette;
     _ = TcOverlayRenderer;
-    _ = TcGuiApp;
 }

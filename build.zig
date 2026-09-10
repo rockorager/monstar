@@ -189,44 +189,6 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    const tc_gui_exe = b.addExecutable(.{
-        .name = "monstar-tc-gui",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tc_gui_main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-        .use_llvm = true,
-    });
-    tc_gui_exe.root_module.addImport("wayland", wayland_mod);
-    tc_gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
-    tc_gui_exe.root_module.linkSystemLibrary("wayland-cursor", .{});
-    tc_gui_exe.root_module.linkSystemLibrary("wayland-server", .{});
-    tc_gui_exe.root_module.addImport("c", c_mod);
-    tc_gui_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image_resize.c") });
-    tc_gui_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image.c") });
-    if (z2d_dep) |dep| {
-        tc_gui_exe.root_module.addImport("z2d", dep.module("z2d"));
-    }
-    if (ghostty_dep) |dep| {
-        const ghostty_vt = dep.module("ghostty-vt");
-        tc_gui_exe.root_module.addImport("ghostty-vt", ghostty_vt);
-        tc_gui_exe.root_module.addImport(
-            "uucode",
-            ghostty_vt.import_table.get("uucode") orelse
-                @panic("ghostty-vt does not provide uucode"),
-        );
-    }
-    b.installArtifact(tc_gui_exe);
-
-    const tc_gui_step = b.step("tc-gui", "Run the standalone TC-Wayland GUI terminal emulator");
-    const run_tc_gui = b.addRunArtifact(tc_gui_exe);
-    tc_gui_step.dependOn(&run_tc_gui.step);
-
-    const tc_step = b.step("tc", "Run the standalone TC-Wayland GUI terminal emulator");
-    tc_step.dependOn(&run_tc_gui.step);
-
     const tc_shell_exe = b.addExecutable(.{
         .name = "monstar-tc-shell",
         .root_module = b.createModule(.{
