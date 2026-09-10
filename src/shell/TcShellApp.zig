@@ -26,6 +26,7 @@ const TcOverlayRenderer = @import("../tc/TcOverlayRenderer.zig");
 const PromptSurface = @import("PromptSurface.zig");
 const CommandBlock = @import("CommandBlock.zig");
 const SessionState = @import("SessionState.zig");
+const CompactCell = @import("../tc/abi.zig").CompactCell;
 const Config = @import("../Config.zig");
 const log = std.log.scoped(.tc_shell);
 
@@ -86,6 +87,7 @@ pub const InteractiveJob = struct {
     suspended: bool,
     start_time_ms: u64 = 0,
     is_fullscreen: bool = false,
+    user_demoted: bool = false,
 };
 
 extern "c" fn popen(command: [*:0]const u8, modes: [*:0]const u8) ?*anyopaque;
@@ -297,7 +299,7 @@ pub fn getActiveJob(self: *TcShellApp) ?*InteractiveJob {
     var i = self.jobs.items.len;
     while (i > 0) {
         i -= 1;
-        if (!self.jobs.items[i].suspended and (self.jobs.items[i].is_fullscreen or self.jobs.items[i].xpty.isAlternateScreen())) {
+        if (!self.jobs.items[i].suspended and self.jobs.items[i].is_fullscreen) {
             return &self.jobs.items[i];
         }
     }
@@ -309,6 +311,50 @@ pub fn findJob(self: *TcShellApp, block_id: usize) ?*InteractiveJob {
         if (j.block_id == block_id) return j;
     }
     return null;
+}
+
+pub fn findJobConst(self: *const TcShellApp, block_id: usize) ?*const InteractiveJob {
+    for (self.jobs.items) |*j| {
+        if (j.block_id == block_id) return j;
+    }
+    return null;
+}
+
+pub fn getEmbeddedJobRows(self: *const TcShellApp) u32 {
+    const default_rows: u32 = 12;
+    if (self.rows <= 6) return @max(2, self.rows - 2);
+    return @min(default_rows, self.rows - 3);
+}
+
+pub fn getBlockContentHeight(self: *const TcShellApp, block: *const CommandBlock) usize {
+    if (block.folded) return 0;
+    if (self.findJobConst(block.id)) |job| {
+        if (!job.is_fullscreen) {
+            return job.xpty.rows;
+        }
+    }
+    return block.output_lines.items.len;
+}
+
+pub fn demoteActiveJob(self: *TcShellApp) void {
+    if (self.getActiveJob()) |job| {
+        job.is_fullscreen = false;
+        job.suspended = false;
+        job.user_demoted = true;
+        job.xpty.is_visible = false;
+        self.active_job_id = null;
+        self.pinned_block_id = job.block_id;
+
+        const emb_rows = self.getEmbeddedJobRows();
+        job.xpty.resize(self.cols, emb_rows) catch {};
+
+        self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+        self.prompt.render();
+        self.prompt.commit() catch {};
+        job.xpty.setPosition(0, -100);
+        _ = self.client.display.flush();
+        self.needs_render = true;
+    }
 }
 
 pub fn suspendActiveJob(self: *TcShellApp) void {
@@ -331,23 +377,14 @@ pub fn suspendActiveJob(self: *TcShellApp) void {
         }
         job.suspended = true;
         job.is_fullscreen = false;
+        job.user_demoted = true;
         job.xpty.is_visible = false;
-        for (self.blocks.items) |b| {
-            if (b.id == job.block_id) {
-                b.folded = false;
-                for (b.output_lines.items) |line| self.allocator.free(line);
-                b.output_lines.clearRetainingCapacity();
-                b.pending_line.clearRetainingCapacity();
-                const msg = std.fmt.allocPrint(self.allocator, "[suspended (Ctrl+Z); type 'fg' or 'fg ${d}' to resume]\n", .{job.block_id}) catch null;
-                if (msg) |m| {
-                    b.appendOutput(m) catch {};
-                    self.allocator.free(m);
-                }
-                break;
-            }
-        }
         self.active_job_id = null;
         self.pinned_block_id = job.block_id;
+
+        const emb_rows = self.getEmbeddedJobRows();
+        job.xpty.resize(self.cols, emb_rows) catch {};
+
         self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
         self.prompt.render();
         self.prompt.commit() catch {};
@@ -367,7 +404,7 @@ pub fn resumeJob(self: *TcShellApp, maybe_target: ?[]const u8) bool {
         var i = self.jobs.items.len;
         while (i > 0) {
             i -= 1;
-            if (self.jobs.items[i].suspended) {
+            if (self.jobs.items[i].suspended or !self.jobs.items[i].is_fullscreen) {
                 target_job = &self.jobs.items[i];
                 break;
             }
@@ -376,44 +413,40 @@ pub fn resumeJob(self: *TcShellApp, maybe_target: ?[]const u8) bool {
 
     if (target_job) |job| {
         if (self.active_job_id != null and self.active_job_id.? != job.block_id) {
-            self.suspendActiveJob();
+            self.demoteActiveJob();
         }
 
-        if (job.xpty.child_pid) |pid| {
-            const pgrp = blk: {
-                if (job.xpty.pty) |p| {
-                    var fg_pgrp: std.posix.pid_t = 0;
-                    if (std.os.linux.ioctl(p.master, std.os.linux.T.IOCGPGRP, @intFromPtr(&fg_pgrp)) == 0 and fg_pgrp > 0) {
-                        break :blk fg_pgrp;
+        if (job.suspended) {
+            if (job.xpty.child_pid) |pid| {
+                const pgrp = blk: {
+                    if (job.xpty.pty) |p| {
+                        var fg_pgrp: std.posix.pid_t = 0;
+                        if (std.os.linux.ioctl(p.master, std.os.linux.T.IOCGPGRP, @intFromPtr(&fg_pgrp)) == 0 and fg_pgrp > 0) {
+                            break :blk fg_pgrp;
+                        }
                     }
-                }
-                break :blk pid;
-            };
-            _ = std.posix.kill(-pgrp, std.posix.SIG.CONT) catch {
-                _ = std.posix.kill(-pid, std.posix.SIG.CONT) catch {
-                    _ = std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+                    break :blk pid;
                 };
-            };
+                _ = std.posix.kill(-pgrp, std.posix.SIG.CONT) catch {
+                    _ = std.posix.kill(-pid, std.posix.SIG.CONT) catch {
+                        _ = std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+                    };
+                };
+            }
+            job.suspended = false;
         }
-        job.suspended = false;
+        job.user_demoted = false;
         job.is_fullscreen = true;
         job.xpty.is_visible = true;
         self.active_job_id = job.block_id;
+
+        job.xpty.resize(self.cols, self.rows) catch {};
 
         self.prompt.setPosition(0, -100);
         job.xpty.setPosition(0, 0);
         job.xpty.commit() catch {};
         _ = self.client.display.flush();
 
-        for (self.blocks.items) |b| {
-            if (b.id == job.block_id) {
-                for (b.output_lines.items) |line| self.allocator.free(line);
-                b.output_lines.clearRetainingCapacity();
-                b.pending_line.clearRetainingCapacity();
-                b.appendOutput("[running in interactive xpty]\n") catch {};
-                break;
-            }
-        }
         self.needs_render = true;
         return true;
     }
@@ -431,9 +464,7 @@ pub fn getSkipLines(self: *const TcShellApp, max_canvas_rows: usize) usize {
             }
         }
         total_lines += 1;
-        if (!block.folded) {
-            total_lines += block.output_lines.items.len;
-        }
+        total_lines += self.getBlockContentHeight(block);
     }
 
     if (total_lines <= max_canvas_rows) return 0;
@@ -473,9 +504,7 @@ pub fn toggleBlockAtRow(self: *TcShellApp, row: u32) void {
             }
         }
         line_idx += 1;
-        if (!block.folded) {
-            line_idx += block.output_lines.items.len;
-        }
+        line_idx += self.getBlockContentHeight(block);
     }
 }
 
@@ -528,9 +557,7 @@ pub fn scrollLines(self: *TcShellApp, lines: i32) void {
     var total_lines: usize = 0;
     for (self.blocks.items) |block| {
         total_lines += 1;
-        if (!block.folded) {
-            total_lines += block.output_lines.items.len;
-        }
+        total_lines += self.getBlockContentHeight(block);
     }
 
     if (total_lines <= max_canvas_rows) {
@@ -768,7 +795,7 @@ fn onJobOutput(ctx: ?*anyopaque, bytes: []const u8) void {
 
 pub fn launchJob(self: *TcShellApp, cmd: []const u8, force_interactive: bool) !void {
     if (self.active_job_id != null) {
-        self.suspendActiveJob();
+        self.demoteActiveJob();
     }
 
     const block_id = self.session.allocateBlockId();
@@ -1083,16 +1110,25 @@ pub fn closeActiveJob(self: *TcShellApp) void {
 
 pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
     var elapsed_ms: u64 = 0;
-    var was_fullscreen = false;
+    var was_interactive = false;
+    var last_cells: ?[]CompactCell = null;
+    var last_cols: u32 = 0;
+    var last_rows: u32 = 0;
+
     var i: usize = 0;
     while (i < self.jobs.items.len) : (i += 1) {
         if (self.jobs.items[i].block_id == block_id) {
-            was_fullscreen = self.jobs.items[i].is_fullscreen;
+            was_interactive = true;
             const now_ms = currentMonotonicMs();
             if (now_ms >= self.jobs.items[i].start_time_ms) {
                 elapsed_ms = now_ms - self.jobs.items[i].start_time_ms;
             }
             const j = self.jobs.orderedRemove(i);
+            if (j.xpty.cells.len > 0) {
+                last_cols = j.xpty.cols;
+                last_rows = j.xpty.rows;
+                last_cells = self.allocator.dupe(CompactCell, j.xpty.cells) catch null;
+            }
             j.xpty.deinit();
             break;
         }
@@ -1100,9 +1136,14 @@ pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
     for (self.blocks.items) |b| {
         if (b.id == block_id) {
             b.finish(exit_code, elapsed_ms);
-            if (was_fullscreen) {
-                b.output_lines.clearRetainingCapacity();
-                b.appendOutput("[interactive session exited]\n") catch {};
+            if (was_interactive) {
+                if (last_cells) |cells| {
+                    defer self.allocator.free(cells);
+                    self.formatCellsToBlock(b, cells, last_cols, last_rows) catch {};
+                } else if (b.output_lines.items.len == 0) {
+                    b.output_lines.clearRetainingCapacity();
+                    b.appendOutput("[interactive session exited]\n") catch {};
+                }
             }
             break;
         }
@@ -1116,6 +1157,49 @@ pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
     }
     _ = self.client.display.flush();
     self.needs_render = true;
+}
+
+pub fn formatCellsToBlock(self: *TcShellApp, block: *CommandBlock, cells: []const CompactCell, cols: u32, rows: u32) !void {
+    for (block.output_lines.items) |line| self.allocator.free(line);
+    block.output_lines.clearRetainingCapacity();
+    block.pending_line.clearRetainingCapacity();
+
+    var r: u32 = 0;
+    while (r < rows) : (r += 1) {
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(self.allocator);
+
+        var cur_fg: ?u8 = null;
+        var cur_bg: ?u8 = null;
+        var cur_bold: bool = false;
+
+        var c: u32 = 0;
+        while (c < cols) : (c += 1) {
+            const cell = cells[r * cols + c];
+            const fg = cell.fg_color;
+            const bg = cell.bg_color;
+            const bold = cell.flags.bold;
+
+            if (cur_fg != fg or cur_bg != bg or cur_bold != bold) {
+                cur_fg = fg;
+                cur_bg = bg;
+                cur_bold = bold;
+                var sgr_buf: [32]u8 = undefined;
+                const bold_str = if (bold) ";1" else "";
+                const sgr = std.fmt.bufPrint(&sgr_buf, "\x1b[0;38;5;{d};48;5;{d}{s}m", .{ fg, bg, bold_str }) catch "";
+                try line_buf.appendSlice(self.allocator, sgr);
+            }
+
+            var utf8_bytes: [4]u8 = undefined;
+            const cp = if (cell.codepoint == 0) ' ' else cell.codepoint;
+            const len = std.unicode.utf8Encode(@intCast(cp), &utf8_bytes) catch 1;
+            try line_buf.appendSlice(self.allocator, utf8_bytes[0..len]);
+        }
+
+        try line_buf.appendSlice(self.allocator, "\x1b[0m");
+        const line_str = try line_buf.toOwnedSlice(self.allocator);
+        try block.output_lines.append(self.allocator, line_str);
+    }
 }
 
 fn color256ToRgba(idx: u8, palette: [16]u32) u32 {
@@ -1391,16 +1475,41 @@ pub fn render(self: *TcShellApp) void {
                     .running => 0xF9E2AFFF,
                 };
 
+                const maybe_job = self.findJob(block.id);
+                const is_live_tui = (maybe_job != null and !maybe_job.?.is_fullscreen and !maybe_job.?.suspended);
+                const is_paused_tui = (maybe_job != null and maybe_job.?.suspended);
+
                 var header_buf: [128]u8 = undefined;
-                const status_str = if (block.status == .success) "ok" else if (block.status == .failed) "err" else "...";
-                const fold_icon = if (block.output_lines.items.len == 0) "•" else (if (block.folded) "▶" else "▼");
-                const header_text = std.fmt.bufPrint(&header_buf, "{s} [${d}] {s} [{s}] ({d}ms)", .{
-                    fold_icon,
-                    block.id,
-                    block.command,
-                    status_str,
-                    block.elapsed_ms,
-                }) catch "▶ command";
+                const status_str = if (is_live_tui)
+                    "live"
+                else if (is_paused_tui)
+                    "suspended"
+                else if (block.status == .success)
+                    "ok"
+                else if (block.status == .failed)
+                    "err"
+                else
+                    "...";
+
+                const content_len = self.getBlockContentHeight(block);
+                const fold_icon = if (content_len == 0 and !block.folded) "•" else (if (block.folded) "▶" else "▼");
+
+                const header_text = if (is_live_tui)
+                    std.fmt.bufPrint(&header_buf, "{s} [${d}] {s} [{s}] ({d}ms) [type 'fg' to zoom]", .{
+                        fold_icon,
+                        block.id,
+                        block.command,
+                        status_str,
+                        block.elapsed_ms,
+                    }) catch "▶ command"
+                else
+                    std.fmt.bufPrint(&header_buf, "{s} [${d}] {s} [{s}] ({d}ms)", .{
+                        fold_icon,
+                        block.id,
+                        block.command,
+                        status_str,
+                        block.elapsed_ms,
+                    }) catch "▶ command";
 
                 if (line_idx >= skip_lines) {
                     const cur_row = line_idx - skip_lines;
@@ -1411,14 +1520,68 @@ pub fn render(self: *TcShellApp) void {
                 line_idx += 1;
 
                 if (!block.folded) {
-                    for (block.output_lines.items) |line| {
-                        if (line_idx >= skip_lines) {
-                            const cur_row = line_idx - skip_lines;
-                            if (cur_row < max_canvas_rows) {
-                                renderRowText(self.compositor.canvas, self.cols, cur_row, line, self.compositor.theme_fg_rgba, self.compositor.theme_bg_rgba, false, self.compositor.theme_palette);
+                    if (maybe_job) |job| {
+                        if (!job.is_fullscreen) {
+                            const x_rows = job.xpty.rows;
+                            const x_cols = job.xpty.cols;
+                            var r: u32 = 0;
+                            while (r < x_rows) : (r += 1) {
+                                if (line_idx >= skip_lines) {
+                                    const cur_row = line_idx - skip_lines;
+                                    if (cur_row < max_canvas_rows) {
+                                        var c: u32 = 0;
+                                        while (c < self.cols) : (c += 1) {
+                                            const dst_idx = cur_row * self.cols + c;
+                                            if (c < x_cols) {
+                                                const src_cell = job.xpty.cells[r * x_cols + c];
+                                                var fg = if (src_cell.flags.fg_is_palette and src_cell.fg_color < 16)
+                                                    self.compositor.theme_palette[src_cell.fg_color]
+                                                else
+                                                    self.compositor.theme_fg_rgba;
+
+                                                var bg = if (src_cell.flags.bg_is_palette and src_cell.bg_color > 0 and src_cell.bg_color < 16)
+                                                    self.compositor.theme_palette[src_cell.bg_color]
+                                                else
+                                                    self.compositor.theme_bg_rgba;
+
+                                                if (src_cell.flags.reverse) {
+                                                    const tmp = fg;
+                                                    fg = bg;
+                                                    bg = tmp;
+                                                }
+
+                                                self.compositor.canvas[dst_idx] = .{
+                                                    .codepoint = if (src_cell.codepoint == 0) ' ' else src_cell.codepoint,
+                                                    .fg_rgba = fg,
+                                                    .bg_rgba = bg,
+                                                    .bold = src_cell.flags.bold,
+                                                    .italic = src_cell.flags.italic,
+                                                    .underline = src_cell.flags.underline,
+                                                };
+                                            } else {
+                                                self.compositor.canvas[dst_idx] = .{
+                                                    .codepoint = ' ',
+                                                    .fg_rgba = self.compositor.theme_fg_rgba,
+                                                    .bg_rgba = self.compositor.theme_bg_rgba,
+                                                    .bold = false,
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                                line_idx += 1;
                             }
                         }
-                        line_idx += 1;
+                    } else {
+                        for (block.output_lines.items) |line| {
+                            if (line_idx >= skip_lines) {
+                                const cur_row = line_idx - skip_lines;
+                                if (cur_row < max_canvas_rows) {
+                                    renderRowText(self.compositor.canvas, self.cols, cur_row, line, self.compositor.theme_fg_rgba, self.compositor.theme_bg_rgba, false, self.compositor.theme_palette);
+                                }
+                            }
+                            line_idx += 1;
+                        }
                     }
                 }
             }
@@ -1644,18 +1807,20 @@ pub fn run(self: *TcShellApp) !void {
                 }
             }
 
-            // Dynamic promotion / demotion based on Ghostty VT alt-screen (only when not suspended)
-            if (j.xpty.isAlternateScreen() and !j.is_fullscreen and !j.suspended) {
+            // Dynamic promotion / demotion based on Ghostty VT alt-screen (only when not suspended and not demoted by user)
+            if (j.xpty.isAlternateScreen() and !j.is_fullscreen and !j.suspended and !j.user_demoted) {
                 j.is_fullscreen = true;
                 j.xpty.is_visible = true;
                 self.active_job_id = j.block_id;
                 self.prompt.setPosition(0, -100);
                 j.xpty.setPosition(0, 0);
+                j.xpty.resize(self.cols, self.rows) catch {};
                 j.xpty.commit() catch {};
                 _ = self.client.display.flush();
                 self.needs_render = true;
-            } else if (!j.xpty.isAlternateScreen() and j.is_fullscreen and !j.suspended) {
+            } else if (!j.xpty.isAlternateScreen() and (j.is_fullscreen or j.user_demoted) and !j.suspended) {
                 j.is_fullscreen = false;
+                j.user_demoted = false;
                 j.xpty.is_visible = false;
                 self.active_job_id = null;
                 self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
@@ -1704,10 +1869,12 @@ fn onResize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
         for (self.jobs.items) |j| {
             if (j.is_fullscreen and !j.suspended) {
                 j.xpty.setPosition(0, 0);
+                try j.xpty.resize(new_cols, new_rows);
             } else {
                 j.xpty.setPosition(0, -100);
+                const emb_rows = self.getEmbeddedJobRows();
+                try j.xpty.resize(new_cols, emb_rows);
             }
-            try j.xpty.resize(new_cols, new_rows);
         }
         _ = self.client.display.flush();
     }
@@ -1773,12 +1940,12 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
     // 1. If an active xpty program is running in foreground, forward input directly
     if (self.getActiveJob()) |job| {
         if (!job.suspended) {
-            // Ctrl+Z: Suspend active interactive xpty program and return to prompt
+            // Ctrl+Z: Demote active interactive xpty program into embedded block and return to prompt
             const is_ctrl_z = (action == .press or action == .repeat) and ((k_event.mods.ctrl and (k_event.key == .key_z or k_event.unshifted_codepoint == 'z' or k_event.unshifted_codepoint == 'Z')) or
                 (k_event.utf8.len == 1 and k_event.utf8[0] == 0x1a));
             if (is_ctrl_z) {
                 self.cancelRepeat();
-                self.suspendActiveJob();
+                self.demoteActiveJob();
                 return;
             }
 
@@ -1820,16 +1987,16 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
 
     // 2. No foreground interactive job: prompt and stationary canvas controls
     if (action == .press) {
-        // Ctrl+Z fallback: suspend any running job in self.jobs
+        // Ctrl+Z fallback: demote any fullscreen job
         if ((k_event.mods.ctrl and (k_event.key == .key_z or k_event.unshifted_codepoint == 'z' or k_event.unshifted_codepoint == 'Z')) or
             (k_event.utf8.len == 1 and k_event.utf8[0] == 0x1a))
         {
             var i = self.jobs.items.len;
             while (i > 0) {
                 i -= 1;
-                if (!self.jobs.items[i].suspended) {
+                if (!self.jobs.items[i].suspended and self.jobs.items[i].is_fullscreen) {
                     self.active_job_id = self.jobs.items[i].block_id;
-                    self.suspendActiveJob();
+                    self.demoteActiveJob();
                     return;
                 }
             }

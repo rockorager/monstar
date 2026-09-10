@@ -427,8 +427,11 @@ pub fn pollPty(self: *Xpty) bool {
         }
     }
 
-    if (any_read and self.is_visible) {
-        self.commit() catch {};
+    if (any_read) {
+        self.syncFromVt() catch {};
+        if (self.is_visible) {
+            self.commit() catch {};
+        }
     }
     return any_read;
 }
@@ -466,6 +469,7 @@ pub fn sendInput(self: *Xpty, bytes: []const u8) !void {
 /// Commits the current grid cells to the Wayland surface.
 pub fn commit(self: *Xpty) !void {
     try self.syncFromVt();
+    if (!self.is_visible) return;
     const cl = self.client orelse return;
     const surf = self.surface orelse return;
 

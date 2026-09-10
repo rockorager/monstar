@@ -285,6 +285,7 @@ test "tc-shell keeps top of running command block at top of screen" {
     const max_canvas_rows: usize = 23;
     var app: TcShellApp = undefined;
     app.blocks = blocks;
+    app.jobs = .empty;
     app.scroll_offset = 0;
     app.pinned_block_id = 2; // Pinned to block 2
 
@@ -295,4 +296,74 @@ test "tc-shell keeps top of running command block at top of screen" {
     // When b2 finishes with 50 lines, it still fills the screen, so its header stays at row 0
     b2.finish(0, 10);
     try std.testing.expectEqual(@as(usize, 11), app.getSkipLines(max_canvas_rows));
+}
+
+test "getBlockContentHeight returns xpty rows for embedded job" {
+    const allocator = std.testing.allocator;
+    const TcShellApp = @import("TcShellApp.zig");
+    const Xpty = @import("../tc/Xpty.zig");
+
+    var blocks: std.ArrayList(*CommandBlock) = .empty;
+    defer {
+        for (blocks.items) |b| b.deinit();
+        blocks.deinit(allocator);
+    }
+
+    var b1 = try CommandBlock.init(allocator, 1, "htop");
+    try blocks.append(allocator, b1);
+
+    var app: TcShellApp = undefined;
+    app.allocator = allocator;
+    app.blocks = blocks;
+    app.jobs = .empty;
+    defer app.jobs.deinit(allocator);
+    app.cols = 80;
+    app.rows = 24;
+
+    var xpty = try Xpty.init(allocator, null, 80, 12);
+    defer xpty.deinit();
+
+    try app.jobs.append(allocator, .{
+        .block_id = 1,
+        .xpty = xpty,
+        .suspended = false,
+        .is_fullscreen = false, // embedded live TUI
+        .user_demoted = true,
+    });
+
+    // Content height should match embedded job rows (12)
+    try std.testing.expectEqual(@as(usize, 12), app.getBlockContentHeight(b1));
+
+    // When folded, content height should be 0
+    b1.folded = true;
+    try std.testing.expectEqual(@as(usize, 0), app.getBlockContentHeight(b1));
+
+    // When fullscreen, embedded content height is 0 (overlay mode)
+    b1.folded = false;
+    app.jobs.items[0].is_fullscreen = true;
+    try std.testing.expectEqual(@as(usize, 0), app.getBlockContentHeight(b1));
+}
+
+test "formatCellsToBlock creates ANSI styled lines from cells" {
+    const allocator = std.testing.allocator;
+    const TcShellApp = @import("TcShellApp.zig");
+    const abi = @import("../tc/abi.zig");
+    const CompactCell = abi.CompactCell;
+
+    var b = try CommandBlock.init(allocator, 1, "htop");
+    defer b.deinit();
+
+    var app: TcShellApp = undefined;
+    app.allocator = allocator;
+
+    var cells: [4]CompactCell = undefined;
+    cells[0] = CompactCell.ascii('C', 2, 0); // green
+    cells[1] = CompactCell.ascii('P', 2, 0);
+    cells[2] = CompactCell.ascii('U', 2, 0);
+    cells[3] = CompactCell.ascii(' ', 7, 0);
+
+    try app.formatCellsToBlock(b, &cells, 4, 1);
+    try std.testing.expectEqual(@as(usize, 1), b.output_lines.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, b.output_lines.items[0], "CPU") != null);
+    try std.testing.expect(std.mem.startsWith(u8, b.output_lines.items[0], "\x1b[0;38;5;2;48;5;0m"));
 }
