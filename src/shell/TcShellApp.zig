@@ -125,7 +125,7 @@ sel_start_col: u32 = 0,
 sel_start_row: u32 = 0,
 sel_end_col: u32 = 0,
 sel_end_row: u32 = 0,
-
+pinned_block_id: ?usize = null,
 scroll_offset: usize = 0,
 scroll_pixels: f64 = 0,
 scroll_clicks: i32 = 0,
@@ -213,6 +213,7 @@ pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
         .blocks = .empty,
         .cols = cols,
         .rows = rows,
+        .pinned_block_id = null,
         .scroll_offset = 0,
         .scroll_pixels = 0,
         .scroll_clicks = 0,
@@ -378,17 +379,47 @@ pub fn resumeJob(self: *TcShellApp, maybe_target: ?[]const u8) bool {
     return false;
 }
 
+pub fn getSkipLines(self: *const TcShellApp, max_canvas_rows: usize) usize {
+    var total_lines: usize = 0;
+    var pinned_start_line: ?usize = null;
+
+    for (self.blocks.items) |block| {
+        if (self.pinned_block_id) |p_id| {
+            if (block.id == p_id and pinned_start_line == null) {
+                pinned_start_line = total_lines;
+            }
+        }
+        total_lines += 1;
+        if (!block.folded) {
+            total_lines += block.output_lines.items.len;
+        }
+    }
+
+    if (total_lines <= max_canvas_rows) return 0;
+    const max_scroll = total_lines - max_canvas_rows;
+
+    if (pinned_start_line) |start| {
+        for (self.blocks.items) |block| {
+            if (self.pinned_block_id) |p_id| {
+                if (block.id == p_id) {
+                    if (block.status == .running or start <= max_scroll) {
+                        return start;
+                    }
+                    break;
+                }
+            }
+        }
+        return @min(start, max_scroll);
+    }
+
+    const effective_scroll = @min(self.scroll_offset, max_scroll);
+    return max_scroll - effective_scroll;
+}
+
 pub fn toggleBlockAtRow(self: *TcShellApp, row: u32) void {
     if (self.active_job_id != null or row >= self.rows - 1) return;
     const max_canvas_rows = if (self.rows > 1) self.rows - 1 else 0;
-    var total_lines: usize = 0;
-    for (self.blocks.items) |block| {
-        total_lines += 1;
-        if (!block.folded) total_lines += block.output_lines.items.len;
-    }
-    const max_scroll = if (total_lines > max_canvas_rows) total_lines - max_canvas_rows else 0;
-    const effective_scroll = @min(self.scroll_offset, max_scroll);
-    const skip_lines = max_scroll - effective_scroll;
+    const skip_lines = self.getSkipLines(max_canvas_rows);
 
     var line_idx: usize = 0;
     for (self.blocks.items) |block| {
@@ -463,10 +494,17 @@ pub fn scrollLines(self: *TcShellApp, lines: i32) void {
 
     if (total_lines <= max_canvas_rows) {
         self.scroll_offset = 0;
+        self.pinned_block_id = null;
         return;
     }
 
     const max_scroll = total_lines - max_canvas_rows;
+
+    if (self.pinned_block_id != null) {
+        const current_skip = self.getSkipLines(max_canvas_rows);
+        self.scroll_offset = if (max_scroll > current_skip) max_scroll - current_skip else 0;
+        self.pinned_block_id = null;
+    }
 
     if (lines < 0) {
         // Scroll UP (towards older commands)
@@ -699,6 +737,7 @@ pub fn launchJob(self: *TcShellApp, cmd: []const u8, force_interactive: bool) !v
         try block.appendOutput("[running in interactive xpty]\n");
     }
     try self.blocks.append(self.allocator, block);
+    self.pinned_block_id = block_id;
 
     var new_xpty = try Xpty.init(self.allocator, self.client, self.cols, self.rows);
 
@@ -778,8 +817,6 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
     const trimmed = std.mem.trim(u8, raw_cmd, " \t\r\n");
     if (trimmed.len == 0) return;
 
-    self.scroll_offset = 0;
-
     // 0. Explicit interactive launcher prefix: "xpty <command>" or "interactive <command>"
     if (std.mem.startsWith(u8, trimmed, "xpty ") or std.mem.startsWith(u8, trimmed, "interactive ")) {
         const cmd_part = if (std.mem.startsWith(u8, trimmed, "xpty "))
@@ -807,6 +844,7 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             for (self.blocks.items) |b| b.deinit();
             self.blocks.clearRetainingCapacity();
             self.scroll_offset = 0;
+            self.pinned_block_id = null;
             self.needs_render = true;
             return;
         },
@@ -833,6 +871,7 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             };
             block.finish(if (success) 0 else 1, 0);
             try self.blocks.append(self.allocator, block);
+            self.pinned_block_id = block_id;
             self.prompt.updateBanner(self.session.getCwd()) catch {};
             self.needs_render = true;
             return;
@@ -845,6 +884,7 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             try block.appendOutput(cwd_str);
             block.finish(0, 0);
             try self.blocks.append(self.allocator, block);
+            self.pinned_block_id = block_id;
             self.needs_render = true;
             return;
         },
@@ -925,8 +965,13 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             if (SessionState.isAllTarget(target)) {
                 for (self.blocks.items) |b| b.deinit();
                 self.blocks.clearRetainingCapacity();
+                self.scroll_offset = 0;
+                self.pinned_block_id = null;
             } else if (SessionState.findBlockIndex(self.blocks.items, target)) |idx| {
                 const removed = self.blocks.orderedRemove(idx);
+                if (self.pinned_block_id == removed.id) {
+                    self.pinned_block_id = null;
+                }
                 removed.deinit();
             }
             self.needs_render = true;
@@ -964,6 +1009,7 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             try block.appendOutput(msg);
             block.finish(0, 0);
             try self.blocks.append(self.allocator, block);
+            self.pinned_block_id = block_id;
             self.needs_render = true;
             return;
         },
@@ -1295,16 +1341,7 @@ pub fn render(self: *TcShellApp) void {
                 }
             }
 
-            var total_lines: usize = 0;
-            for (self.blocks.items) |block| {
-                total_lines += 1;
-                if (!block.folded) {
-                    total_lines += block.output_lines.items.len;
-                }
-            }
-            const max_scroll = if (total_lines > max_canvas_rows) total_lines - max_canvas_rows else 0;
-            const effective_scroll = @min(self.scroll_offset, max_scroll);
-            const skip_lines = max_scroll - effective_scroll;
+            const skip_lines = self.getSkipLines(max_canvas_rows);
 
             var line_idx: usize = 0;
             for (self.blocks.items) |block| {
@@ -1830,9 +1867,10 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
             self.selection_active = false;
             self.needs_render = true;
         }
-        // Pressing Enter in the prompt brings view back to bottom
-        if (k_event.key == .enter) {
+        // Pressing Enter on empty prompt brings view back to bottom
+        if (k_event.key == .enter and self.prompt.input_buf.items.len == 0) {
             self.scroll_offset = 0;
+            self.pinned_block_id = null;
         }
 
         const key_str = switch (k_event.key) {

@@ -256,3 +256,43 @@ test "renderRowText parses ANSI SGR color sequences for ls and diff" {
     try std.testing.expectEqual(@as(u32, '2'), canvas[5].codepoint);
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), canvas[5].fg_rgba);
 }
+
+test "tc-shell keeps top of running command block at top of screen" {
+    const allocator = std.testing.allocator;
+    const TcShellApp = @import("TcShellApp.zig");
+
+    var blocks: std.ArrayList(*CommandBlock) = .empty;
+    defer {
+        for (blocks.items) |b| b.deinit();
+        blocks.deinit(allocator);
+    }
+
+    // Block 1: 10 lines of output (1 header + 10 lines = 11 lines)
+    var b1 = try CommandBlock.init(allocator, 1, "echo first");
+    for (0..10) |_| {
+        try b1.appendOutput("line\n");
+    }
+    b1.finish(0, 5);
+    try blocks.append(allocator, b1);
+
+    // Block 2: running command with 50 lines of output (exceeding canvas of 23 rows)
+    var b2 = try CommandBlock.init(allocator, 2, "ls --help");
+    for (0..50) |_| {
+        try b2.appendOutput("help option\n");
+    }
+    try blocks.append(allocator, b2);
+
+    const max_canvas_rows: usize = 23;
+    var app: TcShellApp = undefined;
+    app.blocks = blocks;
+    app.scroll_offset = 0;
+    app.pinned_block_id = 2; // Pinned to block 2
+
+    // While b2 is running, skip_lines should be 11 (the start line of b2)
+    // so b2's header appears at row 0 (top of the screen)
+    try std.testing.expectEqual(@as(usize, 11), app.getSkipLines(max_canvas_rows));
+
+    // When b2 finishes with 50 lines, it still fills the screen, so its header stays at row 0
+    b2.finish(0, 10);
+    try std.testing.expectEqual(@as(usize, 11), app.getSkipLines(max_canvas_rows));
+}
