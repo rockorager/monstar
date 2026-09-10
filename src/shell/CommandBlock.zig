@@ -113,6 +113,23 @@ pub fn rewindMemfd(self: *CommandBlock) void {
 }
 
 pub fn getMemfd(self: *CommandBlock) ?posix.fd_t {
+    if (self.memfd == null and self.raw_output.items.len > 0) {
+        var name_buf: [32]u8 = undefined;
+        const memfd_name = std.fmt.bufPrintZ(&name_buf, "tc-block-{d}", .{self.id}) catch "tc-block";
+        if (posix.memfd_create(memfd_name, linux.MFD.CLOEXEC)) |fd| {
+            var written: usize = 0;
+            const bytes = self.raw_output.items;
+            while (written < bytes.len) {
+                const rc = linux.write(fd, bytes[written..].ptr, bytes.len - written);
+                if (linux.errno(rc) == .SUCCESS) {
+                    written += rc;
+                } else {
+                    break;
+                }
+            }
+            self.memfd = fd;
+        } else |_| {}
+    }
     self.rewindMemfd();
     return self.memfd;
 }

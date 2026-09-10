@@ -27,6 +27,52 @@ const PromptSurface = @import("PromptSurface.zig");
 const CommandBlock = @import("CommandBlock.zig");
 const SessionState = @import("SessionState.zig");
 const Config = @import("../Config.zig");
+const log = std.log.scoped(.tc_shell);
+
+const disarmed_timer: linux.itimerspec = .{
+    .it_value = .{ .sec = 0, .nsec = 0 },
+    .it_interval = .{ .sec = 0, .nsec = 0 },
+};
+
+fn createTimerFd() !posix.fd_t {
+    const rc = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+    if (linux.errno(rc) != .SUCCESS) return error.TimerFdFailed;
+    return @intCast(rc);
+}
+
+fn setTimer(fd: posix.fd_t, spec: linux.itimerspec, label: []const u8) bool {
+    const rc = linux.timerfd_settime(fd, .{}, &spec, null);
+    const err = linux.errno(rc);
+    if (err == .SUCCESS) return true;
+    log.err("{s} timerfd_settime failed: {}", .{ label, err });
+    return false;
+}
+
+fn readTimer(fd: posix.fd_t) ?u64 {
+    var expirations: u64 = 0;
+    const n = posix.read(fd, std.mem.asBytes(&expirations)) catch return null;
+    return if (n == @sizeOf(u64) and expirations > 0) expirations else null;
+}
+
+fn timespecFromNs(ns: u64) linux.timespec {
+    return .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+}
+
+fn repeatTimerSpec(rate: i32, delay_ms: i32) ?linux.itimerspec {
+    if (rate <= 0 or delay_ms < 0) return null;
+    const interval_ns = @max(
+        1,
+        @divTrunc(std.time.ns_per_s, @as(u64, @intCast(rate))),
+    );
+    const delay_ns = @max(1, @as(u64, @intCast(delay_ms)) * std.time.ns_per_ms);
+    return .{
+        .it_value = timespecFromNs(delay_ns),
+        .it_interval = timespecFromNs(interval_ns),
+    };
+}
 
 pub const InteractiveJob = struct {
     block_id: usize,
@@ -71,9 +117,25 @@ sel_start_row: u32 = 0,
 sel_end_col: u32 = 0,
 sel_end_row: u32 = 0,
 
+scroll_offset: usize = 0,
+scroll_pixels: f64 = 0,
+scroll_clicks: i32 = 0,
+scroll_value120: i32 = 0,
+scroll_had_pixels: bool = false,
+scroll_had_discrete: bool = false,
+scroll_had_value120: bool = false,
+
+repeat_fd: posix.fd_t,
+repeat_keycode: ?u32 = null,
+repeat_rate: i32 = 25,
+repeat_delay: i32 = 600,
+
 pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
     const initial_w: u31 = 900;
     const initial_h: u31 = 600;
+
+    const repeat_fd = try createTimerFd();
+    errdefer _ = linux.close(repeat_fd);
 
     const window = try Window.create(allocator, "dev.rockorager.monstar-tc-shell", "tc-shell (TC-Wayland)", .{
         .width = initial_w,
@@ -81,38 +143,42 @@ pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
     });
     errdefer window.destroy();
 
-    const font_size_px = Config.fontSizePixels(.{ .points = 13 }, window.scale120);
-    var font = try Font.init(allocator, "monospace", font_size_px);
+    var font = try Font.init(allocator, "monospace", 13);
     errdefer font.deinit(allocator);
 
-    const cols: u32 = @max(20, @as(u32, @intCast(initial_w / font.cell_width)));
-    const rows: u32 = @max(10, @as(u32, @intCast(initial_h / font.cell_height)));
+    const font_size_px = Config.fontSizePixels(.{ .points = 13 }, window.scale120);
+    if (font_size_px != 0 and font_size_px != font.size_px) {
+        font.deinit(allocator);
+        font = try Font.init(allocator, "monospace", font_size_px);
+    }
 
     var keyboard = try Keyboard.init();
     errdefer keyboard.deinit();
 
-    // 1. In-process session state
-    var session = try SessionState.init(allocator);
-    errdefer session.deinit();
+    const cols: u32 = @max(20, @as(u32, @intCast(initial_w / font.cell_width)));
+    const rows: u32 = @max(4, @as(u32, @intCast(initial_h / font.cell_height)));
 
-    // 2. TC-Wayland Compositor
     var comp = try Compositor.init(allocator, null, cols, rows);
     errdefer comp.deinit();
     comp.cell_width_px = font.cell_width;
     comp.cell_height_px = font.cell_height;
 
-    // 3. Direct client connection
     var cl = try comp.createDirectClient();
     errdefer cl.deinit();
 
-    // 4. Stationary prompt at bottom row (always focused)
     var prompt_surf = try PromptSurface.init(allocator, cl, cols);
     errdefer prompt_surf.deinit();
+
     prompt_surf.setPosition(0, @as(i32, @intCast(rows - 1)));
-    prompt_surf.setFocus(true);
-    prompt_surf.setSession(session);
+
+    var session = try SessionState.init(allocator);
+    errdefer session.deinit();
+
+    prompt_surf.updateBanner(session.getCwd()) catch {};
 
     const self = try allocator.create(TcShellApp);
+    errdefer allocator.destroy(self);
+
     self.* = .{
         .allocator = allocator,
         .window = window,
@@ -128,6 +194,17 @@ pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
         .blocks = .empty,
         .cols = cols,
         .rows = rows,
+        .scroll_offset = 0,
+        .scroll_pixels = 0,
+        .scroll_clicks = 0,
+        .scroll_value120 = 0,
+        .scroll_had_pixels = false,
+        .scroll_had_discrete = false,
+        .scroll_had_value120 = false,
+        .repeat_fd = repeat_fd,
+        .repeat_keycode = null,
+        .repeat_rate = 25,
+        .repeat_delay = 600,
     };
 
     window.setCallbacks(
@@ -146,6 +223,9 @@ pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
 }
 
 pub fn deinit(self: *TcShellApp) void {
+    self.cancelRepeat();
+    _ = linux.close(self.repeat_fd);
+
     self.compositor.stop();
 
     for (self.jobs.items) |j| {
@@ -166,6 +246,23 @@ pub fn deinit(self: *TcShellApp) void {
     self.font.deinit(self.allocator);
     self.window.destroy();
     self.allocator.destroy(self);
+}
+
+pub fn armRepeat(self: *TcShellApp, evdev_keycode: u32) void {
+    const spec = repeatTimerSpec(self.repeat_rate, self.repeat_delay) orelse return;
+    self.repeat_keycode = evdev_keycode;
+    _ = setTimer(self.repeat_fd, spec, "key repeat");
+}
+
+pub fn cancelRepeat(self: *TcShellApp) void {
+    self.repeat_keycode = null;
+    _ = setTimer(self.repeat_fd, disarmed_timer, "key repeat");
+}
+
+pub fn fireRepeat(self: *TcShellApp) void {
+    const expirations = readTimer(self.repeat_fd) orelse return;
+    const keycode = self.repeat_keycode orelse return;
+    for (0..@min(expirations, 8)) |_| self.onKey(keycode, .repeat);
 }
 
 pub fn getActiveJob(self: *TcShellApp) ?*InteractiveJob {
@@ -261,7 +358,9 @@ pub fn toggleBlockAtRow(self: *TcShellApp, row: u32) void {
         total_lines += 1;
         if (!block.folded) total_lines += block.output_lines.items.len;
     }
-    const skip_lines = if (total_lines > max_canvas_rows) total_lines - max_canvas_rows else 0;
+    const max_scroll = if (total_lines > max_canvas_rows) total_lines - max_canvas_rows else 0;
+    const effective_scroll = @min(self.scroll_offset, max_scroll);
+    const skip_lines = max_scroll - effective_scroll;
 
     var line_idx: usize = 0;
     for (self.blocks.items) |block| {
@@ -278,6 +377,83 @@ pub fn toggleBlockAtRow(self: *TcShellApp, row: u32) void {
             line_idx += block.output_lines.items.len;
         }
     }
+}
+
+pub fn finishScrollFrame(self: *TcShellApp) void {
+    var lines: i32 = 0;
+    if (self.scroll_had_value120) {
+        const wheel_ticks = @as(f64, @floatFromInt(self.scroll_value120)) / 120.0;
+        lines = @intFromFloat(@trunc(wheel_ticks * 3.0));
+    } else if (self.scroll_had_discrete) {
+        lines = self.scroll_clicks * 3;
+    } else if (self.scroll_pixels != 0) {
+        const cell_h = @as(f64, @floatFromInt(@max(1, self.font.cell_height)));
+        const whole = @divTrunc(self.scroll_pixels, cell_h);
+        lines = @intFromFloat(whole);
+        self.scroll_pixels -= whole * cell_h;
+    }
+
+    self.scroll_clicks = 0;
+    self.scroll_value120 = 0;
+    self.scroll_had_pixels = false;
+    self.scroll_had_discrete = false;
+    self.scroll_had_value120 = false;
+
+    if (lines != 0) {
+        self.scrollLines(lines);
+    }
+}
+
+pub fn scrollLines(self: *TcShellApp, lines: i32) void {
+    const active_job = self.getActiveJob();
+    if (active_job != null and !active_job.?.suspended) {
+        // Forward scroll to active interactive xpty (e.g. vim, htop, less)
+        const x = active_job.?.xpty;
+        if (lines < 0) {
+            const count = @min(10, @as(usize, @intCast(-lines)));
+            for (0..count) |_| {
+                x.sendInput("\x1b[A") catch {};
+            }
+        } else if (lines > 0) {
+            const count = @min(10, @as(usize, @intCast(lines)));
+            for (0..count) |_| {
+                x.sendInput("\x1b[B") catch {};
+            }
+        }
+        self.needs_render = true;
+        return;
+    }
+
+    const max_canvas_rows = if (self.rows > 1) self.rows - 1 else 0;
+    var total_lines: usize = 0;
+    for (self.blocks.items) |block| {
+        total_lines += 1;
+        if (!block.folded) {
+            total_lines += block.output_lines.items.len;
+        }
+    }
+
+    if (total_lines <= max_canvas_rows) {
+        self.scroll_offset = 0;
+        return;
+    }
+
+    const max_scroll = total_lines - max_canvas_rows;
+
+    if (lines < 0) {
+        // Scroll UP (towards older commands)
+        const delta: usize = @intCast(-lines);
+        self.scroll_offset = @min(self.scroll_offset + delta, max_scroll);
+    } else if (lines > 0) {
+        // Scroll DOWN (towards prompt / recent commands)
+        const delta: usize = @intCast(lines);
+        if (self.scroll_offset >= delta) {
+            self.scroll_offset -= delta;
+        } else {
+            self.scroll_offset = 0;
+        }
+    }
+    self.needs_render = true;
 }
 
 /// Checks if command is typically an interactive fullscreen/TUI tool.
@@ -489,12 +665,25 @@ pub fn launchBlock(self: *TcShellApp, cmd: []const u8) !void {
     const elapsed: u64 = if (end_ms >= start_ms) end_ms - start_ms else 0;
     block.finish(exit_code, elapsed);
 
+    // If the executed command block output is long (exceeds canvas rows),
+    // align scroll_offset so the top of this block is visible at the top of the canvas,
+    // allowing the user to read from the top and naturally scroll down.
+    const max_canvas_rows = if (self.rows > 1) self.rows - 1 else 0;
+    const block_lines = 1 + block.output_lines.items.len;
+    if (max_canvas_rows > 0 and block_lines > max_canvas_rows) {
+        self.scroll_offset = block_lines - max_canvas_rows;
+    } else {
+        self.scroll_offset = 0;
+    }
+
     self.needs_render = true;
 }
 
 pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
     const trimmed = std.mem.trim(u8, raw_cmd, " \t\r\n");
     if (trimmed.len == 0) return;
+
+    self.scroll_offset = 0;
 
     // 1. Built-in command handling
     const builtin = SessionState.parseBuiltin(trimmed);
@@ -507,6 +696,7 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             self.active_job_id = null;
             for (self.blocks.items) |b| b.deinit();
             self.blocks.clearRetainingCapacity();
+            self.scroll_offset = 0;
             self.needs_render = true;
             return;
         },
@@ -668,7 +858,8 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
         .view => |target| {
             if (SessionState.resolveBlock(self.blocks.items, target)) |b| {
                 if (b.getMemfd()) |fd| {
-                    const view_cmd = try std.fmt.allocPrint(self.allocator, "less -R /proc/self/fd/{d}", .{fd});
+                    const pid = linux.getpid();
+                    const view_cmd = try std.fmt.allocPrint(self.allocator, "less -R /proc/{d}/fd/{d}", .{ pid, fd });
                     defer self.allocator.free(view_cmd);
                     try self.launchInteractive(view_cmd);
                     return;
@@ -848,7 +1039,9 @@ pub fn render(self: *TcShellApp) void {
                     total_lines += block.output_lines.items.len;
                 }
             }
-            const skip_lines = if (total_lines > max_canvas_rows) total_lines - max_canvas_rows else 0;
+            const max_scroll = if (total_lines > max_canvas_rows) total_lines - max_canvas_rows else 0;
+            const effective_scroll = @min(self.scroll_offset, max_scroll);
+            const skip_lines = max_scroll - effective_scroll;
 
             var line_idx: usize = 0;
             for (self.blocks.items) |block| {
@@ -1003,7 +1196,7 @@ pub fn run(self: *TcShellApp) !void {
 
     while (self.running and self.window.running) {
         const job_count = self.jobs.items.len;
-        var fds_buf: [18]posix.pollfd = undefined;
+        var fds_buf: [19]posix.pollfd = undefined;
         fds_buf[0] = .{
             .fd = display.getFd(),
             .events = posix.POLL.IN,
@@ -1014,19 +1207,24 @@ pub fn run(self: *TcShellApp) !void {
             .events = posix.POLL.IN,
             .revents = 0,
         };
+        fds_buf[2] = .{
+            .fd = self.repeat_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        };
 
         const poll_jobs = @min(job_count, 16);
         for (0..poll_jobs) |i| {
             const j = &self.jobs.items[i];
             const pty_fd = if (j.xpty.pty) |p| p.master else -1;
-            fds_buf[2 + i] = .{
+            fds_buf[3 + i] = .{
                 .fd = pty_fd,
                 .events = if (pty_fd >= 0) posix.POLL.IN else 0,
                 .revents = 0,
             };
         }
 
-        const total_poll_fds = 2 + poll_jobs;
+        const total_poll_fds = 3 + poll_jobs;
         const poll_fds = fds_buf[0..total_poll_fds];
 
         while (!display.prepareRead()) {
@@ -1063,10 +1261,14 @@ pub fn run(self: *TcShellApp) !void {
         }
         self.client.dispatchPending();
 
+        if (fds_buf[2].revents & posix.POLL.IN != 0) {
+            self.fireRepeat();
+        }
+
         var job_idx: usize = poll_jobs;
         while (job_idx > 0) {
             job_idx -= 1;
-            const revents = fds_buf[2 + job_idx].revents;
+            const revents = fds_buf[3 + job_idx].revents;
             if ((revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
                 const j = &self.jobs.items[job_idx];
                 if (revents & posix.POLL.IN != 0) {
@@ -1125,7 +1327,7 @@ fn onKeyboard(ctx: *anyopaque, event: wl.Keyboard.Event) void {
     switch (event) {
         .keymap => |keymap| {
             if (keymap.format != .xkb_v1) {
-                _ = std.os.linux.close(keymap.fd);
+                _ = linux.close(keymap.fd);
                 return;
             }
             self.keyboard.setKeymap(keymap.fd, keymap.size) catch {};
@@ -1145,139 +1347,183 @@ fn onKeyboard(ctx: *anyopaque, event: wl.Keyboard.Event) void {
                 .released => .release,
                 else => return,
             };
-
-            var utf8_buf: [32]u8 = undefined;
-            const k_event = self.keyboard.translate(&utf8_buf, key.key, action) orelse return;
-
-            // Ctrl+Z: Suspend active interactive xpty program and return to prompt
-            if (action == .press and k_event.mods.ctrl and k_event.unshifted_codepoint == 'z') {
-                if (self.active_job_id != null) {
-                    self.suspendActiveJob();
-                    return;
-                }
+            self.onKey(key.key, action);
+            switch (action) {
+                .press => if (self.keyboard.keyRepeats(key.key)) self.armRepeat(key.key),
+                .release => if (self.repeat_keycode == key.key) self.cancelRepeat(),
+                else => {},
             }
-
-            // Escape or 'q' to exit fullscreen block if one is zoomed
-            if (action == .press and (k_event.key == .escape or (k_event.unshifted_codepoint == 'q' and self.prompt.input_buf.items.len == 0))) {
-                var was_fullscreen = false;
-                for (self.blocks.items) |b| {
-                    if (b.fullscreen) {
-                        b.fullscreen = false;
-                        was_fullscreen = true;
-                    }
-                }
-                if (was_fullscreen) {
-                    self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
-                    _ = self.client.display.flush();
-                    self.needs_render = true;
-                    return;
-                }
+        },
+        .repeat_info => |info| {
+            self.repeat_rate = info.rate;
+            self.repeat_delay = info.delay;
+            if (self.repeat_keycode) |keycode| {
+                if (repeatTimerSpec(info.rate, info.delay)) |_|
+                    self.armRepeat(keycode)
+                else
+                    self.cancelRepeat();
             }
+        },
+        .leave => {
+            self.cancelRepeat();
+            self.keyboard.resetCompose();
+        },
+        .enter => |enter| {
+            self.last_serial = enter.serial;
+        },
+    }
+}
 
-            // Ctrl+Shift+C: Copy selection or full screen
-            if (action == .press and k_event.mods.ctrl and k_event.mods.shift and (k_event.unshifted_codepoint == 'c' or k_event.unshifted_codepoint == 'C')) {
-                if (self.selection_active) {
-                    if (self.extractSelectedText()) |text| {
-                        defer self.allocator.free(text);
-                        if (text.len > 0) self.copyToClipboard(text);
-                    } else |_| {}
-                } else {
-                    if (self.extractScreenText()) |text| {
-                        defer self.allocator.free(text);
-                        if (text.len > 0) self.copyToClipboard(text);
-                    } else |_| {}
-                }
+pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
+    var utf8_buf: [32]u8 = undefined;
+    const k_event = self.keyboard.translate(&utf8_buf, keycode, action) orelse return;
+
+    if (action == .press) {
+        // Ctrl+Z: Suspend active interactive xpty program and return to prompt
+        if (k_event.mods.ctrl and k_event.unshifted_codepoint == 'z') {
+            if (self.active_job_id != null) {
+                self.cancelRepeat();
+                self.suspendActiveJob();
                 return;
             }
+        }
 
-            // Ctrl+C: If selection active, copy and dismiss; otherwise clear prompt input
-            if (action == .press and k_event.mods.ctrl and k_event.unshifted_codepoint == 'c') {
-                if (self.selection_active) {
-                    if (self.extractSelectedText()) |text| {
-                        defer self.allocator.free(text);
-                        if (text.len > 0) self.copyToClipboard(text);
-                    } else |_| {}
-                    self.selection_active = false;
-                    self.selecting = false;
-                    self.needs_render = true;
-                    return;
+        // Escape or 'q' to exit fullscreen block if one is zoomed
+        if (k_event.key == .escape or (k_event.unshifted_codepoint == 'q' and self.prompt.input_buf.items.len == 0)) {
+            var was_fullscreen = false;
+            for (self.blocks.items) |b| {
+                if (b.fullscreen) {
+                    b.fullscreen = false;
+                    was_fullscreen = true;
                 }
-                self.prompt.input_buf.clearRetainingCapacity();
-                self.prompt.cursor_pos = 0;
-                self.prompt.dismissCompletion();
+            }
+            if (was_fullscreen) {
+                self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+                _ = self.client.display.flush();
+                self.needs_render = true;
+                return;
+            }
+        }
+
+        // Ctrl+Shift+C: Copy selection or full screen
+        if (k_event.mods.ctrl and k_event.mods.shift and (k_event.unshifted_codepoint == 'c' or k_event.unshifted_codepoint == 'C')) {
+            if (self.selection_active) {
+                if (self.extractSelectedText()) |text| {
+                    defer self.allocator.free(text);
+                    if (text.len > 0) self.copyToClipboard(text);
+                } else |_| {}
+            } else {
+                if (self.extractScreenText()) |text| {
+                    defer self.allocator.free(text);
+                    if (text.len > 0) self.copyToClipboard(text);
+                } else |_| {}
+            }
+            return;
+        }
+
+        // Ctrl+C: If selection active, copy and dismiss; otherwise clear prompt input
+        if (k_event.mods.ctrl and k_event.unshifted_codepoint == 'c') {
+            if (self.selection_active) {
+                if (self.extractSelectedText()) |text| {
+                    defer self.allocator.free(text);
+                    if (text.len > 0) self.copyToClipboard(text);
+                } else |_| {}
+                self.selection_active = false;
+                self.selecting = false;
+                self.needs_render = true;
+                return;
+            }
+            self.prompt.input_buf.clearRetainingCapacity();
+            self.prompt.cursor_pos = 0;
+            self.prompt.dismissCompletion();
+            self.prompt.render();
+            self.prompt.commit() catch {};
+            self.needs_render = true;
+            return;
+        }
+
+        // Ctrl+F: Accept ghost text auto-suggestion
+        if (k_event.mods.ctrl and k_event.unshifted_codepoint == 'f') {
+            if (self.prompt.getGhostSuggestion()) |ghost| {
+                self.prompt.input_buf.appendSlice(self.allocator, ghost) catch {};
+                self.prompt.cursor_pos = self.prompt.input_buf.items.len;
                 self.prompt.render();
                 self.prompt.commit() catch {};
                 self.needs_render = true;
                 return;
             }
+        }
+    }
 
-            // Ctrl+F: Accept ghost text auto-suggestion
-            if (action == .press and k_event.mods.ctrl and k_event.unshifted_codepoint == 'f') {
-                if (self.prompt.getGhostSuggestion()) |ghost| {
-                    self.prompt.input_buf.appendSlice(self.allocator, ghost) catch {};
-                    self.prompt.cursor_pos = self.prompt.input_buf.items.len;
-                    self.prompt.render();
-                    self.prompt.commit() catch {};
-                    self.needs_render = true;
-                    return;
-                }
-            }
-
-            // If an active xpty program is running in foreground, forward input directly
-            if (self.getActiveJob()) |job| {
-                if (!job.suspended) {
-                    if (action == .press) {
-                        var out_buf: [128]u8 = undefined;
-                        var writer: std.Io.Writer = .fixed(&out_buf);
-                        vt.input.encodeKey(&writer, k_event, .{}) catch {
-                            if (k_event.utf8.len > 0) {
-                                job.xpty.sendInput(k_event.utf8) catch {};
-                                self.needs_render = true;
-                            }
-                            return;
-                        };
-                        const bytes = writer.buffered();
-                        if (bytes.len > 0) {
-                            job.xpty.sendInput(bytes) catch {};
-                            self.needs_render = true;
-                        }
+    // If an active xpty program is running in foreground, forward input directly
+    if (self.getActiveJob()) |job| {
+        if (!job.suspended) {
+            if (action == .press or action == .repeat) {
+                var out_buf: [128]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&out_buf);
+                vt.input.encodeKey(&writer, k_event, .{}) catch {
+                    if (k_event.utf8.len > 0) {
+                        job.xpty.sendInput(k_event.utf8) catch {};
+                        self.needs_render = true;
                     }
                     return;
-                }
-            }
-
-            // Stationary prompt (always focused)
-            if (action == .press) {
-                // Any typing dismisses previous mouse selection
-                if (self.selection_active) {
-                    self.selection_active = false;
+                };
+                const bytes = writer.buffered();
+                if (bytes.len > 0) {
+                    job.xpty.sendInput(bytes) catch {};
                     self.needs_render = true;
                 }
-
-                const key_str = switch (k_event.key) {
-                    .enter => "Enter",
-                    .tab => "Tab",
-                    .escape => "Escape",
-                    .backspace => "BackSpace",
-                    .delete => "Delete",
-                    .arrow_left => "Left",
-                    .arrow_right => "Right",
-                    .arrow_up => "Up",
-                    .arrow_down => "Down",
-                    .home => "Home",
-                    .end => "End",
-                    else => "",
-                };
-
-                const maybe_cmd = self.prompt.handleKey(key_str, k_event.utf8) catch null;
-                if (maybe_cmd) |cmd| {
-                    defer self.allocator.free(cmd);
-                    self.launchCommand(cmd) catch {};
-                }
-                self.needs_render = true;
             }
-        },
-        else => {},
+            return;
+        }
+    }
+
+    // Stationary prompt (always focused)
+    if (action == .press or action == .repeat) {
+        // PageUp / PageDown or Shift+Up / Shift+Down for scrolling history
+        if (k_event.key == .page_up or k_event.key == .numpad_page_up or (k_event.mods.shift and k_event.key == .arrow_up)) {
+            const delta: i32 = if (k_event.key == .arrow_up) 3 else @intCast(@max(1, self.rows / 2));
+            self.scrollLines(-delta);
+            return;
+        }
+        if (k_event.key == .page_down or k_event.key == .numpad_page_down or (k_event.mods.shift and k_event.key == .arrow_down)) {
+            const delta: i32 = if (k_event.key == .arrow_down) 3 else @intCast(@max(1, self.rows / 2));
+            self.scrollLines(delta);
+            return;
+        }
+
+        // Any typing dismisses previous mouse selection
+        if (self.selection_active) {
+            self.selection_active = false;
+            self.needs_render = true;
+        }
+        // Pressing Enter in the prompt brings view back to bottom
+        if (k_event.key == .enter) {
+            self.scroll_offset = 0;
+        }
+
+        const key_str = switch (k_event.key) {
+            .enter => "Enter",
+            .tab => "Tab",
+            .escape => "Escape",
+            .backspace => "BackSpace",
+            .delete => "Delete",
+            .arrow_left => "Left",
+            .arrow_right => "Right",
+            .arrow_up => "Up",
+            .arrow_down => "Down",
+            .home => "Home",
+            .end => "End",
+            else => "",
+        };
+
+        const maybe_cmd = self.prompt.handleKey(key_str, k_event.utf8) catch null;
+        if (maybe_cmd) |cmd| {
+            defer self.allocator.free(cmd);
+            self.cancelRepeat();
+            self.launchCommand(cmd) catch {};
+        }
+        self.needs_render = true;
     }
 }
 
@@ -1348,6 +1594,26 @@ fn onPointer(ctx: *anyopaque, event: wl.Pointer.Event) void {
                 self.needs_render = true;
             }
         },
+        .axis => |axis| {
+            if (axis.axis == .vertical_scroll and !self.scroll_had_discrete and !self.scroll_had_value120) {
+                self.scroll_pixels += axis.value.toDouble();
+                self.scroll_had_pixels = true;
+            }
+            if (!self.window.pointerHasFrames()) self.finishScrollFrame();
+        },
+        .axis_discrete => |discrete| {
+            if (discrete.axis == .vertical_scroll) {
+                self.scroll_clicks += discrete.discrete;
+                self.scroll_had_discrete = true;
+            }
+        },
+        .axis_value120 => |axis| {
+            if (axis.axis == .vertical_scroll) {
+                self.scroll_value120 += axis.value120;
+                self.scroll_had_value120 = true;
+            }
+        },
+        .frame => self.finishScrollFrame(),
         else => {},
     }
 }

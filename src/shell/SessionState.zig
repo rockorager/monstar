@@ -334,22 +334,24 @@ pub fn expandPipeline(
     errdefer out.deinit(allocator);
 
     const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
+    const pid = linux.getpid();
 
-    // Check if command starts with "$N |" or "$prev |" or "$N >" or "$prev >"
+    // Check if command starts with "$N" or "$prev" followed by '|' or '>'
     var is_leading_pipe_or_redir = false;
     var leading_target: []const u8 = "";
     var rest_offset: usize = 0;
 
-    var iter = std.mem.tokenizeAny(u8, trimmed, " \t");
-    if (iter.next()) |first_tok| {
-        if (std.mem.startsWith(u8, first_tok, "$")) {
-            var skip = first_tok.len;
+    if (std.mem.startsWith(u8, trimmed, "$")) {
+        var end_target: usize = 1;
+        while (end_target < trimmed.len and (std.ascii.isAlphanumeric(trimmed[end_target]) or trimmed[end_target] == '_')) : (end_target += 1) {}
+        const candidate_target = trimmed[0..end_target];
+        if (std.mem.eql(u8, candidate_target, "$prev") or (candidate_target.len > 1 and std.ascii.isDigit(candidate_target[1]))) {
+            var skip = end_target;
             while (skip < trimmed.len and (trimmed[skip] == ' ' or trimmed[skip] == '\t')) : (skip += 1) {}
-            const after_first = trimmed[skip..];
-            if (std.mem.startsWith(u8, after_first, "|") or std.mem.startsWith(u8, after_first, ">")) {
+            if (skip < trimmed.len and (trimmed[skip] == '|' or trimmed[skip] == '>')) {
                 is_leading_pipe_or_redir = true;
-                leading_target = first_tok;
-                rest_offset = first_tok.len;
+                leading_target = candidate_target;
+                rest_offset = skip;
             }
         }
     }
@@ -359,10 +361,13 @@ pub fn expandPipeline(
             if (block.getMemfd()) |fd| {
                 var writer = std.Io.Writer.Allocating.init(allocator);
                 defer writer.deinit();
-                try writer.writer.print("cat /proc/self/fd/{d}", .{fd});
+                try writer.writer.print("cat /proc/{d}/fd/{d}", .{ pid, fd });
                 const cat_str = try writer.toOwnedSlice();
                 defer allocator.free(cat_str);
                 try out.appendSlice(allocator, cat_str);
+                if (rest_offset < trimmed.len and (trimmed[rest_offset] == '|' or trimmed[rest_offset] == '>')) {
+                    try out.append(allocator, ' ');
+                }
                 try out.appendSlice(allocator, trimmed[rest_offset..]);
                 return out.toOwnedSlice(allocator);
             }
@@ -383,7 +388,7 @@ pub fn expandPipeline(
                     if (block.getMemfd()) |fd| {
                         var writer = std.Io.Writer.Allocating.init(allocator);
                         defer writer.deinit();
-                        try writer.writer.print("/proc/self/fd/{d}", .{fd});
+                        try writer.writer.print("/proc/{d}/fd/{d}", .{ pid, fd });
                         const fd_path = try writer.toOwnedSlice();
                         defer allocator.free(fd_path);
                         try out.appendSlice(allocator, fd_path);

@@ -136,15 +136,38 @@ test "SessionState block resolution and pipeline expansion" {
     try std.testing.expect(resolved_prev.? == b2);
 
     // Test pipeline expansion
+    const pid = std.os.linux.getpid();
+    var expected_pipe_prefix_buf: [64]u8 = undefined;
+    const expected_pipe_prefix = try std.fmt.bufPrint(&expected_pipe_prefix_buf, "cat /proc/{d}/fd/", .{pid});
+
     const expanded_pipe = try SessionState.expandPipeline(allocator, &blocks, "$1 | grep line1");
     defer allocator.free(expanded_pipe);
-    try std.testing.expect(std.mem.startsWith(u8, expanded_pipe, "cat /proc/self/fd/"));
+    try std.testing.expect(std.mem.startsWith(u8, expanded_pipe, expected_pipe_prefix));
     try std.testing.expect(std.mem.endsWith(u8, expanded_pipe, " | grep line1"));
 
+    // Test redirection expansion
+    const expanded_redir = try SessionState.expandPipeline(allocator, &blocks, "$1 > test.txt");
+    defer allocator.free(expanded_redir);
+    try std.testing.expect(std.mem.startsWith(u8, expanded_redir, expected_pipe_prefix));
+    try std.testing.expect(std.mem.endsWith(u8, expanded_redir, " > test.txt"));
+
+    const expanded_redir_nospace = try SessionState.expandPipeline(allocator, &blocks, "$1>test.txt");
+    defer allocator.free(expanded_redir_nospace);
+    try std.testing.expect(std.mem.startsWith(u8, expanded_redir_nospace, expected_pipe_prefix));
+    try std.testing.expect(std.mem.endsWith(u8, expanded_redir_nospace, " >test.txt"));
+
+    const expanded_append = try SessionState.expandPipeline(allocator, &blocks, "$prev >> output.log");
+    defer allocator.free(expanded_append);
+    try std.testing.expect(std.mem.startsWith(u8, expanded_append, expected_pipe_prefix));
+    try std.testing.expect(std.mem.endsWith(u8, expanded_append, " >> output.log"));
+
     // Test multi-arg expansion
+    var expected_diff_prefix_buf: [64]u8 = undefined;
+    const expected_diff_prefix = try std.fmt.bufPrint(&expected_diff_prefix_buf, "diff /proc/{d}/fd/", .{pid});
+
     const expanded_diff = try SessionState.expandPipeline(allocator, &blocks, "diff $1 $2");
     defer allocator.free(expanded_diff);
-    try std.testing.expect(std.mem.startsWith(u8, expanded_diff, "diff /proc/self/fd/"));
+    try std.testing.expect(std.mem.startsWith(u8, expanded_diff, expected_diff_prefix));
 }
 
 test "SessionState isAllTarget matching" {
