@@ -445,3 +445,69 @@ test "TC-Wayland stream-safe chunked cell buffer upload over SSH-friendly transp
     try std.testing.expect(std.mem.indexOf(u8, rendered, "CHUNK-MIDDLE") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "CHUNK-END") != null);
 }
+
+test "TC-Wayland prompt visibility restored after interactive xpty exit" {
+    const allocator = std.testing.allocator;
+    const test_socket = "tc-test-prompt-exit-0";
+    var comp = try tc.Compositor.init(allocator, test_socket, 80, 24);
+    defer comp.deinit();
+
+    var running: std.atomic.Value(bool) = .init(true);
+    const ServerRunner = struct {
+        fn run(c: *tc.Compositor, r: *std.atomic.Value(bool)) void {
+            while (r.load(.acquire)) {
+                c.dispatch(10) catch break;
+            }
+        }
+    };
+    const server_thread = try std.Thread.spawn(.{}, ServerRunner.run, .{ comp, &running });
+    defer {
+        running.store(false, .release);
+        comp.stop();
+        server_thread.join();
+    }
+
+    sleepMs(10);
+
+    var client = try tc.Client.connect(allocator, test_socket);
+    defer client.deinit();
+
+    const PromptSurface = @import("../shell/PromptSurface.zig");
+    var prompt = try PromptSurface.init(allocator, client, 80);
+    defer prompt.deinit();
+
+    prompt.setPosition(0, 23);
+    prompt.render();
+    try prompt.commit();
+    try client.roundtrip();
+    sleepMs(10);
+
+    comp.composite();
+    var rendered = try comp.renderToString(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, ":tc>") != null);
+    allocator.free(rendered);
+
+    // Hide prompt and launch interactive job (like less)
+    prompt.setPosition(0, -100);
+    _ = client.display.flush();
+
+    var xpty = try tc.Xpty.init(allocator, client, 80, 24);
+    xpty.is_simulated = true;
+    xpty.setPosition(0, 0);
+    try xpty.commit();
+    try client.roundtrip();
+    sleepMs(10);
+
+    // Now close the interactive job (exactly like closeJob does)
+    xpty.deinit();
+    prompt.setPosition(0, 23);
+    try client.roundtrip();
+    sleepMs(10);
+
+    // DO WHAT closeJob + render DOES:
+    comp.composite();
+    rendered = try comp.renderToString(allocator);
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, ":tc>") != null);
+}

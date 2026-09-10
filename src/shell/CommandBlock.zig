@@ -23,6 +23,7 @@ status: Status = .running,
 exit_code: ?u8 = null,
 elapsed_ms: u64 = 0,
 output_lines: std.ArrayList([]const u8) = .empty,
+pending_line: std.ArrayList(u8) = .empty,
 raw_output: std.ArrayList(u8) = .empty,
 memfd: ?posix.fd_t = null,
 folded: bool = false,
@@ -49,6 +50,7 @@ pub fn init(allocator: std.mem.Allocator, id: usize, command: []const u8) !*Comm
         .id = id,
         .command = duped_cmd,
         .output_lines = .empty,
+        .pending_line = .empty,
         .raw_output = .empty,
         .memfd = memfd,
         .folded = false,
@@ -67,6 +69,7 @@ pub fn deinit(self: *CommandBlock) void {
         self.allocator.free(line);
     }
     self.output_lines.deinit(self.allocator);
+    self.pending_line.deinit(self.allocator);
     self.raw_output.deinit(self.allocator);
     self.allocator.destroy(self);
 }
@@ -90,16 +93,26 @@ pub fn appendOutput(self: *CommandBlock, text: []const u8) !void {
         }
     }
 
-    // Split and maintain structured output lines
-    var iter = std.mem.splitScalar(u8, text, '\n');
-    while (iter.next()) |line| {
-        if (line.len == 0 and iter.peek() == null) break;
-        const duped = try self.allocator.dupe(u8, line);
-        try self.output_lines.append(self.allocator, duped);
+    // Split and maintain structured output lines with proper buffering
+    for (text) |b| {
+        if (b == '\n') {
+            const line = try self.pending_line.toOwnedSlice(self.allocator);
+            try self.output_lines.append(self.allocator, line);
+            self.pending_line = .empty;
+        } else {
+            try self.pending_line.append(self.allocator, b);
+        }
     }
 }
 
 pub fn finish(self: *CommandBlock, code: u8, duration_ms: u64) void {
+    if (self.pending_line.items.len > 0) {
+        const line = self.pending_line.toOwnedSlice(self.allocator) catch null;
+        if (line) |l| {
+            self.output_lines.append(self.allocator, l) catch {};
+        }
+        self.pending_line = .empty;
+    }
     self.exit_code = code;
     self.status = if (code == 0) .success else .failed;
     self.elapsed_ms = duration_ms;

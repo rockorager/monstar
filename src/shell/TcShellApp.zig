@@ -85,6 +85,7 @@ pub const InteractiveJob = struct {
     xpty: *Xpty,
     suspended: bool,
     start_time_ms: u64 = 0,
+    is_fullscreen: bool = false,
 };
 
 extern "c" fn popen(command: [*:0]const u8, modes: [*:0]const u8) ?*anyopaque;
@@ -321,7 +322,10 @@ pub fn suspendActiveJob(self: *TcShellApp) void {
         }
         self.active_job_id = null;
         self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
-        _ = self.client.display.flush();
+        job.xpty.setPosition(0, -100);
+        self.client.roundtrip() catch {
+            _ = self.client.display.flush();
+        };
         self.needs_render = true;
     }
 }
@@ -356,6 +360,9 @@ pub fn resumeJob(self: *TcShellApp, maybe_target: ?[]const u8) bool {
 
         self.prompt.setPosition(0, -100);
         job.xpty.setPosition(0, 0);
+        self.client.roundtrip() catch {
+            _ = self.client.display.flush();
+        };
 
         for (self.blocks.items) |b| {
             if (b.id == job.block_id) {
@@ -480,12 +487,80 @@ pub fn scrollLines(self: *TcShellApp, lines: i32) void {
 /// Checks if command is typically an interactive fullscreen/TUI tool.
 pub fn isInteractiveCommand(cmd: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, cmd, " \t");
-    const bin = iter.next() orelse return false;
+    var bin = iter.next() orelse return false;
+
+    // Skip common execution wrappers like sudo, doas, env, exec, nohup, time
+    while (true) {
+        const base_cur = if (std.mem.lastIndexOfScalar(u8, bin, '/')) |idx| bin[idx + 1 ..] else bin;
+        if (std.mem.eql(u8, base_cur, "sudo") or
+            std.mem.eql(u8, base_cur, "doas") or
+            std.mem.eql(u8, base_cur, "exec") or
+            std.mem.eql(u8, base_cur, "nohup") or
+            std.mem.eql(u8, base_cur, "time"))
+        {
+            while (iter.next()) |next_tok| {
+                if (!std.mem.startsWith(u8, next_tok, "-")) {
+                    bin = next_tok;
+                    break;
+                }
+            } else return false;
+        } else if (std.mem.eql(u8, base_cur, "env")) {
+            while (iter.next()) |next_tok| {
+                if (std.mem.indexOfScalar(u8, next_tok, '=') != null or std.mem.startsWith(u8, next_tok, "-")) {
+                    continue;
+                }
+                bin = next_tok;
+                break;
+            } else return false;
+        } else {
+            break;
+        }
+    }
+
     const base = if (std.mem.lastIndexOfScalar(u8, bin, '/')) |idx| bin[idx + 1 ..] else bin;
 
     const interactive = [_][]const u8{
-        "vim",  "nvim", "vi", "emacs", "nano", "htop", "top",    "less", "more",
-        "bash", "zsh",  "sh", "fish",  "tmux", "man",  "ranger", "yazi", "lazygit",
+        // Editors
+        "kak",        "helix",      "hx",        "vim",      "nvim",    "vi",
+        "view",       "emacs",      "nano",      "pico",     "micro",   "joe",
+        "jed",        "ed",
+
+        // Pagers & Documentation
+                "less",      "more",     "most",    "bat",
+        "glow",       "man",        "info",
+
+        // System Monitors
+             "htop",     "top",     "btop",
+        "glances",    "bottom",     "vtop",      "gtop",     "ncdu",    "gdu",
+        "dua",
+
+        // Shells & Multiplexers
+               "bash",       "zsh",       "sh",       "fish",    "dash",
+        "ksh",        "tcsh",       "csh",       "elvish",   "nu",      "tmux",
+        "screen",     "zellij",
+
+        // File Managers
+            "ranger",    "yazi",     "nnn",     "lf",
+        "mc",         "vifm",       "broot",
+
+        // Git & Container TUIs
+            "lazygit",  "tig",     "gitui",
+        "lazydocker", "k9s",
+
+        // Fuzzy Finders & Selection
+               "fzf",       "fzy",      "peco",    "sk",
+
+        // Audio & Chat & Mail
+        "alsamixer",  "pulsemixer", "ncpamixer", "ncmpcpp",  "cmus",    "mpv",
+        "mutt",       "neomutt",    "aerc",      "newsboat", "weechat", "irssi",
+
+        // Debuggers & REPLs
+        "gdb",        "lldb",       "python",    "python3",  "ipython", "node",
+        "irb",        "ghci",       "lua",       "sqlite3",  "psql",    "mysql",
+        "mongosh",    "redis-cli",
+
+        // Network
+         "ssh",       "mosh",     "telnet",  "nmtui",
     };
     for (interactive) |name| {
         if (std.mem.eql(u8, base, name)) return true;
@@ -607,7 +682,12 @@ fn copyToClipboard(_: *TcShellApp, text: []const u8) void {
     }
 }
 
-pub fn launchInteractive(self: *TcShellApp, cmd: []const u8) !void {
+fn onJobOutput(ctx: ?*anyopaque, bytes: []const u8) void {
+    const block: *CommandBlock = @ptrCast(@alignCast(ctx orelse return));
+    block.appendOutput(bytes) catch {};
+}
+
+pub fn launchJob(self: *TcShellApp, cmd: []const u8, force_interactive: bool) !void {
     if (self.active_job_id != null) {
         self.suspendActiveJob();
     }
@@ -615,14 +695,26 @@ pub fn launchInteractive(self: *TcShellApp, cmd: []const u8) !void {
     const block_id = self.session.allocateBlockId();
     var block = try CommandBlock.init(self.allocator, block_id, cmd);
     block.status = .running;
-    try block.appendOutput("[running in interactive xpty]\n");
+    if (force_interactive) {
+        try block.appendOutput("[running in interactive xpty]\n");
+    }
     try self.blocks.append(self.allocator, block);
 
-    // Hide prompt in fullscreen mode
-    self.prompt.setPosition(0, -100);
-
     var new_xpty = try Xpty.init(self.allocator, self.client, self.cols, self.rows);
-    new_xpty.setPosition(0, 0);
+
+    if (force_interactive) {
+        self.prompt.setPosition(0, -100);
+        new_xpty.setPosition(0, 0);
+        new_xpty.is_visible = true;
+        self.active_job_id = block_id;
+    } else {
+        self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+        new_xpty.setPosition(0, -100);
+        new_xpty.is_visible = false;
+        self.active_job_id = null;
+    }
+
+    new_xpty.setOutputHandler(block, onJobOutput);
 
     const cmd_z = try self.allocator.dupeZ(u8, cmd);
     defer self.allocator.free(cmd_z);
@@ -650,8 +742,8 @@ pub fn launchInteractive(self: *TcShellApp, cmd: []const u8) !void {
             .xpty = new_xpty,
             .suspended = false,
             .start_time_ms = currentMonotonicMs(),
+            .is_fullscreen = force_interactive,
         });
-        self.active_job_id = block_id;
         _ = self.client.display.flush();
         self.needs_render = true;
         return;
@@ -667,65 +759,19 @@ pub fn launchInteractive(self: *TcShellApp, cmd: []const u8) !void {
         .xpty = new_xpty,
         .suspended = false,
         .start_time_ms = currentMonotonicMs(),
+        .is_fullscreen = force_interactive,
     });
-    self.active_job_id = block_id;
+
     _ = self.client.display.flush();
     self.needs_render = true;
 }
 
+pub fn launchInteractive(self: *TcShellApp, cmd: []const u8) !void {
+    return self.launchJob(cmd, true);
+}
+
 pub fn launchBlock(self: *TcShellApp, cmd: []const u8) !void {
-    const block_id = self.session.allocateBlockId();
-    var block = try CommandBlock.init(self.allocator, block_id, cmd);
-    try self.blocks.append(self.allocator, block);
-
-    var ts_start: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts_start);
-
-    // Redirection to capture stdout & stderr cleanly
-    const cmd_with_err_slice = try std.fmt.allocPrint(self.allocator, "{s} 2>&1", .{cmd});
-    defer self.allocator.free(cmd_with_err_slice);
-    const cmd_with_err = try self.allocator.dupeZ(u8, cmd_with_err_slice);
-    defer self.allocator.free(cmd_with_err);
-
-    var exit_code: u8 = 0;
-    if (popen(cmd_with_err.ptr, "r")) |pipe| {
-        var buf: [4096]u8 = undefined;
-        while (fgets(&buf, buf.len, pipe)) |_| {
-            const line = std.mem.sliceTo(&buf, 0);
-            if (line.len > 0) {
-                try block.appendOutput(line);
-            }
-        }
-        const status = pclose(pipe);
-        if (status >= 0) {
-            exit_code = @truncate(@as(u32, @intCast(status >> 8)));
-        } else {
-            exit_code = 1;
-        }
-    } else {
-        try block.appendOutput("failed to execute command\n");
-        exit_code = 127;
-    }
-
-    var ts_end: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts_end);
-    const start_ms = @as(u64, @intCast(ts_start.sec)) * 1000 + @as(u64, @intCast(ts_start.nsec)) / 1_000_000;
-    const end_ms = @as(u64, @intCast(ts_end.sec)) * 1000 + @as(u64, @intCast(ts_end.nsec)) / 1_000_000;
-    const elapsed: u64 = if (end_ms >= start_ms) end_ms - start_ms else 0;
-    block.finish(exit_code, elapsed);
-
-    // If the executed command block output is long (exceeds canvas rows),
-    // align scroll_offset so the top of this block is visible at the top of the canvas,
-    // allowing the user to read from the top and naturally scroll down.
-    const max_canvas_rows = if (self.rows > 1) self.rows - 1 else 0;
-    const block_lines = 1 + block.output_lines.items.len;
-    if (max_canvas_rows > 0 and block_lines > max_canvas_rows) {
-        self.scroll_offset = block_lines - max_canvas_rows;
-    } else {
-        self.scroll_offset = 0;
-    }
-
-    self.needs_render = true;
+    return self.launchJob(cmd, false);
 }
 
 pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
@@ -733,6 +779,21 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
     if (trimmed.len == 0) return;
 
     self.scroll_offset = 0;
+
+    // 0. Explicit interactive launcher prefix: "xpty <command>" or "interactive <command>"
+    if (std.mem.startsWith(u8, trimmed, "xpty ") or std.mem.startsWith(u8, trimmed, "interactive ")) {
+        const cmd_part = if (std.mem.startsWith(u8, trimmed, "xpty "))
+            trimmed[5..]
+        else
+            trimmed[12..];
+        const cmd_trimmed = std.mem.trim(u8, cmd_part, " \t");
+        if (cmd_trimmed.len > 0) {
+            const exp = try SessionState.expandPipeline(self.allocator, self.blocks.items, cmd_trimmed);
+            defer self.allocator.free(exp);
+            try self.launchInteractive(exp);
+            return;
+        }
+    }
 
     // 1. Built-in command handling
     const builtin = SessionState.parseBuiltin(trimmed);
@@ -839,7 +900,9 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             } else {
                 self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
             }
-            _ = self.client.display.flush();
+            self.client.roundtrip() catch {
+                _ = self.client.display.flush();
+            };
             self.needs_render = true;
             return;
         },
@@ -923,12 +986,8 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
     const cmd = try SessionState.expandPipeline(self.allocator, self.blocks.items, trimmed);
     defer self.allocator.free(cmd);
 
-    // 3. Dispatch interactive vs block
-    if (isInteractiveCommand(cmd)) {
-        try self.launchInteractive(cmd);
-    } else {
-        try self.launchBlock(cmd);
-    }
+    // 3. Dispatch job: all external commands run attached to real PTY with Ghostty VT
+    try self.launchJob(cmd, false);
 }
 
 pub fn closeActiveJob(self: *TcShellApp) void {
@@ -939,9 +998,11 @@ pub fn closeActiveJob(self: *TcShellApp) void {
 
 pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
     var elapsed_ms: u64 = 0;
+    var was_fullscreen = false;
     var i: usize = 0;
     while (i < self.jobs.items.len) : (i += 1) {
         if (self.jobs.items[i].block_id == block_id) {
+            was_fullscreen = self.jobs.items[i].is_fullscreen;
             const now_ms = currentMonotonicMs();
             if (now_ms >= self.jobs.items[i].start_time_ms) {
                 elapsed_ms = now_ms - self.jobs.items[i].start_time_ms;
@@ -954,20 +1015,41 @@ pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
     for (self.blocks.items) |b| {
         if (b.id == block_id) {
             b.finish(exit_code, elapsed_ms);
-            b.output_lines.clearRetainingCapacity();
-            b.appendOutput("[interactive session exited]\n") catch {};
+            if (was_fullscreen) {
+                b.output_lines.clearRetainingCapacity();
+                b.appendOutput("[interactive session exited]\n") catch {};
+            }
             break;
         }
     }
     if (self.active_job_id == block_id) {
         self.active_job_id = null;
         self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+        self.prompt.updateBanner(self.session.getCwd()) catch {};
     }
-    _ = self.client.display.flush();
+    self.client.roundtrip() catch {
+        _ = self.client.display.flush();
+    };
     self.needs_render = true;
 }
 
-fn renderRowText(
+fn color256ToRgba(idx: u8, palette: [16]u32) u32 {
+    if (idx < 16) return palette[idx];
+    if (idx < 232) {
+        const cube_idx = idx - 16;
+        const b_idx = cube_idx % 6;
+        const g_idx = (cube_idx / 6) % 6;
+        const r_idx = cube_idx / 36;
+        const r: u32 = if (r_idx == 0) 0 else 55 + r_idx * 40;
+        const g: u32 = if (g_idx == 0) 0 else 55 + g_idx * 40;
+        const b: u32 = if (b_idx == 0) 0 else 55 + b_idx * 40;
+        return (r << 24) | (g << 16) | (b << 8) | 0xFF;
+    }
+    const gray: u32 = (@as(u32, idx - 232)) * 10 + 8;
+    return (gray << 24) | (gray << 16) | (gray << 8) | 0xFF;
+}
+
+pub fn renderRowText(
     canvas: []Compositor.CanvasCell,
     cols: u32,
     row: usize,
@@ -975,33 +1057,160 @@ fn renderRowText(
     fg: u32,
     bg: u32,
     bold: bool,
+    palette: [16]u32,
 ) void {
     var col_idx: usize = 0;
     const trimmed = std.mem.trimEnd(u8, text, "\r\n");
-    if (std.unicode.Utf8View.init(trimmed)) |v| {
-        var iter = v.iterator();
-        while (iter.nextCodepoint()) |cp| {
-            if (col_idx >= cols) break;
+
+    var cur_fg: u32 = fg;
+    var cur_bg: u32 = bg;
+    var cur_bold: bool = bold;
+    var cur_italic: bool = false;
+    var cur_underline: bool = false;
+
+    var i: usize = 0;
+    while (i < trimmed.len and col_idx < cols) {
+        if (trimmed[i] == 0x1b) {
+            if (i + 1 < trimmed.len and trimmed[i + 1] == '[') {
+                // Parse CSI sequence
+                i += 2;
+                var params: [16]u32 = undefined;
+                var param_count: usize = 0;
+                var cur_param: u32 = 0;
+                var has_param_digit = false;
+
+                while (i < trimmed.len) : (i += 1) {
+                    const b = trimmed[i];
+                    if (b >= '0' and b <= '9') {
+                        cur_param = cur_param * 10 + (b - '0');
+                        has_param_digit = true;
+                    } else if (b == ';') {
+                        if (param_count < 16) {
+                            params[param_count] = if (has_param_digit) cur_param else 0;
+                            param_count += 1;
+                        }
+                        cur_param = 0;
+                        has_param_digit = false;
+                    } else if (b >= 0x40 and b <= 0x7e) {
+                        if (has_param_digit or param_count > 0) {
+                            if (param_count < 16) {
+                                params[param_count] = if (has_param_digit) cur_param else 0;
+                                param_count += 1;
+                            }
+                        }
+                        if (b == 'm') {
+                            if (param_count == 0) {
+                                cur_fg = fg;
+                                cur_bg = bg;
+                                cur_bold = bold;
+                                cur_italic = false;
+                                cur_underline = false;
+                            } else {
+                                var p_idx: usize = 0;
+                                while (p_idx < param_count) : (p_idx += 1) {
+                                    const p = params[p_idx];
+                                    switch (p) {
+                                        0 => {
+                                            cur_fg = fg;
+                                            cur_bg = bg;
+                                            cur_bold = bold;
+                                            cur_italic = false;
+                                            cur_underline = false;
+                                        },
+                                        1 => cur_bold = true,
+                                        3 => cur_italic = true,
+                                        4 => cur_underline = true,
+                                        7 => {
+                                            const tmp = cur_fg;
+                                            cur_fg = cur_bg;
+                                            cur_bg = tmp;
+                                        },
+                                        22 => cur_bold = false,
+                                        23 => cur_italic = false,
+                                        24 => cur_underline = false,
+                                        30...37 => cur_fg = palette[p - 30],
+                                        39 => cur_fg = fg,
+                                        40...47 => cur_bg = palette[p - 40],
+                                        49 => cur_bg = bg,
+                                        90...97 => cur_fg = palette[8 + (p - 90)],
+                                        100...107 => cur_bg = palette[8 + (p - 100)],
+                                        38 => {
+                                            if (p_idx + 2 < param_count and params[p_idx + 1] == 5) {
+                                                cur_fg = color256ToRgba(@truncate(params[p_idx + 2]), palette);
+                                                p_idx += 2;
+                                            } else if (p_idx + 4 < param_count and params[p_idx + 1] == 2) {
+                                                const r = params[p_idx + 2] & 0xFF;
+                                                const g = params[p_idx + 3] & 0xFF;
+                                                const bl = params[p_idx + 4] & 0xFF;
+                                                cur_fg = (r << 24) | (g << 16) | (bl << 8) | 0xFF;
+                                                p_idx += 4;
+                                            }
+                                        },
+                                        48 => {
+                                            if (p_idx + 2 < param_count and params[p_idx + 1] == 5) {
+                                                cur_bg = color256ToRgba(@truncate(params[p_idx + 2]), palette);
+                                                p_idx += 2;
+                                            } else if (p_idx + 4 < param_count and params[p_idx + 1] == 2) {
+                                                const r = params[p_idx + 2] & 0xFF;
+                                                const g = params[p_idx + 3] & 0xFF;
+                                                const bl = params[p_idx + 4] & 0xFF;
+                                                cur_bg = (r << 24) | (g << 16) | (bl << 8) | 0xFF;
+                                                p_idx += 4;
+                                            }
+                                        },
+                                        else => {},
+                                    }
+                                }
+                            }
+                        }
+                        i += 1;
+                        break;
+                    }
+                }
+                continue;
+            } else if (i + 1 < trimmed.len and trimmed[i + 1] == ']') {
+                // Skip OSC sequence
+                i += 2;
+                while (i < trimmed.len and trimmed[i] != 0x07) : (i += 1) {
+                    if (trimmed[i] == 0x1b and i + 1 < trimmed.len and trimmed[i + 1] == '\\') {
+                        i += 2;
+                        break;
+                    }
+                }
+                if (i < trimmed.len and trimmed[i] == 0x07) i += 1;
+                continue;
+            } else if (i + 2 < trimmed.len and (trimmed[i + 1] == '(' or trimmed[i + 1] == ')')) {
+                i += 3;
+                continue;
+            } else {
+                i += 1;
+                continue;
+            }
+        }
+
+        // Regular character or UTF-8 sequence
+        const len = std.unicode.utf8ByteSequenceLength(trimmed[i]) catch 1;
+        if (i + len <= trimmed.len) {
+            const cp = std.unicode.utf8Decode(trimmed[i .. i + len]) catch trimmed[i];
+            i += len;
+            if (cp == '\r') {
+                col_idx = 0;
+                continue;
+            }
             canvas[row * cols + col_idx] = .{
                 .codepoint = cp,
-                .fg_rgba = fg,
-                .bg_rgba = bg,
-                .bold = bold,
+                .fg_rgba = cur_fg,
+                .bg_rgba = cur_bg,
+                .bold = cur_bold,
+                .italic = cur_italic,
+                .underline = cur_underline,
             };
             col_idx += 1;
-        }
-    } else |_| {
-        for (trimmed) |ch| {
-            if (col_idx >= cols) break;
-            canvas[row * cols + col_idx] = .{
-                .codepoint = ch,
-                .fg_rgba = fg,
-                .bg_rgba = bg,
-                .bold = bold,
-            };
-            col_idx += 1;
+        } else {
+            i += 1;
         }
     }
+
     while (col_idx < cols) : (col_idx += 1) {
         canvas[row * cols + col_idx] = .{
             .codepoint = ' ',
@@ -1061,12 +1270,12 @@ pub fn render(self: *TcShellApp) void {
                 fb.elapsed_ms,
             }) catch "▶ command";
 
-            renderRowText(self.compositor.canvas, self.cols, cur_row, header_text, status_fg, header_bg, true);
+            renderRowText(self.compositor.canvas, self.cols, cur_row, header_text, status_fg, header_bg, true, self.compositor.theme_palette);
             cur_row += 1;
 
             for (fb.output_lines.items) |line| {
                 if (cur_row >= self.rows) break;
-                renderRowText(self.compositor.canvas, self.cols, cur_row, line, self.compositor.theme_fg_rgba, self.compositor.theme_bg_rgba, false);
+                renderRowText(self.compositor.canvas, self.cols, cur_row, line, self.compositor.theme_fg_rgba, self.compositor.theme_bg_rgba, false, self.compositor.theme_palette);
                 cur_row += 1;
             }
         } else {
@@ -1120,7 +1329,7 @@ pub fn render(self: *TcShellApp) void {
                 if (line_idx >= skip_lines) {
                     const cur_row = line_idx - skip_lines;
                     if (cur_row < max_canvas_rows) {
-                        renderRowText(self.compositor.canvas, self.cols, cur_row, header_text, status_fg, header_bg, true);
+                        renderRowText(self.compositor.canvas, self.cols, cur_row, header_text, status_fg, header_bg, true, self.compositor.theme_palette);
                     }
                 }
                 line_idx += 1;
@@ -1130,7 +1339,7 @@ pub fn render(self: *TcShellApp) void {
                         if (line_idx >= skip_lines) {
                             const cur_row = line_idx - skip_lines;
                             if (cur_row < max_canvas_rows) {
-                                renderRowText(self.compositor.canvas, self.cols, cur_row, line, self.compositor.theme_fg_rgba, self.compositor.theme_bg_rgba, false);
+                                renderRowText(self.compositor.canvas, self.cols, cur_row, line, self.compositor.theme_fg_rgba, self.compositor.theme_bg_rgba, false, self.compositor.theme_palette);
                             }
                         }
                         line_idx += 1;
@@ -1220,6 +1429,15 @@ pub fn render(self: *TcShellApp) void {
                     .visible = true,
                 };
             }
+        }
+    } else {
+        const cur_col = self.prompt.getCursorScreenCol();
+        if (cur_col < self.cols and self.rows > 0) {
+            maybe_cursor = .{
+                .col = @intCast(cur_col),
+                .row = self.rows - 1,
+                .visible = true,
+            };
         }
     }
 
@@ -1349,6 +1567,31 @@ pub fn run(self: *TcShellApp) !void {
                     continue;
                 }
             }
+
+            // Dynamic promotion / demotion based on Ghostty VT alt-screen
+            if (j.xpty.isAlternateScreen() and !j.is_fullscreen) {
+                j.is_fullscreen = true;
+                j.xpty.is_visible = true;
+                self.active_job_id = j.block_id;
+                self.prompt.setPosition(0, -100);
+                j.xpty.setPosition(0, 0);
+                j.xpty.commit() catch {};
+                self.client.roundtrip() catch {
+                    _ = self.client.display.flush();
+                };
+                self.needs_render = true;
+            } else if (!j.xpty.isAlternateScreen() and j.is_fullscreen) {
+                j.is_fullscreen = false;
+                j.xpty.is_visible = false;
+                self.active_job_id = null;
+                self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+                j.xpty.setPosition(0, -100);
+                self.client.roundtrip() catch {
+                    _ = self.client.display.flush();
+                };
+                self.needs_render = true;
+            }
+
             if (j.xpty.checkChildExited()) |st| {
                 _ = j.xpty.pollPty();
                 const bid = j.block_id;
@@ -1510,7 +1753,9 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
             }
             if (was_fullscreen) {
                 self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
-                _ = self.client.display.flush();
+                self.client.roundtrip() catch {
+                    _ = self.client.display.flush();
+                };
                 self.needs_render = true;
                 return;
             }

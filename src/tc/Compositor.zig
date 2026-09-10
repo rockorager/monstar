@@ -342,11 +342,15 @@ fn handleCompositorRequest(res: *server.wl.Compositor, req: server.wl.Compositor
 }
 
 fn handleSurfaceRequest(res: *server.wl.Surface, req: server.wl.Surface.Request, self: *Compositor) void {
+    if (req == .destroy) {
+        res.destroy();
+        return;
+    }
     self.lock();
     defer self.unlock();
     const surf = self.surface_map.get(res) orelse return;
     switch (req) {
-        .destroy => {},
+        .destroy => unreachable,
         .attach => |args| {
             if (args.buffer) |buf_res| {
                 if (self.buffer_map.get(buf_res)) |buf| {
@@ -405,9 +409,15 @@ fn bindZtermCompositor(client: *server.wl.Client, data: *Compositor, version: u3
 }
 
 fn handleZtermCompositorRequest(res: *server.zterm.CompositorV1, req: server.zterm.CompositorV1.Request, self: *Compositor) void {
+    if (req == .destroy) {
+        res.destroy();
+        return;
+    }
+    self.lock();
+    defer self.unlock();
     const client = res.getClient();
     switch (req) {
-        .destroy => {},
+        .destroy => unreachable,
         .get_grid_surface => |args| {
             const surf = self.surface_map.get(args.surface) orelse return;
             surf.role = .grid;
@@ -434,11 +444,15 @@ fn handleZtermCompositorRequest(res: *server.zterm.CompositorV1, req: server.zte
 }
 
 fn handleGridSurfaceRequest(res: *server.zterm.GridSurfaceV1, req: server.zterm.GridSurfaceV1.Request, self: *Compositor) void {
+    if (req == .destroy) {
+        res.destroy();
+        return;
+    }
     self.lock();
     defer self.unlock();
     const surf = self.grid_map.get(res) orelse return;
     switch (req) {
-        .destroy => {},
+        .destroy => unreachable,
         .set_title => |args| {
             const title_slice = std.mem.sliceTo(args.title, 0);
             surf.setTitle(title_slice) catch return;
@@ -493,11 +507,15 @@ fn handleLayerShellRequest(res: *server.zwlr.LayerShellV1, req: server.zwlr.Laye
 }
 
 fn handleLayerSurfaceRequest(res: *server.zwlr.LayerSurfaceV1, req: server.zwlr.LayerSurfaceV1.Request, self: *Compositor) void {
+    if (req == .destroy) {
+        res.destroy();
+        return;
+    }
     self.lock();
     defer self.unlock();
     const surf = self.layer_map.get(res) orelse return;
     switch (req) {
-        .destroy => {},
+        .destroy => unreachable,
         .set_size => {},
         .set_anchor => {},
         .set_exclusive_zone => {},
@@ -566,10 +584,9 @@ fn handleBufferFactoryRequest(res: *server.zterm.BufferFactoryV1, req: server.zt
 }
 
 fn handleBufferRequest(res: *server.wl.Buffer, req: server.wl.Buffer.Request, self: *Compositor) void {
-    _ = res;
     _ = self;
     switch (req) {
-        .destroy => {},
+        .destroy => res.destroy(),
     }
 }
 
@@ -810,15 +827,21 @@ pub fn composite(self: *Compositor) void {
                             const src_cell = cells[r * buf.cols + c];
                             const dst_idx = @as(usize, @intCast(target_y)) * self.cols + @as(usize, @intCast(target_x));
 
-                            const fg = if (src_cell.flags.fg_is_palette and src_cell.fg_color < 16)
+                            var fg = if (src_cell.flags.fg_is_palette and src_cell.fg_color < 16)
                                 self.theme_palette[src_cell.fg_color]
                             else
                                 self.theme_fg_rgba;
 
-                            const bg = if (src_cell.flags.bg_is_palette and src_cell.bg_color > 0 and src_cell.bg_color < 16)
+                            var bg = if (src_cell.flags.bg_is_palette and src_cell.bg_color > 0 and src_cell.bg_color < 16)
                                 self.theme_palette[src_cell.bg_color]
                             else
                                 self.theme_bg_rgba;
+
+                            if (src_cell.flags.reverse) {
+                                const tmp = fg;
+                                fg = bg;
+                                bg = tmp;
+                            }
 
                             self.canvas[dst_idx] = .{
                                 .codepoint = if (src_cell.codepoint == 0) ' ' else src_cell.codepoint,

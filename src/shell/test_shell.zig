@@ -186,6 +186,73 @@ test "interactive commands identify less and pager tools" {
     try std.testing.expect(TcShellApp.isInteractiveCommand("/usr/bin/less -R /tmp/log"));
     try std.testing.expect(TcShellApp.isInteractiveCommand("vim test.zig"));
     try std.testing.expect(TcShellApp.isInteractiveCommand("htop"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("kak"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("kak file.txt"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("/usr/bin/kak src/main.zig"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("sudo kak /etc/hosts"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("sudo -E kak /etc/hosts"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("env FOO=bar kak"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("hx"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("helix src/main.zig"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("fzf"));
     try std.testing.expect(!TcShellApp.isInteractiveCommand("ls -la"));
     try std.testing.expect(!TcShellApp.isInteractiveCommand("cat foo.txt"));
+}
+
+test "renderRowText parses ANSI SGR color sequences for ls and diff" {
+    const TcShellApp = @import("TcShellApp.zig");
+    const Compositor = @import("../tc/Compositor.zig");
+
+    var canvas: [20]Compositor.CanvasCell = undefined;
+    for (&canvas) |*c| {
+        c.* = .{};
+    }
+
+    const palette = [_]u32{
+        0x000000FF, // 0: black
+        0xFF0000FF, // 1: red
+        0x00FF00FF, // 2: green
+        0xFFFF00FF, // 3: yellow
+        0x0000FFFF, // 4: blue
+        0xFF00FFFF, // 5: magenta
+        0x00FFFFFF, // 6: cyan
+        0xFFFFFFFF, // 7: white
+        0x555555FF, // 8: bright black
+        0xFF5555FF, // 9: bright red
+        0x55FF55FF, // 10: bright green
+        0xFFFF55FF, // 11: bright yellow
+        0x5555FFFF, // 12: bright blue
+        0xFF55FFFF, // 13: bright magenta
+        0x55FFFFFF, // 14: bright cyan
+        0xFFFFFFFF, // 15: bright white
+    };
+
+    // Test text containing colored output like jj diff --stat or ls:
+    // \x1b[32m+10\x1b[0m \x1b[31m-2\x1b[0m
+    const text = "\x1b[32m+10\x1b[0m \x1b[31m-2\x1b[0m";
+    TcShellApp.renderRowText(&canvas, 20, 0, text, 0xCCCCCCFF, 0x000000FF, false, palette);
+
+    // canvas[0] should be '+' in green (palette[2])
+    try std.testing.expectEqual(@as(u32, '+'), canvas[0].codepoint);
+    try std.testing.expectEqual(@as(u32, 0x00FF00FF), canvas[0].fg_rgba);
+
+    // canvas[1] should be '1' in green
+    try std.testing.expectEqual(@as(u32, '1'), canvas[1].codepoint);
+    try std.testing.expectEqual(@as(u32, 0x00FF00FF), canvas[1].fg_rgba);
+
+    // canvas[2] should be '0' in green
+    try std.testing.expectEqual(@as(u32, '0'), canvas[2].codepoint);
+    try std.testing.expectEqual(@as(u32, 0x00FF00FF), canvas[2].fg_rgba);
+
+    // canvas[3] should be ' ' in default fg (0xCCCCCCFF)
+    try std.testing.expectEqual(@as(u32, ' '), canvas[3].codepoint);
+    try std.testing.expectEqual(@as(u32, 0xCCCCCCFF), canvas[3].fg_rgba);
+
+    // canvas[4] should be '-' in red (palette[1])
+    try std.testing.expectEqual(@as(u32, '-'), canvas[4].codepoint);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), canvas[4].fg_rgba);
+
+    // canvas[5] should be '2' in red
+    try std.testing.expectEqual(@as(u32, '2'), canvas[5].codepoint);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), canvas[5].fg_rgba);
 }

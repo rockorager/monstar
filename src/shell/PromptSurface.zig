@@ -190,9 +190,9 @@ pub fn getCursorScreenCol(self: *const PromptSurface) usize {
 
 fn isBuiltinName(name: []const u8) bool {
     const builtins = [_][]const u8{
-        "cd",     "pwd",   "collapse", "expand", "fullscreen", "fg",   "edit",
-        "run",    "rm",    "copy",     "view",   "clear",      "exit", "quit",
-        "export", "unset",
+        "cd",     "pwd",   "collapse", "expand",      "fullscreen", "fg",   "edit",
+        "run",    "rm",    "copy",     "view",        "clear",      "exit", "quit",
+        "export", "unset", "xpty",     "interactive",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;

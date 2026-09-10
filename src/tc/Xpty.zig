@@ -42,8 +42,13 @@ pty: ?Pty = null,
 child_pid: ?std.posix.pid_t = null,
 pty_buffer: [4096]u8 = undefined,
 
+// Output hook (e.g. for streaming PTY bytes into command blocks)
+output_fn: ?*const fn (ctx: ?*anyopaque, bytes: []const u8) void = null,
+output_ctx: ?*anyopaque = null,
+
 // Simulated shell state if no real PTY is spawned
 is_simulated: bool = false,
+is_visible: bool = true,
 sim_prompt: []const u8 = "monstar:xpty$ ",
 sim_input_buf: [256]u8 = undefined,
 sim_input_len: usize = 0,
@@ -100,6 +105,7 @@ pub fn init(
     var term: vt.Terminal = try .init(defaultIo(), allocator, .{
         .cols = @intCast(cols),
         .rows = @intCast(rows),
+        .max_scrollback_bytes = 0,
     });
     errdefer term.deinit(allocator);
 
@@ -114,6 +120,7 @@ pub fn init(
         .cells = cells,
         .term = term,
         .stream = undefined,
+        .is_visible = true,
     };
     self.stream = self.term.vtStream();
     self.stream.handler.effects.write_pty = effectWritePty;
@@ -158,6 +165,12 @@ pub fn statusToExitCode(status: u32) u8 {
     } else {
         return @truncate(128 + (status & 0x7f));
     }
+}
+
+/// Returns true if the terminal is currently in the alternate screen buffer
+/// (e.g. entered via \x1b[?1049h or \x1b[?47h by curses/TUI applications).
+pub fn isAlternateScreen(self: *const Xpty) bool {
+    return self.term.screens.active_key == .alternate;
 }
 
 pub fn setPosition(self: *Xpty, x: i32, y: i32) void {
@@ -386,6 +399,11 @@ pub fn scrollDown(self: *Xpty, lines: u32) void {
     self.feedBytes(seq);
 }
 
+pub fn setOutputHandler(self: *Xpty, ctx: ?*anyopaque, handler: ?*const fn (ctx: ?*anyopaque, bytes: []const u8) void) void {
+    self.output_ctx = ctx;
+    self.output_fn = handler;
+}
+
 /// Drains any pending output from the real PTY and commits on damage.
 pub fn pollPty(self: *Xpty) bool {
     const p = self.pty orelse return false;
@@ -397,13 +415,19 @@ pub fn pollPty(self: *Xpty) bool {
         const rc = std.c.read(p.master, &self.pty_buffer, self.pty_buffer.len);
         if (rc > 0) {
             any_read = true;
-            self.stream.nextSlice(self.pty_buffer[0..@intCast(rc)]);
+            const chunk = self.pty_buffer[0..@intCast(rc)];
+            self.stream.nextSlice(chunk);
+            if (self.output_fn) |cb| {
+                if (!self.isAlternateScreen()) {
+                    cb(self.output_ctx, chunk);
+                }
+            }
         } else {
             break;
         }
     }
 
-    if (any_read) {
+    if (any_read and (self.is_visible or self.isAlternateScreen())) {
         self.commit() catch {};
     }
     return any_read;
@@ -562,4 +586,31 @@ test "xpty child process exit detection" {
     }
     try std.testing.expect(exited);
     try std.testing.expect(xpty.child_pid == null);
+}
+
+test "xpty alternate screen detection" {
+    const allocator = std.testing.allocator;
+    const cols: u32 = 80;
+    const rows: u32 = 24;
+
+    var xpty = try Xpty.init(allocator, null, cols, rows);
+    defer xpty.deinit();
+
+    // Initially in primary screen
+    try std.testing.expect(!xpty.isAlternateScreen());
+
+    // Enter alternate screen buffer: \x1b[?1049h
+    xpty.feedBytes("\x1b[?1049h");
+    try std.testing.expect(xpty.isAlternateScreen());
+
+    // Exit alternate screen buffer: \x1b[?1049l
+    xpty.feedBytes("\x1b[?1049l");
+    try std.testing.expect(!xpty.isAlternateScreen());
+
+    // Legacy alternate screen buffer: \x1b[?47h / \x1b[?47l
+    xpty.feedBytes("\x1b[?47h");
+    try std.testing.expect(xpty.isAlternateScreen());
+
+    xpty.feedBytes("\x1b[?47l");
+    try std.testing.expect(!xpty.isAlternateScreen());
 }
