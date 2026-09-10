@@ -289,9 +289,17 @@ pub fn fireRepeat(self: *TcShellApp) void {
 }
 
 pub fn getActiveJob(self: *TcShellApp) ?*InteractiveJob {
-    const jid = self.active_job_id orelse return null;
-    for (self.jobs.items) |*j| {
-        if (j.block_id == jid) return j;
+    if (self.active_job_id) |jid| {
+        for (self.jobs.items) |*j| {
+            if (j.block_id == jid) return j;
+        }
+    }
+    var i = self.jobs.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (!self.jobs.items[i].suspended and (self.jobs.items[i].is_fullscreen or self.jobs.items[i].xpty.isAlternateScreen())) {
+            return &self.jobs.items[i];
+        }
     }
     return null;
 }
@@ -306,13 +314,30 @@ pub fn findJob(self: *TcShellApp, block_id: usize) ?*InteractiveJob {
 pub fn suspendActiveJob(self: *TcShellApp) void {
     if (self.getActiveJob()) |job| {
         if (job.xpty.child_pid) |pid| {
-            _ = std.posix.kill(pid, std.posix.SIG.TSTP) catch {};
+            const pgrp = blk: {
+                if (job.xpty.pty) |p| {
+                    var fg_pgrp: std.posix.pid_t = 0;
+                    if (std.os.linux.ioctl(p.master, std.os.linux.T.IOCGPGRP, @intFromPtr(&fg_pgrp)) == 0 and fg_pgrp > 0) {
+                        break :blk fg_pgrp;
+                    }
+                }
+                break :blk pid;
+            };
+            _ = std.posix.kill(-pgrp, std.posix.SIG.STOP) catch {
+                _ = std.posix.kill(-pid, std.posix.SIG.STOP) catch {
+                    _ = std.posix.kill(pid, std.posix.SIG.STOP) catch {};
+                };
+            };
         }
         job.suspended = true;
+        job.is_fullscreen = false;
+        job.xpty.is_visible = false;
         for (self.blocks.items) |b| {
             if (b.id == job.block_id) {
                 b.folded = false;
+                for (b.output_lines.items) |line| self.allocator.free(line);
                 b.output_lines.clearRetainingCapacity();
+                b.pending_line.clearRetainingCapacity();
                 const msg = std.fmt.allocPrint(self.allocator, "[suspended (Ctrl+Z); type 'fg' or 'fg ${d}' to resume]\n", .{job.block_id}) catch null;
                 if (msg) |m| {
                     b.appendOutput(m) catch {};
@@ -322,11 +347,12 @@ pub fn suspendActiveJob(self: *TcShellApp) void {
             }
         }
         self.active_job_id = null;
+        self.pinned_block_id = job.block_id;
         self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+        self.prompt.render();
+        self.prompt.commit() catch {};
         job.xpty.setPosition(0, -100);
-        self.client.roundtrip() catch {
-            _ = self.client.display.flush();
-        };
+        _ = self.client.display.flush();
         self.needs_render = true;
     }
 }
@@ -354,25 +380,40 @@ pub fn resumeJob(self: *TcShellApp, maybe_target: ?[]const u8) bool {
         }
 
         if (job.xpty.child_pid) |pid| {
-            _ = std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+            const pgrp = blk: {
+                if (job.xpty.pty) |p| {
+                    var fg_pgrp: std.posix.pid_t = 0;
+                    if (std.os.linux.ioctl(p.master, std.os.linux.T.IOCGPGRP, @intFromPtr(&fg_pgrp)) == 0 and fg_pgrp > 0) {
+                        break :blk fg_pgrp;
+                    }
+                }
+                break :blk pid;
+            };
+            _ = std.posix.kill(-pgrp, std.posix.SIG.CONT) catch {
+                _ = std.posix.kill(-pid, std.posix.SIG.CONT) catch {
+                    _ = std.posix.kill(pid, std.posix.SIG.CONT) catch {};
+                };
+            };
         }
         job.suspended = false;
+        job.is_fullscreen = true;
+        job.xpty.is_visible = true;
         self.active_job_id = job.block_id;
 
         self.prompt.setPosition(0, -100);
         job.xpty.setPosition(0, 0);
-        self.client.roundtrip() catch {
-            _ = self.client.display.flush();
-        };
+        job.xpty.commit() catch {};
+        _ = self.client.display.flush();
 
         for (self.blocks.items) |b| {
             if (b.id == job.block_id) {
+                for (b.output_lines.items) |line| self.allocator.free(line);
                 b.output_lines.clearRetainingCapacity();
+                b.pending_line.clearRetainingCapacity();
                 b.appendOutput("[running in interactive xpty]\n") catch {};
                 break;
             }
         }
-        _ = self.client.display.flush();
         self.needs_render = true;
         return true;
     }
@@ -940,9 +981,7 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             } else {
                 self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
             }
-            self.client.roundtrip() catch {
-                _ = self.client.display.flush();
-            };
+            _ = self.client.display.flush();
             self.needs_render = true;
             return;
         },
@@ -1071,11 +1110,11 @@ pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
     if (self.active_job_id == block_id) {
         self.active_job_id = null;
         self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+        self.prompt.render();
+        self.prompt.commit() catch {};
         self.prompt.updateBanner(self.session.getCwd()) catch {};
     }
-    self.client.roundtrip() catch {
-        _ = self.client.display.flush();
-    };
+    _ = self.client.display.flush();
     self.needs_render = true;
 }
 
@@ -1605,27 +1644,23 @@ pub fn run(self: *TcShellApp) !void {
                 }
             }
 
-            // Dynamic promotion / demotion based on Ghostty VT alt-screen
-            if (j.xpty.isAlternateScreen() and !j.is_fullscreen) {
+            // Dynamic promotion / demotion based on Ghostty VT alt-screen (only when not suspended)
+            if (j.xpty.isAlternateScreen() and !j.is_fullscreen and !j.suspended) {
                 j.is_fullscreen = true;
                 j.xpty.is_visible = true;
                 self.active_job_id = j.block_id;
                 self.prompt.setPosition(0, -100);
                 j.xpty.setPosition(0, 0);
                 j.xpty.commit() catch {};
-                self.client.roundtrip() catch {
-                    _ = self.client.display.flush();
-                };
+                _ = self.client.display.flush();
                 self.needs_render = true;
-            } else if (!j.xpty.isAlternateScreen() and j.is_fullscreen) {
+            } else if (!j.xpty.isAlternateScreen() and j.is_fullscreen and !j.suspended) {
                 j.is_fullscreen = false;
                 j.xpty.is_visible = false;
                 self.active_job_id = null;
                 self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
                 j.xpty.setPosition(0, -100);
-                self.client.roundtrip() catch {
-                    _ = self.client.display.flush();
-                };
+                _ = self.client.display.flush();
                 self.needs_render = true;
             }
 
@@ -1667,7 +1702,11 @@ fn onResize(ctx: *anyopaque, width: u31, height: u31) anyerror!void {
         }
 
         for (self.jobs.items) |j| {
-            j.xpty.setPosition(0, 0);
+            if (j.is_fullscreen and !j.suspended) {
+                j.xpty.setPosition(0, 0);
+            } else {
+                j.xpty.setPosition(0, -100);
+            }
             try j.xpty.resize(new_cols, new_rows);
         }
         _ = self.client.display.flush();
@@ -1735,7 +1774,9 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
     if (self.getActiveJob()) |job| {
         if (!job.suspended) {
             // Ctrl+Z: Suspend active interactive xpty program and return to prompt
-            if (action == .press and k_event.mods.ctrl and k_event.unshifted_codepoint == 'z') {
+            const is_ctrl_z = (action == .press or action == .repeat) and ((k_event.mods.ctrl and (k_event.key == .key_z or k_event.unshifted_codepoint == 'z' or k_event.unshifted_codepoint == 'Z')) or
+                (k_event.utf8.len == 1 and k_event.utf8[0] == 0x1a));
+            if (is_ctrl_z) {
                 self.cancelRepeat();
                 self.suspendActiveJob();
                 return;
@@ -1779,6 +1820,21 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
 
     // 2. No foreground interactive job: prompt and stationary canvas controls
     if (action == .press) {
+        // Ctrl+Z fallback: suspend any running job in self.jobs
+        if ((k_event.mods.ctrl and (k_event.key == .key_z or k_event.unshifted_codepoint == 'z' or k_event.unshifted_codepoint == 'Z')) or
+            (k_event.utf8.len == 1 and k_event.utf8[0] == 0x1a))
+        {
+            var i = self.jobs.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (!self.jobs.items[i].suspended) {
+                    self.active_job_id = self.jobs.items[i].block_id;
+                    self.suspendActiveJob();
+                    return;
+                }
+            }
+        }
+
         // Escape or 'q' to exit fullscreen block if one is zoomed
         if (k_event.key == .escape or (k_event.unshifted_codepoint == 'q' and self.prompt.input_buf.items.len == 0)) {
             var was_fullscreen = false;
@@ -1790,9 +1846,7 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
             }
             if (was_fullscreen) {
                 self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
-                self.client.roundtrip() catch {
-                    _ = self.client.display.flush();
-                };
+                _ = self.client.display.flush();
                 self.needs_render = true;
                 return;
             }

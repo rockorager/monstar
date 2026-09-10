@@ -427,7 +427,7 @@ pub fn pollPty(self: *Xpty) bool {
         }
     }
 
-    if (any_read and (self.is_visible or self.isAlternateScreen())) {
+    if (any_read and self.is_visible) {
         self.commit() catch {};
     }
     return any_read;
