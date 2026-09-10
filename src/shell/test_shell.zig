@@ -179,3 +179,13 @@ test "SessionState isAllTarget matching" {
     try std.testing.expect(!SessionState.isAllTarget("$prev"));
     try std.testing.expect(!SessionState.isAllTarget(""));
 }
+
+test "interactive commands identify less and pager tools" {
+    const TcShellApp = @import("TcShellApp.zig");
+    try std.testing.expect(TcShellApp.isInteractiveCommand("less file.txt"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("/usr/bin/less -R /tmp/log"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("vim test.zig"));
+    try std.testing.expect(TcShellApp.isInteractiveCommand("htop"));
+    try std.testing.expect(!TcShellApp.isInteractiveCommand("ls -la"));
+    try std.testing.expect(!TcShellApp.isInteractiveCommand("cat foo.txt"));
+}

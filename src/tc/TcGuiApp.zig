@@ -427,6 +427,11 @@ pub fn run(self: *TcGuiApp) !void {
                 break;
             }
         }
+        if (self.xpty.checkChildExited()) |_| {
+            _ = self.xpty.pollPty();
+            self.running = false;
+            break;
+        }
 
         // Drain split PTY output
         if (pty_fd1 >= 0 and (fds[3].revents & (posix.POLL.IN | posix.POLL.HUP)) != 0) {
@@ -436,6 +441,13 @@ pub fn run(self: *TcGuiApp) !void {
                 }
             }
             if (fds[3].revents & posix.POLL.HUP != 0) {
+                self.closeSplit();
+                self.needs_render = true;
+            }
+        }
+        if (self.split_xpty) |split| {
+            if (split.checkChildExited()) |_| {
+                _ = split.pollPty();
                 self.closeSplit();
                 self.needs_render = true;
             }
@@ -577,11 +589,11 @@ fn onKeyboard(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             }
 
             // Normal shell input routed to active pane
-            if (action == .press) {
+            if (action == .press or action == .repeat) {
                 const active = self.getActiveXpty();
                 var out_buf: [128]u8 = undefined;
                 var writer: std.Io.Writer = .fixed(&out_buf);
-                vt.input.encodeKey(&writer, k_event, .{}) catch {
+                vt.input.encodeKey(&writer, k_event, .fromTerminal(&active.term)) catch {
                     if (k_event.utf8.len > 0) {
                         active.sendInput(k_event.utf8) catch {};
                         self.needs_render = true;

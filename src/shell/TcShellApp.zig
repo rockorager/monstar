@@ -74,10 +74,17 @@ fn repeatTimerSpec(rate: i32, delay_ms: i32) ?linux.itimerspec {
     };
 }
 
+fn currentMonotonicMs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
 pub const InteractiveJob = struct {
     block_id: usize,
     xpty: *Xpty,
     suspended: bool,
+    start_time_ms: u64 = 0,
 };
 
 extern "c" fn popen(command: [*:0]const u8, modes: [*:0]const u8) ?*anyopaque;
@@ -97,6 +104,7 @@ session: *SessionState,
 // Interactive child jobs (e.g. vim, htop)
 jobs: std.ArrayList(InteractiveJob) = .empty,
 active_job_id: ?usize = null,
+signal_fd: posix.fd_t = -1,
 
 // Command blocks for pipeline / non-interactive commands
 blocks: std.ArrayList(*CommandBlock) = .empty,
@@ -176,6 +184,15 @@ pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
 
     prompt_surf.updateBanner(session.getCwd()) catch {};
 
+    var sigmask = posix.sigemptyset();
+    posix.sigaddset(&sigmask, .CHLD);
+    posix.sigprocmask(std.os.linux.SIG.BLOCK, &sigmask, null);
+    const signal_fd: posix.fd_t = posix.signalfd(
+        -1,
+        &sigmask,
+        std.os.linux.SFD.CLOEXEC | std.os.linux.SFD.NONBLOCK,
+    ) catch -1;
+
     const self = try allocator.create(TcShellApp);
     errdefer allocator.destroy(self);
 
@@ -191,6 +208,7 @@ pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
         .session = session,
         .jobs = .empty,
         .active_job_id = null,
+        .signal_fd = signal_fd,
         .blocks = .empty,
         .cols = cols,
         .rows = rows,
@@ -225,6 +243,9 @@ pub fn init(allocator: std.mem.Allocator) !*TcShellApp {
 pub fn deinit(self: *TcShellApp) void {
     self.cancelRepeat();
     _ = linux.close(self.repeat_fd);
+    if (self.signal_fd >= 0) {
+        _ = linux.close(self.signal_fd);
+    }
 
     self.compositor.stop();
 
@@ -457,7 +478,7 @@ pub fn scrollLines(self: *TcShellApp, lines: i32) void {
 }
 
 /// Checks if command is typically an interactive fullscreen/TUI tool.
-fn isInteractiveCommand(cmd: []const u8) bool {
+pub fn isInteractiveCommand(cmd: []const u8) bool {
     var iter = std.mem.tokenizeAny(u8, cmd, " \t");
     const bin = iter.next() orelse return false;
     const base = if (std.mem.lastIndexOfScalar(u8, bin, '/')) |idx| bin[idx + 1 ..] else bin;
@@ -610,7 +631,34 @@ pub fn launchInteractive(self: *TcShellApp, cmd: []const u8) !void {
     const c_arg: [*:0]const u8 = "-c";
     const argv = [_:null]?[*:0]const u8{ sh_z, c_arg, cmd_z.ptr, null };
 
-    new_xpty.spawnPty(sh_z, &argv, std.c.environ) catch {
+    var env_list: std.ArrayList(?[*:0]const u8) = .empty;
+    defer env_list.deinit(self.allocator);
+
+    var env_idx: usize = 0;
+    while (std.c.environ[env_idx]) |entry| : (env_idx += 1) {
+        const val = std.mem.span(entry);
+        if (std.mem.startsWith(u8, val, "TERM=")) continue;
+        if (std.mem.startsWith(u8, val, "COLORTERM=")) continue;
+        env_list.append(self.allocator, entry) catch continue;
+    }
+    env_list.append(self.allocator, "TERM=xterm-256color") catch {};
+    env_list.append(self.allocator, "COLORTERM=truecolor") catch {};
+    const envp = env_list.toOwnedSliceSentinel(self.allocator, null) catch {
+        new_xpty.initSimulatedShell();
+        try self.jobs.append(self.allocator, .{
+            .block_id = block_id,
+            .xpty = new_xpty,
+            .suspended = false,
+            .start_time_ms = currentMonotonicMs(),
+        });
+        self.active_job_id = block_id;
+        _ = self.client.display.flush();
+        self.needs_render = true;
+        return;
+    };
+    defer self.allocator.free(envp);
+
+    new_xpty.spawnPty(sh_z, &argv, envp.ptr) catch {
         new_xpty.initSimulatedShell();
     };
 
@@ -618,6 +666,7 @@ pub fn launchInteractive(self: *TcShellApp, cmd: []const u8) !void {
         .block_id = block_id,
         .xpty = new_xpty,
         .suspended = false,
+        .start_time_ms = currentMonotonicMs(),
     });
     self.active_job_id = block_id;
     _ = self.client.display.flush();
@@ -884,24 +933,29 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
 
 pub fn closeActiveJob(self: *TcShellApp) void {
     if (self.active_job_id) |bid| {
-        self.closeJob(bid);
+        self.closeJob(bid, 0);
     }
 }
 
-pub fn closeJob(self: *TcShellApp, block_id: usize) void {
-    for (self.blocks.items) |b| {
-        if (b.id == block_id) {
-            b.finish(0, 0);
-            b.output_lines.clearRetainingCapacity();
-            b.appendOutput("[interactive session exited]\n") catch {};
-            break;
-        }
-    }
+pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
+    var elapsed_ms: u64 = 0;
     var i: usize = 0;
     while (i < self.jobs.items.len) : (i += 1) {
         if (self.jobs.items[i].block_id == block_id) {
+            const now_ms = currentMonotonicMs();
+            if (now_ms >= self.jobs.items[i].start_time_ms) {
+                elapsed_ms = now_ms - self.jobs.items[i].start_time_ms;
+            }
             const j = self.jobs.orderedRemove(i);
             j.xpty.deinit();
+            break;
+        }
+    }
+    for (self.blocks.items) |b| {
+        if (b.id == block_id) {
+            b.finish(exit_code, elapsed_ms);
+            b.output_lines.clearRetainingCapacity();
+            b.appendOutput("[interactive session exited]\n") catch {};
             break;
         }
     }
@@ -1196,7 +1250,7 @@ pub fn run(self: *TcShellApp) !void {
 
     while (self.running and self.window.running) {
         const job_count = self.jobs.items.len;
-        var fds_buf: [19]posix.pollfd = undefined;
+        var fds_buf: [20]posix.pollfd = undefined;
         fds_buf[0] = .{
             .fd = display.getFd(),
             .events = posix.POLL.IN,
@@ -1212,19 +1266,24 @@ pub fn run(self: *TcShellApp) !void {
             .events = posix.POLL.IN,
             .revents = 0,
         };
+        fds_buf[3] = .{
+            .fd = if (self.signal_fd >= 0) self.signal_fd else -1,
+            .events = if (self.signal_fd >= 0) posix.POLL.IN else 0,
+            .revents = 0,
+        };
 
         const poll_jobs = @min(job_count, 16);
         for (0..poll_jobs) |i| {
             const j = &self.jobs.items[i];
             const pty_fd = if (j.xpty.pty) |p| p.master else -1;
-            fds_buf[3 + i] = .{
+            fds_buf[4 + i] = .{
                 .fd = pty_fd,
                 .events = if (pty_fd >= 0) posix.POLL.IN else 0,
                 .revents = 0,
             };
         }
 
-        const total_poll_fds = 3 + poll_jobs;
+        const total_poll_fds = 4 + poll_jobs;
         const poll_fds = fds_buf[0..total_poll_fds];
 
         while (!display.prepareRead()) {
@@ -1265,21 +1324,35 @@ pub fn run(self: *TcShellApp) !void {
             self.fireRepeat();
         }
 
-        var job_idx: usize = poll_jobs;
+        if (self.signal_fd >= 0 and fds_buf[3].revents & posix.POLL.IN != 0) {
+            var info: std.os.linux.signalfd_siginfo = undefined;
+            while (true) {
+                const n = posix.read(self.signal_fd, std.mem.asBytes(&info)) catch break;
+                if (n == 0) break;
+            }
+        }
+
+        var job_idx: usize = self.jobs.items.len;
         while (job_idx > 0) {
             job_idx -= 1;
-            const revents = fds_buf[3 + job_idx].revents;
-            if ((revents & (posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR)) != 0) {
-                const j = &self.jobs.items[job_idx];
-                if (revents & posix.POLL.IN != 0) {
+            const j = &self.jobs.items[job_idx];
+            if (job_idx < poll_jobs) {
+                const revents = fds_buf[4 + job_idx].revents;
+                if ((revents & posix.POLL.IN) != 0) {
                     if (j.xpty.pollPty()) {
                         self.needs_render = true;
                     }
                 }
                 if ((revents & (posix.POLL.HUP | posix.POLL.ERR)) != 0) {
                     const bid = j.block_id;
-                    self.closeJob(bid);
+                    self.closeJob(bid, 0);
+                    continue;
                 }
+            }
+            if (j.xpty.checkChildExited()) |st| {
+                _ = j.xpty.pollPty();
+                const bid = j.block_id;
+                self.closeJob(bid, Xpty.statusToExitCode(st));
             }
         }
 
@@ -1378,16 +1451,54 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [32]u8 = undefined;
     const k_event = self.keyboard.translate(&utf8_buf, keycode, action) orelse return;
 
-    if (action == .press) {
-        // Ctrl+Z: Suspend active interactive xpty program and return to prompt
-        if (k_event.mods.ctrl and k_event.unshifted_codepoint == 'z') {
-            if (self.active_job_id != null) {
+    // 1. If an active xpty program is running in foreground, forward input directly
+    if (self.getActiveJob()) |job| {
+        if (!job.suspended) {
+            // Ctrl+Z: Suspend active interactive xpty program and return to prompt
+            if (action == .press and k_event.mods.ctrl and k_event.unshifted_codepoint == 'z') {
                 self.cancelRepeat();
                 self.suspendActiveJob();
                 return;
             }
-        }
 
+            // Ctrl+Shift+C: Copy selection or full screen
+            if (action == .press and k_event.mods.ctrl and k_event.mods.shift and (k_event.unshifted_codepoint == 'c' or k_event.unshifted_codepoint == 'C')) {
+                if (self.selection_active) {
+                    if (self.extractSelectedText()) |text| {
+                        defer self.allocator.free(text);
+                        if (text.len > 0) self.copyToClipboard(text);
+                    } else |_| {}
+                } else {
+                    if (self.extractScreenText()) |text| {
+                        defer self.allocator.free(text);
+                        if (text.len > 0) self.copyToClipboard(text);
+                    } else |_| {}
+                }
+                return;
+            }
+
+            if (action == .press or action == .repeat) {
+                var out_buf: [128]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&out_buf);
+                vt.input.encodeKey(&writer, k_event, .fromTerminal(&job.xpty.term)) catch {
+                    if (k_event.utf8.len > 0) {
+                        job.xpty.sendInput(k_event.utf8) catch {};
+                        self.needs_render = true;
+                    }
+                    return;
+                };
+                const bytes = writer.buffered();
+                if (bytes.len > 0) {
+                    job.xpty.sendInput(bytes) catch {};
+                    self.needs_render = true;
+                }
+            }
+            return;
+        }
+    }
+
+    // 2. No foreground interactive job: prompt and stationary canvas controls
+    if (action == .press) {
         // Escape or 'q' to exit fullscreen block if one is zoomed
         if (k_event.key == .escape or (k_event.unshifted_codepoint == 'q' and self.prompt.input_buf.items.len == 0)) {
             var was_fullscreen = false;
@@ -1452,29 +1563,6 @@ pub fn onKey(self: *TcShellApp, keycode: u32, action: vt.input.KeyAction) void {
                 self.needs_render = true;
                 return;
             }
-        }
-    }
-
-    // If an active xpty program is running in foreground, forward input directly
-    if (self.getActiveJob()) |job| {
-        if (!job.suspended) {
-            if (action == .press or action == .repeat) {
-                var out_buf: [128]u8 = undefined;
-                var writer: std.Io.Writer = .fixed(&out_buf);
-                vt.input.encodeKey(&writer, k_event, .{}) catch {
-                    if (k_event.utf8.len > 0) {
-                        job.xpty.sendInput(k_event.utf8) catch {};
-                        self.needs_render = true;
-                    }
-                    return;
-                };
-                const bytes = writer.buffered();
-                if (bytes.len > 0) {
-                    job.xpty.sendInput(bytes) catch {};
-                    self.needs_render = true;
-                }
-            }
-            return;
         }
     }
 

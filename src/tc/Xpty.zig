@@ -123,6 +123,10 @@ pub fn init(
 }
 
 pub fn deinit(self: *Xpty) void {
+    if (self.child_pid) |pid| {
+        _ = Pty.tryWait(pid) catch {};
+        self.child_pid = null;
+    }
     if (self.pty) |*p| {
         p.deinit();
     }
@@ -133,6 +137,27 @@ pub fn deinit(self: *Xpty) void {
     if (self.grid_surface) |grid| grid.destroy();
     if (self.surface) |surf| surf.destroy();
     self.allocator.destroy(self);
+}
+
+/// Checks if the spawned child process has exited and reaps it.
+/// Returns the wait status if exited, or null if still running.
+pub fn checkChildExited(self: *Xpty) ?u32 {
+    const pid = self.child_pid orelse return null;
+    const status = Pty.tryWait(pid) catch return null;
+    if (status) |st| {
+        self.child_pid = null;
+        return st;
+    }
+    return null;
+}
+
+/// Converts a Linux wait status into a standard exit code (0-255).
+pub fn statusToExitCode(status: u32) u8 {
+    if ((status & 0x7f) == 0) {
+        return @truncate(status >> 8);
+    } else {
+        return @truncate(128 + (status & 0x7f));
+    }
 }
 
 pub fn setPosition(self: *Xpty, x: i32, y: i32) void {
@@ -505,4 +530,36 @@ test "xpty chunk boundary split CSI and UTF-8 sequences" {
     xpty.feedBytes("\x1b[2 q");
     try std.testing.expectEqual(@as(u32, 0), xpty.cursor_col);
     try std.testing.expectEqual(@as(u32, ' '), xpty.cells[0].codepoint);
+}
+
+test "xpty child process exit detection" {
+    const allocator = std.testing.allocator;
+    const cols: u32 = 80;
+    const rows: u32 = 24;
+
+    var xpty = try Xpty.init(allocator, null, cols, rows);
+    defer xpty.deinit();
+
+    const sh_z: [*:0]const u8 = "/bin/sh";
+    const c_arg: [*:0]const u8 = "-c";
+    const cmd_z: [*:0]const u8 = "exit 42";
+    const argv = [_:null]?[*:0]const u8{ sh_z, c_arg, cmd_z, null };
+
+    try xpty.spawnPty(sh_z, &argv, std.c.environ);
+    try std.testing.expect(xpty.child_pid != null);
+
+    // Wait for the child to exit
+    var exited = false;
+    var attempts: usize = 0;
+    while (attempts < 50) : (attempts += 1) {
+        if (xpty.checkChildExited()) |st| {
+            try std.testing.expectEqual(@as(u8, 42), statusToExitCode(st));
+            exited = true;
+            break;
+        }
+        const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 10_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+    try std.testing.expect(exited);
+    try std.testing.expect(xpty.child_pid == null);
 }
