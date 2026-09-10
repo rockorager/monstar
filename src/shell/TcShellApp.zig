@@ -88,6 +88,7 @@ pub const InteractiveJob = struct {
     start_time_ms: u64 = 0,
     is_fullscreen: bool = false,
     user_demoted: bool = false,
+    is_interactive: bool = false,
 };
 
 extern "c" fn popen(command: [*:0]const u8, modes: [*:0]const u8) ?*anyopaque;
@@ -100,7 +101,7 @@ font: Font,
 font_size_px: u32,
 keyboard: Keyboard,
 compositor: *Compositor,
-client: *Client,
+client: ?*Client = null,
 prompt: *PromptSurface,
 session: *SessionState,
 
@@ -265,7 +266,7 @@ pub fn deinit(self: *TcShellApp) void {
 
     self.prompt.deinit();
     self.session.deinit();
-    self.client.deinit();
+    if (self.client) |cl| cl.deinit();
     self.compositor.deinit();
     self.keyboard.deinit();
     self.font.deinit(self.allocator);
@@ -341,6 +342,7 @@ pub fn demoteActiveJob(self: *TcShellApp) void {
         job.is_fullscreen = false;
         job.suspended = false;
         job.user_demoted = true;
+        job.is_interactive = true;
         job.xpty.is_visible = false;
         self.active_job_id = null;
         self.pinned_block_id = job.block_id;
@@ -378,6 +380,7 @@ pub fn suspendActiveJob(self: *TcShellApp) void {
         job.suspended = true;
         job.is_fullscreen = false;
         job.user_demoted = true;
+        job.is_interactive = true;
         job.xpty.is_visible = false;
         self.active_job_id = null;
         self.pinned_block_id = job.block_id;
@@ -437,6 +440,7 @@ pub fn resumeJob(self: *TcShellApp, maybe_target: ?[]const u8) bool {
         }
         job.user_demoted = false;
         job.is_fullscreen = true;
+        job.is_interactive = true;
         job.xpty.is_visible = true;
         self.active_job_id = job.block_id;
 
@@ -471,16 +475,6 @@ pub fn getSkipLines(self: *const TcShellApp, max_canvas_rows: usize) usize {
     const max_scroll = total_lines - max_canvas_rows;
 
     if (pinned_start_line) |start| {
-        for (self.blocks.items) |block| {
-            if (self.pinned_block_id) |p_id| {
-                if (block.id == p_id) {
-                    if (block.status == .running or start <= max_scroll) {
-                        return start;
-                    }
-                    break;
-                }
-            }
-        }
         return @min(start, max_scroll);
     }
 
@@ -850,6 +844,7 @@ pub fn launchJob(self: *TcShellApp, cmd: []const u8, force_interactive: bool) !v
             .suspended = false,
             .start_time_ms = currentMonotonicMs(),
             .is_fullscreen = force_interactive,
+            .is_interactive = force_interactive,
         });
         _ = self.client.display.flush();
         self.needs_render = true;
@@ -867,6 +862,7 @@ pub fn launchJob(self: *TcShellApp, cmd: []const u8, force_interactive: bool) !v
         .suspended = false,
         .start_time_ms = currentMonotonicMs(),
         .is_fullscreen = force_interactive,
+        .is_interactive = force_interactive,
     });
 
     _ = self.client.display.flush();
@@ -1118,13 +1114,18 @@ pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
     var i: usize = 0;
     while (i < self.jobs.items.len) : (i += 1) {
         if (self.jobs.items[i].block_id == block_id) {
-            was_interactive = true;
+            const j_ref = &self.jobs.items[i];
+            was_interactive = j_ref.is_interactive or
+                j_ref.is_fullscreen or
+                j_ref.user_demoted or
+                j_ref.suspended or
+                j_ref.xpty.isAlternateScreen();
             const now_ms = currentMonotonicMs();
-            if (now_ms >= self.jobs.items[i].start_time_ms) {
-                elapsed_ms = now_ms - self.jobs.items[i].start_time_ms;
+            if (now_ms >= j_ref.start_time_ms) {
+                elapsed_ms = now_ms - j_ref.start_time_ms;
             }
             const j = self.jobs.orderedRemove(i);
-            if (j.xpty.cells.len > 0) {
+            if (was_interactive and j.xpty.cells.len > 0) {
                 last_cols = j.xpty.cols;
                 last_rows = j.xpty.rows;
                 last_cells = self.allocator.dupe(CompactCell, j.xpty.cells) catch null;
@@ -1140,7 +1141,8 @@ pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
                 if (last_cells) |cells| {
                     defer self.allocator.free(cells);
                     self.formatCellsToBlock(b, cells, last_cols, last_rows) catch {};
-                } else if (b.output_lines.items.len == 0) {
+                }
+                if (b.output_lines.items.len == 0) {
                     b.output_lines.clearRetainingCapacity();
                     b.appendOutput("[interactive session exited]\n") catch {};
                 }
@@ -1155,7 +1157,9 @@ pub fn closeJob(self: *TcShellApp, block_id: usize, exit_code: u8) void {
         self.prompt.commit() catch {};
         self.prompt.updateBanner(self.session.getCwd()) catch {};
     }
-    _ = self.client.display.flush();
+    if (self.client) |cl| {
+        _ = cl.display.flush();
+    }
     self.needs_render = true;
 }
 
@@ -1164,8 +1168,24 @@ pub fn formatCellsToBlock(self: *TcShellApp, block: *CommandBlock, cells: []cons
     block.output_lines.clearRetainingCapacity();
     block.pending_line.clearRetainingCapacity();
 
+    var effective_rows: u32 = rows;
+    while (effective_rows > 0) {
+        const r = effective_rows - 1;
+        var row_has_content = false;
+        var c: u32 = 0;
+        while (c < cols) : (c += 1) {
+            const cell = cells[r * cols + c];
+            if ((cell.codepoint != 0 and cell.codepoint != ' ') or cell.bg_color != 0 or cell.flags.reverse) {
+                row_has_content = true;
+                break;
+            }
+        }
+        if (row_has_content) break;
+        effective_rows -= 1;
+    }
+
     var r: u32 = 0;
-    while (r < rows) : (r += 1) {
+    while (r < effective_rows) : (r += 1) {
         var line_buf: std.ArrayList(u8) = .empty;
         defer line_buf.deinit(self.allocator);
 
@@ -1173,8 +1193,18 @@ pub fn formatCellsToBlock(self: *TcShellApp, block: *CommandBlock, cells: []cons
         var cur_bg: ?u8 = null;
         var cur_bold: bool = false;
 
+        var effective_cols: u32 = cols;
+        while (effective_cols > 0) {
+            const c = effective_cols - 1;
+            const cell = cells[r * cols + c];
+            if ((cell.codepoint != 0 and cell.codepoint != ' ') or cell.bg_color != 0 or cell.flags.reverse) {
+                break;
+            }
+            effective_cols -= 1;
+        }
+
         var c: u32 = 0;
-        while (c < cols) : (c += 1) {
+        while (c < effective_cols) : (c += 1) {
             const cell = cells[r * cols + c];
             const fg = cell.fg_color;
             const bg = cell.bg_color;
@@ -1810,6 +1840,7 @@ pub fn run(self: *TcShellApp) !void {
             // Dynamic promotion / demotion based on Ghostty VT alt-screen (only when not suspended and not demoted by user)
             if (j.xpty.isAlternateScreen() and !j.is_fullscreen and !j.suspended and !j.user_demoted) {
                 j.is_fullscreen = true;
+                j.is_interactive = true;
                 j.xpty.is_visible = true;
                 self.active_job_id = j.block_id;
                 self.prompt.setPosition(0, -100);

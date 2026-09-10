@@ -367,3 +367,122 @@ test "formatCellsToBlock creates ANSI styled lines from cells" {
     try std.testing.expect(std.mem.indexOf(u8, b.output_lines.items[0], "CPU") != null);
     try std.testing.expect(std.mem.startsWith(u8, b.output_lines.items[0], "\x1b[0;38;5;2;48;5;0m"));
 }
+
+test "formatCellsToBlock trims trailing blank rows" {
+    const allocator = std.testing.allocator;
+    const TcShellApp = @import("TcShellApp.zig");
+    const abi = @import("../tc/abi.zig");
+    const CompactCell = abi.CompactCell;
+
+    var b = try CommandBlock.init(allocator, 1, "htop");
+    defer b.deinit();
+
+    var app: TcShellApp = undefined;
+    app.allocator = allocator;
+
+    // 4 cols x 10 rows grid, but only first 2 rows have content
+    var cells: [40]CompactCell = undefined;
+    for (&cells) |*cell| cell.* = CompactCell.ascii(' ', 7, 0);
+    cells[0] = CompactCell.ascii('h', 7, 0);
+    cells[4] = CompactCell.ascii('o', 7, 0);
+
+    try app.formatCellsToBlock(b, &cells, 4, 10);
+    try std.testing.expectEqual(@as(usize, 2), b.output_lines.items.len);
+}
+
+test "closeJob on non-interactive command preserves streamed output without trailing blank rows" {
+    const allocator = std.testing.allocator;
+    const TcShellApp = @import("TcShellApp.zig");
+    const Xpty = @import("../tc/Xpty.zig");
+
+    var blocks: std.ArrayList(*CommandBlock) = .empty;
+    defer {
+        for (blocks.items) |b| b.deinit();
+        blocks.deinit(allocator);
+    }
+
+    var b1 = try CommandBlock.init(allocator, 1, "ls");
+    try b1.appendOutput("file1\nfile2\n");
+    try blocks.append(allocator, b1);
+
+    var app: TcShellApp = undefined;
+    app.allocator = allocator;
+    app.blocks = blocks;
+    app.jobs = .empty;
+    defer app.jobs.deinit(allocator);
+    app.cols = 80;
+    app.rows = 24;
+    app.active_job_id = null;
+    app.client = null;
+
+    var xpty = try Xpty.init(allocator, null, 80, 24);
+    errdefer xpty.deinit();
+
+    try app.jobs.append(allocator, .{
+        .block_id = 1,
+        .xpty = xpty,
+        .suspended = false,
+        .is_fullscreen = false,
+        .user_demoted = false,
+        .is_interactive = false, // regular shell command (ls)
+    });
+
+    app.closeJob(1, 0);
+
+    // b1 output_lines must NOT be overwritten with 24 empty terminal rows
+    try std.testing.expectEqual(@as(usize, 2), b1.output_lines.items.len);
+    try std.testing.expectEqualStrings("file1", b1.output_lines.items[0]);
+    try std.testing.expectEqualStrings("file2", b1.output_lines.items[1]);
+}
+
+test "ls followed by demoted vim preview block has no huge gap" {
+    const allocator = std.testing.allocator;
+    const TcShellApp = @import("TcShellApp.zig");
+    const Xpty = @import("../tc/Xpty.zig");
+
+    var blocks: std.ArrayList(*CommandBlock) = .empty;
+    defer {
+        for (blocks.items) |b| b.deinit();
+        blocks.deinit(allocator);
+    }
+
+    // 1. ls command block with 1 line of output
+    var b1 = try CommandBlock.init(allocator, 1, "ls");
+    try b1.appendOutput("build.zig  src/\n");
+    b1.finish(0, 10);
+    try blocks.append(allocator, b1);
+
+    // 2. vim command block with demoted preview job
+    const b2 = try CommandBlock.init(allocator, 2, "vim");
+    try blocks.append(allocator, b2);
+
+    var app: TcShellApp = undefined;
+    app.allocator = allocator;
+    app.blocks = blocks;
+    app.jobs = .empty;
+    defer app.jobs.deinit(allocator);
+    app.cols = 80;
+    app.rows = 24;
+    app.scroll_offset = 0;
+    app.pinned_block_id = 2; // Pinned to demoted vim job
+
+    var xpty = try Xpty.init(allocator, null, 80, 12);
+    defer xpty.deinit();
+
+    try app.jobs.append(allocator, .{
+        .block_id = 2,
+        .xpty = xpty,
+        .suspended = false,
+        .is_fullscreen = false,
+        .user_demoted = true,
+        .is_interactive = true,
+    });
+
+    // Content height of ls is 1 line, vim is 12 rows
+    try std.testing.expectEqual(@as(usize, 1), app.getBlockContentHeight(b1));
+    try std.testing.expectEqual(@as(usize, 12), app.getBlockContentHeight(b2));
+
+    // Total lines = 1 (b1 header) + 1 (b1 out) + 1 (b2 header) + 12 (b2 out) = 15
+    const max_canvas_rows: usize = 23;
+    try std.testing.expectEqual(@as(usize, 0), app.getSkipLines(max_canvas_rows));
+}
