@@ -190,9 +190,9 @@ pub fn getCursorScreenCol(self: *const PromptSurface) usize {
 
 fn isBuiltinName(name: []const u8) bool {
     const builtins = [_][]const u8{
-        "cd",     "pwd",   "collapse", "expand",      "fullscreen", "fg",   "edit",
-        "run",    "rm",    "copy",     "view",        "clear",      "exit", "quit",
-        "export", "unset", "xpty",     "interactive",
+        "cd",     "pwd",   "hide", "show", "fg",    "edit",
+        "run",    "rm",    "cp",   "view", "clear", "exit",
+        "export", "unset",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
@@ -409,8 +409,8 @@ fn triggerCompletion(self: *PromptSurface) !void {
                 try matches.append(self.allocator, try self.allocator.dupe(u8, t));
             }
         }
-    } else if (start > 0 and (std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "collapse") or
-        std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "expand") or
+    } else if (start > 0 and (std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "hide") or
+        std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "show") or
         std.mem.startsWith(u8, std.mem.trim(u8, input[0..start], " \t"), "rm")))
     {
         const block_options = [_][]const u8{ "all", "$all", "$prev", "$1", "$2", "$3" };
@@ -422,8 +422,8 @@ fn triggerCompletion(self: *PromptSurface) !void {
     } else if (start == 0 and std.mem.indexOfScalar(u8, token, '/') == null) {
         // 2. Command name completion (builtins + executables in PATH)
         const builtins = [_][]const u8{
-            "cd",     "pwd",   "collapse", "expand", "fullscreen", "fg",   "edit",
-            "run",    "rm",    "copy",     "view",   "clear",      "exit", "quit",
+            "cd",     "pwd",   "hide", "show", "fg",    "edit",
+            "run",    "rm",    "cp",   "view", "clear", "exit",
             "export", "unset",
         };
         for (builtins) |b| {

@@ -151,11 +151,11 @@ pub fn getRawOutput(self: *const CommandBlock) []const u8 {
     return self.raw_output.items;
 }
 
-pub fn collapse(self: *CommandBlock) void {
+pub fn hide(self: *CommandBlock) void {
     self.folded = true;
 }
 
-pub fn expand(self: *CommandBlock) void {
+pub fn show(self: *CommandBlock) void {
     self.folded = false;
 }
 

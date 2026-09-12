@@ -75,31 +75,40 @@ test "SessionState environment and builtins parsing" {
     const b_pwd = SessionState.parseBuiltin("pwd");
     try std.testing.expect(b_pwd == .pwd);
 
-    const b_collapse = SessionState.parseBuiltin("collapse $2");
-    try std.testing.expectEqualStrings("$2", b_collapse.collapse);
+    const b_hide = SessionState.parseBuiltin("hide $2");
+    try std.testing.expectEqualStrings("$2", b_hide.hide);
 
-    const b_collapse_default = SessionState.parseBuiltin("collapse");
-    try std.testing.expectEqualStrings("$prev", b_collapse_default.collapse);
+    const b_hide_default = SessionState.parseBuiltin("hide");
+    try std.testing.expectEqualStrings("$prev", b_hide_default.hide);
 
-    const b_expand = SessionState.parseBuiltin("expand $1");
-    try std.testing.expectEqualStrings("$1", b_expand.expand);
+    const b_show = SessionState.parseBuiltin("show $1");
+    try std.testing.expectEqualStrings("$1", b_show.show);
 
-    const b_copy_cmd = SessionState.parseBuiltin("copy $1.cmd");
-    try std.testing.expectEqualStrings("$1", b_copy_cmd.copy.target);
-    try std.testing.expect(b_copy_cmd.copy.is_cmd);
+    const b_fg_none = SessionState.parseBuiltin("fg");
+    try std.testing.expect(b_fg_none.fg.target == null);
 
-    const b_copy_out = SessionState.parseBuiltin("copy $prev");
-    try std.testing.expectEqualStrings("$prev", b_copy_out.copy.target);
-    try std.testing.expect(!b_copy_out.copy.is_cmd);
+    const b_fg_block = SessionState.parseBuiltin("fg $2");
+    try std.testing.expectEqualStrings("$2", b_fg_block.fg.target.?);
 
-    const b_copy_screen = SessionState.parseBuiltin("copy screen");
-    try std.testing.expect(b_copy_screen.copy.is_screen);
+    const b_fg_cmd = SessionState.parseBuiltin("fg python");
+    try std.testing.expectEqualStrings("python", b_fg_cmd.fg.cmd);
 
-    const b_copy_default = SessionState.parseBuiltin("copy");
-    try std.testing.expect(b_copy_default.copy.is_screen);
+    const b_cp_cmd = SessionState.parseBuiltin("cp $1.cmd");
+    try std.testing.expectEqualStrings("$1", b_cp_cmd.cp.target);
+    try std.testing.expect(b_cp_cmd.cp.is_cmd);
 
-    const b_copy_all = SessionState.parseBuiltin("copy all");
-    try std.testing.expect(b_copy_all.copy.is_all);
+    const b_cp_out = SessionState.parseBuiltin("cp $prev");
+    try std.testing.expectEqualStrings("$prev", b_cp_out.cp.target);
+    try std.testing.expect(!b_cp_out.cp.is_cmd);
+
+    const b_cp_screen = SessionState.parseBuiltin("cp screen");
+    try std.testing.expect(b_cp_screen.cp.is_screen);
+
+    const b_cp_default = SessionState.parseBuiltin("cp");
+    try std.testing.expect(b_cp_default.cp.is_screen);
+
+    const b_cp_all = SessionState.parseBuiltin("cp all");
+    try std.testing.expect(b_cp_all.cp.is_all);
 
     const b_run = SessionState.parseBuiltin("run $3");
     try std.testing.expectEqualStrings("$3", b_run.run);
@@ -112,6 +121,13 @@ test "SessionState environment and builtins parsing" {
 
     const b_view = SessionState.parseBuiltin("view $1");
     try std.testing.expectEqualStrings("$1", b_view.view);
+
+    // Verify removed aliases return .none
+    try std.testing.expect(SessionState.parseBuiltin("fullscreen") == .none);
+    try std.testing.expect(SessionState.parseBuiltin("collapse") == .none);
+    try std.testing.expect(SessionState.parseBuiltin("expand") == .none);
+    try std.testing.expect(SessionState.parseBuiltin("copy") == .none);
+    try std.testing.expect(SessionState.parseBuiltin("quit") == .none);
 }
 
 test "SessionState block resolution and pipeline expansion" {

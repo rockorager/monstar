@@ -5,7 +5,7 @@
 //! - 1D vertical document reflow canvas below the prompt (row 1+).
 //! - Subsurface command blocks tagged $1..$n and $prev with memfd-backed streams.
 //! - Floating cursor-anchored Tab completion popup overlay.
-//! - Dispatcher for stateful built-ins (cd, export, collapse, expand, fullscreen, edit, run, rm, copy, view).
+//! - Dispatcher for stateful built-ins (cd, export, unset, hide, show, fg, edit, run, rm, cp, view, clear, exit).
 
 const TcShellApp = @This();
 
@@ -944,21 +944,6 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
     const trimmed = std.mem.trim(u8, raw_cmd, " \t\r\n");
     if (trimmed.len == 0) return;
 
-    // 0. Explicit interactive launcher prefix: "xpty <command>" or "interactive <command>"
-    if (std.mem.startsWith(u8, trimmed, "xpty ") or std.mem.startsWith(u8, trimmed, "interactive ")) {
-        const cmd_part = if (std.mem.startsWith(u8, trimmed, "xpty "))
-            trimmed[5..]
-        else
-            trimmed[12..];
-        const cmd_trimmed = std.mem.trim(u8, cmd_part, " \t");
-        if (cmd_trimmed.len > 0) {
-            const exp = try SessionState.expandPipeline(self.allocator, self.blocks.items, cmd_trimmed);
-            defer self.allocator.free(exp);
-            try self.launchInteractive(exp);
-            return;
-        }
-    }
-
     // 1. Built-in command handling
     const builtin = SessionState.parseBuiltin(trimmed);
     switch (builtin) {
@@ -1025,51 +1010,59 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             self.needs_render = true;
             return;
         },
-        .collapse => |target| {
+        .hide => |target| {
             if (SessionState.isAllTarget(target)) {
                 for (self.blocks.items) |b| {
-                    b.collapse();
+                    b.hide();
                 }
             } else if (SessionState.resolveBlock(self.blocks.items, target)) |b| {
-                b.collapse();
+                b.hide();
             }
             self.needs_render = true;
             return;
         },
-        .expand => |target| {
+        .show => |target| {
             if (SessionState.isAllTarget(target)) {
                 for (self.blocks.items) |b| {
-                    b.expand();
+                    b.show();
                 }
             } else if (SessionState.resolveBlock(self.blocks.items, target)) |b| {
-                b.expand();
+                b.show();
             }
             self.needs_render = true;
             return;
         },
-        .fullscreen => |maybe_target| {
-            if (self.resumeJob(maybe_target)) {
+        .fg => |action| switch (action) {
+            .target => |maybe_target| {
+                if (self.resumeJob(maybe_target)) {
+                    return;
+                }
+                var any_fullscreen = false;
+                if (maybe_target) |target| {
+                    if (SessionState.resolveBlock(self.blocks.items, target)) |b| {
+                        b.fullscreen = !b.fullscreen;
+                        any_fullscreen = b.fullscreen;
+                    }
+                } else {
+                    for (self.blocks.items) |b| {
+                        b.fullscreen = false;
+                    }
+                }
+                if (any_fullscreen) {
+                    self.prompt.setPosition(0, -100);
+                } else {
+                    self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
+                }
+                _ = self.client.display.flush();
+                self.needs_render = true;
                 return;
-            }
-            var any_fullscreen = false;
-            if (maybe_target) |target| {
-                if (SessionState.resolveBlock(self.blocks.items, target)) |b| {
-                    b.fullscreen = !b.fullscreen;
-                    any_fullscreen = b.fullscreen;
-                }
-            } else {
-                for (self.blocks.items) |b| {
-                    b.fullscreen = false;
-                }
-            }
-            if (any_fullscreen) {
-                self.prompt.setPosition(0, -100);
-            } else {
-                self.prompt.setPosition(0, @as(i32, @intCast(self.rows - 1)));
-            }
-            _ = self.client.display.flush();
-            self.needs_render = true;
-            return;
+            },
+            .cmd => |fg_cmd| {
+                const exp = try SessionState.expandPipeline(self.allocator, self.blocks.items, fg_cmd);
+                defer self.allocator.free(exp);
+                try self.launchInteractive(exp);
+                return;
+            },
         },
         .edit => |target| {
             if (SessionState.resolveBlock(self.blocks.items, target)) |b| {
@@ -1102,7 +1095,7 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
             self.needs_render = true;
             return;
         },
-        .copy => |info| {
+        .cp => |info| {
             const block_id = self.session.allocateBlockId();
             var block = try CommandBlock.init(self.allocator, block_id, raw_cmd);
             var copied_len: usize = 0;

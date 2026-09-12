@@ -2,7 +2,7 @@
 //! Manages:
 //! - Working directory tracking (cwd, old_pwd, cd navigation).
 //! - Environment variable store (export, unset, child process envp).
-//! - Builtin command parsing (cd, collapse, expand, fullscreen, edit, run, rm, copy, view, export, unset).
+//! - Builtin command parsing (cd, export, unset, hide, show, fg, edit, run, rm, cp, view, clear, exit).
 //! - Tag and pipeline reference resolution ($1..$n, $prev, $1.cmd, /proc/self/fd/<fd>).
 
 const SessionState = @This();
@@ -21,13 +21,16 @@ pub const Builtin = union(enum) {
     pwd,
     export_var: struct { key: []const u8, value: []const u8 },
     unset_var: []const u8,
-    collapse: []const u8,
-    expand: []const u8,
-    fullscreen: ?[]const u8,
+    hide: []const u8,
+    show: []const u8,
+    fg: union(enum) {
+        target: ?[]const u8,
+        cmd: []const u8,
+    },
     edit: []const u8,
     run: []const u8,
     rm: []const u8,
-    copy: struct {
+    cp: struct {
         target: []const u8,
         is_cmd: bool,
         is_all: bool = false,
@@ -203,7 +206,7 @@ pub fn parseBuiltin(cmd: []const u8) Builtin {
     if (std.mem.eql(u8, first, "clear")) {
         return .clear;
     }
-    if (std.mem.eql(u8, first, "exit") or std.mem.eql(u8, first, "quit")) {
+    if (std.mem.eql(u8, first, "exit")) {
         return .exit;
     }
     if (std.mem.eql(u8, first, "cd")) {
@@ -225,14 +228,20 @@ pub fn parseBuiltin(cmd: []const u8) Builtin {
         if (rest.len == 0) return .none;
         return .{ .unset_var = rest };
     }
-    if (std.mem.eql(u8, first, "collapse")) {
-        return .{ .collapse = if (rest.len > 0) rest else "$prev" };
+    if (std.mem.eql(u8, first, "hide")) {
+        return .{ .hide = if (rest.len > 0) rest else "$prev" };
     }
-    if (std.mem.eql(u8, first, "expand")) {
-        return .{ .expand = if (rest.len > 0) rest else "$prev" };
+    if (std.mem.eql(u8, first, "show")) {
+        return .{ .show = if (rest.len > 0) rest else "$prev" };
     }
-    if (std.mem.eql(u8, first, "fullscreen") or std.mem.eql(u8, first, "fg")) {
-        return .{ .fullscreen = if (rest.len > 0) rest else null };
+    if (std.mem.eql(u8, first, "fg")) {
+        if (rest.len == 0) {
+            return .{ .fg = .{ .target = null } };
+        }
+        if (isBlockTarget(rest)) {
+            return .{ .fg = .{ .target = rest } };
+        }
+        return .{ .fg = .{ .cmd = rest } };
     }
     if (std.mem.eql(u8, first, "edit")) {
         return .{ .edit = if (rest.len > 0) rest else "$prev" };
@@ -246,34 +255,44 @@ pub fn parseBuiltin(cmd: []const u8) Builtin {
     if (std.mem.eql(u8, first, "view")) {
         return .{ .view = if (rest.len > 0) rest else "$prev" };
     }
-    if (std.mem.eql(u8, first, "copy")) {
-        if (rest.len == 0 or std.mem.eql(u8, rest, "screen") or std.mem.eql(u8, rest, "canvas")) {
-            return .{ .copy = .{
+    if (std.mem.eql(u8, first, "cp")) {
+        if (rest.len == 0 or std.mem.eql(u8, rest, "screen")) {
+            return .{ .cp = .{
                 .target = "",
                 .is_cmd = false,
                 .is_screen = true,
             } };
         }
-        if (std.mem.eql(u8, rest, "all") or std.mem.eql(u8, rest, "session")) {
-            return .{ .copy = .{
+        if (std.mem.eql(u8, rest, "all")) {
+            return .{ .cp = .{
                 .target = "",
                 .is_cmd = false,
                 .is_all = true,
             } };
         }
         if (std.mem.endsWith(u8, rest, ".cmd")) {
-            return .{ .copy = .{
+            return .{ .cp = .{
                 .target = rest[0 .. rest.len - 4],
                 .is_cmd = true,
             } };
         }
-        return .{ .copy = .{
+        return .{ .cp = .{
             .target = rest,
             .is_cmd = false,
         } };
     }
 
     return .none;
+}
+
+/// Checks if raw_target looks like a block reference ($1, 1, $prev, prev).
+pub fn isBlockTarget(raw_target: []const u8) bool {
+    const target = std.mem.trim(u8, raw_target, " \t");
+    if (target.len == 0) return false;
+    if (std.mem.eql(u8, target, "$prev") or std.mem.eql(u8, target, "prev")) return true;
+    const num_str = if (std.mem.startsWith(u8, target, "$")) target[1..] else target;
+    _ = std.fmt.parseInt(usize, num_str, 10) catch return false;
+    return true;
 }
 
 /// Checks if target string represents all blocks ("all", "$all", or "*").
