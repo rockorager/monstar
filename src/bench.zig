@@ -4,6 +4,8 @@
 //! RenderState update, full and dirty-row renders, and the frame copy
 //! into a swapchain buffer. The render target is heap memory, which
 //! behaves like the wl_shm buffer (both are plain anonymous pages).
+//! Every suite runs against the 8-bit sRGB target and the 16-bit linear
+//! target used by gamma-correct blending.
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
@@ -33,6 +35,29 @@ pub fn run(init: std.process.Init) !void {
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
 
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &out_buf);
+    const w = &stdout.interface;
+    defer w.flush() catch {};
+
+    try w.print(
+        "font {s} {d:.1}{s} ({d}px)\n\n8-bit sRGB target\n\n",
+        .{ config.font_family, config.font_size.value(), config.font_size.unit(), font_size_px },
+    );
+    try runFormat(init, alloc, config, &renderer, u32, w);
+    try w.writeAll("\n16-bit linear target (gamma-correct blending)\n\n");
+    try runFormat(init, alloc, config, &renderer, u64, w);
+}
+
+fn runFormat(
+    init: std.process.Init,
+    alloc: std.mem.Allocator,
+    config: Config,
+    renderer: *Renderer,
+    comptime P: type,
+    w: *std.Io.Writer,
+) !void {
+    const font = renderer.font;
     const width: u31 = font.cell_width * cols;
     const height: u31 = font.cell_height * rows;
 
@@ -51,24 +76,16 @@ pub fn run(init: std.process.Init) !void {
     var render_state: vt.RenderState = .empty;
     defer render_state.deinit(alloc);
 
-    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    const pixels = try alloc.alloc(P, @as(usize, width) * height);
     defer alloc.free(pixels);
-    const shm = try alloc.alloc(u32, pixels.len);
+    const shm = try alloc.alloc(P, pixels.len);
     defer alloc.free(shm);
 
-    var out_buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &out_buf);
-    const w = &stdout.interface;
-    defer w.flush() catch {};
-
     try w.print(
-        "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame), font {s} {d:.1}{s} ({d}px)\n\n",
+        "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame)\n\n",
         .{
-            cols,                                          rows,
-            width,                                         height,
-            @as(f64, @floatFromInt(pixels.len * 4)) / 1e6, config.font_family,
-            config.font_size.value(),                      config.font_size.unit(),
-            font_size_px,
+            cols,                                                   rows, width, height,
+            @as(f64, @floatFromInt(pixels.len * @sizeOf(P))) / 1e6,
         },
     );
 
@@ -145,16 +162,16 @@ pub fn run(init: std.process.Init) !void {
             @memcpy(shm, pixels);
             std.mem.doNotOptimizeAway(shm);
         }
-        try report(w, "copy full frame", nowNs(init.io) - start, iters, pixels.len * 4);
+        try report(w, "copy full frame", nowNs(init.io) - start, iters, pixels.len * @sizeOf(P));
     }
     {
         const iters = 300;
         const start = nowNs(init.io);
         for (0..iters) |_| {
-            _ = memcpy(shm.ptr, pixels.ptr, pixels.len * 4);
+            _ = memcpy(shm.ptr, pixels.ptr, pixels.len * @sizeOf(P));
             std.mem.doNotOptimizeAway(shm);
         }
-        try report(w, "copy full frame (libc)", nowNs(init.io) - start, iters, pixels.len * 4);
+        try report(w, "copy full frame (libc)", nowNs(init.io) - start, iters, pixels.len * @sizeOf(P));
     }
     {
         const iters = 300;
@@ -163,8 +180,8 @@ pub fn run(init: std.process.Init) !void {
             Renderer.copyPixels(shm, pixels);
             std.mem.doNotOptimizeAway(shm);
         }
-        try report(w, "copy full frame (NT stores)", nowNs(init.io) - start, iters, pixels.len * 4);
-        if (!std.mem.eql(u32, shm, pixels)) try w.writeAll("  (!) NT copy MISMATCH\n");
+        try report(w, "copy full frame (NT stores)", nowNs(init.io) - start, iters, pixels.len * @sizeOf(P));
+        if (!std.mem.eql(P, shm, pixels)) try w.writeAll("  (!) NT copy MISMATCH\n");
     }
     {
         // A typical partial frame: one dirty row expanded to three.
@@ -177,23 +194,23 @@ pub fn run(init: std.process.Init) !void {
             @memcpy(shm[offset..][0..span_len], pixels[offset..][0..span_len]);
             std.mem.doNotOptimizeAway(shm);
         }
-        try report(w, "copy 3-row span", nowNs(init.io) - start, iters, span_len * 4);
+        try report(w, "copy 3-row span", nowNs(init.io) - start, iters, span_len * @sizeOf(P));
     }
 
     try w.writeAll("\n4K-ish stress cases\n");
-    var row_renderer: Renderer = try .init(alloc, &font, .{
+    var row_renderer: Renderer = try .init(alloc, renderer.font, .{
         .track_cell_damage = false,
         .partial_cell_raster = false,
     });
     defer row_renderer.deinit();
-    try benchFullGrid(init.io, alloc, config, &row_renderer, w, 384, 112, "full render rows 384x112");
-    try benchShapePrefixChurn(init.io, alloc, config, &row_renderer, w, 384, 112, "prefix-churn rows 384x112", false);
-    try benchFullGrid(init.io, alloc, config, &renderer, w, 384, 112, "full render+cell snapshot 384x112");
-    try benchShapePrefixChurn(init.io, alloc, config, &renderer, w, 384, 112, "prefix-churn cells 384x112", false);
-    var pipeline_renderer: Renderer = try .init(alloc, &font, .{});
+    try benchFullGrid(init.io, alloc, config, &row_renderer, w, P, 384, 112, "full render rows 384x112");
+    try benchShapePrefixChurn(init.io, alloc, config, &row_renderer, w, P, 384, 112, "prefix-churn rows 384x112", false);
+    try benchFullGrid(init.io, alloc, config, renderer, w, P, 384, 112, "full render+cell snapshot 384x112");
+    try benchShapePrefixChurn(init.io, alloc, config, renderer, w, P, 384, 112, "prefix-churn cells 384x112", false);
+    var pipeline_renderer: Renderer = try .init(alloc, renderer.font, .{});
     defer pipeline_renderer.deinit();
-    try benchShapePrefixChurn(init.io, alloc, config, &pipeline_renderer, w, 384, 112, "prefix-churn cells+repair 384x112", true);
-    try benchCopies(init.io, alloc, w, 3840, 2160, "copy 3840x2160");
+    try benchShapePrefixChurn(init.io, alloc, config, &pipeline_renderer, w, P, 384, 112, "prefix-churn cells+repair 384x112", true);
+    try benchCopies(init.io, alloc, w, P, 3840, 2160, "copy 3840x2160");
 }
 
 fn benchFullGrid(
@@ -202,6 +219,7 @@ fn benchFullGrid(
     config: Config,
     renderer: *Renderer,
     w: *std.Io.Writer,
+    comptime P: type,
     comptime bench_cols: u16,
     comptime bench_rows: u16,
     comptime name: []const u8,
@@ -223,7 +241,7 @@ fn benchFullGrid(
     var render_state: vt.RenderState = .empty;
     defer render_state.deinit(alloc);
 
-    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    const pixels = try alloc.alloc(P, @as(usize, width) * height);
     defer alloc.free(pixels);
 
     try fillScreenDims(alloc, &stream, bench_cols, bench_rows);
@@ -239,7 +257,7 @@ fn benchFullGrid(
             bench_rows,
             width,
             height,
-            @as(f64, @floatFromInt(pixels.len * 4)) / 1e6,
+            @as(f64, @floatFromInt(pixels.len * @sizeOf(P))) / 1e6,
         },
     );
 
@@ -255,17 +273,18 @@ fn benchCopies(
     io: std.Io,
     alloc: std.mem.Allocator,
     w: *std.Io.Writer,
+    comptime P: type,
     comptime width: usize,
     comptime height: usize,
     comptime name: []const u8,
 ) !void {
-    const pixels = try alloc.alloc(u32, width * height);
+    const pixels = try alloc.alloc(P, width * height);
     defer alloc.free(pixels);
-    const shm = try alloc.alloc(u32, pixels.len);
+    const shm = try alloc.alloc(P, pixels.len);
     defer alloc.free(shm);
     @memset(pixels, 0xff1a1b26);
 
-    const bytes = pixels.len * 4;
+    const bytes = pixels.len * @sizeOf(P);
     try w.print("{s}: {d}x{d} px ({d:.1} MB frame)\n", .{
         name,
         width,
@@ -298,7 +317,7 @@ fn benchCopies(
             std.mem.doNotOptimizeAway(shm);
         }
         try report(w, "copy 4K frame (NT stores)", nowNs(io) - start, iters, bytes);
-        if (!std.mem.eql(u32, shm, pixels)) try w.writeAll("  (!) NT copy MISMATCH\n");
+        if (!std.mem.eql(P, shm, pixels)) try w.writeAll("  (!) NT copy MISMATCH\n");
     }
 }
 
@@ -308,6 +327,7 @@ fn benchShapePrefixChurn(
     config: Config,
     renderer: *Renderer,
     w: *std.Io.Writer,
+    comptime P: type,
     comptime bench_cols: u16,
     comptime bench_rows: u16,
     name: []const u8,
@@ -332,7 +352,7 @@ fn benchShapePrefixChurn(
 
     const frame_len = @as(usize, width) * height;
     const buffer_count: usize = if (repair_stale_buffers) 3 else 1;
-    const buffers = try alloc.alloc(u32, frame_len * buffer_count);
+    const buffers = try alloc.alloc(P, frame_len * buffer_count);
     defer alloc.free(buffers);
     var damage_history: [2]std.ArrayList(Renderer.PixelRect) = .{ .empty, .empty };
     defer for (&damage_history) |*rects| rects.deinit(alloc);
@@ -357,7 +377,7 @@ fn benchShapePrefixChurn(
         if (repair_stale_buffers) {
             const history_len = @min(frame, damage_history.len);
             for (damage_history[0..history_len]) |rects| {
-                copyDamageRects(target, newest, width, rects.items);
+                copyDamageRects(P, target, newest, width, rects.items);
             }
         }
         try fillPrefixChurnFrame(alloc, &stream, bench_cols, bench_rows, frame + 1);
@@ -395,7 +415,7 @@ fn replaceCoalescedDamage(
     }
 }
 
-fn copyDamageRects(dest: []u32, source: []const u32, stride: u31, rects: []const Renderer.PixelRect) void {
+fn copyDamageRects(comptime P: type, dest: []P, source: []const P, stride: u31, rects: []const Renderer.PixelRect) void {
     for (rects) |rect| {
         for (rect.y..rect.y + rect.height) |y| {
             const offset = @as(usize, y) * stride + rect.x;
