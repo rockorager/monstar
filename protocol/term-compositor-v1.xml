@@ -1,0 +1,524 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="term_compositor_unstable_v1">
+  <copyright>
+    Copyright © 2026 The Monstar Terminal Compositor Authors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="Terminal Compositor Protocol">
+    This protocol defines extensions to the Wayland core protocol to support
+    terminal compositing, cell-buffer rendering, cursor-anchored overlays,
+    remote SSH operation without file-descriptor passing, structured terminal
+    input, theme synchronization, and legacy PTY bridging.
+  </description>
+
+  <!-- ===================================================================== -->
+  <!-- Core Factory Interface: zterm_compositor_v1                           -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_compositor_v1" version="1">
+    <description summary="terminal compositor factory singleton">
+      The global factory interface for creating terminal-specific surface roles,
+      cursor-anchored positioners, and buffer factories.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the terminal compositor factory">
+        Informs the server that the client will not use this factory further.
+        Existing objects created through this interface remain unaffected.
+      </description>
+    </request>
+
+    <request name="get_grid_surface">
+      <description summary="assign the grid surface role to a wl_surface">
+        Assigns the 2D character grid surface role to an existing wl_surface.
+        Grid surfaces represent addressable character cell matrices such as
+        terminal panes, floating dialogs, menus, and TUI canvases.
+
+        A wl_surface must only be assigned one role.
+      </description>
+      <arg name="id" type="new_id" interface="zterm_grid_surface_v1" summary="new grid surface object"/>
+      <arg name="surface" type="object" interface="wl_surface" summary="target wayland surface"/>
+    </request>
+
+    <request name="get_stream_surface">
+      <description summary="assign the stream surface role to a wl_surface">
+        Assigns the structured append-only text/log stream role to a wl_surface.
+        Stream surfaces represent continuous log outputs with infinite scrollback
+        and zero coordinate-based cursor jumping.
+      </description>
+      <arg name="id" type="new_id" interface="zterm_stream_surface_v1" summary="new stream surface object"/>
+      <arg name="surface" type="object" interface="wl_surface" summary="target wayland surface"/>
+    </request>
+
+    <request name="get_cursor_anchor">
+      <description summary="create a cursor-anchored positioner">
+        Creates a positioner that anchors a child surface (e.g. an autocomplete
+        menu or hover card) relative to the active text cursor in a target surface.
+      </description>
+      <arg name="id" type="new_id" interface="zterm_cursor_anchor_v1" summary="new cursor anchor object"/>
+      <arg name="surface" type="object" interface="wl_surface" summary="the overlay surface to position"/>
+      <arg name="target_surface" type="object" interface="wl_surface" summary="the surface whose cursor is followed"/>
+    </request>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Buffer Factory: zterm_buffer_factory_v1                               -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_buffer_factory_v1" version="1">
+    <description summary="factory for stream-safe and SSH-forwarded cell buffers">
+      Creates wl_buffer instances backed by character cell matrices without
+      requiring file-descriptor passing (SCM_RIGHTS), enabling transparent
+      OpenSSH socket forwarding (ssh -R) on both macOS and Linux.
+    </description>
+
+    <enum name="cell_format">
+      <description summary="supported cell memory binary layouts">
+        Defines the ABI format of cell memory in the buffer.
+      </description>
+      <entry name="compact_v1" value="1" summary="8 bytes per cell: u32 codepoint, u8 fg, u8 bg, u16 flags"/>
+      <entry name="rich_v1" value="2" summary="32 bytes per cell: u32 codepoint, u32 fg_rgba, u32 bg_rgba, u32 ul_rgba, u32 hyperlink_id, u32 flags, u8 width"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy buffer factory">
+        Destroys the factory. Existing buffers remain valid until destroyed.
+      </description>
+    </request>
+
+    <request name="create_cell_buffer">
+      <description summary="allocate an inline cell buffer">
+        Allocates a wl_buffer of the specified dimensions. The client populates
+        the buffer data using upload_cells before attaching and committing to a surface.
+      </description>
+      <arg name="id" type="new_id" interface="wl_buffer" summary="new buffer object"/>
+      <arg name="cols" type="uint" summary="buffer width in character cells"/>
+      <arg name="rows" type="uint" summary="buffer height in character cells"/>
+      <arg name="format" type="uint" enum="cell_format" summary="binary cell ABI format"/>
+    </request>
+
+    <request name="upload_cells">
+      <description summary="upload a chunk of cell binary data">
+        Appends or writes a chunk of row-major cell data at byte offset within the buffer.
+        Chunk sizes MUST NOT exceed 3072 bytes per request to stay safely within
+        the Wayland wire protocol message limit (WL_MAX_MESSAGE_SIZE = 4096).
+      </description>
+      <arg name="buffer" type="object" interface="wl_buffer" summary="target buffer object"/>
+      <arg name="offset" type="uint" summary="byte offset within buffer"/>
+      <arg name="data" type="array" summary="contiguous raw cell binary data"/>
+    </request>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Grid Surface Role: zterm_grid_surface_v1                              -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_grid_surface_v1" version="1">
+    <description summary="2D character grid surface interface">
+      Represents a 2D character cell canvas. The client attaches cell wl_buffers
+      created via standard wl_shm to the underlying wl_surface, damages
+      cell regions, and commits atomically.
+    </description>
+
+    <enum name="cursor_shape">
+      <entry name="block" value="0" summary="full solid block cursor"/>
+      <entry name="beam" value="1" summary="vertical bar / beam cursor"/>
+      <entry name="underline" value="2" summary="horizontal underline cursor"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy grid surface role">
+        Destroys the grid surface role and unmaps it from the compositor scene.
+      </description>
+    </request>
+
+    <request name="set_title">
+      <description summary="set title or tab label">
+        Sets the user-visible title or pane label for this surface.
+      </description>
+      <arg name="title" type="string" summary="surface title string"/>
+    </request>
+
+    <request name="set_scrollback_max_lines">
+      <description summary="configure scrollback capacity">
+        Specifies the maximum scrollback lines maintained for this surface.
+        A value of 0 disables scrollback history.
+      </description>
+      <arg name="lines" type="uint" summary="maximum history lines"/>
+    </request>
+
+    <request name="clear_scrollback">
+      <description summary="clear scrollback history">
+        Clears existing scrollback lines without disturbing active grid contents.
+      </description>
+    </request>
+
+    <request name="ack_configure">
+      <description summary="acknowledge a configure event">
+        Signals to the compositor that the client has processed the configure
+        event with the specified serial.
+      </description>
+      <arg name="serial" type="uint" summary="serial of the configure event"/>
+    </request>
+
+    <request name="set_position">
+      <description summary="explicitly set surface canvas offset">
+        Sets the top-left (col, row) offset of this grid surface on the compositor canvas.
+      </description>
+      <arg name="x" type="int" summary="column coordinate"/>
+      <arg name="y" type="int" summary="row coordinate"/>
+    </request>
+
+    <event name="configure">
+      <description summary="geometry and cell metrics notification">
+        Informs the client of the current grid dimensions in character cells
+        and the physical pixel dimensions of a single character cell.
+      </description>
+      <arg name="cols" type="uint" summary="width in character cells"/>
+      <arg name="rows" type="uint" summary="height in character cells"/>
+      <arg name="cell_width_px" type="uint" summary="physical pixel width of one cell"/>
+      <arg name="cell_height_px" type="uint" summary="physical pixel height of one cell"/>
+      <arg name="serial" type="uint" summary="serial number for acknowledgement"/>
+    </event>
+
+    <event name="cursor_position">
+      <description summary="active cursor coordinate update">
+        Emitted when the surface's active text cursor position moves. Useful
+        for clients rendering cursor-relative overlays or synchronizing state.
+      </description>
+      <arg name="col" type="int" summary="0-indexed column coordinate"/>
+      <arg name="row" type="int" summary="0-indexed row coordinate"/>
+      <arg name="visible" type="uint" summary="1 if visible, 0 if hidden"/>
+      <arg name="shape" type="uint" enum="cursor_shape" summary="cursor shape"/>
+    </event>
+
+    <event name="close">
+      <description summary="request client to close surface">
+        Emitted when the user or compositor requests that this surface be closed.
+      </description>
+    </event>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Stream Surface Role: zterm_stream_surface_v1                          -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_stream_surface_v1" version="1">
+    <description summary="structured append-only text stream surface">
+      Represents a pure text or log stream surface with dedicated infinite
+      scrollback and search. Applications append text sequentially without
+      handling 2D cursor positions.
+    </description>
+
+    <enum name="style_flags">
+      <description summary="text style attribute flags">
+        Bitmask flags controlling text decoration and attributes.
+      </description>
+      <entry name="bold" value="1" summary="bold or increased intensity"/>
+      <entry name="dim" value="2" summary="dim or decreased intensity"/>
+      <entry name="italic" value="4" summary="italicized text"/>
+      <entry name="underline" value="8" summary="single underline"/>
+      <entry name="blink" value="16" summary="blinking text"/>
+      <entry name="reverse" value="32" summary="swap foreground and background"/>
+      <entry name="strikethrough" value="64" summary="crossed out / strikethrough"/>
+      <entry name="fg_palette" value="128" summary="treat fg as ANSI 16-color palette index"/>
+      <entry name="bg_palette" value="256" summary="treat bg as ANSI 16-color palette index"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy stream surface">
+        Destroys the stream surface.
+      </description>
+    </request>
+
+    <request name="append_text">
+      <description summary="append plain text to stream">
+        Appends UTF-8 text to the end of the stream with default styling.
+      </description>
+      <arg name="text" type="string" summary="UTF-8 text payload"/>
+    </request>
+
+    <request name="append_styled_text">
+      <description summary="append text with explicit styling without ANSI escapes">
+        Appends UTF-8 text to the end of the stream with explicit colors and style attributes.
+        Colors are packed 32-bit RGBA (0xRRGGBBAA) unless fg_palette / bg_palette flags
+        are specified, in which case the lowest 8 bits specify an ANSI 16-color palette index (0-15).
+      </description>
+      <arg name="text" type="string" summary="UTF-8 text payload"/>
+      <arg name="fg" type="uint" summary="packed 32-bit RGBA foreground color or palette index"/>
+      <arg name="bg" type="uint" summary="packed 32-bit RGBA background color or palette index"/>
+      <arg name="flags" type="uint" enum="style_flags" summary="style attribute bitmask"/>
+    </request>
+
+    <request name="clear">
+      <description summary="clear stream buffer">
+        Clears all scrollback and active contents in the stream surface.
+      </description>
+    </request>
+
+    <event name="configure">
+      <description summary="stream geometry notification">
+        Notifies the client of the current visible column width and row height.
+      </description>
+      <arg name="cols" type="uint" summary="visible column width"/>
+      <arg name="rows" type="uint" summary="visible row height"/>
+    </event>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Cursor Anchor Positioner: zterm_cursor_anchor_v1                      -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_cursor_anchor_v1" version="1">
+    <description summary="anchors an overlay surface to a target text cursor">
+      Positions a child overlay surface (such as an autocomplete popup, inline
+      lint tooltip, or hover card) relative to the active text cursor of a
+      target surface.
+    </description>
+
+    <enum name="placement">
+      <entry name="below_start" value="1" summary="below cursor, aligned to cursor start"/>
+      <entry name="above_start" value="2" summary="above cursor, aligned to cursor start"/>
+      <entry name="right" value="3" summary="to the right of cursor"/>
+      <entry name="left" value="4" summary="to the left of cursor"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy cursor anchor">
+        Destroys the anchor positioner.
+      </description>
+    </request>
+
+    <request name="set_placement">
+      <description summary="set preferred placement direction">
+        Specifies the preferred orientation of the overlay relative to the cursor.
+      </description>
+      <arg name="placement" type="uint" enum="placement" summary="preferred placement"/>
+    </request>
+
+    <request name="set_offset">
+      <description summary="set cell offsets">
+        Specifies fine-tuning offsets in character cell units.
+      </description>
+      <arg name="col_offset" type="int" summary="horizontal column delta"/>
+      <arg name="row_offset" type="int" summary="vertical row delta"/>
+    </request>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Terminal Keyboard Interface: zterm_keyboard_v1                        -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_keyboard_v1" version="1">
+    <description summary="structured terminal keyboard input">
+      Extends or complements wl_keyboard by delivering resolved keys and UTF-8
+      payloads directly to CLI/TUI applications without requiring client-side
+      xkbcommon libraries over remote SSH connections.
+    </description>
+
+    <enum name="key_state">
+      <entry name="released" value="0" summary="key is released"/>
+      <entry name="pressed" value="1" summary="key is pressed"/>
+      <entry name="repeat" value="2" summary="key repeat event"/>
+    </enum>
+
+    <enum name="modifier_mask" bitfield="true">
+      <entry name="shift" value="1" summary="Shift modifier active"/>
+      <entry name="ctrl" value="2" summary="Control modifier active"/>
+      <entry name="alt" value="4" summary="Alt / Option modifier active"/>
+      <entry name="super" value="8" summary="Super / Meta / Command modifier active"/>
+      <entry name="caps_lock" value="16" summary="Caps Lock active"/>
+      <entry name="num_lock" value="32" summary="Num Lock active"/>
+    </enum>
+
+    <request name="release" type="destructor">
+      <description summary="release keyboard interface">
+        Releases the terminal keyboard listener.
+      </description>
+    </request>
+
+    <event name="key">
+      <description summary="keyboard event with resolved key name and UTF-8 text">
+        Emitted when a key is pressed, repeated, or released.
+
+        The 'key_name' argument provides a normalized symbol (e.g., 'Enter',
+        'Escape', 'Tab', 'ArrowUp', 'F1', 'PageDown', 'BackSpace').
+
+        The 'utf8_text' argument contains printable character text if applicable.
+      </description>
+      <arg name="serial" type="uint" summary="serial of the event"/>
+      <arg name="time" type="uint" summary="monotonic timestamp in milliseconds"/>
+      <arg name="key_name" type="string" summary="canonical key symbol name"/>
+      <arg name="utf8_text" type="string" summary="UTF-8 printable text representation"/>
+      <arg name="modifiers" type="uint" enum="modifier_mask" summary="active keyboard modifier bitmask"/>
+      <arg name="state" type="uint" enum="key_state" summary="pressed, released, or repeated"/>
+    </event>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Theme Manager Interface: zterm_theme_manager_v1                       -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_theme_manager_v1" version="1">
+    <description summary="dynamic theme and color palette manager">
+      Allows clients to discover the active terminal color theme, dark/light mode,
+      standard 16 ANSI colors, and semantic UI tokens. Emits events when the
+      user switches themes.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy theme manager">
+        Destroys the theme manager interface.
+      </description>
+    </request>
+
+    <request name="get_theme">
+      <description summary="request immediate theme broadcast">
+        Requests the compositor to immediately emit the current theme event.
+      </description>
+    </request>
+
+    <event name="theme">
+      <description summary="broadcast active theme colors">
+        Broadcasts the active color scheme, background/foreground, and ANSI palette.
+        Colors are packed 32-bit RGBA (0xRRGGBBAA).
+      </description>
+      <arg name="theme_name" type="string" summary="human-readable theme name (e.g. 'Catppuccin Mocha')"/>
+      <arg name="is_dark" type="uint" summary="1 for dark mode, 0 for light mode"/>
+      <arg name="bg_rgba" type="uint" summary="default background 32-bit RGBA"/>
+      <arg name="fg_rgba" type="uint" summary="default foreground 32-bit RGBA"/>
+      <arg name="cursor_rgba" type="uint" summary="cursor 32-bit RGBA"/>
+      <arg name="ansi_palette" type="array" summary="16 x 32-bit RGBA packed array representing ANSI 0-15"/>
+    </event>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Property & Capability Manager: zterm_property_manager_v1             -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_property_manager_v1" version="1">
+    <description summary="session properties, feature flags, and getters/setters">
+      Provides structured out-of-band getters, setters, and change subscriptions
+      for terminal properties, window state, desktop notifications, and security
+      feature flags (replacing in-band OSC escape sequences).
+    </description>
+
+    <enum name="error_code">
+      <entry name="not_found" value="404" summary="property key not recognized"/>
+      <entry name="read_only" value="405" summary="property is not writable"/>
+      <entry name="permission_denied" value="403" summary="action prohibited by user security policy"/>
+      <entry name="invalid_value" value="400" summary="property value format invalid"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy property manager">
+        Destroys the property manager interface.
+      </description>
+    </request>
+
+    <request name="get_property">
+      <description summary="query a property value">
+        Asynchronously queries the value of a property key (e.g. 'window.title',
+        'a11y.screen_reader_active', 'features.system_notifications').
+      </description>
+      <arg name="key" type="string" summary="property identifier"/>
+    </request>
+
+    <request name="set_property">
+      <description summary="mutate a writable property">
+        Mutates a writable property (e.g. 'window.title', 'window.subtitle').
+      </description>
+      <arg name="key" type="string" summary="property identifier"/>
+      <arg name="value" type="string" summary="serialized property value"/>
+    </request>
+
+    <request name="watch_property">
+      <description summary="subscribe to property changes">
+        Subscribes to asynchronous change notifications whenever the specified
+        property key changes value.
+      </description>
+      <arg name="key" type="string" summary="property identifier to watch"/>
+    </request>
+
+    <request name="unwatch_property">
+      <description summary="unsubscribe from property changes">
+        Cancels subscription for the specified property key.
+      </description>
+      <arg name="key" type="string" summary="property identifier"/>
+    </request>
+
+    <request name="system_notify">
+      <description summary="post native desktop notification">
+        Posts a desktop notification via the compositor.
+      </description>
+      <arg name="title" type="string" summary="notification title"/>
+      <arg name="body" type="string" summary="notification body"/>
+      <arg name="urgency" type="uint" summary="0=low, 1=normal, 2=critical"/>
+    </request>
+
+    <event name="property_value">
+      <description summary="property value response or change notification">
+        Emitted in response to get_property, or when a watched property mutates.
+      </description>
+      <arg name="key" type="string" summary="property identifier"/>
+      <arg name="value" type="string" summary="property value"/>
+    </event>
+
+    <event name="error">
+      <description summary="property query or mutation error">
+        Emitted when a get_property or set_property fails.
+      </description>
+      <arg name="key" type="string" summary="property identifier"/>
+      <arg name="code" type="uint" enum="error_code" summary="standard error code"/>
+      <arg name="message" type="string" summary="human-readable error description"/>
+    </event>
+  </interface>
+
+  <!-- ===================================================================== -->
+  <!-- Legacy PTY Bridge: zterm_xpty_v1 ('xpty')                             -->
+  <!-- ===================================================================== -->
+
+  <interface name="zterm_xpty_v1" version="1">
+    <description summary="legacy VT100 / PTY bridge factory ('xpty', analogous to Xwayland)">
+      Allows the terminal compositor or helper processes to wrap legacy VT
+      processes (bash, zsh, vim, htop) into an isolated grid surface backed
+      by an existing slave PTY descriptor.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy xpty bridge">
+        Destroys the xpty bridge factory.
+      </description>
+    </request>
+
+    <request name="attach_pty">
+      <description summary="attach a slave PTY to a grid surface">
+        Attaches a slave PTY file descriptor to an existing grid surface. The xpty
+        bridge parses the PTY stream in complete isolation, clamping all escapes to
+        the surface bounds and emitting cell buffer commits.
+      </description>
+      <arg name="grid_surface" type="object" interface="zterm_grid_surface_v1" summary="target grid surface"/>
+      <arg name="pty_slave_fd" type="fd" summary="slave PTY descriptor to sandbox"/>
+    </request>
+  </interface>
+
+</protocol>

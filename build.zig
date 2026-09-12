@@ -51,6 +51,15 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_data_device_manager", 4);
     scanner.generate("zwp_primary_selection_device_manager_v1", 1);
     scanner.generate("zwp_text_input_manager_v3", 1);
+    scanner.addCustomProtocol(b.path("protocol/term-compositor-v1.xml"));
+    scanner.generate("zterm_compositor_v1", 1);
+    scanner.generate("zterm_buffer_factory_v1", 1);
+    scanner.generate("zterm_theme_manager_v1", 1);
+    scanner.generate("zterm_property_manager_v1", 1);
+    scanner.generate("zterm_keyboard_v1", 1);
+    scanner.generate("zterm_xpty_v1", 1);
+    scanner.addCustomProtocol(b.path("protocol/wlr-layer-shell-unstable-v1.xml"));
+    scanner.generate("zwlr_layer_shell_v1", 4);
     const wayland_mod = b.createModule(.{ .root_source_file = scanner.result });
 
     const root_module = b.createModule(.{
@@ -70,6 +79,7 @@ pub fn build(b: *std.Build) void {
     root_module.addImport("wayland", wayland_mod);
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("wayland-cursor", .{});
+    root_module.linkSystemLibrary("wayland-server", .{});
 
     const ghostty_dep = b.lazyDependency("ghostty", .{
         .target = target,
@@ -88,12 +98,14 @@ pub fn build(b: *std.Build) void {
     translate_c.linkSystemLibrary("freetype2", .{});
     translate_c.linkSystemLibrary("harfbuzz", .{});
     translate_c.linkSystemLibrary("xkbcommon", .{});
-    root_module.addImport("c", translate_c.createModule());
+    const c_mod = translate_c.createModule();
+    root_module.addImport("c", c_mod);
 
-    if (b.lazyDependency("z2d", .{
+    const z2d_dep = b.lazyDependency("z2d", .{
         .target = target,
         .optimize = optimize,
-    })) |dep| {
+    });
+    if (z2d_dep) |dep| {
         root_module.addImport("z2d", dep.module("z2d"));
     }
 
@@ -176,6 +188,41 @@ pub fn build(b: *std.Build) void {
             .exclude_extensions = &.{".md"},
         });
     }
+
+    const tc_shell_exe = b.addExecutable(.{
+        .name = "monstar-tc-shell",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tc_shell_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .use_llvm = true,
+    });
+    tc_shell_exe.root_module.addImport("wayland", wayland_mod);
+    tc_shell_exe.root_module.linkSystemLibrary("wayland-client", .{});
+    tc_shell_exe.root_module.linkSystemLibrary("wayland-cursor", .{});
+    tc_shell_exe.root_module.linkSystemLibrary("wayland-server", .{});
+    tc_shell_exe.root_module.addImport("c", c_mod);
+    tc_shell_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image_resize.c") });
+    tc_shell_exe.root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image.c") });
+    if (z2d_dep) |dep| {
+        tc_shell_exe.root_module.addImport("z2d", dep.module("z2d"));
+    }
+    if (ghostty_dep) |dep| {
+        const ghostty_vt = dep.module("ghostty-vt");
+        tc_shell_exe.root_module.addImport("ghostty-vt", ghostty_vt);
+        tc_shell_exe.root_module.addImport(
+            "uucode",
+            ghostty_vt.import_table.get("uucode") orelse
+                @panic("ghostty-vt does not provide uucode"),
+        );
+    }
+    b.installArtifact(tc_shell_exe);
+
+    const tc_shell_step = b.step("tc-shell", "Run the standalone TC-Wayland shell");
+    const run_tc_shell = b.addRunArtifact(tc_shell_exe);
+    tc_shell_step.dependOn(&run_tc_shell.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
