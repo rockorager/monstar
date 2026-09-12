@@ -43,6 +43,14 @@ pub fn premultipliedArgb(rgb: vt.color.RGB, alpha_u8: u8) u32 {
     return (alpha << 24) | (r << 16) | (g << 8) | b;
 }
 
+/// Pack opaque foreign image bytes without color conversion. Kitty image
+/// data uses this: like foot's pixman pipeline, foreign pixels are treated
+/// as already being in the framebuffer's encoding (sRGB for 8-bit,
+/// linear-expanded for the 16-bit `linear` namespace).
+pub fn expandedArgb(r: u8, g: u8, b: u8) u32 {
+    return 0xff000000 | (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
+}
+
 pub fn fillRect(
     pixels: []u32,
     stride: u31,
@@ -386,6 +394,299 @@ fn blendPremultipliedBgra(src: []const u8, bg: u32) u32 {
     return (out_alpha << 24) | (r << 16) | (g << 8) | b;
 }
 
+/// Gamma-correct blending primitives for 16-bit linear-light framebuffers
+/// (WL_SHM_FORMAT_ABGR16161616, little-endian u64 pixels: R bits 0-15,
+/// G 16-31, B 32-47, A 48-63). Mirrors foot's gamma-correct-blending:
+/// terminal colors decode from sRGB to 16-bit linear at the color→pixel
+/// boundary, coverage blending runs in linear space, and the compositor
+/// converts linear→display because the surface is tagged as linear sRGB
+/// via wp-color-manager-v1. Foreign pixel data (color emoji, Kitty
+/// images) expands to 16-bit without decoding, the same tradeoff foot's
+/// pixman pipeline makes. Signatures mirror the 8-bit root namespace so
+/// render code can alias one of the two with a comptime pixel type.
+pub const linear = struct {
+    /// 8-bit sRGB to 16-bit linear decode table. Like foot, this uses a
+    /// pure 2.2 gamma rather than the piece-wise sRGB transfer function
+    /// because that is what compositors apply to tagged surfaces.
+    pub const srgb_decode_8_to_16_table: [256]u16 = blk: {
+        @setEvalBranchQuota(100_000);
+        var table: [256]u16 = undefined;
+        for (&table, 0..) |*entry, i| {
+            const c: f64 = @as(f64, @floatFromInt(i)) / 255.0;
+            entry.* = @intFromFloat(std.math.pow(f64, c, 2.2) * 65535.0 + 0.5);
+        }
+        break :blk table;
+    };
+
+    /// Pack an opaque color as a linear ABGR16161616 pixel.
+    pub fn argb(rgb: vt.color.RGB) u64 {
+        return @as(u64, 0xffff) << 48 |
+            @as(u64, srgb_decode_8_to_16_table[rgb.b]) << 32 |
+            @as(u64, srgb_decode_8_to_16_table[rgb.g]) << 16 |
+            @as(u64, srgb_decode_8_to_16_table[rgb.r]);
+    }
+
+    pub fn premultipliedArgb(rgb: vt.color.RGB, alpha_u8: u8) u64 {
+        const a: u64 = @as(u64, alpha_u8) * 257;
+        const r = (@as(u64, srgb_decode_8_to_16_table[rgb.r]) * a + 32767) / 65535;
+        const g = (@as(u64, srgb_decode_8_to_16_table[rgb.g]) * a + 32767) / 65535;
+        const b = (@as(u64, srgb_decode_8_to_16_table[rgb.b]) * a + 32767) / 65535;
+        return (a << 48) | (b << 32) | (g << 16) | r;
+    }
+
+    /// Pack opaque foreign image bytes without sRGB decoding, the same
+    /// tradeoff foot's pixman pipeline makes for 8-bit sources on its
+    /// 16-bit surface.
+    pub fn expandedArgb(r: u8, g: u8, b: u8) u64 {
+        return @as(u64, 0xffff) << 48 |
+            @as(u64, b) * 257 << 32 |
+            @as(u64, g) * 257 << 16 |
+            @as(u64, r) * 257;
+    }
+
+    pub fn fillRect(
+        pixels: []u64,
+        stride: u31,
+        buf_width: u31,
+        buf_height: u31,
+        x: u31,
+        y: u31,
+        w: u31,
+        h: u31,
+        color: u64,
+    ) void {
+        if (x >= buf_width or y >= buf_height) return;
+        const x_end = @min(x + w, buf_width);
+        const y_end = @min(y + h, buf_height);
+        for (y..y_end) |row| {
+            linear.fillSpan(pixels[row * stride + x .. row * stride + x_end], color);
+        }
+    }
+
+    fn fillSpan(dst: []u64, color: u64) void {
+        const V = @Vector(4, u64);
+        const splat: V = @splat(color);
+        var i: usize = 0;
+        while (i + 4 <= dst.len) : (i += 4) dst[i..][0..4].* = splat;
+        for (dst[i..]) |*px| px.* = color;
+    }
+
+    pub fn blendCapsule(
+        pixels: []u64,
+        stride: u31,
+        buf_width: u31,
+        buf_height: u31,
+        thumb: ScrollbarThumb,
+        color: u64,
+    ) void {
+        if (thumb.alpha == 0 or thumb.width == 0 or thumb.height == 0 or
+            thumb.x >= buf_width or thumb.y >= buf_height) return;
+        std.debug.assert(color >> 48 == 0xffff);
+
+        const x_end = @min(thumb.x + thumb.width, buf_width);
+        const y_end = @min(thumb.y + thumb.height, buf_height);
+        const radius = @as(f64, @floatFromInt(@min(thumb.width, thumb.height))) / 2.0;
+        const center_x = @as(f64, @floatFromInt(thumb.x)) +
+            @as(f64, @floatFromInt(thumb.width)) / 2.0;
+        const cap_top = @as(f64, @floatFromInt(thumb.y)) + radius;
+        const cap_bottom = @as(f64, @floatFromInt(thumb.y + thumb.height)) - radius;
+
+        for (thumb.y..y_end) |y| {
+            const py = @as(f64, @floatFromInt(y)) + 0.5;
+            const nearest_y = std.math.clamp(py, cap_top, cap_bottom);
+            for (thumb.x..x_end) |x| {
+                const px = @as(f64, @floatFromInt(x)) + 0.5;
+                const dx = px - center_x;
+                const dy = py - nearest_y;
+                // One pixel of coverage around the mathematical edge gives the
+                // small pill smooth caps without involving the vector renderer.
+                const coverage = std.math.clamp(radius + 0.5 - @sqrt(dx * dx + dy * dy), 0, 1);
+                if (coverage == 0) continue;
+                const alpha: u16 = @intFromFloat(@round(@as(f64, @floatFromInt(thumb.alpha)) * 257.0 * coverage));
+                const pixel = &pixels[@as(usize, y) * stride + x];
+                pixel.* = linear.blend(color, pixel.*, alpha);
+            }
+        }
+    }
+
+    /// Alpha-blend an 8-bit coverage bitmap in `color` over the buffer.
+    pub fn blitGlyph(
+        pixels: []u64,
+        stride: u31,
+        buf_width: u31,
+        buf_height: u31,
+        g: *const Font.Glyph,
+        x0: i32,
+        y0: i32,
+        color: u64,
+        reverse_color_glyph: bool,
+        clip_x: ?PixelRange,
+    ) void {
+        switch (g.format) {
+            .alpha => if (g.fully_opaque)
+                linear.blitOpaqueGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x)
+            else
+                linear.blitAlphaGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x),
+            .bgra => if (reverse_color_glyph)
+                linear.blitBgraGlyphAsAlpha(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x)
+            else
+                linear.blitBgraGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, clip_x),
+        }
+    }
+
+    fn blitOpaqueGlyph(
+        pixels: []u64,
+        stride: u31,
+        buf_width: u31,
+        buf_height: u31,
+        g: *const Font.Glyph,
+        x0: i32,
+        y0: i32,
+        color: u64,
+        clip_x: ?PixelRange,
+    ) void {
+        const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
+        const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+        const span_len = clip.gx_end - clip.gx_start;
+        for (clip.gy_start..clip.gy_end) |gy| {
+            const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+            linear.fillSpan(pixels[py * stride + px_start ..][0..span_len], color);
+        }
+    }
+
+    fn blitAlphaGlyph(
+        pixels: []u64,
+        stride: u31,
+        buf_width: u31,
+        buf_height: u31,
+        g: *const Font.Glyph,
+        x0: i32,
+        y0: i32,
+        color: u64,
+        clip_x: ?PixelRange,
+    ) void {
+        const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
+        const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+        for (clip.gy_start..clip.gy_end) |gy| {
+            const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+            const src = g.bitmap[gy * g.width + clip.gx_start .. gy * g.width + clip.gx_end];
+            const dst = pixels[py * stride + px_start ..][0..src.len];
+            linear.blendAlphaSpan(dst, src, color);
+        }
+    }
+
+    /// Scalar counterpart of the 8-bit blendAlphaSpan: coverage expands
+    /// to 16-bit (v*257, pixman's mask expansion) and blending runs on
+    /// the linear 16-bit channels. Zero-coverage pixels keep their
+    /// background; full coverage stores the foreground unchanged.
+    fn blendAlphaSpan(noalias dst: []u64, noalias coverage: []const u8, color: u64) void {
+        std.debug.assert(dst.len == coverage.len);
+        std.debug.assert(color >> 48 == 0xffff);
+        for (dst, coverage) |*pixel, cov| {
+            if (cov == 0) continue;
+            if (cov == 0xff) {
+                pixel.* = color;
+                continue;
+            }
+            pixel.* = linear.blend(color, pixel.*, @as(u16, cov) * 257);
+        }
+    }
+
+    fn blitBgraGlyph(
+        pixels: []u64,
+        stride: u31,
+        buf_width: u31,
+        buf_height: u31,
+        g: *const Font.Glyph,
+        x0: i32,
+        y0: i32,
+        clip_x: ?PixelRange,
+    ) void {
+        const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
+        const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+        for (clip.gy_start..clip.gy_end) |gy| {
+            const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
+            const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+            const dst = pixels[py * stride + px_start ..][0 .. clip.gx_end - clip.gx_start];
+            for (dst, 0..) |*pixel, i| {
+                const cell = src[i * 4 ..][0..4];
+                if (cell[3] == 0) continue;
+                pixel.* = linear.blendPremultipliedBgra(cell, pixel.*);
+            }
+        }
+    }
+
+    fn blitBgraGlyphAsAlpha(
+        pixels: []u64,
+        stride: u31,
+        buf_width: u31,
+        buf_height: u31,
+        g: *const Font.Glyph,
+        x0: i32,
+        y0: i32,
+        color: u64,
+        clip_x: ?PixelRange,
+    ) void {
+        const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
+        const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+        for (clip.gy_start..clip.gy_end) |gy| {
+            const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
+            const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
+            const dst = pixels[py * stride + px_start ..][0 .. clip.gx_end - clip.gx_start];
+            for (dst, 0..) |*pixel, i| {
+                const alpha = src[i * 4 + 3];
+                if (alpha == 0) continue;
+                pixel.* = linear.blend(color, pixel.*, @as(u16, alpha) * 257);
+            }
+        }
+    }
+
+    fn blend(fg: u64, bg: u64, alpha: u16) u64 {
+        if (alpha == 0xffff) return fg;
+        const a: u64 = alpha;
+        const na: u64 = 65535 - a;
+        const r = ((fg & 0xffff) * a + (bg & 0xffff) * na) / 65535;
+        const g = ((fg >> 16 & 0xffff) * a + (bg >> 16 & 0xffff) * na) / 65535;
+        const b = ((fg >> 32 & 0xffff) * a + (bg >> 32 & 0xffff) * na) / 65535;
+        const out_alpha = ((fg >> 48) * a + (bg >> 48) * na) / 65535;
+        return (out_alpha << 48) | (b << 32) | (g << 16) | r;
+    }
+
+    pub fn blendPixel(dst: u64, src: *const [4]u8) u64 {
+        const alpha = @as(u64, src[3]) * 257;
+        const inv_alpha = 65535 - alpha;
+        const dst_r = dst & 0xffff;
+        const dst_g = (dst >> 16) & 0xffff;
+        const dst_b = (dst >> 32) & 0xffff;
+        const dst_a = dst >> 48;
+        const r = (@as(u64, src[0]) * 257 * alpha + dst_r * inv_alpha + 32767) / 65535;
+        const g = (@as(u64, src[1]) * 257 * alpha + dst_g * inv_alpha + 32767) / 65535;
+        const b = (@as(u64, src[2]) * 257 * alpha + dst_b * inv_alpha + 32767) / 65535;
+        const a = (65535 * alpha + dst_a * inv_alpha + 32767) / 65535;
+        return (a << 48) | (b << 32) | (g << 16) | r;
+    }
+
+    /// Blend 8-bit premultiplied BGRA over the linear buffer. The source
+    /// channels expand to 16-bit without sRGB decoding: they are treated
+    /// as linear, exactly what foot's pixman pipeline does when
+    /// compositing 8-bit emoji onto its 16-bit surface.
+    fn blendPremultipliedBgra(src: []const u8, bg: u64) u64 {
+        const a: u64 = @as(u64, src[3]) * 257;
+        const r16 = @as(u64, src[2]) * 257;
+        const g16 = @as(u64, src[1]) * 257;
+        const b16 = @as(u64, src[0]) * 257;
+        if (a == 0xffff) {
+            return (a << 48) | (b16 << 32) | (g16 << 16) | r16;
+        }
+        const na: u64 = 65535 - a;
+        const out_alpha: u64 = @min(65535, a + ((bg >> 48) * na) / 65535);
+        const r: u64 = @min(out_alpha, r16 + ((bg & 0xffff) * na) / 65535);
+        const g: u64 = @min(out_alpha, g16 + ((bg >> 16 & 0xffff) * na) / 65535);
+        const b: u64 = @min(out_alpha, b16 + ((bg >> 32 & 0xffff) * na) / 65535);
+        return (out_alpha << 48) | (b << 32) | (g << 16) | r;
+    }
+};
+
 test "fillRect clips to a view while honoring framebuffer stride" {
     const untouched: u32 = 0x12345678;
     var pixels = [_]u32{untouched} ** 15;
@@ -579,5 +880,117 @@ test "blendPremultipliedBgraSpan matches scalar blend" {
             blendPremultipliedBgraSpan(got[0..len], source[0 .. len * 4]);
             try std.testing.expectEqualSlices(u32, want[0..len], got[0..len]);
         }
+    }
+}
+
+test "linear sRGB decode table matches pure 2.2 gamma" {
+    const table = &linear.srgb_decode_8_to_16_table;
+    try std.testing.expectEqual(@as(u16, 0), table[0]);
+    try std.testing.expectEqual(@as(u16, 14386), table[128]);
+    try std.testing.expectEqual(@as(u16, 64971), table[254]);
+    try std.testing.expectEqual(@as(u16, 65535), table[255]);
+    for (1..256) |i| try std.testing.expect(table[i] >= table[i - 1]);
+}
+
+test "linear argb packs opaque premultiplied ABGR16161616" {
+    const white: vt.color.RGB = .{ .r = 0xff, .g = 0xff, .b = 0xff };
+    const black: vt.color.RGB = .{ .r = 0, .g = 0, .b = 0 };
+    try std.testing.expectEqual(@as(u64, 0xffff_ffff_ffff_ffff), linear.argb(white));
+    try std.testing.expectEqual(@as(u64, 0xffff_0000_0000_0000), linear.argb(black));
+    const red: vt.color.RGB = .{ .r = 0xff, .g = 0, .b = 0 };
+    try std.testing.expectEqual(@as(u64, 0xffff_0000_0000_ffff), linear.argb(red));
+}
+
+test "linear premultipliedArgb endpoints" {
+    const rgb: vt.color.RGB = .{ .r = 255, .g = 255, .b = 255 };
+    try std.testing.expectEqual(@as(u64, 0), linear.premultipliedArgb(rgb, 0));
+    try std.testing.expectEqual(linear.argb(rgb), linear.premultipliedArgb(rgb, 255));
+    // Half alpha premultiplies the linear channel by the same fraction.
+    try std.testing.expectEqual(@as(u64, 0x8080_8080_8080_8080), linear.premultipliedArgb(rgb, 128));
+}
+
+test "linear blend endpoints" {
+    const opaque_white: u64 = 0xffff_ffff_ffff_ffff;
+    const opaque_black: u64 = 0xffff_0000_0000_0000;
+    try std.testing.expectEqual(opaque_white, linear.blend(opaque_white, opaque_black, 0xffff));
+    try std.testing.expectEqual(opaque_black, linear.blend(opaque_white, opaque_black, 0));
+    try std.testing.expectEqual(
+        @as(u64, 0xffff_8000_8000_8000),
+        linear.blend(opaque_white, opaque_black, 0x8000),
+    );
+}
+
+test "linear blendPixel expands opaque sources and keeps covered pixels" {
+    const dst: u64 = 0xffff_1000_2000_3000;
+    try std.testing.expectEqual(dst, linear.blendPixel(dst, &.{ 200, 100, 50, 0 }));
+    try std.testing.expectEqual(
+        @as(u64, 0xffff_0000_0000_0000 | (30 * 257 << 32) | (20 * 257 << 16) | (10 * 257)),
+        linear.blendPixel(dst, &.{ 10, 20, 30, 255 }),
+    );
+}
+
+test "linear premultiplied BGRA clamps channels to alpha" {
+    // Imperfectly premultiplied glyphs (color > alpha) must clamp to the
+    // resulting alpha so the premultiplied invariant holds.
+    const over: [4]u8 = .{ 255, 255, 255, 128 };
+    const bg: u64 = 0xffff_ffff_ffff_ffff;
+    const pixel = linear.blendPremultipliedBgra(&over, bg);
+    const alpha = pixel >> 48;
+    try std.testing.expect(pixel & 0xffff <= alpha);
+    try std.testing.expect(pixel >> 16 & 0xffff <= alpha);
+    try std.testing.expect(pixel >> 32 & 0xffff <= alpha);
+
+    const opaque_px = linear.blendPremultipliedBgra(&.{ 10, 20, 30, 255 }, bg);
+    // BGRA byte order: B lands at bits 32-47, R at bits 0-15.
+    try std.testing.expectEqual(
+        @as(u64, 0xffff_0000_0000_0000 | (10 * 257 << 32) | (20 * 257 << 16) | (30 * 257)),
+        opaque_px,
+    );
+}
+
+test "linear opaque glyph fast path matches alpha blending with clipping" {
+    const bitmap: [12]u8 = @splat(0xff);
+    const alpha_glyph: Font.Glyph = .{
+        .bitmap = @constCast(&bitmap),
+        .width = 4,
+        .height = 3,
+        .bearing_x = 0,
+        .bearing_y = 0,
+    };
+    var opaque_glyph = alpha_glyph;
+    opaque_glyph.fully_opaque = true;
+
+    var alpha_pixels: [5 * 4]u64 = @splat(0xffff_1234_5678_9abc);
+    var opaque_pixels = alpha_pixels;
+    linear.blitGlyph(&alpha_pixels, 5, 5, 4, &alpha_glyph, -1, 2, 0xffff_abcd_ef01_2345, false, null);
+    linear.blitGlyph(&opaque_pixels, 5, 5, 4, &opaque_glyph, -1, 2, 0xffff_abcd_ef01_2345, false, null);
+    try std.testing.expectEqualSlices(u64, &alpha_pixels, &opaque_pixels);
+}
+
+test "linear alpha glyph blending matches scalar blend" {
+    const bitmap: [12]u8 = .{ 0, 1, 32, 64, 128, 192, 255, 7, 99, 200, 23, 250 };
+    const glyph: Font.Glyph = .{
+        .bitmap = @constCast(&bitmap),
+        .width = 4,
+        .height = 3,
+        .bearing_x = 0,
+        .bearing_y = 0,
+    };
+    const color: u64 = 0xffff_abcd_ef01_2345;
+    var pixels: [5 * 4]u64 = @splat(0xffff_1111_2222_3333);
+    linear.blitGlyph(&pixels, 5, 5, 4, &glyph, -1, 2, color, false, null);
+    for (bitmap, 0..) |cov, i| {
+        // x0 = -1 clips bitmap column 0; buf_height = 4 clips glyph row 2.
+        const x: i32 = @as(i32, @intCast(i % 4)) - 1;
+        const y = 2 + i / 4;
+        if (x < 0 or y >= 4) continue;
+        const px = pixels[y * 5 + @as(usize, @intCast(x))];
+        const want: u64 = if (cov == 0)
+            0xffff_1111_2222_3333
+        else if (cov == 0xff)
+            color
+        else
+            linear.blend(color, 0xffff_1111_2222_3333, @as(u16, cov) * 257);
+        try std.testing.expectEqual(want, px);
     }
 }

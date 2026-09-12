@@ -4,6 +4,7 @@
 const Window = @This();
 
 const std = @import("std");
+const PixelBuffer = @import("pixel_buffer.zig").PixelBuffer;
 const ShmBuffer = @import("ShmBuffer.zig");
 const wayland = @import("wayland");
 const ext = wayland.client.ext;
@@ -33,6 +34,13 @@ system_bell: ?*xdg.SystemBellV1,
 toplevel_icon_manager: ?*xdg.ToplevelIconManagerV1,
 background_effect_manager: ?*ext.BackgroundEffectManagerV1,
 background_effect: ?*ext.BackgroundEffectSurfaceV1,
+color_manager: ?*wp.ColorManagerV1,
+color_surface: ?*wp.ColorManagementSurfaceV1,
+/// True when the compositor supports everything linear blending needs:
+/// wp-color-manager-v1 parametric descriptions (ext_linear transfer, sRGB
+/// primaries, perceptual intent) and 16-bit shm buffers.
+gamma_correct_supported: bool,
+gamma_correct: bool,
 seat: ?*wl.Seat,
 keyboard: ?*wl.Keyboard,
 pointer: ?*wl.Pointer,
@@ -63,6 +71,9 @@ buffers: std.ArrayList(*Buffer),
 /// Format new render buffers use. Old-format buffers may remain in the list
 /// while the compositor owns them; acquireBuffer retires them after release.
 buffer_format: BufferFormat,
+/// Format selection inputs; updateBufferFormat combines them (gamma-correct
+/// linear buffers take precedence over alpha).
+buffer_alpha: bool,
 /// Most recently committed buffer. Its memory may still be busy with the
 /// compositor, but wl_shm memory remains readable and can seed stale buffers.
 newest_buffer: ?*Buffer,
@@ -221,6 +232,15 @@ const Globals = struct {
     primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1 = null,
     text_input_manager: ?*zwp.TextInputManagerV3 = null,
     decoration_manager: ?*zxdg.DecorationManagerV1 = null,
+    color_manager: ?*wp.ColorManagerV1 = null,
+    /// wp-color-manager-v1 capabilities reported before the done event.
+    cm_feature_parametric: bool = false,
+    cm_intent_perceptual: bool = false,
+    cm_tf_ext_linear: bool = false,
+    cm_primaries_srgb: bool = false,
+    /// Set once the compositor advertises the 16-bit shm format needed for
+    /// linear blending.
+    shm_abgr16161616: bool = false,
     outputs: std.ArrayList(*OutputState) = .empty,
 
     fn deinit(self: *Globals) void {
@@ -259,6 +279,10 @@ pub fn create(
     globals.* = .{ .alloc = alloc };
     errdefer globals.deinit();
     registry.setListener(*Globals, registryListener, globals);
+    if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+    // Events emitted on bind (wl_shm formats, wp_color_manager_v1
+    // capabilities) trail the initial sync; collect them with a second
+    // roundtrip before the window state reads them.
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
 
     const compositor = globals.compositor orelse return error.NoWlCompositor;
@@ -371,6 +395,13 @@ pub fn create(
         .toplevel_icon_manager = globals.toplevel_icon_manager,
         .background_effect_manager = globals.background_effect_manager,
         .background_effect = background_effect,
+        .color_manager = globals.color_manager,
+        .color_surface = null,
+        .gamma_correct_supported = globals.color_manager != null and
+            globals.cm_feature_parametric and globals.cm_intent_perceptual and
+            globals.cm_tf_ext_linear and globals.cm_primaries_srgb and
+            globals.shm_abgr16161616,
+        .gamma_correct = false,
         .seat = globals.seat,
         .keyboard = null,
         .pointer = null,
@@ -397,6 +428,7 @@ pub fn create(
         .toplevel = toplevel,
         .buffers = .empty,
         .buffer_format = .xrgb8888,
+        .buffer_alpha = false,
         .newest_buffer = null,
         // Zero until the first configure so the resize callback always
         // fires before the first draw.
@@ -480,9 +512,11 @@ pub fn destroy(self: *Window) void {
     if (self.system_bell) |bell| bell.destroy();
     if (self.toplevel_icon_manager) |manager| manager.destroy();
     if (self.background_effect) |effect| effect.destroy();
+    if (self.color_surface) |color_surface| color_surface.destroy();
     self.toplevel.destroy();
     self.xdg_surface.destroy();
     self.surface.destroy();
+    if (self.color_manager) |manager| manager.destroy();
     if (self.background_effect_manager) |manager| manager.destroy();
     self.wm_base.destroy();
     if (self.shm.getVersion() >= wl.Shm.release_since_version)
@@ -567,7 +601,70 @@ pub fn setCursorShape(self: *Window, shape: CursorShape) void {
 /// cannot be destroyed until wl_buffer.release, so they are retired lazily.
 /// After startup, callers must invalidate any in-flight or held frame.
 pub fn setBufferAlpha(self: *Window, enabled: bool) void {
-    const format: BufferFormat = if (enabled) .argb8888 else .xrgb8888;
+    if (enabled == self.buffer_alpha) return;
+    self.buffer_alpha = enabled;
+    self.updateBufferFormat();
+}
+
+/// Whether gamma-correct (linear) blending can be enabled: the compositor
+/// advertises wp-color-manager-v1 with parametric descriptions, the
+/// ext_linear transfer function, sRGB primaries, the perceptual render
+/// intent, and 16-bit shm buffers.
+pub fn gammaCorrectAvailable(self: *const Window) bool {
+    return self.gamma_correct_supported;
+}
+
+/// Enable or disable gamma-correct blending. Enabling tags the surface with
+/// a linear-light sRGB image description and switches render buffers to
+/// 16-bit; it is a no-op when gammaCorrectAvailable is false. Like
+/// setBufferAlpha, callers must invalidate any in-flight or held frame.
+pub fn setGammaCorrect(self: *Window, enabled: bool) void {
+    if (enabled == self.gamma_correct) return;
+    if (enabled and !self.gamma_correct_supported) return;
+    self.gamma_correct = enabled;
+    if (enabled) {
+        self.applyLinearImageDescription();
+    } else if (self.color_surface) |color_surface| {
+        color_surface.unsetImageDescription();
+    }
+    self.updateBufferFormat();
+}
+
+fn applyLinearImageDescription(self: *Window) void {
+    const manager = self.color_manager orelse {
+        self.gamma_correct = false;
+        return;
+    };
+    if (self.color_surface == null) {
+        self.color_surface = manager.getSurface(self.surface) catch |err| {
+            log.warn("color management surface setup failed: {}", .{err});
+            self.gamma_correct = false;
+            return;
+        };
+    }
+    const params = manager.createParametricCreator() catch |err| {
+        log.warn("parametric image description creator failed: {}", .{err});
+        self.gamma_correct = false;
+        return;
+    };
+    params.setTfNamed(.ext_linear);
+    params.setPrimariesNamed(.srgb);
+    const description = params.create() catch |err| {
+        log.warn("linear image description creation failed: {}", .{err});
+        self.gamma_correct = false;
+        return;
+    };
+    self.color_surface.?.setImageDescription(description, .perceptual);
+    description.destroy();
+}
+
+fn updateBufferFormat(self: *Window) void {
+    const format: BufferFormat = if (self.gamma_correct)
+        .abgr16161616
+    else if (self.buffer_alpha)
+        .argb8888
+    else
+        .xrgb8888;
     if (format == self.buffer_format) return;
     self.buffer_format = format;
     if (self.newest_buffer) |newest| {
@@ -793,11 +890,11 @@ pub const RenderTarget = struct {
     /// The checked-out buffer to pass to commitRender or cancelRender.
     buffer: *Buffer,
     /// Writable storage owned by `buffer`, valid until the checkout ends.
-    pixels: []u32,
+    pixels: PixelBuffer,
     /// Read-only contents of the newest compatible committed buffer, when
     /// available. It may alias `pixels`; the borrowed storage is valid until
     /// the checkout ends.
-    source_pixels: ?[]const u32,
+    source_pixels: ?PixelBuffer.Const,
     width: u31,
     height: u31,
     /// Buffer-age hint derived from commit-attempt bookkeeping, or 0 when no
@@ -823,10 +920,10 @@ fn beginRender(self: *Window, phys_width: u31, phys_height: u31) !RenderTarget {
     buffer.rendering = true;
     self.rendering_pending = true;
     const age: usize = if (buffer.frame == 0) 0 else @intCast(self.frame_counter + 1 - buffer.frame);
-    const source_pixels: ?[]const u32 = if (self.newest_buffer) |newest|
+    const source_pixels: ?PixelBuffer.Const = if (self.newest_buffer) |newest|
         if (newest.frame != 0 and newest.width == phys_width and newest.height == phys_height and
             newest.format == buffer.format)
-            newest.pixels()
+            newest.pixels().asConst()
         else
             null
     else
@@ -961,8 +1058,11 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 };
                 proxy.setListener(*OutputState, outputListener, output);
             } else if (std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
-                if (globals.shm == null)
-                    globals.shm = registry.bind(global.name, wl.Shm, @min(global.version, wl.Shm.generated_version)) catch return;
+                if (globals.shm == null) {
+                    const shm = registry.bind(global.name, wl.Shm, @min(global.version, wl.Shm.generated_version)) catch return;
+                    globals.shm = shm;
+                    shm.setListener(*Globals, shmListener, globals);
+                }
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
                 if (globals.wm_base == null)
                     globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, xdg.WmBase.generated_version)) catch return;
@@ -1009,6 +1109,12 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
             } else if (std.mem.orderZ(u8, global.interface, zxdg.DecorationManagerV1.interface.name) == .eq) {
                 if (globals.decoration_manager == null)
                     globals.decoration_manager = registry.bind(global.name, zxdg.DecorationManagerV1, @min(global.version, zxdg.DecorationManagerV1.generated_version)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wp.ColorManagerV1.interface.name) == .eq) {
+                if (globals.color_manager == null) {
+                    const manager = registry.bind(global.name, wp.ColorManagerV1, 1) catch return;
+                    globals.color_manager = manager;
+                    manager.setListener(*Globals, colorManagerListener, globals);
+                }
             }
         },
         .global_remove => |removed| {
@@ -1022,6 +1128,32 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
                 globals.seat_name = null;
             }
         },
+    }
+}
+
+fn shmListener(_: *wl.Shm, event: wl.Shm.Event, globals: *Globals) void {
+    switch (event) {
+        .format => |format| {
+            if (format.format == .abgr16161616) globals.shm_abgr16161616 = true;
+        },
+    }
+}
+
+fn colorManagerListener(_: *wp.ColorManagerV1, event: wp.ColorManagerV1.Event, globals: *Globals) void {
+    switch (event) {
+        .supported_intent => |supported| {
+            if (supported.render_intent == .perceptual) globals.cm_intent_perceptual = true;
+        },
+        .supported_feature => |supported| {
+            if (supported.feature == .parametric) globals.cm_feature_parametric = true;
+        },
+        .supported_tf_named => |supported| {
+            if (supported.tf == .ext_linear) globals.cm_tf_ext_linear = true;
+        },
+        .supported_primaries_named => |supported| {
+            if (supported.primaries == .srgb) globals.cm_primaries_srgb = true;
+        },
+        .done => {},
     }
 }
 

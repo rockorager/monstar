@@ -32,8 +32,8 @@ pub const Repair = union(enum) {
 /// are read-only. A returned `Result.job` preserves these borrows and does not
 /// transfer ownership of their backing storage.
 pub const Job = struct {
-    pixels: []u32,
-    source_pixels: ?[]const u32,
+    pixels: Renderer.PixelBuffer,
+    source_pixels: ?Renderer.PixelBuffer.Const,
     width: u31,
     height: u31,
     grid_x: u31,
@@ -488,7 +488,14 @@ fn workerMain(self: *AsyncRaster) void {
 }
 
 fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
-    const grid_pixels = gridPixels(job);
+    switch (job.pixels) {
+        inline else => |pixels| try self.renderJobT(job, pixels, damage),
+    }
+}
+
+fn renderJobT(self: *AsyncRaster, job: Job, pixels: anytype, damage: *Damage) !void {
+    const P = std.meta.Child(@TypeOf(pixels));
+    const grid_pixels = gridPixels(job, pixels);
     // Overlays draw outside the grid rows that dirty tracking accounts
     // for, so an overlay frame is always a full render with full damage.
     if (job.hasOverlay()) {
@@ -497,11 +504,11 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         // so repair to it instead of re-rendering. Without this a
         // visible kitty image turns every submitted job into a full
         // render.
-        if (!job.overlay_dirty and self.state.dirty == .false and repairToPreviousFrame(job)) {
+        if (!job.overlay_dirty and self.state.dirty == .false and repairToPreviousFrameT(job, pixels)) {
             damage.* = .none;
             return;
         }
-        clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
+        clearPadding(job, pixels, self.renderer.backgroundPixel(P, self.state.colors.background));
         if (job.kitty_items.len > 0) {
             try self.renderer.renderWithKittyItems(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height);
         } else {
@@ -526,7 +533,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         if (job.scrollbar) |thumb| {
             self.renderer.renderScrollbarThumb(
                 self.state,
-                job.pixels,
+                pixels,
                 job.width,
                 job.height,
                 thumb,
@@ -536,8 +543,8 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         return;
     }
     if (job.scroll_shift) |shift| {
-        clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
-        if (scrollFromPreviousFrame(job, shift, self.font.cell_height)) {
+        clearPadding(job, pixels, self.renderer.backgroundPixel(P, self.state.colors.background));
+        if (scrollFromPreviousFrameT(job, pixels, shift, self.font.cell_height)) {
             try self.renderer.shiftCellState(self.state.rows, self.state.cols, shift);
             try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
             // Rasterization touched only dirty rows, but every retained row
@@ -553,13 +560,13 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     }
     switch (self.state.dirty) {
         .full => {
-            clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
+            clearPadding(job, pixels, self.renderer.backgroundPixel(P, self.state.colors.background));
             try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
             damage.* = .full;
         },
         .partial => {
-            if (!repairToPreviousFrame(job)) {
-                clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
+            if (!repairToPreviousFrameT(job, pixels)) {
+                clearPadding(job, pixels, self.renderer.backgroundPixel(P, self.state.colors.background));
                 try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
                 damage.* = .full;
                 return;
@@ -568,8 +575,8 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             damage.* = if (self.renderer.rendered_rects.items.len == 0) .none else .partial;
         },
         .false => {
-            if (!repairToPreviousFrame(job)) {
-                clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
+            if (!repairToPreviousFrameT(job, pixels)) {
+                clearPadding(job, pixels, self.renderer.backgroundPixel(P, self.state.colors.background));
                 try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
                 damage.* = .full;
                 return;
@@ -579,38 +586,56 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     }
 }
 
-fn gridPixels(job: Job) []u32 {
+fn gridPixels(job: Job, pixels: anytype) @TypeOf(pixels) {
     std.debug.assert(job.grid_x + job.grid_width <= job.width);
     std.debug.assert(job.grid_y + job.grid_height <= job.height);
     const offset = @as(usize, job.grid_y) * job.width + job.grid_x;
-    return job.pixels[offset..];
+    return pixels[offset..];
 }
 
-fn clearPadding(job: Job, color: u32) void {
-    @memset(job.pixels[0 .. @as(usize, job.grid_y) * job.width], color);
+fn clearPadding(job: Job, pixels: anytype, color: std.meta.Child(@TypeOf(pixels))) void {
+    @memset(pixels[0 .. @as(usize, job.grid_y) * job.width], color);
     const grid_bottom = @as(usize, job.grid_y + job.grid_height) * job.width;
-    @memset(job.pixels[grid_bottom..], color);
+    @memset(pixels[grid_bottom..], color);
     for (job.grid_y..job.grid_y + job.grid_height) |y| {
         const row = @as(usize, y) * job.width;
-        @memset(job.pixels[row .. row + job.grid_x], color);
+        @memset(pixels[row .. row + job.grid_x], color);
         const right = row + job.grid_x + job.grid_width;
-        @memset(job.pixels[right .. row + job.width], color);
+        @memset(pixels[right .. row + job.width], color);
     }
 }
 
+/// The job's previous-frame pixels when their format matches the target
+/// buffer's. A mismatch cannot happen (App retires old-format buffers),
+/// so treat it as "no usable source".
+fn jobSource(job: Job, comptime P: type) ?[]const P {
+    const source = job.source_pixels orelse return null;
+    return switch (source) {
+        .rgba8 => |s| if (P == u32) s else null,
+        .rgba16 => |s| if (P == u64) s else null,
+    };
+}
+
 fn repairToPreviousFrame(job: Job) bool {
+    return switch (job.pixels) {
+        inline else => |pixels| repairToPreviousFrameT(job, pixels),
+    };
+}
+
+fn repairToPreviousFrameT(job: Job, pixels: anytype) bool {
+    const P = std.meta.Child(@TypeOf(pixels));
     return switch (job.repair) {
         .none => true,
         .full => repair: {
-            const source = job.source_pixels orelse break :repair false;
-            if (source.len != job.pixels.len) break :repair false;
-            if (source.ptr != job.pixels.ptr) Renderer.copyPixels(job.pixels, source);
+            const source = jobSource(job, P) orelse break :repair false;
+            if (source.len != pixels.len) break :repair false;
+            if (source.ptr != pixels.ptr) Renderer.copyPixels(pixels, source);
             break :repair true;
         },
         .rects => |rects| repair: {
-            const source = job.source_pixels orelse break :repair false;
-            if (source.len != job.pixels.len) break :repair false;
-            if (source.ptr == job.pixels.ptr) break :repair true;
+            const source = jobSource(job, P) orelse break :repair false;
+            if (source.len != pixels.len) break :repair false;
+            if (source.ptr == pixels.ptr) break :repair true;
             for (rects) |rect| {
                 if (rect.x > job.width or rect.width > job.width - rect.x or
                     rect.y > job.height or rect.height > job.height - rect.y)
@@ -620,7 +645,7 @@ fn repairToPreviousFrame(job: Job) bool {
                 for (rect.y..rect.y + rect.height) |y| {
                     const offset = @as(usize, y) * job.width + rect.x;
                     Renderer.copyPixels(
-                        job.pixels[offset..][0..rect.width],
+                        pixels[offset..][0..rect.width],
                         source[offset..][0..rect.width],
                     );
                 }
@@ -634,16 +659,23 @@ fn repairToPreviousFrame(job: Job) bool {
 /// their new positions. This avoids a full stale-buffer repair followed by
 /// a second in-place shift when source and destination differ.
 fn scrollFromPreviousFrame(job: Job, shift_rows: isize, cell_height: u31) bool {
+    return switch (job.pixels) {
+        inline else => |pixels| scrollFromPreviousFrameT(job, pixels, shift_rows, cell_height),
+    };
+}
+
+fn scrollFromPreviousFrameT(job: Job, pixels: anytype, shift_rows: isize, cell_height: u31) bool {
+    const P = std.meta.Child(@TypeOf(pixels));
     const rows: usize = @abs(shift_rows);
     if (rows == 0) return false;
     const shift_pixels = rows * cell_height;
     if (shift_pixels >= job.grid_height) return false;
 
     const source = if (job.age == 1)
-        @as([]const u32, job.pixels)
+        @as([]const P, pixels)
     else
-        job.source_pixels orelse return false;
-    if (source.len != job.pixels.len) return false;
+        jobSource(job, P) orelse return false;
+    if (source.len != pixels.len) return false;
 
     const stride: usize = job.width;
     const grid_start = @as(usize, job.grid_y) * stride;
@@ -651,16 +683,16 @@ fn scrollFromPreviousFrame(job: Job, shift_rows: isize, cell_height: u31) bool {
     const offset = shift_pixels * stride;
     const retained = grid_end - grid_start - offset;
     if (shift_rows > 0) {
-        const dst = job.pixels[grid_start .. grid_start + retained];
+        const dst = pixels[grid_start .. grid_start + retained];
         const src = source[grid_start + offset .. grid_end];
-        if (source.ptr == job.pixels.ptr)
+        if (source.ptr == pixels.ptr)
             @memmove(dst, src)
         else
             Renderer.copyPixels(dst, src);
     } else {
-        const dst = job.pixels[grid_start + offset .. grid_end];
+        const dst = pixels[grid_start + offset .. grid_end];
         const src = source[grid_start .. grid_start + retained];
-        if (source.ptr == job.pixels.ptr)
+        if (source.ptr == pixels.ptr)
             @memmove(dst, src)
         else
             Renderer.copyPixels(dst, src);
@@ -699,7 +731,7 @@ test "unchanged dirty rows report no damage" {
     const pixels = try alloc.alloc(u32, @as(usize, width) * height);
     defer alloc.free(pixels);
     const job: Job = .{
-        .pixels = pixels,
+        .pixels = .{ .rgba8 = pixels },
         .source_pixels = null,
         .width = width,
         .height = height,
@@ -745,8 +777,8 @@ test "repair previous frame" {
     var target = [_]u32{ 1, 2, 3, 4 };
     const source = [_]u32{ 5, 6, 7, 8 };
     const base: Job = .{
-        .pixels = &target,
-        .source_pixels = &source,
+        .pixels = .{ .rgba8 = &target },
+        .source_pixels = .{ .rgba8 = &source },
         .width = 2,
         .height = 2,
         .grid_x = 0,
@@ -817,7 +849,7 @@ test "scroll previous frame in place and from distinct source" {
         12, 13, 14,
     };
     var job: Job = .{
-        .pixels = &pixels,
+        .pixels = .{ .rgba8 = &pixels },
         .source_pixels = null,
         .width = 3,
         .height = 5,
@@ -859,7 +891,7 @@ test "scroll previous frame in place and from distinct source" {
     };
     @memset(&pixels, 99);
     job.age = 0;
-    job.source_pixels = &source;
+    job.source_pixels = .{ .rgba8 = &source };
     try std.testing.expect(scrollFromPreviousFrame(job, -1, 1));
     try std.testing.expectEqualSlices(u32, &.{ 23, 24, 25, 26, 27, 28 }, pixels[6..12]);
     try std.testing.expectEqualSlices(u32, &.{ 99, 99, 99 }, pixels[3..6]);

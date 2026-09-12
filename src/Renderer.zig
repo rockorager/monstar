@@ -43,6 +43,30 @@ const blendRgb = pixel_raster.blendRgb;
 const blitGlyph = pixel_raster.blitGlyph;
 const fillRect = pixel_raster.fillRect;
 
+/// Raster primitives for a framebuffer pixel type: 8-bit sRGB ARGB8888
+/// (u32), or 16-bit linear ABGR16161616 (u64) when gamma-correct blending
+/// renders into linear-light buffers. The pixel slice's child type selects
+/// the pipeline, so a single Renderer serves both buffer formats.
+fn Raster(comptime P: type) type {
+    return switch (P) {
+        u32 => pixel_raster,
+        u64 => pixel_raster.linear,
+        else => @compileError("unsupported framebuffer pixel type"),
+    };
+}
+
+/// Element type of a framebuffer slice; tests often pass a pointer to an
+/// array instead of a slice.
+fn PixelChild(comptime T: type) type {
+    const info = @typeInfo(T).pointer;
+    return if (info.size == .slice) info.child else std.meta.Child(info.child);
+}
+
+/// A framebuffer pixel slice in the window's current buffer format:
+/// 8-bit sRGB ARGB8888, or 16-bit linear ABGR16161616 when gamma-correct
+/// blending is active.
+pub const PixelBuffer = @import("pixel_buffer.zig").PixelBuffer;
+
 alloc: std.mem.Allocator,
 font: *Font,
 text_shaper: TextShaper,
@@ -248,7 +272,7 @@ fn pixelStride(self: *const Renderer, width: u31) u31 {
     return stride;
 }
 
-fn pixelBufferFits(pixels: []const u32, stride: u31, width: u31, height: u31) bool {
+fn pixelBufferFits(pixels: anytype, stride: u31, width: u31, height: u31) bool {
     if (width == 0 or height == 0) return true;
     return pixels.len >= @as(usize, height - 1) * stride + width;
 }
@@ -257,14 +281,16 @@ fn pixelBufferFits(pixels: []const u32, stride: u31, width: u31, height: u31) bo
 pub fn render(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
 
     if (state.rows == 0 or state.cols == 0) {
-        fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
+        pr.fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(P, state.colors.background));
         if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
         return;
     }
@@ -289,7 +315,7 @@ pub fn render(
     // grid row remains.
     const grid_bottom = @as(usize, state.rows) * self.font.cell_height;
     if (grid_bottom < height) {
-        fillRect(
+        pr.fillRect(
             pixels,
             self.pixelStride(width),
             width,
@@ -298,7 +324,7 @@ pub fn render(
             @intCast(grid_bottom),
             width,
             height - @as(u31, @intCast(grid_bottom)),
-            self.backgroundPixel(state.colors.background),
+            self.backgroundPixel(P, state.colors.background),
         );
     }
     if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
@@ -311,10 +337,12 @@ pub fn renderWithKittyItems(
     self: *Renderer,
     state: *const vt.RenderState,
     items: []const KittyRenderItem,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
     self.kitty_frame +%= 1;
 
@@ -333,7 +361,7 @@ pub fn renderWithKittyItems(
         }
     }
 
-    fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
+    pr.fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(P, state.colors.background));
     if (state.rows == 0 or state.cols == 0) {
         if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
         return;
@@ -393,7 +421,7 @@ pub fn renderWithKittyItems(
 pub fn renderDirty(
     self: *Renderer,
     state: *vt.RenderState,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
@@ -620,12 +648,14 @@ pub fn shiftCellState(self: *Renderer, rows: usize, cols: usize, shift_rows: isi
 pub fn renderPreedit(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     text: []const u8,
 ) !void {
     if (text.len == 0) return;
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     const cursor = state.cursor.viewport orelse return;
     if (cursor.y >= state.rows) return;
 
@@ -646,7 +676,7 @@ pub fn renderPreedit(
         const clipped_span: u31 = @min(span, state.cols - x);
         const cp = cps[i - cluster.len];
 
-        fillRect(
+        pr.fillRect(
             pixels,
             self.pixelStride(width),
             width,
@@ -655,7 +685,7 @@ pub fn renderPreedit(
             y * self.font.cell_height,
             clipped_span * self.font.cell_width,
             self.font.cell_height,
-            self.backgroundPixel(state.colors.background),
+            self.backgroundPixel(P, state.colors.background),
         );
 
         const face_idx = self.font.faceForCodepoint(self.alloc, cp);
@@ -663,7 +693,7 @@ pub fn renderPreedit(
         const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
         if (glyph_idx != 0) {
             const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
-            blitGlyph(
+            pr.blitGlyph(
                 pixels,
                 self.pixelStride(width),
                 width,
@@ -671,12 +701,12 @@ pub fn renderPreedit(
                 g,
                 @as(i32, x) * self.font.cell_width + g.bearing_x,
                 baseline_y - g.bearing_y,
-                argb(state.colors.foreground),
+                pr.argb(state.colors.foreground),
                 false,
                 self.glyph_clip_x,
             );
         }
-        try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), pixels, width, height);
+        try self.blitDecoration(.underline, x, y, pixels, width, height, pr.argb(state.colors.foreground));
         x += span;
     }
 }
@@ -684,7 +714,7 @@ pub fn renderPreedit(
 pub fn renderLinkHint(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     uri: []const u8,
@@ -703,7 +733,7 @@ pub fn renderLinkHint(
 pub fn renderSearch(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     text: []const u8,
@@ -726,18 +756,20 @@ pub fn renderSearch(
 pub fn renderScrollbarThumb(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     thumb: ScrollbarThumb,
 ) void {
-    blendCapsule(
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
+    pr.blendCapsule(
         pixels,
         self.pixelStride(width),
         width,
         height,
         thumb,
-        argb(state.colors.foreground),
+        pr.argb(state.colors.foreground),
     );
 }
 
@@ -782,7 +814,7 @@ fn overlayText(cps: []const u21, max_width: u31, suffix: bool) OverlayText {
 
 fn renderTextOverlay(
     self: *Renderer,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     text: []const u8,
@@ -791,6 +823,8 @@ fn renderTextOverlay(
     fg: vt.color.RGB,
 ) !void {
     if (text.len == 0 or width == 0 or height < self.font.cell_height) return;
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
 
     const cols: u31 = @max(1, width / self.font.cell_width);
     const padding: u31 = @intFromBool(cols > 2);
@@ -802,7 +836,7 @@ fn renderTextOverlay(
     const y: u31 = if (position == .top_right) 0 else height - self.font.cell_height;
     const baseline_y: i32 = @as(i32, @intCast(y)) + self.font.baseline;
 
-    fillRect(
+    pr.fillRect(
         pixels,
         self.pixelStride(width),
         width,
@@ -811,7 +845,7 @@ fn renderTextOverlay(
         y,
         box_width * self.font.cell_width,
         self.font.cell_height,
-        argb(bg),
+        pr.argb(bg),
     );
 
     var x = box_x + padding;
@@ -830,7 +864,7 @@ fn renderTextOverlay(
         const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
         if (glyph_idx != 0) {
             const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
-            blitGlyph(
+            pr.blitGlyph(
                 pixels,
                 self.pixelStride(width),
                 width,
@@ -838,7 +872,7 @@ fn renderTextOverlay(
                 g,
                 @as(i32, x) * self.font.cell_width + g.bearing_x,
                 baseline_y - g.bearing_y,
-                argb(fg),
+                pr.argb(fg),
                 false,
                 self.glyph_clip_x,
             );
@@ -850,7 +884,7 @@ fn renderTextOverlay(
 fn renderKittyItems(
     self: *Renderer,
     items: []const KittyRenderItem,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     layer: KittyGraphicsLayer,
@@ -878,7 +912,7 @@ const KittyGraphicsLayer = enum {
 
 fn renderKittyPlacement(
     self: *Renderer,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     image: KittyImage,
@@ -985,7 +1019,7 @@ fn makeKittyScaleRoom(self: *Renderer, new_bytes: usize) bool {
 /// bytes: one pass per row with the destination rect clipped up front,
 /// converting from the image's wire format as it writes.
 fn blitKittyUnscaled(
-    pixels: []u32,
+    pixels: anytype,
     stride: u31,
     width: u31,
     height: u31,
@@ -994,6 +1028,8 @@ fn blitKittyUnscaled(
     dest_x: i64,
     dest_y: i64,
 ) void {
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     std.debug.assert(viewport.pixel_width == viewport.source_width);
     std.debug.assert(viewport.pixel_height == viewport.source_height);
 
@@ -1031,36 +1067,42 @@ fn blitKittyUnscaled(
                 const s = src[i * 4 ..][0..4];
                 switch (s[3]) {
                     0 => {},
-                    0xff => px.* = 0xff000000 |
-                        (@as(u32, s[0]) << 16) | (@as(u32, s[1]) << 8) | s[2],
-                    else => px.* = blendPixel(px.*, s),
+                    0xff => px.* = pr.expandedArgb(s[0], s[1], s[2]),
+                    else => px.* = pr.blendPixel(px.*, s),
                 }
             },
             .gray => for (dst, 0..) |*px, i| {
-                const gray: u32 = src[i];
-                px.* = 0xff000000 | (gray << 16) | (gray << 8) | gray;
+                px.* = pr.expandedArgb(src[i], src[i], src[i]);
             },
             .gray_alpha => for (dst, 0..) |*px, i| {
                 const gray = src[i * 2];
-                px.* = blendPixel(px.*, &.{ gray, gray, gray, src[i * 2 + 1] });
+                px.* = pr.blendPixel(px.*, &.{ gray, gray, gray, src[i * 2 + 1] });
             },
             .png => unreachable,
         }
     }
 }
 
-/// Expand packed RGB into the framebuffer's opaque ARGB8888 format.
+/// Expand packed RGB into the framebuffer's opaque pixel format.
 /// Kitty video frames are normally RGB and cover millions of pixels,
-/// so shuffle four pixels at a time instead of assembling each u32
-/// channel by channel. ARGB8888 is BGRA in memory only on little-endian
-/// targets; keep the channel-explicit fallback everywhere else.
-fn copyOpaqueRgbSpan(noalias dst: []u32, noalias src: []const u8) void {
+/// so the 8-bit path shuffles four pixels at a time instead of assembling
+/// each u32 channel by channel. ARGB8888 is BGRA in memory only on
+/// little-endian targets; keep the channel-explicit fallback everywhere
+/// else. The 16-bit linear path expands bytes without sRGB decoding, the
+/// same tradeoff foot's pixman pipeline makes.
+fn copyOpaqueRgbSpan(noalias dst: anytype, noalias src: []const u8) void {
+    const P = std.meta.Child(@TypeOf(dst));
     std.debug.assert(src.len == dst.len * 3);
-    if (comptime builtin.target.cpu.arch.endian() != .little) {
+    if (P == u64) {
         for (dst, 0..) |*pixel, i| {
             const rgb = src[i * 3 ..][0..3];
-            pixel.* = 0xff000000 |
-                (@as(u32, rgb[0]) << 16) | (@as(u32, rgb[1]) << 8) | rgb[2];
+            pixel.* = pixel_raster.linear.expandedArgb(rgb[0], rgb[1], rgb[2]);
+        }
+        return;
+    } else if (comptime builtin.target.cpu.arch.endian() != .little) {
+        for (dst, 0..) |*pixel, i| {
+            const rgb = src[i * 3 ..][0..3];
+            pixel.* = pixel_raster.expandedArgb(rgb[0], rgb[1], rgb[2]);
         }
         return;
     }
@@ -1170,7 +1212,7 @@ fn resizeRgba(
 }
 
 fn blendRgba(
-    pixels: []u32,
+    pixels: anytype,
     stride: u31,
     width: u31,
     height: u31,
@@ -1180,6 +1222,8 @@ fn blendRgba(
     dest_x: i64,
     dest_y: i64,
 ) void {
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     for (0..image_height) |src_y| {
         const y = dest_y + @as(i64, @intCast(src_y));
         if (y < 0 or y >= height) continue;
@@ -1194,14 +1238,15 @@ fn blendRgba(
 
             const dst_idx = @as(usize, @intCast(y)) * stride + @as(usize, @intCast(x));
             if (alpha == 0xff) {
-                pixels[dst_idx] = 0xff000000 |
-                    (@as(u32, rgba[src_offset + 0]) << 16) |
-                    (@as(u32, rgba[src_offset + 1]) << 8) |
-                    @as(u32, rgba[src_offset + 2]);
+                pixels[dst_idx] = pr.expandedArgb(
+                    rgba[src_offset + 0],
+                    rgba[src_offset + 1],
+                    rgba[src_offset + 2],
+                );
                 continue;
             }
 
-            pixels[dst_idx] = blendPixel(pixels[dst_idx], rgba[src_offset..][0..4]);
+            pixels[dst_idx] = pr.blendPixel(pixels[dst_idx], rgba[src_offset..][0..4]);
         }
     }
 }
@@ -1212,7 +1257,7 @@ fn renderRow(
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     selection: ?[2]vt.size.CellCountInt,
     y: u31,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
@@ -1227,7 +1272,7 @@ fn renderRowCells(
     selection: ?[2]vt.size.CellCountInt,
     cell_range: CellRange,
     y: u31,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
@@ -1289,7 +1334,7 @@ fn prepareRow(
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     selection: ?[2]vt.size.CellCountInt,
     y: u31,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     backgrounds: Backgrounds,
@@ -1314,11 +1359,13 @@ fn prepareRowCells(
     selection: ?[2]vt.size.CellCountInt,
     cell_range: CellRange,
     y: u31,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
     backgrounds: Backgrounds,
 ) !void {
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     const font = self.font;
     const colors = &state.colors;
     const raws = cells.items(.raw);
@@ -1408,16 +1455,16 @@ fn prepareRowCells(
         self.fg_scratch.items[x] = fg;
         self.reverse_scratch.items[x] = reverse_color_glyph;
         if (backgrounds != .none and x >= cell_range.start and x < cell_range.end) {
-            const color: ?u32 = if (dim_search_bg) color: {
+            const color: ?P = if (dim_search_bg) color: {
                 const mixed = blendRgb(self.search_bg, bg orelse colors.background, search_match_alpha);
                 break :color if (bg == null or background_uses_alpha)
-                    self.backgroundPixel(mixed)
+                    self.backgroundPixel(P, mixed)
                 else
-                    argb(mixed);
+                    pr.argb(mixed);
             } else if (bg) |bg_color|
-                if (background_uses_alpha) self.backgroundPixel(bg_color) else argb(bg_color)
+                if (background_uses_alpha) self.backgroundPixel(P, bg_color) else pr.argb(bg_color)
             else switch (backgrounds) {
-                .all => self.backgroundPixel(colors.background),
+                .all => self.backgroundPixel(P, colors.background),
                 else => null,
             };
             if (color) |pixel| {
@@ -1441,7 +1488,7 @@ fn prepareRowCells(
     if (backgrounds == .all and cell_range.end == cols) {
         const margin_start: u31 = cols * font.cell_width;
         if (margin_start < width) {
-            const color = self.backgroundPixel(colors.background);
+            const color = self.backgroundPixel(P, colors.background);
             if (bg_run.active and color == bg_run.color) {
                 bg_run.end_px = width;
             } else {
@@ -1468,7 +1515,7 @@ fn prepareRowCells(
             const clipped_bottom: u31 = @intCast(std.math.clamp(bottom, 0, height));
             if (clipped_bottom > clipped_top) {
                 const cursor_width = font.cell_width * glyph_constraints.cellSpan(raws[cx]);
-                fillRect(
+                pr.fillRect(
                     pixels,
                     self.pixelStride(width),
                     width,
@@ -1477,23 +1524,26 @@ fn prepareRowCells(
                     clipped_top,
                     cursor_width,
                     clipped_bottom - clipped_top,
-                    argb(self.cursorFill(colors, cell.fg, cell.bg)),
+                    pr.argb(self.cursorFill(colors, cell.fg, cell.bg)),
                 );
             }
         }
     }
 }
 
-/// A pending run of adjacent equal-color cell backgrounds.
+/// A pending run of adjacent equal-color cell backgrounds. The color is
+/// stored widened to u64 so the same struct serves 8-bit and 16-bit
+/// framebuffers.
 const BgRun = struct {
     active: bool = false,
-    color: u32 = 0,
+    color: u64 = 0,
     start_px: u31 = 0,
     end_px: u31 = 0,
 
-    fn flush(run: *BgRun, pixels: []u32, stride: u31, buf_width: u31, buf_height: u31, y_px: u31, h: u31) void {
+    fn flush(run: *BgRun, pixels: anytype, stride: u31, buf_width: u31, buf_height: u31, y_px: u31, h: u31) void {
         if (!run.active) return;
-        fillRect(pixels, stride, buf_width, buf_height, run.start_px, y_px, run.end_px - run.start_px, h, run.color);
+        const pr = Raster(PixelChild(@TypeOf(pixels)));
+        pr.fillRect(pixels, stride, buf_width, buf_height, run.start_px, y_px, run.end_px - run.start_px, h, @intCast(run.color));
         run.active = false;
     }
 };
@@ -1503,7 +1553,7 @@ fn renderRowForeground(
     state: *const vt.RenderState,
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     y: u31,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
@@ -1524,10 +1574,12 @@ fn renderRowForegroundCells(
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     cell_range: CellRange,
     y: u31,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     const colors = &state.colors;
     const raws = cells.items(.raw);
     const styles = cells.items(.style);
@@ -1595,7 +1647,7 @@ fn renderRowForegroundCells(
 
         const cell_x: u31 = @intCast(dx);
         if (show_hyperlink) {
-            try self.blitDecoration(.underline, cell_x, y, argb(self.fg_scratch.items[dx]), pixels, width, height);
+            try self.blitDecoration(.underline, cell_x, y, pixels, width, height, pr.argb(self.fg_scratch.items[dx]));
         }
         if (underline) |u| {
             const kind: @import("sprite.zig").Decoration = switch (u) {
@@ -1607,15 +1659,15 @@ fn renderRowForegroundCells(
                 .none => unreachable,
             };
             const color = style.underlineColor(&colors.palette) orelse self.fg_scratch.items[dx];
-            try self.blitDecoration(kind, cell_x, y, argb(color), pixels, width, height);
+            try self.blitDecoration(kind, cell_x, y, pixels, width, height, pr.argb(color));
         }
         if (style.flags.strikethrough) {
             const color = self.fg_scratch.items[dx];
-            try self.blitDecoration(.strikethrough, cell_x, y, argb(color), pixels, width, height);
+            try self.blitDecoration(.strikethrough, cell_x, y, pixels, width, height, pr.argb(color));
         }
         if (style.flags.overline) {
             const color = self.fg_scratch.items[dx];
-            try self.blitDecoration(.overline, cell_x, y, argb(color), pixels, width, height);
+            try self.blitDecoration(.overline, cell_x, y, pixels, width, height, pr.argb(color));
         }
     }
 
@@ -1635,7 +1687,7 @@ fn renderRowForegroundCells(
         if (kind) |k| {
             const cell = cursorCellRgb(state.cursor.style, &state.cursor.cell, colors);
             const color = self.cursorFill(colors, cell.fg, cell.bg);
-            try self.blitDecoration(k, cx, y, argb(color), pixels, width, height);
+            try self.blitDecoration(k, cx, y, pixels, width, height, pr.argb(color));
         }
     }
 }
@@ -1652,16 +1704,17 @@ fn blitDecoration(
     kind: @import("sprite.zig").Decoration,
     cell_x: u31,
     y: u31,
-    color: u32,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
+    color: PixelChild(@TypeOf(pixels)),
 ) !void {
+    const pr = Raster(PixelChild(@TypeOf(pixels)));
     const font = self.font;
     const g = try font.decorationGlyph(self.alloc, kind);
     self.noteOverhang(@as(i32, font.baseline) - g.bearing_y, g.height);
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
-    blitGlyph(
+    pr.blitGlyph(
         pixels,
         self.pixelStride(width),
         width,
@@ -1686,11 +1739,13 @@ fn drawRun(
     end: u31,
     cols: u31,
     y: u31,
-    pixels: []u32,
+    pixels: anytype,
     width: u31,
     height: u31,
 ) !void {
     if (start >= end) return;
+    const P = PixelChild(@TypeOf(pixels));
+    const pr = Raster(P);
     const font = self.font;
 
     // Sprite glyphs are drawn directly, one per cell: they never shape
@@ -1705,7 +1760,7 @@ fn drawRun(
             const cell_span: u2 = @intCast(@min(glyph_constraints.cellSpan(raw), 2));
             const g = try font.spriteGlyph(self.alloc, cp, cell_span);
             self.noteOverhang(@as(i32, font.baseline) - g.bearing_y, g.height);
-            blitGlyph(
+            pr.blitGlyph(
                 pixels,
                 self.pixelStride(width),
                 width,
@@ -1713,7 +1768,7 @@ fn drawRun(
                 g,
                 @as(i32, @intCast(x)) * font.cell_width + g.bearing_x,
                 baseline_y - g.bearing_y,
-                argb(self.fg_scratch.items[x]),
+                pr.argb(self.fg_scratch.items[x]),
                 false,
                 self.glyph_clip_x,
             );
@@ -1775,7 +1830,7 @@ fn drawRun(
             else => |e| return e,
         };
         self.noteOverhang(@as(i32, font.baseline) - sg.y_offset - g.bearing_y, g.height);
-        blitGlyph(
+        pr.blitGlyph(
             pixels,
             self.pixelStride(width),
             width,
@@ -1783,7 +1838,7 @@ fn drawRun(
             g,
             pen_x + sg.x_offset + g.bearing_x,
             baseline_y - sg.y_offset - g.bearing_y,
-            argb(self.fg_scratch.items[cluster]),
+            pr.argb(self.fg_scratch.items[cluster]),
             self.reverse_scratch.items[cluster],
             self.glyph_clip_x,
         );
@@ -1803,13 +1858,15 @@ fn overlayCodepoints(self: *Renderer, text: []const u8) ![]const u21 {
 /// the read-for-ownership of every destination cache line (about a
 /// third of the bus traffic) and keep the copy from evicting the
 /// render working set.
-pub fn copyPixels(noalias dst: []u32, noalias src: []const u32) void {
+pub fn copyPixels(noalias dst: anytype, noalias src: anytype) void {
     return pixel_copy.copyPixels(dst, src);
 }
 
-/// Pack a background color in wl_shm's premultiplied ARGB8888 form.
-pub fn backgroundPixel(self: *const Renderer, rgb: vt.color.RGB) u32 {
-    return pixel_raster.premultipliedArgb(rgb, self.background_alpha);
+/// Pack a background color in the framebuffer's premultiplied form for
+/// pixel type P: sRGB ARGB8888 (u32), or linear ABGR16161616 (u64) when
+/// gamma-correct blending renders into 16-bit buffers.
+pub fn backgroundPixel(self: *const Renderer, comptime P: type, rgb: vt.color.RGB) P {
+    return Raster(P).premultipliedArgb(rgb, self.background_alpha);
 }
 
 test "kitty unscaled blit converts rgb and clips" {
@@ -2626,12 +2683,12 @@ test "background opacity cells controls explicit cell backgrounds" {
     const explicit_bg = pixels[@as(usize, y) * width + font.cell_width / 2];
     const default_bg = pixels[@as(usize, y) * width + font.cell_width + font.cell_width / 2];
     try std.testing.expectEqual(argb(state.colors.palette[1]), explicit_bg);
-    try std.testing.expectEqual(renderer.backgroundPixel(state.colors.background), default_bg);
+    try std.testing.expectEqual(renderer.backgroundPixel(u32, state.colors.background), default_bg);
 
     renderer.background_alpha_cells = true;
     try renderer.render(&state, pixels, width, height);
     const faded_explicit_bg = pixels[@as(usize, y) * width + font.cell_width / 2];
-    try std.testing.expectEqual(renderer.backgroundPixel(state.colors.palette[1]), faded_explicit_bg);
+    try std.testing.expectEqual(renderer.backgroundPixel(u32, state.colors.palette[1]), faded_explicit_bg);
 }
 
 test "render rectangular selection spans" {
@@ -2681,7 +2738,7 @@ test "render rectangular selection spans" {
     try renderer.render(&state, pixels, width, height);
 
     const selected = argb(selection_bg);
-    const background = renderer.backgroundPixel(state.colors.background);
+    const background = renderer.backgroundPixel(u32, state.colors.background);
     for (0..5) |y| {
         for (0..8) |x| {
             const px = (y * font.cell_height + font.cell_height / 2) * width +
@@ -3260,7 +3317,7 @@ test "unselected search match tints its existing background" {
     defer alloc.free(pixels);
     try renderer.render(&state, pixels, width, height);
 
-    const expected = renderer.backgroundPixel(blendRgb(
+    const expected = renderer.backgroundPixel(u32, blendRgb(
         renderer.search_bg,
         state.colors.background,
         search_match_alpha,

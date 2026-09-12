@@ -596,6 +596,7 @@ pub fn init(
     const window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
     errdefer window.destroy();
     window.setBufferAlpha(config.background_opacity < 255);
+    applyGammaCorrect(window, config.gamma_correct_blending);
     window.setBackgroundBlur(config.background_blur and config.background_opacity < 255);
 
     // Timerfds must be nonblocking: disarming a timerfd clears its
@@ -2215,6 +2216,17 @@ fn spawnEnvp(
     return slice.ptr;
 }
 
+/// Enable gamma-correct blending when the compositor supports it; warn and
+/// stay on 8-bit rendering otherwise. The trailing requestFullAsyncRedraw in
+/// applyConfig invalidates in-flight and held frames after a format switch.
+fn applyGammaCorrect(window: *Window, enabled: bool) void {
+    if (enabled and !window.gammaCorrectAvailable()) {
+        log.warn("gamma-correct blending requested but the compositor lacks support; rendering in 8-bit sRGB", .{});
+        return;
+    }
+    window.setGammaCorrect(enabled);
+}
+
 fn applyConfig(self: *App, new_config: Config) !void {
     const desired_font_size = Config.fontSizePixels(self.runtime_font_size orelse new_config.font_size, self.window.scale120);
     const new_font: Font = try .init(
@@ -2226,6 +2238,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
 
     self.applyColorDefaultsForConfig(new_config);
     self.window.setBufferAlpha(new_config.background_opacity < 255);
+    applyGammaCorrect(self.window, new_config.gamma_correct_blending);
     self.window.setBackgroundBlur(new_config.background_blur and new_config.background_opacity < 255);
     self.window.toplevel.setAppId(new_config.app_id);
 
@@ -5840,9 +5853,16 @@ fn redrawReady(ctx: *anyopaque) void {
     self.needs_redraw = true;
 }
 
-fn findRenderingBuffer(self: *App, pixels: []u32) ?*Window.Buffer {
+fn findRenderingBuffer(self: *App, pixels: Renderer.PixelBuffer) ?*Window.Buffer {
     for (self.window.buffers.items) |buffer| {
-        if (buffer.rendering and buffer.pixels().ptr == pixels.ptr) return buffer;
+        if (!buffer.rendering) continue;
+        const buffer_pixels = buffer.pixels();
+        if (std.meta.activeTag(buffer_pixels) != std.meta.activeTag(pixels)) continue;
+        const matches = switch (pixels) {
+            .rgba8 => |p| buffer_pixels.rgba8.ptr == p.ptr,
+            .rgba16 => |p| buffer_pixels.rgba16.ptr == p.ptr,
+        };
+        if (matches) return buffer;
     }
     return null;
 }

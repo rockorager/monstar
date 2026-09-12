@@ -127,6 +127,11 @@ background_opacity: u8 = 255,
 background_blur: bool = true,
 /// Whether background opacity also applies to explicit cell backgrounds.
 background_opacity_cells: bool = false,
+/// Blend text in linear light on 16-bit wl_shm buffers tagged as linear
+/// sRGB (foot's gamma-correct-blending). Requires a compositor implementing
+/// wp-color-manager-v1 with ext_linear/sRGB and the ABGR16161616 shm format;
+/// unsupported compositors fall back to the regular 8-bit pipeline.
+gamma_correct_blending: bool = false,
 
 theme: ?Theme = null,
 light_theme_overrides: ?ThemeOverrides = null,
@@ -273,6 +278,13 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
             return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background-opacity-cells")) {
         self.background_opacity_cells = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "gamma-correct-blending")) {
+        self.gamma_correct_blending = if (std.mem.eql(u8, value, "true"))
             true
         else if (std.mem.eql(u8, value, "false"))
             false
@@ -542,6 +554,7 @@ test "defaults" {
     try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
     try std.testing.expect(config.background_blur);
     try std.testing.expect(!config.background_opacity_cells);
+    try std.testing.expect(!config.gamma_correct_blending);
     try std.testing.expectEqual(@as(?Theme, null), config.theme);
     try std.testing.expectEqual(@as(?ThemeOverrides, null), config.light_theme_overrides);
     try std.testing.expectEqual(@as(?ThemeOverrides, null), config.dark_theme_overrides);
@@ -583,6 +596,7 @@ test "parse config" {
         \\background-opacity = 0.8
         \\background-blur = false
         \\background-opacity-cells = true
+        \\gamma-correct-blending = true
         \\background = #1a1b26
         \\foreground = c0caf5
         \\cursor-color = #aabbcc
@@ -616,6 +630,7 @@ test "parse config" {
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
     try std.testing.expect(!config.background_blur);
     try std.testing.expect(config.background_opacity_cells);
+    try std.testing.expect(config.gamma_correct_blending);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x1a, .g = 0x1b, .b = 0x26 }, config.background.?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xc0, .g = 0xca, .b = 0xf5 }, config.foreground.?);
     try std.testing.expectEqual(TerminalColor{ .rgb = .{ .r = 0xaa, .g = 0xbb, .b = 0xcc } }, config.cursor_color.?);

@@ -11,11 +11,13 @@ const builtin = @import("builtin");
 /// the read-for-ownership of every destination cache line (about a
 /// third of the bus traffic) and keep the copy from evicting the
 /// render working set.
-pub fn copyPixels(noalias dst: []u32, noalias src: []const u32) void {
+pub fn copyPixels(noalias dst: anytype, noalias src: anytype) void {
+    const P = std.meta.Child(@TypeOf(dst));
+    std.debug.assert(P == std.meta.Child(@TypeOf(src)));
     std.debug.assert(dst.len == src.len);
     // Below this size the fence and alignment fixup outweigh the saved
     // traffic, and freshly written destination lines may still be hot.
-    const nt_threshold = 256 * 1024 / @sizeOf(u32);
+    const nt_threshold = 256 * 1024 / @sizeOf(P);
     // The self-hosted backend's assembler can't parse the SSE memory
     // operands, so the non-temporal path is LLVM-only (all release
     // builds; debug performance doesn't matter).
@@ -25,10 +27,10 @@ pub fn copyPixels(noalias dst: []u32, noalias src: []const u32) void {
     @memcpy(dst, src);
 }
 
-fn copyNonTemporal(noalias dst: []u32, noalias src: []const u32) void {
+fn copyNonTemporal(noalias dst: anytype, noalias src: anytype) void {
     var d: [*]u8 = @ptrCast(dst.ptr);
     var s: [*]const u8 = @ptrCast(src.ptr);
-    var n: usize = dst.len * @sizeOf(u32);
+    var n: usize = dst.len * @sizeOf(std.meta.Child(@TypeOf(dst)));
 
     // movntdq requires a 16-byte-aligned destination.
     const misalign = @intFromPtr(d) & 15;

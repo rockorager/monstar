@@ -155,6 +155,17 @@ to explicit cell background colors too.
 The default is false.
 Selections, cursors, text, and terminal graphics retain their own opacity.
 .TP
+.BI gamma-correct-blending " = boolean"
+Blend text gamma-correctly in linear light, the same approach as the foot
+terminal emulator.
+The default is false.
+This requires a compositor that supports the wp-color-management-v1 protocol
+with parametric image descriptions (the ext_linear transfer function, sRGB
+primaries, and the perceptual render intent) as well as 16-bit shared memory
+buffers; otherwise monstar logs a warning and falls back to 8-bit rendering.
+When enabled, render buffers use 16 bits per channel, roughly doubling their
+memory usage.
+.TP
 .BI window-padding-x " = pixels[,pixels]"
 Set minimum left and right padding in logical pixels.
 One value applies to both sides; two values set left and right independently.
