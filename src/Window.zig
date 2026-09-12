@@ -280,10 +280,6 @@ pub fn create(
     errdefer globals.deinit();
     registry.setListener(*Globals, registryListener, globals);
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
-    // Events emitted on bind (wl_shm formats, wp_color_manager_v1
-    // capabilities) trail the initial sync; collect them with a second
-    // roundtrip before the window state reads them.
-    if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
 
     const compositor = globals.compositor orelse return error.NoWlCompositor;
     const shm = globals.shm orelse return error.NoWlShm;
@@ -397,10 +393,9 @@ pub fn create(
         .background_effect = background_effect,
         .color_manager = globals.color_manager,
         .color_surface = null,
-        .gamma_correct_supported = globals.color_manager != null and
-            globals.cm_feature_parametric and globals.cm_intent_perceptual and
-            globals.cm_tf_ext_linear and globals.cm_primaries_srgb and
-            globals.shm_abgr16161616,
+        // Computed after the post-bind roundtrip below; the capability
+        // events it reads have not arrived yet at this point.
+        .gamma_correct_supported = false,
         .gamma_correct = false,
         .seat = globals.seat,
         .keyboard = null,
@@ -468,6 +463,18 @@ pub fn create(
     surface.setListener(*Window, surfaceListener, self);
     xdg_surface.setListener(*Window, xdgSurfaceListener, self);
     toplevel.setListener(*Window, toplevelListener, self);
+
+    // Events emitted on bind (seat capabilities, wl_shm formats,
+    // wp_color_manager_v1 capabilities) trail the initial sync. Collect
+    // them with a second roundtrip now that every listener is installed:
+    // dispatching earlier would drop the seat capabilities that install
+    // the keyboard.
+    if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+    self.gamma_correct_supported = globals.color_manager != null and
+        globals.cm_feature_parametric and globals.cm_intent_perceptual and
+        globals.cm_tf_ext_linear and globals.cm_primaries_srgb and
+        globals.shm_abgr16161616;
+
     surface.commit();
     // Send the initial commit now so the compositor can prepare configure
     // while the App finishes initialization. A full socket is harmless: the
