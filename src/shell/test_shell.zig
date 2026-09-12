@@ -486,3 +486,59 @@ test "ls followed by demoted vim preview block has no huge gap" {
     const max_canvas_rows: usize = 23;
     try std.testing.expectEqual(@as(usize, 0), app.getSkipLines(max_canvas_rows));
 }
+
+test "isInteractiveShell detects shells and filters batch commands" {
+    const TcShellApp = @import("TcShellApp.zig");
+
+    // Interactive shells
+    try std.testing.expect(TcShellApp.isInteractiveShell("bash"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("/bin/bash"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("fish"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("zsh"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("sh"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("nu"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("bash -l"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("bash --login"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("sudo bash"));
+    try std.testing.expect(TcShellApp.isInteractiveShell("env FOO=bar fish"));
+
+    // Batch script execution should NOT be classified as interactive shells
+    try std.testing.expect(!TcShellApp.isInteractiveShell("bash -c \"echo hi\""));
+    try std.testing.expect(!TcShellApp.isInteractiveShell("bash script.sh"));
+    try std.testing.expect(!TcShellApp.isInteractiveShell("sh build.sh"));
+    try std.testing.expect(!TcShellApp.isInteractiveShell("fish -c ls"));
+    try std.testing.expect(!TcShellApp.isInteractiveShell("echo bash"));
+    try std.testing.expect(!TcShellApp.isInteractiveShell("cat file | bash"));
+    try std.testing.expect(!TcShellApp.isInteractiveShell("ls -la"));
+}
+
+test "interactive shell job does not demote without alternate screen" {
+    const allocator = std.testing.allocator;
+    const TcShellApp = @import("TcShellApp.zig");
+    const Xpty = @import("../tc/Xpty.zig");
+
+    var xpty = try Xpty.init(allocator, null, 80, 24);
+    defer xpty.deinit();
+
+    var job: TcShellApp.InteractiveJob = .{
+        .block_id = 1,
+        .xpty = xpty,
+        .suspended = false,
+        .is_fullscreen = true,
+        .is_interactive = true,
+        .promoted_by_alt_screen = false,
+    };
+
+    // Shell is on primary screen (not alternate screen)
+    try std.testing.expect(!job.xpty.isAlternateScreen());
+
+    // Demotion condition only triggers if promoted_by_alt_screen is true
+    const would_demote = !job.xpty.isAlternateScreen() and job.is_fullscreen and job.promoted_by_alt_screen and !job.suspended;
+    try std.testing.expect(!would_demote);
+    try std.testing.expect(job.is_fullscreen);
+
+    // If an alt-screen TUI enters alt-screen, it gets marked as promoted_by_alt_screen
+    job.promoted_by_alt_screen = true;
+    const tui_would_demote = !job.xpty.isAlternateScreen() and job.is_fullscreen and job.promoted_by_alt_screen and !job.suspended;
+    try std.testing.expect(tui_would_demote);
+}

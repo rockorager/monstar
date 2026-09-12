@@ -89,6 +89,7 @@ pub const InteractiveJob = struct {
     is_fullscreen: bool = false,
     user_demoted: bool = false,
     is_interactive: bool = false,
+    promoted_by_alt_screen: bool = false,
 };
 
 extern "c" fn popen(command: [*:0]const u8, modes: [*:0]const u8) ?*anyopaque;
@@ -342,6 +343,7 @@ pub fn demoteActiveJob(self: *TcShellApp) void {
         job.is_fullscreen = false;
         job.suspended = false;
         job.user_demoted = true;
+        job.promoted_by_alt_screen = false;
         job.is_interactive = true;
         job.xpty.is_visible = false;
         self.active_job_id = null;
@@ -379,6 +381,7 @@ pub fn suspendActiveJob(self: *TcShellApp) void {
         }
         job.suspended = true;
         job.is_fullscreen = false;
+        job.promoted_by_alt_screen = false;
         job.user_demoted = true;
         job.is_interactive = true;
         job.xpty.is_visible = false;
@@ -439,6 +442,7 @@ pub fn resumeJob(self: *TcShellApp, maybe_target: ?[]const u8) bool {
             job.suspended = false;
         }
         job.user_demoted = false;
+        job.promoted_by_alt_screen = false;
         job.is_fullscreen = true;
         job.is_interactive = true;
         job.xpty.is_visible = true;
@@ -584,10 +588,9 @@ pub fn scrollLines(self: *TcShellApp, lines: i32) void {
     self.needs_render = true;
 }
 
-/// Checks if command is typically an interactive fullscreen/TUI tool.
-pub fn isInteractiveCommand(cmd: []const u8) bool {
+fn unwrapCommand(cmd: []const u8) ?struct { base: []const u8, iter: std.mem.TokenIterator(u8, .any) } {
     var iter = std.mem.tokenizeAny(u8, cmd, " \t");
-    var bin = iter.next() orelse return false;
+    var bin = iter.next() orelse return null;
 
     // Skip common execution wrappers like sudo, doas, env, exec, nohup, time
     while (true) {
@@ -603,7 +606,7 @@ pub fn isInteractiveCommand(cmd: []const u8) bool {
                     bin = next_tok;
                     break;
                 }
-            } else return false;
+            } else return null;
         } else if (std.mem.eql(u8, base_cur, "env")) {
             while (iter.next()) |next_tok| {
                 if (std.mem.indexOfScalar(u8, next_tok, '=') != null or std.mem.startsWith(u8, next_tok, "-")) {
@@ -611,13 +614,20 @@ pub fn isInteractiveCommand(cmd: []const u8) bool {
                 }
                 bin = next_tok;
                 break;
-            } else return false;
+            } else return null;
         } else {
             break;
         }
     }
 
     const base = if (std.mem.lastIndexOfScalar(u8, bin, '/')) |idx| bin[idx + 1 ..] else bin;
+    return .{ .base = base, .iter = iter };
+}
+
+/// Checks if command is typically an interactive fullscreen/TUI tool.
+pub fn isInteractiveCommand(cmd: []const u8) bool {
+    const unwrapped = unwrapCommand(cmd) orelse return false;
+    const base = unwrapped.base;
 
     const interactive = [_][]const u8{
         // Editors
@@ -666,6 +676,59 @@ pub fn isInteractiveCommand(cmd: []const u8) bool {
         if (std.mem.eql(u8, base, name)) return true;
     }
     return false;
+}
+
+/// Checks if command is an interactive shell (e.g. bash, zsh, fish) rather than
+/// a batch script invocation (e.g. bash script.sh or bash -c "cmd").
+pub fn isInteractiveShell(cmd: []const u8) bool {
+    const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    // Redirections, pipelines, or background jobs are never interactive shells
+    if (std.mem.indexOfAny(u8, trimmed, "|><&;") != null) return false;
+
+    var unwrapped = unwrapCommand(trimmed) orelse return false;
+    const base = unwrapped.base;
+
+    const known_shells = [_][]const u8{
+        "bash",
+        "zsh",
+        "fish",
+        "sh",
+        "dash",
+        "ksh",
+        "tcsh",
+        "csh",
+        "nu",
+        "elvish",
+        "xonsh",
+    };
+
+    var is_shell = false;
+    for (known_shells) |name| {
+        if (std.mem.eql(u8, base, name)) {
+            is_shell = true;
+            break;
+        }
+    }
+    if (!is_shell) return false;
+
+    // Check remaining arguments for batch / script execution
+    while (unwrapped.iter.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "-c") or
+            std.mem.eql(u8, arg, "--command") or
+            std.mem.startsWith(u8, arg, "-lc") or
+            std.mem.startsWith(u8, arg, "-cl"))
+        {
+            return false;
+        }
+        // Non-option argument: indicates a script file to execute
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 fn getNormalizedSelection(self: *const TcShellApp) ?struct { r1: u32, c1: u32, r2: u32, c2: u32 } {
@@ -1094,8 +1157,10 @@ pub fn launchCommand(self: *TcShellApp, raw_cmd: []const u8) !void {
     const cmd = try SessionState.expandPipeline(self.allocator, self.blocks.items, trimmed);
     defer self.allocator.free(cmd);
 
-    // 3. Dispatch job: all external commands run attached to real PTY with Ghostty VT
-    try self.launchJob(cmd, false);
+    // 3. Dispatch job: external commands run attached to real PTY with Ghostty VT.
+    // Interactive shells (bash, zsh, fish, etc.) are launched fullscreen.
+    const force_interactive = isInteractiveShell(cmd);
+    try self.launchJob(cmd, force_interactive);
 }
 
 pub fn closeActiveJob(self: *TcShellApp) void {
@@ -1841,6 +1906,7 @@ pub fn run(self: *TcShellApp) !void {
             if (j.xpty.isAlternateScreen() and !j.is_fullscreen and !j.suspended and !j.user_demoted) {
                 j.is_fullscreen = true;
                 j.is_interactive = true;
+                j.promoted_by_alt_screen = true;
                 j.xpty.is_visible = true;
                 self.active_job_id = j.block_id;
                 self.prompt.setPosition(0, -100);
@@ -1849,8 +1915,9 @@ pub fn run(self: *TcShellApp) !void {
                 j.xpty.commit() catch {};
                 _ = self.client.display.flush();
                 self.needs_render = true;
-            } else if (!j.xpty.isAlternateScreen() and (j.is_fullscreen or j.user_demoted) and !j.suspended) {
+            } else if (!j.xpty.isAlternateScreen() and j.is_fullscreen and j.promoted_by_alt_screen and !j.suspended) {
                 j.is_fullscreen = false;
+                j.promoted_by_alt_screen = false;
                 j.user_demoted = false;
                 j.xpty.is_visible = false;
                 self.active_job_id = null;
@@ -1858,6 +1925,8 @@ pub fn run(self: *TcShellApp) !void {
                 j.xpty.setPosition(0, -100);
                 _ = self.client.display.flush();
                 self.needs_render = true;
+            } else if (!j.xpty.isAlternateScreen() and j.user_demoted and !j.is_fullscreen) {
+                j.user_demoted = false;
             }
 
             if (j.xpty.checkChildExited()) |st| {
