@@ -59,6 +59,21 @@ pub fn encodeLatin1(alloc: std.mem.Allocator, text: []const u8) std.mem.Allocato
     return result;
 }
 
+/// Decode an ICCCM STRING selection to UTF-8 for ordinary terminal paste.
+/// The caller owns the result; MIME-preserving transfers keep the original bytes.
+pub fn decodeLatin1(alloc: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
+    var len = text.len;
+    for (text) |byte| if (byte >= 0x80) {
+        len += 1;
+    };
+    const result = try alloc.alloc(u8, len);
+    var offset: usize = 0;
+    for (text) |byte| {
+        offset += std.unicode.utf8Encode(byte, result[offset..]) catch unreachable;
+    }
+    return result;
+}
+
 test "STRING selections use Latin-1 without replacing unrepresentable text" {
     const cases = [_]struct { text: []const u8, expected: []const u8 }{
         .{ .text = "", .expected = "" },

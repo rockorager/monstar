@@ -3997,7 +3997,17 @@ fn writeTerminalPaste(
         .text => {},
     }
 
-    const contents = [_]vt.clipboard.Content{.{ .mime = mime, .data = data }};
+    // STRING is Latin-1, unlike the other accepted text representations.
+    // Decode only ordinary paste; Kitty transfers retain their MIME and bytes.
+    const decoded = if (std.mem.eql(u8, mime, "STRING"))
+        clipboard_format.decodeLatin1(self.alloc, data) catch return
+    else
+        null;
+    defer if (decoded) |text| self.alloc.free(text);
+    const contents = [_]vt.clipboard.Content{.{
+        .mime = if (decoded != null) "text/plain;charset=utf-8" else mime,
+        .data = decoded orelse data,
+    }};
     _ = self.stream.handler.terminal_handler.paste(.{
         .source = source,
         .contents = .{ .memory = &contents },
@@ -4007,6 +4017,56 @@ fn writeTerminalPaste(
     }) catch |err| {
         log.warn("terminal paste failed: {}", .{err});
     };
+}
+
+test "ordinary STRING pastes and text drops decode Latin-1" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.stream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer app.stream.deinit();
+    app.stream.handler.terminal_handler.effects = .readonly;
+    app.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+
+    // C3 A9 is valid UTF-8 too, but STRING still means two Latin-1 characters.
+    const latin1 = "caf\xe9 \xa3\xff \xc3\xa9\n";
+    const utf8 = "café £ÿ Ã©\n";
+    const cases = [_]struct { mime: []const u8, data: []const u8 }{
+        .{ .mime = "STRING", .data = latin1 },
+        .{ .mime = "UTF8_STRING", .data = utf8 },
+    };
+    for (cases) |case| {
+        app.term.modes.set(.bracketed_paste, false);
+        app.writeTerminalPaste(.{ .clipboard = .standard }, case.mime, case.data);
+        var buf: [128]u8 = undefined;
+        const n = try posix.read(output[0], &buf);
+        try std.testing.expectEqualStrings("café £ÿ Ã©\r", buf[0..n]);
+
+        app.term.modes.set(.bracketed_paste, true);
+        app.writeTerminalPaste(.{ .clipboard = .selection }, case.mime, case.data);
+        const bracketed_n = try posix.read(output[0], &buf);
+        try std.testing.expectEqualStrings("\x1b[200~café £ÿ Ã©\n\x1b[201~", buf[0..bracketed_n]);
+
+        const drop = try app.formatDropPaste(case.mime, case.data);
+        defer alloc.free(drop);
+        try std.testing.expectEqualStrings(utf8, drop);
+    }
 }
 
 fn kittyClipboardTarget(target: Clipboard.Target) KittyClipboard.Target {
@@ -4099,6 +4159,7 @@ fn kittyDndMove(
 }
 
 fn formatDropPaste(self: *App, mime: []const u8, data: []const u8) ![]u8 {
+    if (std.mem.eql(u8, mime, "STRING")) return clipboard_format.decodeLatin1(self.alloc, data);
     if (!std.mem.eql(u8, mime, clipboard_format.uri_list_mime)) return self.alloc.dupe(u8, data);
     return try clipboard_format.formatUriListDrop(self.alloc, data);
 }
