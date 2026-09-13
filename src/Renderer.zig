@@ -9,7 +9,6 @@ const Renderer = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 const c = @import("c");
 const vt = @import("ghostty-vt");
 const CellDamageTracker = @import("CellDamageTracker.zig");
@@ -20,7 +19,6 @@ const glyph_constraints = @import("glyph_constraints.zig");
 const kitty_graphics = @import("kitty_graphics.zig");
 const pixel_copy = @import("pixel_copy.zig");
 const pixel_raster = @import("pixel_raster.zig");
-const blending = if (build_options.linear_light_blending) pixel_raster.linear_light else pixel_raster;
 
 const log = std.log.scoped(.renderer);
 const KittyImage = vt.kitty.graphics.Image;
@@ -39,10 +37,10 @@ pub const kittyItemsEqual = kitty_graphics.kittyItemsEqual;
 
 const PixelRange = pixel_raster.PixelRange;
 const argb = pixel_raster.argb;
-const blendCapsule = blending.blendCapsule;
-const blendPixel = blending.blendPixel;
+const blendCapsule = pixel_raster.blendCapsule;
+const blendPixel = pixel_raster.blendPixel;
 const blendRgb = pixel_raster.blendRgb;
-const blitGlyph = blending.blitGlyph;
+const blitGlyph = pixel_raster.blitGlyph;
 const fillRect = pixel_raster.fillRect;
 
 alloc: std.mem.Allocator,
@@ -1780,23 +1778,26 @@ fn drawRun(
     const shaped = try self.text_shaper.shape(face_index, face_style, end - start);
 
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
-    var pen_x: i32 = 0;
+    var pen_x: i64 = 0; // 26.6 physical pixels, including the grid anchor.
     var cluster: u32 = std.math.maxInt(u32);
     for (shaped) |sg| {
         const abs_cluster: u32 = start + sg.cluster;
         // Snap each new cluster to its cell so the grid stays aligned.
         if (abs_cluster != cluster) {
             cluster = abs_cluster;
-            pen_x = @as(i32, @intCast(cluster)) * font.cell_width;
+            pen_x = @as(i64, cluster) * font.cell_width * 64;
         }
         const cluster_x: usize = @intCast(cluster);
         const constraint_width = glyph_constraints.constraintWidth(raws, cluster_x, cols);
         const cp = glyph_constraints.cellCodepoint(raws[cluster_x]);
-        const g = font.face(sg.face).glyph(
+        const origin_x = Font.splitPosition(pen_x + sg.x_offset);
+        const origin_y = Font.splitPosition(-@as(i64, sg.y_offset));
+        const g = font.face(sg.face).glyphPhase(
             self.alloc,
             sg.glyph,
             constraint_width,
             glyph_constraints.isSymbol(cp),
+            .{ .x = origin_x.phase, .y = origin_y.phase },
         ) catch |err| switch (err) {
             error.FontLoadFailed, error.GlyphResizeFailed => {
                 log.warn("skipping glyph render face={d} glyph={d} codepoint=U+{X}: {}", .{
@@ -1810,15 +1811,15 @@ fn drawRun(
             },
             else => |e| return e,
         };
-        self.noteOverhang(@as(i32, font.baseline) - sg.y_offset - g.bearing_y, g.height);
+        self.noteOverhang(@as(i32, font.baseline) + origin_y.pixel - g.bearing_y, g.height);
         blitGlyph(
             pixels,
             self.pixelStride(width),
             width,
             height,
             g,
-            pen_x + sg.x_offset + g.bearing_x,
-            baseline_y - sg.y_offset - g.bearing_y,
+            origin_x.pixel + g.bearing_x,
+            baseline_y + origin_y.pixel - g.bearing_y,
             argb(self.fg_scratch.items[cluster]),
             self.reverse_scratch.items[cluster],
             self.glyph_clip_x,
@@ -1917,9 +1918,9 @@ test "kitty unscaled blit honors rgba alpha" {
     blitKittyUnscaled(&pixels, 2, 2, 2, image, viewport, 0, 0);
     try std.testing.expectEqual(bg, pixels[0]); // alpha 0 skipped
     try std.testing.expectEqual(@as(u32, 0xffc8c8c8), pixels[1]); // opaque
-    // Mixing encoded 200 with 17 rounds to 109; decoding with gamma 2.2,
-    // mixing at alpha 128/255, and encoding rounds to 146.
-    const mixed: u32 = if (build_options.linear_light_blending) 0xff929292 else 0xff6d6d6d;
+    // Piecewise sRGB decode of 200 and 17, mixing at alpha 128/255,
+    // and encode rounds to 147.
+    const mixed: u32 = 0xff939393;
     try std.testing.expectEqual(mixed, pixels[2]);
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
 }
@@ -2902,13 +2903,13 @@ test "dirty row render matches full render" {
     defer term.deinit(alloc);
     var stream = term.vtStream();
     defer stream.deinit();
-    stream.nextSlice("aaaaaaaa\r\nbbbbbbbb\r\ncccccccc");
+    stream.nextSlice("\x1b[?25l\x1b[3ma\u{0301}aaaaaaa\r\nb\u{0323}bbbbbbb\r\ncccccccc");
 
     var state: vt.RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &term);
 
-    var font: Font = try .init(alloc, "monospace", 16, null);
+    var font: Font = try .init(alloc, "monospace", 25.25, .{ .absolute = -8 });
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});
     defer renderer.deinit();
@@ -3358,4 +3359,51 @@ test "unselected search match tints its existing background" {
     }
     try std.testing.expect(highlighted > 0);
     try std.testing.expect(expected != argb(renderer.search_bg));
+}
+
+test "fractional pen accumulates within clusters and reanchors at grid cells" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 3, .rows = 1 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25laaa");
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    var font: Font = try .init(alloc, "monospace", 25.25, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    try renderer.text_shaper.beginKey(0, .regular);
+    for (0..3) |i| try renderer.text_shaper.appendKeyCodepoints(@intCast(i), 'a', &.{});
+    const shaped = try renderer.text_shaper.shapeRun(0, .regular);
+    try std.testing.expectEqual(@as(usize, 3), shaped.len);
+    // Synthetic HB output makes accidental pixel truncation, y-sign errors,
+    // repeated fractional translation, and failure to reset the pen distinct.
+    shaped[0].x_advance = 83;
+    shaped[0].x_offset = -13;
+    shaped[0].y_offset = 21;
+    shaped[1].cluster = 0;
+    shaped[1].x_advance = 109;
+    shaped[1].x_offset = -18;
+    shaped[1].y_offset = 0;
+    shaped[2].x_offset = 3;
+    shaped[2].y_offset = -7;
+    const width = font.cell_width * 3;
+    const height = font.cell_height;
+    const actual = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(actual);
+    const expected = try alloc.alloc(u32, actual.len);
+    defer alloc.free(expected);
+    @memset(expected, argb(state.colors.background));
+    const phases = [_]Font.Phase{ .{ .x = 51, .y = 43 }, .{ .x = 1 }, .{ .x = 3, .y = 7 } };
+    const origins_x = [_]i32{ -1, 1, @as(i32, font.cell_width) * 2 };
+    const origins_y = [_]i32{ -1, 0, 0 };
+    for (shaped, phases, origins_x, origins_y) |sg, phase, x, y| {
+        const g = try font.face(0).glyphPhase(alloc, sg.glyph, 1, false, phase);
+        blitGlyph(expected, width, width, height, g, x + g.bearing_x, @as(i32, font.baseline) + y - g.bearing_y, argb(state.colors.foreground), false, null);
+    }
+    try renderer.render(&state, actual, width, height);
+    try std.testing.expectEqualSlices(u32, expected, actual);
 }

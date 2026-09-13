@@ -57,7 +57,7 @@ sprite_glyphs: std.AutoHashMapUnmanaged(SpriteGlyphKey, Glyph),
 /// Text decoration sprites (underline styles, strikethrough, overline).
 decoration_glyphs: std.AutoHashMapUnmanaged(sprite.Decoration, Glyph),
 sprite_metrics: sprite.Metrics,
-size_px: u31,
+size_px: f64,
 
 /// Fixed cell metrics in pixels, derived from the primary face.
 cell_width: u31,
@@ -109,13 +109,13 @@ const style_count = std.meta.fields(FaceStyle).len;
 pub const Discovery = struct {
     refs: std.atomic.Value(usize),
     family: [:0]u8,
-    size_px: u31,
+    size_px: f64,
     adjust_cell_height: ?Config.MetricModifier,
     sort_sets: [style_count]*c.FcFontSet,
 
     fn init(
         family: [:0]const u8,
-        size_px: u31,
+        size_px: f64,
         adjust_cell_height: ?Config.MetricModifier,
     ) Error!*Discovery {
         if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
@@ -181,7 +181,7 @@ pub const Face = struct {
         ft_lib: c.FT_Library,
         path: [*:0]const u8,
         index: c_int,
-        size_px: u31,
+        size_px: f64,
         metrics: GlyphMetrics,
     ) Error!Face {
         var ft_face: c.FT_Face = undefined;
@@ -193,7 +193,7 @@ pub const Face = struct {
     fn loadMemory(
         ft_lib: c.FT_Library,
         bytes: []const u8,
-        size_px: u31,
+        size_px: f64,
         metrics: GlyphMetrics,
     ) Error!Face {
         var ft_face: c.FT_Face = undefined;
@@ -202,14 +202,18 @@ pub const Face = struct {
         return fromFtFace(ft_face, size_px, metrics);
     }
 
-    fn fromFtFace(ft_face: c.FT_Face, size_px: u31, metrics: GlyphMetrics) Error!Face {
+    fn fromFtFace(ft_face: c.FT_Face, size_px: f64, metrics: GlyphMetrics) Error!Face {
         errdefer _ = c.FT_Done_Face(ft_face);
-        if (c.FT_Set_Pixel_Sizes(ft_face, 0, size_px) != 0) {
-            if (!selectNearestStrike(ft_face, size_px)) return error.FontLoadFailed;
+        if (c.FT_IS_SCALABLE(ft_face)) {
+            if (c.FT_Set_Char_Size(ft_face, 0, @intFromFloat(@round(size_px * 64)), 72, 72) != 0)
+                return error.FontLoadFailed;
+        } else if (!selectNearestStrike(ft_face, @intFromFloat(@round(size_px)))) {
+            return error.FontLoadFailed;
         }
 
         const hb_font = c.hb_ft_font_create_referenced(ft_face) orelse
             return error.FontLoadFailed;
+        c.hb_ft_font_set_load_flags(hb_font, loadFlags(ft_face));
 
         return .{
             .ft_face = ft_face,
@@ -234,6 +238,24 @@ pub const Face = struct {
         return c.FT_Get_Char_Index(self.ft_face, cp) != 0;
     }
 
+    fn loadFlags(ft_face: c.FT_Face) c.FT_Int32 {
+        // Color and bitmap faces retain their strike selection and color path.
+        if (!c.FT_IS_SCALABLE(ft_face) or c.FT_HAS_COLOR(ft_face))
+            return c.FT_LOAD_DEFAULT | c.FT_LOAD_COLOR;
+        return c.FT_LOAD_NO_BITMAP | c.FT_LOAD_TARGET_LIGHT;
+    }
+
+    /// Shape with identity transform even if a caller has temporarily moved
+    /// the face. Restore that state afterward; raster phases are never metrics.
+    pub fn shape(self: *Face, buffer: *c.hb_buffer_t) void {
+        var matrix: c.FT_Matrix = undefined;
+        var delta: c.FT_Vector = undefined;
+        c.FT_Get_Transform(self.ft_face, &matrix, &delta);
+        c.FT_Set_Transform(self.ft_face, null, null);
+        defer c.FT_Set_Transform(self.ft_face, &matrix, &delta);
+        c.hb_shape(self.hb_font, buffer, null, 0);
+    }
+
     /// Rasterize (or fetch from cache) the glyph with the given index. The
     /// returned cache pointer is owned by this face and may be invalidated by
     /// a later cache-missing `glyph` call on the same face or by Font.deinit.
@@ -244,17 +266,38 @@ pub const Face = struct {
         constraint_width: u2,
         constrain_alpha: bool,
     ) Error!*const Glyph {
+        return self.glyphPhase(alloc, index, constraint_width, constrain_alpha, .{});
+    }
+
+    /// Like glyph, but rasterizes outline text at a screen-space subpixel
+    /// phase. Bearings already include the phase: blit only at the floored
+    /// integer origin. Cell-fitted symbols and color/bitmap faces ignore it.
+    pub fn glyphPhase(
+        self: *Face,
+        alloc: std.mem.Allocator,
+        index: u32,
+        constraint_width: u2,
+        constrain_alpha: bool,
+        phase: Phase,
+    ) Error!*const Glyph {
+        const text_outline = c.FT_IS_SCALABLE(self.ft_face) and !c.FT_HAS_COLOR(self.ft_face) and !constrain_alpha;
         const key: GlyphKey = .{
             .index = index,
             .constraint_width = constraint_width,
             .constrain_alpha = constrain_alpha,
+            .phase = if (text_outline) phase else .{},
         };
         const gop = try self.glyphs.getOrPut(alloc, key);
         if (gop.found_existing) return gop.value_ptr;
         errdefer _ = self.glyphs.remove(key);
 
-        const load_flags: c.FT_Int32 = @intCast(c.FT_LOAD_DEFAULT | c.FT_LOAD_COLOR);
-        if (c.FT_Load_Glyph(self.ft_face, index, load_flags) != 0)
+        var matrix: c.FT_Matrix = undefined;
+        var delta: c.FT_Vector = undefined;
+        c.FT_Get_Transform(self.ft_face, &matrix, &delta);
+        var translation: c.FT_Vector = .{ .x = key.phase.x, .y = -@as(c.FT_Pos, key.phase.y) };
+        c.FT_Set_Transform(self.ft_face, null, &translation);
+        defer c.FT_Set_Transform(self.ft_face, &matrix, &delta);
+        if (c.FT_Load_Glyph(self.ft_face, index, loadFlags(self.ft_face)) != 0)
             return error.FontLoadFailed;
         if (c.FT_Render_Glyph(self.ft_face.*.glyph, c.FT_RENDER_MODE_NORMAL) != 0)
             return error.FontLoadFailed;
@@ -451,7 +494,16 @@ const GlyphKey = struct {
     index: u32,
     constraint_width: u2,
     constrain_alpha: bool,
+    phase: Phase,
 };
+
+/// Fractions of a physical pixel, in 26.6 units; y increases down the screen.
+pub const Phase = struct { x: u6 = 0, y: u6 = 0 };
+
+/// Floor rather than truncate so negative positions have nonnegative phases.
+pub fn splitPosition(position: i64) struct { pixel: i32, phase: u6 } {
+    return .{ .pixel = @intCast(@divFloor(position, 64)), .phase = @intCast(@mod(position, 64)) };
+}
 
 const SpriteGlyphKey = struct {
     cp: u21,
@@ -689,11 +741,11 @@ fn bitmapRow(bitmap: c.FT_Bitmap, height: u31, y: usize) usize {
     return if (bitmap.pitch < 0) height - 1 - y else y;
 }
 
-fn fontSort(family: [:0]const u8, size_px: u31, style: FaceStyle) Error!*c.FcFontSet {
+fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle) Error!*c.FcFontSet {
     const pattern = c.FcPatternCreate() orelse return error.FontLoadFailed;
     defer c.FcPatternDestroy(pattern);
     _ = c.FcPatternAddString(pattern, c.FC_FAMILY, family.ptr);
-    _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, @floatFromInt(size_px));
+    _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, size_px);
     _ = c.FcPatternAddInteger(pattern, c.FC_SPACING, c.FC_MONO);
     if (style.weight()) |weight| _ = c.FcPatternAddInteger(pattern, c.FC_WEIGHT, weight);
     if (style.slant()) |slant| _ = c.FcPatternAddInteger(pattern, c.FC_SLANT, slant);
@@ -715,7 +767,7 @@ fn loadPrimaryStyle(
     ft_lib: c.FT_Library,
     sort_sets: [style_count]*c.FcFontSet,
     style: FaceStyle,
-    size_px: u31,
+    size_px: f64,
     metrics: GlyphMetrics,
 ) ?u16 {
     const regular = sort_sets[@intFromEnum(FaceStyle.regular)].*.fonts[0];
@@ -749,7 +801,7 @@ fn samePatternFace(a: ?*c.FcPattern, b: ?*c.FcPattern) bool {
 pub fn init(
     alloc: std.mem.Allocator,
     family: [:0]const u8,
-    size_px: u31,
+    size_px: f64,
     adjust_cell_height: ?Config.MetricModifier,
 ) Error!Font {
     std.debug.assert(size_px > 0);
@@ -772,6 +824,11 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     if (c.FT_Init_FreeType(&ft_lib) != 0) return error.FontLoadFailed;
     errdefer _ = c.FT_Done_FreeType(ft_lib);
 
+    // Adobe's CFF stem darkening compensates for linear-light coverage.
+    var no_darkening: c.FT_Bool = 0;
+    if (c.FT_Property_Set(ft_lib, "cff", "no-stem-darkening", &no_darkening) != 0)
+        return error.FontLoadFailed;
+
     // Faces own their resources once appended; the errdefer below is the
     // single cleanup path for all of them.
     var faces: std.ArrayList(Face) = .empty;
@@ -780,7 +837,8 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         faces.deinit(alloc);
     }
     {
-        var primary = try loadFromPattern(ft_lib, sort_sets[@intFromEnum(FaceStyle.regular)].*.fonts[0], size_px, .{});
+        // Preserve integer grid geometry independently of fractional outlines.
+        var primary = try loadFromPattern(ft_lib, sort_sets[@intFromEnum(FaceStyle.regular)].*.fonts[0], @round(size_px), .{});
         errdefer primary.deinit(alloc);
         try faces.append(alloc, primary);
     }
@@ -814,6 +872,11 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     primary.cell_width = cell_width;
     primary.cell_height = cell_height;
     primary.baseline = baseline;
+    if (c.FT_IS_SCALABLE(primary.ft_face)) {
+        if (c.FT_Set_Char_Size(primary.ft_face, 0, @intFromFloat(@round(size_px * 64)), 72, 72) != 0)
+            return error.FontLoadFailed;
+        c.hb_ft_font_changed(primary.hb_font);
+    }
 
     // The embedded symbols face; not fatal if it somehow fails.
     const embedded_face: ?u16 = embedded: {
@@ -1368,7 +1431,7 @@ test "cluster info derives coverage requirements and emoji signals" {
 fn loadFromPattern(
     ft_lib: c.FT_Library,
     pattern: ?*c.FcPattern,
-    size_px: u31,
+    size_px: f64,
     metrics: GlyphMetrics,
 ) Error!Face {
     var file: [*c]c.FcChar8 = undefined;
@@ -1554,6 +1617,7 @@ test "color emoji fallback rasterizes as scaled BGRA" {
     try std.testing.expect(glyph_index != 0);
     const g = try fallback.glyph(alloc, glyph_index, 2, false);
     try std.testing.expectEqual(GlyphFormat.bgra, g.format);
+    try std.testing.expectEqual(g, try fallback.glyphPhase(alloc, glyph_index, 2, false, .{ .x = 13, .y = 47 }));
     try std.testing.expect(g.width <= font.cell_width * 2);
     try std.testing.expect(g.height <= font.cell_height);
     try std.testing.expect(g.bearing_x >= 0);
@@ -1597,4 +1661,74 @@ test "cell height adjustment changes metrics and centers the baseline" {
     try std.testing.expectEqual(@as(u31, 1), minimum.cell_height);
     try std.testing.expect(minimum.baseline <= minimum.cell_height);
     try std.testing.expect(minimum.multi_row_overhang);
+}
+
+test "fractional sizing preserves the integer terminal grid" {
+    const alloc = std.testing.allocator;
+    var integer: Font = try .init(alloc, "monospace", 25, null);
+    defer integer.deinit(alloc);
+    var fractional: Font = try .init(alloc, "monospace", 25.25, null);
+    defer fractional.deinit(alloc);
+    try std.testing.expectEqual(integer.cell_width, fractional.cell_width);
+    try std.testing.expectEqual(integer.cell_height, fractional.cell_height);
+    try std.testing.expectEqual(integer.baseline, fractional.baseline);
+    try std.testing.expect(integer.face(0).ft_face.*.size.*.metrics.y_scale != fractional.face(0).ft_face.*.size.*.metrics.y_scale);
+    var x: c_int = 0;
+    var y: c_int = 0;
+    c.hb_font_get_scale(fractional.face(0).hb_font, &x, &y);
+    try std.testing.expectEqual(@as(c_int, 1616), y);
+    try std.testing.expectEqual(@as(c.FT_Int32, c.FT_LOAD_TARGET_LIGHT | c.FT_LOAD_NO_BITMAP), Face.loadFlags(fractional.face(0).ft_face));
+    try std.testing.expectEqual(Face.loadFlags(fractional.face(0).ft_face), c.hb_ft_font_get_load_flags(fractional.face(0).hb_font));
+    var no_darkening: c.FT_Bool = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.FT_Property_Get(fractional.ft_lib, "cff", "no-stem-darkening", &no_darkening));
+    try std.testing.expectEqual(@as(c.FT_Bool, 0), no_darkening);
+}
+
+test "signed 26.6 positions floor at pixel boundaries" {
+    const values = [_]i64{ -129, -128, -65, -64, -63, -13, -1, 0, 1, 21, 63, 64, 65 };
+    const pixels = [_]i32{ -3, -2, -2, -1, -1, -1, -1, 0, 0, 0, 0, 1, 1 };
+    const phases = [_]u6{ 63, 0, 63, 0, 1, 51, 63, 0, 1, 21, 63, 0, 1 };
+    for (values, pixels, phases) |value, pixel, phase| {
+        const actual = splitPosition(value);
+        try std.testing.expectEqual(pixel, actual.pixel);
+        try std.testing.expectEqual(phase, actual.phase);
+    }
+}
+
+test "phase cache and bearings match direct negative FreeType translation" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 25.25, null);
+    defer font.deinit(alloc);
+    const glyph_face = font.face(0);
+    const idx = c.FT_Get_Char_Index(glyph_face.ft_face, 'j');
+    const zero_bitmap = (try glyph_face.glyph(alloc, idx, 1, false)).bitmap.ptr;
+    const phased = try glyph_face.glyphPhase(alloc, idx, 1, false, .{ .x = 51, .y = 43 });
+    try std.testing.expect(zero_bitmap != phased.bitmap.ptr);
+    try std.testing.expectEqual(phased, try glyph_face.glyphPhase(alloc, idx, 1, false, .{ .x = 51, .y = 43 }));
+    try std.testing.expectEqual(@as(u32, 2), glyph_face.glyphs.count());
+
+    // Independent full translation: x=-13/64, screen y=-21/64. Integer
+    // displacement belongs in the blit, not in the cached raster phase.
+    var delta: c.FT_Vector = .{ .x = -13, .y = 21 };
+    c.FT_Set_Transform(glyph_face.ft_face, null, &delta);
+    defer c.FT_Set_Transform(glyph_face.ft_face, null, null);
+    try std.testing.expectEqual(@as(c_int, 0), c.FT_Load_Glyph(glyph_face.ft_face, idx, Face.loadFlags(glyph_face.ft_face)));
+    try std.testing.expectEqual(@as(c_int, 0), c.FT_Render_Glyph(glyph_face.ft_face.*.glyph, c.FT_RENDER_MODE_NORMAL));
+    const slot = glyph_face.ft_face.*.glyph;
+    try std.testing.expectEqual(slot.*.bitmap_left, phased.bearing_x - 1);
+    try std.testing.expectEqual(slot.*.bitmap_top, phased.bearing_y + 1);
+    try std.testing.expectEqual(slot.*.bitmap.width, phased.width);
+    try std.testing.expectEqual(slot.*.bitmap.rows, phased.height);
+    const expected = try alloc.alloc(u8, phased.bitmap.len);
+    defer alloc.free(expected);
+    try copyGrayRows(expected, slot.*.bitmap, phased.width, phased.height);
+    try std.testing.expectEqualSlices(u8, expected, phased.bitmap);
+
+    // Cell-fitted symbols deliberately reuse one raster regardless of phase.
+    const fitted = (try glyph_face.glyph(alloc, idx, 1, true)).bitmap.ptr;
+    try std.testing.expectEqual(fitted, (try glyph_face.glyphPhase(alloc, idx, 1, true, .{ .x = 7, .y = 31 })).bitmap.ptr);
+    var restored: c.FT_Vector = undefined;
+    c.FT_Get_Transform(glyph_face.ft_face, null, &restored);
+    try std.testing.expectEqual(delta.x, restored.x);
+    try std.testing.expectEqual(delta.y, restored.y);
 }

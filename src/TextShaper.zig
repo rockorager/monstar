@@ -38,6 +38,7 @@ pub const ShapedGlyph = struct {
     /// for clusters that shaped to .notdef and were repaired against a
     /// further fallback candidate.
     face: u16,
+    /// HarfBuzz 26.6 physical pixels. Only cluster origins snap to the grid.
     x_advance: i32,
     x_offset: i32,
     y_offset: i32,
@@ -143,7 +144,7 @@ pub fn shapeRun(self: *TextShaper, face_index: u16, style: Font.FaceStyle) ![]Sh
     }
     c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
     c.hb_buffer_guess_segment_properties(self.hb_buf);
-    c.hb_shape(face.hb_font, self.hb_buf, null, 0);
+    face.shape(self.hb_buf);
 
     var glyph_count: c_uint = 0;
     const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
@@ -158,9 +159,9 @@ pub fn shapeRun(self: *TextShaper, face_index: u16, style: Font.FaceStyle) ![]Sh
                 .glyph = info.codepoint,
                 .cluster = info.cluster,
                 .face = face_index,
-                .x_advance = pos.x_advance >> 6,
-                .x_offset = pos.x_offset >> 6,
-                .y_offset = pos.y_offset >> 6,
+                .x_advance = pos.x_advance,
+                .x_offset = pos.x_offset,
+                .y_offset = pos.y_offset,
             };
             if (info.codepoint == 0) has_notdef = true;
         }
@@ -266,7 +267,7 @@ fn shapeClusterWith(
     for (cps) |cp| c.hb_buffer_add(self.hb_buf, cp, cluster);
     c.hb_buffer_set_content_type(self.hb_buf, c.HB_BUFFER_CONTENT_TYPE_UNICODE);
     c.hb_buffer_guess_segment_properties(self.hb_buf);
-    c.hb_shape(face.hb_font, self.hb_buf, null, 0);
+    face.shape(self.hb_buf);
 
     var glyph_count: c_uint = 0;
     const infos = c.hb_buffer_get_glyph_infos(self.hb_buf, &glyph_count);
@@ -282,9 +283,9 @@ fn shapeClusterWith(
             .glyph = info.codepoint,
             .cluster = cluster,
             .face = face_index,
-            .x_advance = pos.x_advance >> 6,
-            .x_offset = pos.x_offset >> 6,
-            .y_offset = pos.y_offset >> 6,
+            .x_advance = pos.x_advance,
+            .x_offset = pos.x_offset,
+            .y_offset = pos.y_offset,
         });
     }
     return true;
@@ -307,4 +308,38 @@ test "cache separates identical runs by fallback style" {
 
     try std.testing.expectEqual(@as(usize, 2), shaper.readStats().cache_misses);
     try std.testing.expectEqual(@as(usize, 0), shaper.readStats().cache_hits);
+}
+
+test "normal and repair shaping retain fractional metrics with identity transform" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 25.25, null);
+    defer font.deinit(alloc);
+    var shaper: TextShaper = try .init(alloc, &font);
+    defer shaper.deinit();
+    try shaper.beginKey(0, .regular);
+    try shaper.appendKeyCodepoints(0, 'x', &.{0x0301});
+    const face = font.face(0);
+    var delta: c.FT_Vector = .{ .x = -29, .y = 11 };
+    c.FT_Set_Transform(face.ft_face, null, &delta);
+    const shaped = try shaper.shape(0, .regular, 1);
+    var restored: c.FT_Vector = undefined;
+    c.FT_Get_Transform(face.ft_face, null, &restored);
+    try std.testing.expectEqual(delta.x, restored.x);
+    try std.testing.expectEqual(delta.y, restored.y);
+
+    var count: c_uint = 0;
+    const positions = c.hb_buffer_get_glyph_positions(shaper.hb_buf, &count);
+    var has_fraction = false;
+    for (shaped, positions[0..count]) |glyph, pos| {
+        try std.testing.expectEqual(pos.x_advance, glyph.x_advance);
+        try std.testing.expectEqual(pos.x_offset, glyph.x_offset);
+        try std.testing.expectEqual(pos.y_offset, glyph.y_offset);
+        has_fraction = has_fraction or @mod(pos.x_advance, 64) != 0 or @mod(pos.x_offset, 64) != 0 or @mod(pos.y_offset, 64) != 0;
+    }
+    try std.testing.expect(has_fraction);
+    c.FT_Set_Transform(face.ft_face, null, null);
+    var repaired: std.ArrayList(ShapedGlyph) = .empty;
+    defer repaired.deinit(alloc);
+    try std.testing.expect(try shaper.shapeClusterWith(0, 0, &.{ 'x', 0x0301 }, &repaired));
+    try std.testing.expectEqualSlices(ShapedGlyph, shaped, repaired.items);
 }

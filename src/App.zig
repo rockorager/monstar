@@ -122,7 +122,7 @@ pipeline: ReadPipeline,
 child_pid: posix.pid_t,
 font: Font,
 /// The physical pixel size the font is currently loaded at.
-font_size_px: u31,
+font_size_px: f64,
 /// Runtime-only size override from keyboard shortcuts, preserving the
 /// configured point or logical-pixel unit.
 runtime_font_size: ?Config.FontSize,

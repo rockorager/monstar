@@ -423,7 +423,9 @@ fn parseWindowPadding(value: []const u8) error{InvalidValue}!WindowPadding {
 
 /// Convert a configured size to physical pixels. Point sizes use the
 /// conventional Linux 96 DPI baseline; pixel sizes are already logical pixels.
-pub fn fontSizePixels(size: FontSize, scale120: u32) u31 {
+/// Leave rounding to Font so grid pixels and 26.6 outline sizes are derived
+/// independently (rounding twice would change the grid near half pixels).
+pub fn fontSizePixels(size: FontSize, scale120: u32) f64 {
     std.debug.assert(std.math.isFinite(size.value()) and size.value() > 0);
     std.debug.assert(scale120 > 0);
 
@@ -433,7 +435,7 @@ pub fn fontSizePixels(size: FontSize, scale120: u32) u31 {
         .pixels => |pixels| pixels,
     };
     const pixels = logical_pixels * output_scale;
-    return @max(1, @as(u31, @intFromFloat(@round(pixels))));
+    return @max(1, pixels);
 }
 
 pub const colorsForScheme = config_theme.colorsForScheme;
@@ -787,16 +789,21 @@ test "palette accepts all indices and numeric bases" {
 }
 
 test "font size points convert to scaled physical pixels" {
-    try std.testing.expectEqual(@as(u31, 16), fontSizePixels(.{ .points = 12 }, 120));
-    try std.testing.expectEqual(@as(u31, 24), fontSizePixels(.{ .points = 12 }, 180));
-    try std.testing.expectEqual(@as(u31, 32), fontSizePixels(.{ .points = 12 }, 240));
-    try std.testing.expectEqual(@as(u31, 17), fontSizePixels(.{ .points = 12.5 }, 120));
+    try std.testing.expectEqual(@as(f64, 16), fontSizePixels(.{ .points = 12 }, 120));
+    try std.testing.expectEqual(@as(f64, 24), fontSizePixels(.{ .points = 12 }, 180));
+    try std.testing.expectEqual(@as(f64, 32), fontSizePixels(.{ .points = 12 }, 240));
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0 / 3.0), fontSizePixels(.{ .points = 12.5 }, 120), 0.000001);
+    try std.testing.expectEqual(@as(f64, 25), fontSizePixels(.{ .points = 12.5 }, 180));
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0 / 3.0), fontSizePixels(.{ .points = 12.5 }, 240), 0.000001);
+    try std.testing.expectEqual(@as(f64, 17), @round(fontSizePixels(.{ .pixels = 17.499 }, 120)));
+    try std.testing.expectEqual(@as(f64, 18), @round(fontSizePixels(.{ .pixels = 17.501 }, 120)));
+    try std.testing.expectEqual(@as(f64, 1), fontSizePixels(.{ .pixels = 0.1 }, 120));
 }
 
 test "font size pixels scale directly with the output" {
-    try std.testing.expectEqual(@as(u31, 12), fontSizePixels(.{ .pixels = 12 }, 120));
-    try std.testing.expectEqual(@as(u31, 18), fontSizePixels(.{ .pixels = 12 }, 180));
-    try std.testing.expectEqual(@as(u31, 24), fontSizePixels(.{ .pixels = 12 }, 240));
+    try std.testing.expectEqual(@as(f64, 12), fontSizePixels(.{ .pixels = 12 }, 120));
+    try std.testing.expectEqual(@as(f64, 18), fontSizePixels(.{ .pixels = 12 }, 180));
+    try std.testing.expectEqual(@as(f64, 24), fontSizePixels(.{ .pixels = 12 }, 240));
 }
 
 test "font size accepts bare points and explicit point or pixel units" {
@@ -808,7 +815,7 @@ test "font size accepts bare points and explicit point or pixel units" {
     try std.testing.expectEqual(FontSize{ .points = 12 }, config.font_size);
     try config.set(std.testing.allocator, "font-size", "12px");
     try std.testing.expectEqual(FontSize{ .pixels = 12 }, config.font_size);
-    try std.testing.expectEqual(@as(u31, 12), fontSizePixels(config.font_size, 120));
+    try std.testing.expectEqual(@as(f64, 12), fontSizePixels(config.font_size, 120));
 
     try config.set(std.testing.allocator, "font-size", "16.5px");
     try std.testing.expectEqual(FontSize{ .pixels = 16.5 }, config.font_size);

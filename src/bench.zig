@@ -6,7 +6,6 @@
 //! behaves like the wl_shm buffer (both are plain anonymous pages).
 
 const std = @import("std");
-const build_options = @import("build_options");
 const vt = @import("ghostty-vt");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
@@ -62,10 +61,7 @@ pub fn run(init: std.process.Init) !void {
     const w = &stdout.interface;
     defer w.flush() catch {};
 
-    try w.print("blending: {s}\n\n", .{if (build_options.linear_light_blending)
-        "linear light, encoded 8-bit framebuffer"
-    else
-        "encoded-space 8-bit"});
+    try w.writeAll("blending: exact-sRGB linear light, encoded 8-bit framebuffer\n\n");
     try w.print(
         "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame), font {s} {d:.1}{s} ({d}px)\n\n",
         .{
