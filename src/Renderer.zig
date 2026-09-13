@@ -9,6 +9,7 @@ const Renderer = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const c = @import("c");
 const vt = @import("ghostty-vt");
 const CellDamageTracker = @import("CellDamageTracker.zig");
@@ -19,6 +20,7 @@ const glyph_constraints = @import("glyph_constraints.zig");
 const kitty_graphics = @import("kitty_graphics.zig");
 const pixel_copy = @import("pixel_copy.zig");
 const pixel_raster = @import("pixel_raster.zig");
+const blending = if (build_options.linear_light_blending) pixel_raster.linear_light else pixel_raster;
 
 const log = std.log.scoped(.renderer);
 const KittyImage = vt.kitty.graphics.Image;
@@ -37,10 +39,10 @@ pub const kittyItemsEqual = kitty_graphics.kittyItemsEqual;
 
 const PixelRange = pixel_raster.PixelRange;
 const argb = pixel_raster.argb;
-const blendCapsule = pixel_raster.blendCapsule;
-const blendPixel = pixel_raster.blendPixel;
+const blendCapsule = blending.blendCapsule;
+const blendPixel = blending.blendPixel;
 const blendRgb = pixel_raster.blendRgb;
-const blitGlyph = pixel_raster.blitGlyph;
+const blitGlyph = blending.blitGlyph;
 const fillRect = pixel_raster.fillRect;
 
 alloc: std.mem.Allocator,
@@ -1915,10 +1917,10 @@ test "kitty unscaled blit honors rgba alpha" {
     blitKittyUnscaled(&pixels, 2, 2, 2, image, viewport, 0, 0);
     try std.testing.expectEqual(bg, pixels[0]); // alpha 0 skipped
     try std.testing.expectEqual(@as(u32, 0xffc8c8c8), pixels[1]); // opaque
-    try std.testing.expectEqual(
-        blendPixel(bg, &.{ 200, 200, 200, 128 }),
-        pixels[2],
-    ); // partial alpha blends
+    // Mixing encoded 200 with 17 rounds to 109; decoding with gamma 2.2,
+    // mixing at alpha 128/255, and encoding rounds to 146.
+    const mixed: u32 = if (build_options.linear_light_blending) 0xff929292 else 0xff6d6d6d;
+    try std.testing.expectEqual(mixed, pixels[2]);
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[3]);
 }
 

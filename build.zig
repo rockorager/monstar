@@ -63,6 +63,11 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "enable_dbus", enable_dbus);
+    build_options.addOption(bool, "linear_light_blending", b.option(
+        bool,
+        "linear-light-blending",
+        "Blend in linear light using the existing 8-bit buffers (default: false)",
+    ) orelse false);
     root_module.addOptions("build_options", build_options);
     root_module.addAnonymousImport("monstar-terminfo-source", .{
         .root_source_file = b.path("dist/monstar.terminfo"),

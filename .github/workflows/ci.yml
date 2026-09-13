@@ -84,6 +84,9 @@ jobs:
       - name: Run tests
         run: zig build test --summary all
 
+      - name: Run linear-light blending tests
+        run: zig build test -Dlinear-light-blending=true --summary all
+
       - name: Build executable
         run: zig build --summary all
 

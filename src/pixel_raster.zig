@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
+const raster = @This();
 
 pub const ScrollbarThumb = struct {
     x: u31,
@@ -81,6 +82,18 @@ pub fn blendCapsule(
     thumb: ScrollbarThumb,
     color: u32,
 ) void {
+    blendCapsuleWith(raster, pixels, stride, buf_width, buf_height, thumb, color);
+}
+
+fn blendCapsuleWith(
+    comptime pr: type,
+    pixels: []u32,
+    stride: u31,
+    buf_width: u31,
+    buf_height: u31,
+    thumb: ScrollbarThumb,
+    color: u32,
+) void {
     if (thumb.alpha == 0 or thumb.width == 0 or thumb.height == 0 or
         thumb.x >= buf_width or thumb.y >= buf_height) return;
     std.debug.assert(color >> 24 == 0xff);
@@ -106,7 +119,7 @@ pub fn blendCapsule(
             if (coverage == 0) continue;
             const alpha: u8 = @intFromFloat(@round(@as(f64, @floatFromInt(thumb.alpha)) * coverage));
             const pixel = &pixels[@as(usize, y) * stride + x];
-            pixel.* = blend(color, pixel.*, alpha);
+            pixel.* = pr.blend(color, pixel.*, alpha);
         }
     }
 }
@@ -124,15 +137,31 @@ pub fn blitGlyph(
     reverse_color_glyph: bool,
     clip_x: ?PixelRange,
 ) void {
+    blitGlyphWith(raster, pixels, stride, buf_width, buf_height, g, x0, y0, color, reverse_color_glyph, clip_x);
+}
+
+fn blitGlyphWith(
+    comptime pr: type,
+    pixels: []u32,
+    stride: u31,
+    buf_width: u31,
+    buf_height: u31,
+    g: *const Font.Glyph,
+    x0: i32,
+    y0: i32,
+    color: u32,
+    reverse_color_glyph: bool,
+    clip_x: ?PixelRange,
+) void {
     switch (g.format) {
         .alpha => if (g.fully_opaque)
             blitOpaqueGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x)
         else
-            blitAlphaGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x),
+            blitAlphaGlyph(pr, pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x),
         .bgra => if (reverse_color_glyph)
-            blitBgraGlyphAsAlpha(pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x)
+            blitBgraGlyphAsAlpha(pr, pixels, stride, buf_width, buf_height, g, x0, y0, color, clip_x)
         else
-            blitBgraGlyph(pixels, stride, buf_width, buf_height, g, x0, y0, clip_x),
+            blitBgraGlyph(pr, pixels, stride, buf_width, buf_height, g, x0, y0, clip_x),
     }
 }
 
@@ -189,6 +218,7 @@ fn blitOpaqueGlyph(
 }
 
 fn blitAlphaGlyph(
+    comptime pr: type,
     pixels: []u32,
     stride: u31,
     buf_width: u31,
@@ -205,7 +235,7 @@ fn blitAlphaGlyph(
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
         const src = g.bitmap[gy * g.width + clip.gx_start .. gy * g.width + clip.gx_end];
         const dst = pixels[py * stride + px_start ..][0..src.len];
-        blendAlphaSpan(dst, src, color);
+        pr.blendAlphaSpan(dst, src, color);
     }
 }
 
@@ -244,6 +274,7 @@ fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) 
 }
 
 fn blitBgraGlyph(
+    comptime pr: type,
     pixels: []u32,
     stride: u31,
     buf_width: u31,
@@ -259,7 +290,7 @@ fn blitBgraGlyph(
         const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
         const dst = pixels[py * stride + px_start ..][0 .. clip.gx_end - clip.gx_start];
-        blendPremultipliedBgraSpan(dst, src[0 .. dst.len * 4]);
+        pr.blendPremultipliedBgraSpan(dst, src[0 .. dst.len * 4]);
     }
 }
 
@@ -321,6 +352,7 @@ fn blendPremultipliedBgraSpan(noalias dst: []u32, noalias src: []const u8) void 
 }
 
 fn blitBgraGlyphAsAlpha(
+    comptime pr: type,
     pixels: []u32,
     stride: u31,
     buf_width: u31,
@@ -340,7 +372,7 @@ fn blitBgraGlyphAsAlpha(
         for (dst, 0..) |*pixel, i| {
             const alpha = src[i * 4 + 3];
             if (alpha == 0) continue;
-            pixel.* = blend(color, pixel.*, alpha);
+            pixel.* = pr.blend(color, pixel.*, alpha);
         }
     }
 }
@@ -385,6 +417,168 @@ fn blendPremultipliedBgra(src: []const u8, bg: u32) u32 {
     const b: u32 = @min(out_alpha, @as(u32, src[0]) + ((bg & 0xff) * na) / 255);
     return (out_alpha << 24) | (r << 16) | (g << 8) | b;
 }
+
+/// Linear-light composition with encoded, premultiplied 8-bit storage.
+/// Uses a gamma-2.2 transfer function and 16-bit linear intermediates, without
+/// a framebuffer conversion pass or compositor color-management support.
+/// Each blend requantizes its result, so repeated blends can lose detail.
+pub const linear_light = struct {
+    // The gamma-2.2 decode convention follows cnt0's proposal in PR #58.
+    const decode: [256]u16 = blk: {
+        @setEvalBranchQuota(100_000);
+        var table: [256]u16 = undefined;
+        for (&table, 0..) |*entry, i| {
+            const c: f64 = @as(f64, @floatFromInt(i)) / 255.0;
+            entry.* = @intFromFloat(std.math.pow(f64, c, 2.2) * 65535.0 + 0.5);
+        }
+        break :blk table;
+    };
+    // Construct the 64 KiB encode table using the 255 boundaries between
+    // rounded output bytes, instead of evaluating pow for all 65536 entries.
+    const encode: [65536]u8 = blk: {
+        @setEvalBranchQuota(200_000);
+        var table: [65536]u8 = undefined;
+        var start: usize = 0;
+        for (0..256) |value| {
+            const end: usize = if (value == 255) table.len else @intFromFloat(@ceil(
+                std.math.pow(f64, (@as(f64, @floatFromInt(value)) + 0.5) / 255, 2.2) * 65535,
+            ));
+            @memset(table[start..end], @intCast(value));
+            start = end;
+        }
+        break :blk table;
+    };
+
+    pub fn blendCapsule(pixels: []u32, stride: u31, width: u31, height: u31, thumb: ScrollbarThumb, color: u32) void {
+        blendCapsuleWith(linear_light, pixels, stride, width, height, thumb, color);
+    }
+
+    pub fn blitGlyph(
+        pixels: []u32,
+        stride: u31,
+        width: u31,
+        height: u31,
+        g: *const Font.Glyph,
+        x: i32,
+        y: i32,
+        color: u32,
+        reverse_color_glyph: bool,
+        clip_x: ?PixelRange,
+    ) void {
+        blitGlyphWith(linear_light, pixels, stride, width, height, g, x, y, color, reverse_color_glyph, clip_x);
+    }
+
+    fn decodeRgb(color: u32) [3]u32 {
+        return .{ decode[color >> 16 & 0xff], decode[color >> 8 & 0xff], decode[color & 0xff] };
+    }
+
+    // Text repeatedly uses the same color pairs and coverage bytes. Keep
+    // exact encoded results, populated lazily so rare pairs do not pay for
+    // 256 blends. Thread-local storage isolates independent raster workers.
+    const CoverageCache = struct {
+        foreground: u32 = 0,
+        background: u32 = 0,
+        valid: [4]u64 = @splat(0),
+        pixels: [256]u32 = undefined,
+    };
+    threadlocal var coverage_cache: [32]CoverageCache = @splat(.{});
+
+    fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) void {
+        std.debug.assert(dst.len == coverage.len and color >> 24 == 255);
+        if (dst.len == 0) return;
+        const fg = decodeRgb(color);
+        const background = dst[0];
+        const cache = &coverage_cache[((color *% 0x9e3779b9) ^ (background *% 0x85ebca6b)) >> 27];
+        if (cache.foreground != color or cache.background != background) {
+            cache.foreground = color;
+            cache.background = background;
+            cache.valid = @splat(0);
+        }
+        for (dst, coverage) |*pixel, cov| {
+            if (cov == 0) continue;
+            if (cov == 255) {
+                pixel.* = color;
+            } else if (pixel.* == background) {
+                const bit = @as(u64, 1) << @as(u6, @truncate(cov));
+                const valid = &cache.valid[cov >> 6];
+                if (valid.* & bit == 0) {
+                    cache.pixels[cov] = blendDecoded(color, fg, background, cov);
+                    valid.* |= bit;
+                }
+                pixel.* = cache.pixels[cov];
+            } else {
+                // Overlapping glyphs and images may change the destination
+                // within a span. Never substitute the assumed background.
+                pixel.* = blendDecoded(color, fg, pixel.*, cov);
+            }
+        }
+    }
+
+    fn blend(fg: u32, bg: u32, alpha: u8) u32 {
+        std.debug.assert(fg >> 24 == 255);
+        return blendDecoded(fg, decodeRgb(fg), bg, alpha);
+    }
+
+    fn blendDecoded(fg: u32, fg_linear: [3]u32, bg: u32, alpha: u8) u32 {
+        if (alpha == 0) return bg;
+        if (alpha == 255 or fg == bg) return fg;
+        const a: u32 = alpha;
+        const na = 255 - a;
+        const bg_alpha = bg >> 24;
+        if (bg_alpha == 255) {
+            var result: u32 = 0xff000000;
+            inline for (.{ 16, 8, 0 }, 0..) |shift, channel| {
+                const bg_linear: u32 = decode[bg >> shift & 0xff];
+                const mixed = (fg_linear[channel] * a + bg_linear * na + 127) / 255;
+                result |= @as(u32, encode[mixed]) << shift;
+            }
+            return result;
+        }
+        if (bg_alpha == 0) return raster.premultipliedArgb(.{
+            .r = @truncate(fg >> 16),
+            .g = @truncate(fg >> 8),
+            .b = @truncate(fg),
+        }, alpha);
+
+        // Unassociate the encoded destination before decoding, blend with
+        // exact alpha weights, then encode and premultiply for wl_shm.
+        const fg_weight = a * 255;
+        const bg_weight = bg_alpha * na;
+        const weight = fg_weight + bg_weight;
+        const out_alpha = (weight + 127) / 255;
+        var result: u32 = out_alpha << 24;
+        inline for (.{ 16, 8, 0 }, 0..) |shift, channel| {
+            const bg_linear: u32 = decode[unassociate(bg >> shift & 0xff, bg_alpha)];
+            const mixed = (fg_linear[channel] * fg_weight + bg_linear * bg_weight + weight / 2) / weight;
+            const premultiplied = (@as(u32, encode[mixed]) * out_alpha + 127) / 255;
+            result |= premultiplied << shift;
+        }
+        return result;
+    }
+
+    fn unassociate(channel: u32, alpha: u32) u8 {
+        std.debug.assert(alpha > 0 and alpha <= 255);
+        return @intCast(@min(255, (channel * 255 + alpha / 2) / alpha));
+    }
+
+    pub fn blendPixel(dst: u32, src: *const [4]u8) u32 {
+        return linear_light.blend(raster.argb(.{ .r = src[0], .g = src[1], .b = src[2] }), dst, src[3]);
+    }
+
+    fn blendPremultipliedBgraSpan(noalias dst: []u32, noalias src: []const u8) void {
+        std.debug.assert(src.len == dst.len * 4);
+        for (dst, 0..) |*pixel, i| {
+            const bgra = src[i * 4 ..][0..4];
+            if (bgra[3] == 0) continue;
+            const fg = raster.argb(.{
+                .r = unassociate(bgra[2], bgra[3]),
+                .g = unassociate(bgra[1], bgra[3]),
+                .b = unassociate(bgra[0], bgra[3]),
+            });
+            pixel.* = linear_light.blend(fg, pixel.*, bgra[3]);
+        }
+    }
+};
 
 test "fillRect clips to a view while honoring framebuffer stride" {
     const untouched: u32 = 0x12345678;
@@ -580,4 +774,103 @@ test "blendPremultipliedBgraSpan matches scalar blend" {
             try std.testing.expectEqualSlices(u32, want[0..len], got[0..len]);
         }
     }
+}
+
+test "linear-light encode table matches the inverse transfer function" {
+    for (linear_light.encode, 0..) |encoded, i| {
+        const expected: u8 = @intFromFloat(@round(std.math.pow(f64, @as(f64, @floatFromInt(i)) / 65535, 1.0 / 2.2) * 255));
+        try std.testing.expectEqual(expected, encoded);
+    }
+    try std.testing.expectEqual(@as(u32, 0xffbababa), linear_light.blend(0xffffffff, 0xff000000, 128));
+    try std.testing.expectEqual(@as(u32, 0xffbababa), linear_light.blend(0xff000000, 0xffffffff, 128));
+}
+
+test "linear-light composition matches floating point for opaque and premultiplied destinations" {
+    const fg: u32 = 0xff60c811;
+    for ([_]u8{ 0, 1, 63, 128, 254, 255 }) |bg_alpha| {
+        const bg = premultipliedArgb(.{ .r = 5, .g = 80, .b = 224 }, bg_alpha);
+        for (0..256) |alpha| {
+            const got = linear_light.blend(fg, bg, @intCast(alpha));
+            const expected = referenceLinearLightBlend(fg, bg, @intCast(alpha));
+            try std.testing.expectEqual(expected >> 24, got >> 24);
+            inline for (.{ 16, 8, 0 }) |shift| {
+                const channel: i32 = @intCast(got >> shift & 0xff);
+                const want: i32 = @intCast(expected >> shift & 0xff);
+                // Quantized decode and unassociation can each cost a byte
+                // step, but encoded-space blending differs by much more.
+                try std.testing.expect(@abs(channel - want) <= 2);
+                try std.testing.expect(channel <= got >> 24);
+            }
+        }
+        try std.testing.expectEqual(bg, linear_light.blend(fg, bg, 0));
+        try std.testing.expectEqual(fg, linear_light.blend(fg, bg, 255));
+    }
+}
+
+fn referenceLinearLightBlend(fg: u32, bg: u32, alpha: u8) u32 {
+    const a = @as(f64, @floatFromInt(alpha)) / 255;
+    const ba = @as(f64, @floatFromInt(bg >> 24)) / 255;
+    const out_alpha = a + ba * (1 - a);
+    if (out_alpha == 0) return 0;
+    const out_byte: u32 = @intFromFloat(@round(out_alpha * 255));
+    var result = out_byte << 24;
+    inline for (.{ 16, 8, 0 }) |shift| {
+        const f = @as(f64, @floatFromInt(fg >> shift & 0xff)) / 255;
+        const b = if (ba == 0) 0 else @as(f64, @floatFromInt(bg >> shift & 0xff)) / (ba * 255);
+        const value = (std.math.pow(f64, f, 2.2) * a + std.math.pow(f64, b, 2.2) * ba * (1 - a)) / out_alpha;
+        const encoded = std.math.pow(f64, value, 1.0 / 2.2);
+        const channel: u32 = @intFromFloat(@round(encoded * @as(f64, @floatFromInt(out_byte))));
+        result |= channel << shift;
+    }
+    return result;
+}
+
+test "linear-light glyph clipping and image color preservation" {
+    var bitmap = [_]u8{ 255, 128, 0, 64, 192, 255 };
+    const glyph: Font.Glyph = .{ .bitmap = &bitmap, .width = 3, .height = 2, .bearing_x = 0, .bearing_y = 0 };
+    var pixels = [_]u32{0xff000000} ** 12;
+    linear_light.blitGlyph(&pixels, 4, 3, 3, &glyph, -1, 1, 0xffffffff, false, .{ .start = 0, .end = 1 });
+    try std.testing.expectEqual(@as(u32, 0xffbababa), pixels[4]);
+    try std.testing.expectEqual(referenceLinearLightBlend(0xffffffff, 0xff000000, 192), pixels[8]);
+    for (pixels, 0..) |pixel, i| {
+        if (i != 4 and i != 8) try std.testing.expectEqual(@as(u32, 0xff000000), pixel);
+    }
+    try std.testing.expectEqual(@as(u32, 0xff804020), linear_light.blendPixel(0, &.{ 128, 64, 32, 255 }));
+    try std.testing.expectEqual(@as(u32, 0x80402010), linear_light.blendPixel(0, &.{ 128, 64, 32, 128 }));
+    var emoji = [_]u32{0} ** 3;
+    linear_light.blendPremultipliedBgraSpan(&emoji, &.{ 32, 64, 128, 255, 16, 32, 64, 128, 255, 255, 255, 128 });
+    try std.testing.expectEqualSlices(u32, &.{ 0xff804020, 0x80402010, 0x80808080 }, &emoji);
+}
+
+test "linear-light coverage cache preserves exact blends across backgrounds and eviction" {
+    var coverage: [256]u8 = undefined;
+    for (&coverage, 0..) |*cov, i| cov.* = @intCast(i);
+    // More distinct pairs than cache slots forces eviction. Repeat in reverse
+    // order to exercise both warm entries and slots holding different keys.
+    for (0..2) |pass| {
+        for (0..96) |index| {
+            const i: u32 = @intCast(if (pass == 0) index else 95 - index);
+            const foreground = 0xff000000 | (i * 0x010203);
+            for ([_]u8{ 0, 1, 63, 128, 254, 255 }) |alpha| {
+                const background = premultipliedArgb(.{ .r = 17, .g = 95, .b = 231 }, alpha);
+                for ([_]bool{ false, true }) |overlap| {
+                    var got: [256]u32 = @splat(background);
+                    var want: [256]u32 = undefined;
+                    // The first pixel stays on the nominal background. Some
+                    // later pixels contain previous ink with different alpha.
+                    if (overlap) {
+                        for (&got, 0..) |*pixel, x| {
+                            if (x % 3 == 1) pixel.* = 0xa0137d48;
+                        }
+                    }
+                    for (&want, got, coverage) |*expected, bg, cov| {
+                        expected.* = linear_light.blend(foreground, bg, cov);
+                    }
+                    linear_light.blendAlphaSpan(&got, &coverage, foreground);
+                    try std.testing.expectEqualSlices(u32, &want, &got);
+                }
+            }
+        }
+    }
+    linear_light.blendAlphaSpan(&.{}, &.{}, 0xff123456);
 }

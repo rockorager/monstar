@@ -6,6 +6,7 @@
 //! behaves like the wl_shm buffer (both are plain anonymous pages).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const vt = @import("ghostty-vt");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
@@ -61,6 +62,10 @@ pub fn run(init: std.process.Init) !void {
     const w = &stdout.interface;
     defer w.flush() catch {};
 
+    try w.print("blending: {s}\n\n", .{if (build_options.linear_light_blending)
+        "linear light, encoded 8-bit framebuffer"
+    else
+        "encoded-space 8-bit"});
     try w.print(
         "grid {d}x{d}, {d}x{d} px ({d:.1} MB frame), font {s} {d:.1}{s} ({d}px)\n\n",
         .{
@@ -91,6 +96,22 @@ pub fn run(init: std.process.Init) !void {
         try report(w, "full render", nowNs(init.io) - start, iters, null);
     }
 
+    // Warm the destination-aware translucent path separately from opaque
+    // text, then restore an opaque frame before dirty-render benchmarks.
+    {
+        const original_background_alpha = renderer.background_alpha;
+        defer renderer.background_alpha = original_background_alpha;
+        renderer.background_alpha = 128;
+        try renderer.render(&render_state, pixels, width, height);
+        const iters = 100;
+        const start = nowNs(init.io);
+        for (0..iters) |_| {
+            try renderer.render(&render_state, pixels, width, height);
+        }
+        try report(w, "full render (alpha=128 target)", nowNs(init.io) - start, iters, null);
+    }
+    try renderer.render(&render_state, pixels, width, height);
+
     // Baseline end-to-end scroll frame without the application's async
     // viewport-shift reuse. This remains useful as the full-repaint cost
     // against which the live scroll-blit path is measured.
@@ -109,16 +130,25 @@ pub fn run(init: std.process.Init) !void {
 
     // Steady-state frame: one row changes (cursor line, status bar).
     {
-        const status_line = "\x1b[5;1H\x1b[36mstatus 0123456789 abcdefghijklmnop\x1b[0m";
-        const iters = 1000;
-        const start = nowNs(init.io);
-        for (0..iters) |_| {
-            stream.nextSlice(status_line);
+        const status_lines = [2][]const u8{
+            "\x1b[5;1H\x1b[36mstatus 0123456789 abcdefghijklmnop\x1b[0m",
+            "\x1b[5;1H\x1b[36mSTATUS 9876543210 ponmlkjihgfedcba\x1b[0m",
+        };
+        for (status_lines) |line| {
+            stream.nextSlice(line);
             try render_state.update(alloc, &term);
             try renderer.renderDirty(&render_state, pixels, width, height);
             clearDirty(&render_state);
         }
-        try report(w, "one-row frame (feed+update+render)", nowNs(init.io) - start, iters, null);
+        const iters = 1000;
+        const start = nowNs(init.io);
+        for (0..iters) |i| {
+            stream.nextSlice(status_lines[i % status_lines.len]);
+            try render_state.update(alloc, &term);
+            try renderer.renderDirty(&render_state, pixels, width, height);
+            clearDirty(&render_state);
+        }
+        try report(w, "one-row redraw (feed+update+render)", nowNs(init.io) - start, iters, null);
     }
 
     // Background-heavy content: TUIs paint most cell backgrounds, which
