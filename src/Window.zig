@@ -243,6 +243,35 @@ const Globals = struct {
     }
 };
 
+fn connectDisplay() !*wl.Display {
+    if (wl.Display.connect(null)) |disp| {
+        return disp;
+    } else |err| {
+        // If an explicit WAYLAND_DISPLAY was set, or if failure wasn't ConnectFailed, propagate.
+        if (err != error.ConnectFailed) return err;
+        if (std.c.getenv("WAYLAND_DISPLAY") != null) return err;
+
+        // When WAYLAND_DISPLAY is unset, libwayland defaults to "wayland-0". If the compositor
+        // opened a different socket (e.g. "wayland-1"), try scanning XDG_RUNTIME_DIR.
+        const runtime_dir = std.c.getenv("XDG_RUNTIME_DIR") orelse return err;
+        const dir = std.c.opendir(runtime_dir) orelse return err;
+        defer _ = std.c.closedir(dir);
+
+        while (std.c.readdir(dir)) |entry| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.name)));
+            if (!std.mem.startsWith(u8, name, "wayland-")) continue;
+            if (std.mem.endsWith(u8, name, ".lock")) continue;
+
+            if (wl.Display.connect(@ptrCast(&entry.name))) |disp| {
+                log.info("connected to Wayland socket '{s}' (auto-detected in {s})", .{ name, runtime_dir });
+                return disp;
+            } else |_| {}
+        }
+
+        return err;
+    }
+}
+
 /// Heap-allocated because Wayland listeners hold a pointer to the Window.
 pub fn create(
     alloc: std.mem.Allocator,
@@ -250,7 +279,7 @@ pub fn create(
     title: [:0]const u8,
     initial_size: InitialSize,
 ) !*Window {
-    const display = try wl.Display.connect(null);
+    const display = try connectDisplay();
     errdefer display.disconnect();
 
     const registry = try display.getRegistry();

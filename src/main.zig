@@ -616,3 +616,9 @@ test "terminal emulation of simple output" {
     defer alloc.free(text);
     try std.testing.expectEqualStrings("a\nb\nc", text);
 }
+
+test {
+    _ = @import("tc.zig");
+    _ = @import("tc/test_integration.zig");
+    _ = @import("shell.zig");
+}
