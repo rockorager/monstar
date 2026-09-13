@@ -351,6 +351,16 @@ zig build fmt
 zig build test
 ```
 
+To try CPU linear-light blending with the existing 8-bit framebuffers:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dlinear-light-blending=true
+```
+
+This build-time option defaults to `false` and needs no compositor color
+management. See [linear-light blending](docs/linear-light-blending.md) for
+precision, memory, and benchmark tradeoffs.
+
 To smoke-test Kitty graphics animation in a running Monstar window:
 
 ```sh

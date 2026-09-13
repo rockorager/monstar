@@ -5848,9 +5848,11 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             !std.meta.eql(self.async_job.scrollbar, new_scrollbar);
         try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_search, new_search_no_match, new_range, new_search_range, new_search_matches, new_scrollbar, hyperlink_hints);
         new_search_matches = .empty;
-        const kitty_dirty = self.term.screens.active.kitty_images.dirty;
-        var kitty_changed = kitty_dirty;
+        var kitty_changed = false;
         if (has_kitty_graphics) {
+            // Text-only scrolling also dirties the kitty storage. It can
+            // change pixels only when placements exist (or were removed).
+            kitty_changed = self.term.screens.active.kitty_images.dirty;
             const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
             if (!Renderer.kittyItemsEqual(self.async_job.kitty, items)) kitty_changed = true;
             try self.async_job.replaceKitty(self.alloc, &self.kitty_cache, items);

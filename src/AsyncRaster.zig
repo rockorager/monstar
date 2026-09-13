@@ -537,7 +537,12 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     }
     if (job.scroll_shift) |shift| {
         clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
-        if (scrollFromPreviousFrame(job, shift, self.font.cell_height)) {
+        // Ink crossing row boundaries cannot be reused independently: a
+        // discarded row may have painted into a retained row's pixels.
+        if (!self.font.neighbor_row_overhang and
+            self.renderer.row_overhang.count() == 0 and
+            scrollFromPreviousFrame(job, shift, self.font.cell_height))
+        {
             try self.renderer.shiftCellState(self.state.rows, self.state.cols, shift);
             try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
             // Rasterization touched only dirty rows, but every retained row
@@ -545,8 +550,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             damage.* = .full;
             return;
         }
-        // App normally excludes this case before narrowing the dirty rows.
-        // A full render is still a safe fallback if the job is malformed.
+        // Dirty rows may already have been narrowed by the detector.
         try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
         damage.* = .full;
         return;
@@ -739,6 +743,92 @@ test "unchanged dirty rows report no damage" {
 
     try std.testing.expectEqual(Damage.none, damage);
     try std.testing.expectEqual(@as(usize, 0), raster.renderer.rendered_rects.items.len);
+}
+
+test "primary and alternate screen scroll pixels match full repaint" {
+    const ScrollDetector = @import("ScrollDetector.zig");
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |stale| {
+        for ([_]?Config.MetricModifier{ null, .{ .percent = -25 } }) |cell_height| {
+            for ([_][]const u8{ "", "\x1b[?1049h" }) |screen| {
+                for ([_]isize{ 1, -1 }) |shift| {
+                    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 12, .rows = 4 });
+                    defer term.deinit(alloc);
+                    var stream = term.vtStream();
+                    defer stream.deinit();
+                    stream.nextSlice(screen);
+                    stream.nextSlice("Ågj\r\n\x1b[31msecond\r\n\x1b[32mc\u{301}\r\npq");
+                    var state: vt.RenderState = .empty;
+                    defer state.deinit(alloc);
+                    try state.update(alloc, &term);
+                    var font: Font = try .init(alloc, "DejaVu Sans Mono", 16, cell_height);
+                    defer font.deinit(alloc);
+                    var raster = try AsyncRaster.init(font.discovery(), .{ .r = 1, .g = 2, .b = 3 }, null, null, null, 255, false, &state);
+                    defer raster.deinit();
+                    const width = font.cell_width * 12;
+                    const height = font.cell_height * 4;
+                    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+                    defer alloc.free(pixels);
+                    const previous = try alloc.alloc(u32, pixels.len);
+                    defer alloc.free(previous);
+                    const expected = try alloc.alloc(u32, pixels.len);
+                    defer alloc.free(expected);
+                    var job: Job = .{
+                        .pixels = pixels,
+                        .source_pixels = null,
+                        .width = width,
+                        .height = height,
+                        .grid_x = 0,
+                        .grid_y = 0,
+                        .grid_width = width,
+                        .grid_height = height,
+                        .age = 1,
+                        .generation = 1,
+                        .focused = true,
+                        .hyperlink_hints = false,
+                        .link_range = null,
+                        .search_range = null,
+                        .search_matches = &.{},
+                        .search_background = .{ .r = 1, .g = 2, .b = 3 },
+                        .search_foreground = .{ .r = 4, .g = 5, .b = 6 },
+                        .preedit = null,
+                        .link_hint = null,
+                        .search = null,
+                        .search_no_match = false,
+                        .scrollbar = null,
+                        .kitty_items = &.{},
+                        .overlay_dirty = false,
+                        .scroll_shift = null,
+                        .repair = .none,
+                    };
+                    var damage: Damage = .none;
+                    try raster.renderJob(job, &damage);
+                    @memcpy(previous, pixels);
+                    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+                    state.dirty = .false;
+                    const old_cursor = state.cursor;
+                    stream.nextSlice(if (shift > 0) "\r\nnew" else "\x1b[T\x1b[1;1Hnew");
+                    var detector: ScrollDetector = .{};
+                    defer detector.deinit(alloc);
+                    const scroll = (try detector.detect(alloc, &state, &term)).?;
+                    try state.update(alloc, &term);
+                    detector.prepare(&state, scroll, old_cursor);
+                    job.scroll_shift = scroll.shift;
+                    if (stale) {
+                        @memset(pixels, 0x1234);
+                        job.age = 2;
+                        job.source_pixels = previous;
+                    }
+                    try raster.renderJob(job, &damage);
+                    try std.testing.expectEqual(cell_height == null, raster.renderer.cellDamageStats().dirty_rows > 0);
+                    var reference: Renderer = try .init(alloc, &font, .{});
+                    defer reference.deinit();
+                    try reference.render(&state, expected, width, height);
+                    try std.testing.expectEqualSlices(u32, expected, pixels);
+                }
+            }
+        }
+    }
 }
 
 test "repair previous frame" {
