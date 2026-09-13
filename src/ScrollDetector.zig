@@ -1,6 +1,7 @@
 //! Detects whole-row viewport shifts by matching the previous render
 //! snapshot's row pins against the terminal's new viewport. Ghostty marks a
 //! viewport-pin change as a full redraw but does not report the displacement.
+//! In-place one-row rotations instead require matching copied cell contents.
 
 const ScrollDetector = @This();
 
@@ -49,7 +50,27 @@ pub fn detect(
 
     const old_viewport = state.viewport_pin orelse return null;
     const new_viewport = screen.pages.getTopLeft(.viewport);
-    if (old_viewport.eql(new_viewport)) return null;
+    if (old_viewport.eql(new_viewport)) {
+        // Row rotation changes the page layout without moving its pins.
+        // Ordinary writes leave the layout serial unchanged: avoid scanning
+        // the viewport on those updates. Only dereference the current pin.
+        if (rows < 2 or new_viewport.node.serial == state.row_data.items(.serial)[0]) return null;
+        try self.predirty.resize(alloc, rows, false);
+        self.predirty.unsetAll();
+        for ([_]isize{ 1, -1 }) |shift| {
+            var current = screen.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+            var matched: usize = 0;
+            var y: usize = 0;
+            while (current.next()) |pin| : (y += 1) {
+                const old_y = @as(isize, @intCast(y)) + shift;
+                if (old_y < 0 or old_y >= rows) continue;
+                if (!rowMatches(pin, state.row_data.items(.cells)[@intCast(old_y)].slice())) break;
+                matched += 1;
+            }
+            if (matched == rows - 1) return .{ .shift = shift };
+        }
+        return null;
+    }
 
     try self.pins.resize(alloc, rows);
     try self.predirty.resize(alloc, rows, false);
@@ -103,6 +124,20 @@ pub fn prepare(self: *const ScrollDetector, state: *vt.RenderState, scroll: Scro
         }
     }
     state.dirty = .partial;
+}
+
+fn rowMatches(pin: vt.Pin, previous: std.MultiArrayList(vt.RenderState.Cell).Slice) bool {
+    const cells = pin.cells(.all);
+    if (cells.len != previous.len) return false;
+    for (cells, previous.items(.raw), 0..) |*cell, old, x| {
+        if (@as(u64, @bitCast(cell.*)) != @as(u64, @bitCast(old))) return false;
+        // Interned IDs are page-local and may have been reused since the
+        // snapshot. Compare resolved values, never old page pointers.
+        if (cell.style_id != 0 and !pin.style(cell).eql(previous.items(.style)[x])) return false;
+        if (cell.content_tag == .codepoint_grapheme and
+            !std.mem.eql(u21, pin.grapheme(cell) orelse &.{}, previous.items(.grapheme)[x])) return false;
+    }
+    return true;
 }
 
 fn findPin(needle: vt.Pin, pins: []const vt.Pin) ?usize {
@@ -165,4 +200,58 @@ test "scroll detector finds viewport shifts and narrows dirty rows" {
     detector.prepare(&state, up, state.cursor);
     const dirty = state.row_data.items(.dirty);
     try std.testing.expectEqualSlices(bool, &.{ true, true, false, false }, dirty[0..4]);
+}
+
+test "alternate screen row rotation reuses unchanged content" {
+    const alloc = std.testing.allocator;
+    for ([_]isize{ 1, -1 }) |shift| {
+        var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 4 });
+        defer term.deinit(alloc);
+        var stream = term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?1049h\x1b[?25lfirst\r\n\x1b[31msecond\r\n\x1b[32mc\u{301}\r\nlast");
+        var state: vt.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &term);
+        clearStateDirty(&state);
+        const old_cursor = state.cursor;
+        stream.nextSlice(if (shift > 0) "\r\nnew" else "\x1b[T\x1b[1;1Hnew");
+        var detector: ScrollDetector = .{};
+        defer detector.deinit(alloc);
+        const scroll = (try detector.detect(alloc, &state, &term)).?;
+        try std.testing.expectEqual(shift, scroll.shift);
+        try state.update(alloc, &term);
+        detector.prepare(&state, scroll, old_cursor);
+        try std.testing.expectEqualSlices(bool, if (shift > 0)
+            &.{ false, false, false, true }
+        else
+            &.{ true, false, false, false }, state.row_data.items(.dirty));
+    }
+}
+
+test "row rotation rejects changed retained cells and resolved contents" {
+    const alloc = std.testing.allocator;
+    for (0..3) |change| {
+        var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 4 });
+        defer term.deinit(alloc);
+        var stream = term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?1049hfirst\r\n\x1b[31msecond\r\n\x1b[32mc\u{301}\r\nlast");
+        var state: vt.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &term);
+        clearStateDirty(&state);
+        stream.nextSlice("\r\nnew");
+        switch (change) {
+            0 => stream.nextSlice("\x1b[1;1HX"),
+            // Simulate interned IDs reused for different resolved data:
+            // raw cells still compare equal, but their old pixels do not.
+            1 => state.row_data.items(.cells)[1].items(.style)[0].flags.bold = true,
+            2 => state.row_data.items(.cells)[2].items(.grapheme)[0] = &.{0x300},
+            else => unreachable,
+        }
+        var detector: ScrollDetector = .{};
+        defer detector.deinit(alloc);
+        try std.testing.expectEqual(@as(?Scroll, null), try detector.detect(alloc, &state, &term));
+    }
 }
