@@ -6,6 +6,7 @@ const KittyClipboard = @This();
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
+const clipboard_format = @import("clipboard_format.zig");
 
 const clipboard = vt.kitty.clipboard;
 
@@ -72,10 +73,13 @@ pub const Read = struct {
 
     pub fn encodeSuccess(
         self: *const Read,
+        alloc: std.mem.Allocator,
         writer: *std.Io.Writer,
         available: []const []const u8,
         content: ?vt.clipboard.Content,
-    ) std.Io.Writer.Error!void {
+    ) (std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+        var converted: ?[]u8 = null;
+        defer if (converted) |data| alloc.free(data);
         var served_buf: [clipboard.max_read_mimes]vt.clipboard.Content = undefined;
         var served_len: usize = 0;
         for (self.mimes) |mime| {
@@ -85,7 +89,19 @@ pub const Read = struct {
             {
                 continue;
             }
-            served_buf[served_len] = .{ .mime = mime, .data = source.data };
+            var data = source.data;
+            // Exact MIME reads preserve bytes. Text aliases crossing STRING's
+            // Latin-1 boundary need conversion, not just a new MIME label.
+            if (!std.mem.eql(u8, source.mime, mime)) {
+                if (std.mem.eql(u8, source.mime, "STRING")) {
+                    if (converted == null) converted = try clipboard_format.decodeLatin1(alloc, source.data);
+                    data = converted.?;
+                } else if (std.mem.eql(u8, mime, "STRING")) {
+                    if (converted == null) converted = try clipboard_format.encodeLatin1(alloc, source.data);
+                    data = converted orelse continue;
+                }
+            }
+            served_buf[served_len] = .{ .mime = mime, .data = data };
             served_len += 1;
         }
 
@@ -557,12 +573,54 @@ test "read response serves text aliases in request order" {
     var output: [1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&output);
     try state.front().?.read.encodeSuccess(
+        std.testing.allocator,
         &writer,
         &.{"text/plain"},
         .{ .mime = "text/plain", .data = "hello" },
     );
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), ":mime=VVRGOF9TVFJJTkc=") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), ":mime=dGV4dC9wbGFpbg==") != null);
+}
+
+test "read response transcodes STRING aliases without changing exact MIME bytes" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+    try state.handle(.{
+        .metadata = "type=read:id=r",
+        .payload = "U1RSSU5HIFVURjhfU1RSSU5HIHRleHQvcGxhaW4=",
+        .terminator = .st,
+    });
+
+    const cases = [_]struct { mime: []const u8, data: []const u8, packets: []const u8 }{
+        .{
+            .mime = "STRING",
+            .data = "caf\xe9",
+            .packets = "\x1b]5522;type=read:status=DATA:id=r:mime=U1RSSU5H;Y2Fm6Q==\x1b\\" ++
+                "\x1b]5522;type=read:status=DATA:id=r:mime=VVRGOF9TVFJJTkc=;Y2Fmw6k=\x1b\\" ++
+                "\x1b]5522;type=read:status=DATA:id=r:mime=dGV4dC9wbGFpbg==;Y2Fmw6k=\x1b\\",
+        },
+        .{
+            .mime = "UTF8_STRING",
+            .data = "café",
+            .packets = "\x1b]5522;type=read:status=DATA:id=r:mime=U1RSSU5H;Y2Fm6Q==\x1b\\" ++
+                "\x1b]5522;type=read:status=DATA:id=r:mime=VVRGOF9TVFJJTkc=;Y2Fmw6k=\x1b\\" ++
+                "\x1b]5522;type=read:status=DATA:id=r:mime=dGV4dC9wbGFpbg==;Y2Fmw6k=\x1b\\",
+        },
+        .{
+            .mime = "text/plain",
+            .data = "€",
+            .packets = "\x1b]5522;type=read:status=DATA:id=r:mime=VVRGOF9TVFJJTkc=;4oKs\x1b\\" ++
+                "\x1b]5522;type=read:status=DATA:id=r:mime=dGV4dC9wbGFpbg==;4oKs\x1b\\",
+        },
+    };
+    for (cases) |case| {
+        var output: [1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&output);
+        try state.front().?.read.encodeSuccess(std.testing.allocator, &writer, &.{case.mime}, .{ .mime = case.mime, .data = case.data });
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "\x1b]5522;type=read:status=OK:id=r\x1b\\{s}\x1b]5522;type=read:status=DONE:id=r\x1b\\", .{case.packets});
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, writer.buffered());
+    }
 }
 
 test "targets listing does not consume a paste grant" {

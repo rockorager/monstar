@@ -3930,7 +3930,7 @@ fn finishKittyClipboardRead(
 ) void {
     var writer: std.Io.Writer.Allocating = .init(self.alloc);
     defer writer.deinit();
-    read.encodeSuccess(&writer.writer, available, content) catch {
+    read.encodeSuccess(self.alloc, &writer.writer, available, content) catch {
         self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EIO);
         self.kitty_clipboard.pop();
         return;
