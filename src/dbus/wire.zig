@@ -454,7 +454,10 @@ pub const Decoder = struct {
             'g' => _ = try self.signature(),
             'v' => {
                 const inner = try self.variantSignature();
-                try self.skipSignatureValue(inner);
+                // A variant's dynamic signature continues the same nesting budget.
+                var child: usize = 0;
+                try self.skipOne(inner, &child, depth + 1);
+                std.debug.assert(child == inner.len);
             },
             'a' => {
                 const start = index.*;
@@ -639,4 +642,37 @@ test "dictionary entries are only valid as array elements" {
     try std.testing.expectError(error.InvalidSignature, e.signature("a{s{sv}}"));
     try e.signature("a{sv}");
     try e.signature("(a{sv})");
+}
+
+test "message validation bounds variant nesting across container types" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |in_array| {
+        for ([_]usize{ 30, 31, 32, 128 }) |variants| {
+            var body = Encoder.init(a);
+            defer body.deinit();
+            const array = if (in_array) try body.beginArray(1) else null;
+            for (1..variants) |_| try body.variantSignature("v");
+            try body.variantSignature("y");
+            try body.byte(42);
+            if (array) |bookmark| try body.endArray(bookmark);
+
+            const bytes = try encodeMessage(a, .{
+                .message_type = .method_call,
+                .path = "/x",
+                .member = "M",
+                .signature = if (in_array) "av" else "v",
+            }, 1, body.bytes(), 0);
+            // Retain cleanup here even if an expected rejection succeeds.
+            defer a.free(bytes);
+            const fds = try a.alloc(std.posix.fd_t, 0);
+            defer a.free(fds);
+
+            if (variants + @intFromBool(in_array) >= 32) {
+                try std.testing.expectError(error.InvalidSignature, parseMessage(a, bytes, fds));
+            } else {
+                const message = try parseMessage(a, bytes, fds);
+                try std.testing.expectEqualStrings(body.bytes(), message.body());
+            }
+        }
+    }
 }
