@@ -2860,7 +2860,7 @@ test "busy OSC 52 read replies empty without disturbing the active transfer" {
     defer app.write_queue.deinit(alloc);
     app.pty.master = output[1];
     app.clipboard.transfer_fd = incoming[0];
-    app.clipboard.transfer_action = .{ .osc52_read = 'c' };
+    app.clipboard.transfer_action = .{ .osc52_read = .{ .kind = 'c', .mime = "UTF8_STRING" } };
 
     app.beginOsc52Read('p');
     var buf: [64]u8 = undefined;
@@ -4018,8 +4018,60 @@ fn finishKittyClipboardRead(
         self.kitty_clipboard.pop();
         return;
     };
-    self.writePty(writer.writer.buffered());
+    // Multiple text aliases can expand a bounded clipboard into a reply
+    // larger than the PTY backlog. Reject before emitting OK or any DATA.
+    const pending = self.write_queue.items.len - self.write_queue_offset;
+    if (writer.writer.buffered().len > max_pty_write_queue -| pending) {
+        self.writeKittyClipboardStatus(.read, read.id, read.terminator, .EBUSY);
+    } else {
+        self.writePty(writer.writer.buffered());
+    }
     self.kitty_clipboard.pop();
+}
+
+test "oversized Kitty read replies fail explicitly and retire the request" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.kitty_clipboard = .init(alloc);
+    defer app.kitty_clipboard.deinit();
+    const data = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(data);
+    @memset(data, 'x');
+    try app.kitty_clipboard.handle(.{
+        .metadata = "type=read:id=large",
+        // Four individually valid text representations exceed the PTY bound.
+        .payload = "dGV4dC9wbGFpbiBVVEY4X1NUUklORyBURVhUIFNUUklORw==",
+        .terminator = .st,
+    });
+    const request = &app.kitty_clipboard.front().?.read;
+    app.finishKittyClipboardRead(request, &.{"text/plain"}, .{ .mime = "text/plain", .data = data });
+    try std.testing.expect(app.kitty_clipboard.front() == null);
+    var reply: [256]u8 = undefined;
+    const n = try posix.read(fds[0], &reply);
+    try std.testing.expectEqualStrings("\x1b]5522;type=read:status=EBUSY:id=large\x1b\\", reply[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), app.write_queue.items.len);
+
+    try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=next", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
+    app.finishKittyClipboardRead(&app.kitty_clipboard.front().?.read, &.{"text/plain"}, .{ .mime = "text/plain", .data = "ok" });
+    const next_n = try posix.read(fds[0], &reply);
+    try std.testing.expectEqualStrings(
+        "\x1b]5522;type=read:status=OK:id=next\x1b\\" ++
+            "\x1b]5522;type=read:status=DATA:id=next:mime=dGV4dC9wbGFpbg==;b2s=\x1b\\" ++
+            "\x1b]5522;type=read:status=DONE:id=next\x1b\\",
+        reply[0..next_n],
+    );
+    try std.testing.expect(app.kitty_clipboard.front() == null);
 }
 
 fn failStartedKittyRead(self: *App, status: vt.kitty.clipboard.Status) void {

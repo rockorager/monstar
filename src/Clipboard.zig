@@ -96,7 +96,7 @@ const TransferAction = union(enum) {
         target: Target,
         mime: [*:0]const u8,
     },
-    osc52_read: u8,
+    osc52_read: struct { kind: u8, mime: [*:0]const u8 },
     kitty_read: [*:0]const u8,
     dnd: *DataOffer,
 };
@@ -348,7 +348,7 @@ pub fn expireTransfers(self: *Clipboard) bool {
 pub fn osc52ReadKind(self: *const Clipboard) ?u8 {
     if (self.transfer_fd < 0) return null;
     return switch (self.transfer_action) {
-        .osc52_read => |kind| kind,
+        .osc52_read => |read| read.kind,
         else => null,
     };
 }
@@ -394,7 +394,8 @@ pub fn setDndAcceptance(self: *Clipboard, operation: enum { none, copy, move }) 
     };
     const mime = if (preferred.copy or preferred.move) offer.bestDndMime() else null;
     offer.offer.accept(offer.enter_serial, mime);
-    offer.offer.setActions(allowed, preferred);
+    if (offer.offer.getVersion() >= wl.DataOffer.set_actions_since_version)
+        offer.offer.setActions(allowed, preferred);
 }
 
 /// Takes ownership of `text` on every path.
@@ -414,7 +415,7 @@ pub fn request(self: *Clipboard, target: Target, purpose: Purpose) RequestResult
             const mime = offer.bestMime() orelse return .unavailable;
             const action: TransferAction = switch (purpose) {
                 .terminal => |source| .{ .terminal = .{ .target = source, .mime = mime } },
-                .osc52_read => |kind| .{ .osc52_read = kind },
+                .osc52_read => |kind| .{ .osc52_read = .{ .kind = kind, .mime = mime } },
                 .kitty_read => .{ .kitty_read = mime },
             };
             self.beginTransfer(mime, .{ .clipboard = offer }, action) catch return .unavailable;
@@ -424,7 +425,7 @@ pub fn request(self: *Clipboard, target: Target, purpose: Purpose) RequestResult
             const mime = offer.bestMime() orelse return .unavailable;
             const action: TransferAction = switch (purpose) {
                 .terminal => |source| .{ .terminal = .{ .target = source, .mime = mime } },
-                .osc52_read => |kind| .{ .osc52_read = kind },
+                .osc52_read => |kind| .{ .osc52_read = .{ .kind = kind, .mime = mime } },
                 .kitty_read => .{ .kitty_read = mime },
             };
             self.beginTransfer(mime, .{ .primary = offer }, action) catch return .unavailable;
@@ -468,7 +469,18 @@ pub fn readTransfer(self: *Clipboard) !?Event {
             .mime = std.mem.span(transfer.mime),
             .data = self.transfer_buf.items,
         } },
-        .osc52_read => |kind| .{ .osc52_read = .{ .kind = kind, .data = self.transfer_buf.items } },
+        .osc52_read => |read| read: {
+            // OSC 52 carries text without a MIME label, unlike Kitty reads.
+            if (std.mem.eql(u8, std.mem.span(read.mime), "STRING")) {
+                const decoded = clipboard_format.decodeLatin1(self.alloc, self.transfer_buf.items) catch |err| {
+                    self.abortTransfer();
+                    return err;
+                };
+                self.transfer_buf.deinit(self.alloc);
+                self.transfer_buf = .fromOwnedSlice(decoded);
+            }
+            break :read .{ .osc52_read = .{ .kind = read.kind, .data = self.transfer_buf.items } };
+        },
         .kitty_read => |mime| .{ .kitty_read = .{
             .mime = std.mem.span(mime),
             .data = self.transfer_buf.items,
@@ -761,7 +773,8 @@ fn dataDeviceListener(_: *wl.DataDevice, event: wl.DataDevice.Event, self: *Clip
                 offer.x = enter.x.toDouble();
                 offer.y = enter.y.toDouble();
                 offer.offer.accept(enter.serial, mime);
-                offer.offer.setActions(.{ .copy = true }, .{ .copy = true });
+                if (offer.offer.getVersion() >= wl.DataOffer.set_actions_since_version)
+                    offer.offer.setActions(.{ .copy = true }, .{ .copy = true });
                 if (self.dnd_offer) |old| old.destroy();
                 self.dnd_offer = offer;
                 self.updateDndNegotiation(offer);
@@ -800,6 +813,7 @@ fn reportDnd(self: *Clipboard, event: DndEvent) bool {
 
 fn updateDndNegotiation(self: *Clipboard, offer: *DataOffer) void {
     if (!self.reportDndMotion(offer)) return;
+    if (offer.offer.getVersion() < wl.DataOffer.set_actions_since_version) return;
     const actions = dndActions(offer.source_actions);
     offer.offer.setActions(actions.allowed, actions.preferred);
 }
@@ -1074,12 +1088,44 @@ test "incoming deadline preserves OSC 52 kind until expiry" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })));
     defer _ = linux.close(fds[1]);
     clipboard.transfer_fd = fds[0];
-    clipboard.transfer_action = .{ .osc52_read = 'c' };
+    clipboard.transfer_action = .{ .osc52_read = .{ .kind = 'c', .mime = "UTF8_STRING" } };
     clipboard.transfer_deadline_ms = monotonicMs() - 1;
     try std.testing.expectEqual(@as(?u8, 'c'), clipboard.osc52ReadKind());
     try std.testing.expectEqual(@as(i32, 0), clipboard.pollTimeoutMs());
     try std.testing.expect(clipboard.expireTransfers());
     try std.testing.expectEqual(@as(?u8, null), clipboard.osc52ReadKind());
+}
+
+test "OSC 52 reads normalize STRING while Kitty reads preserve MIME bytes" {
+    const linux = std.os.linux;
+    var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+    defer clipboard.deinit();
+    const cases = [_]struct { action: TransferAction, data: []const u8, expected: []const u8 }{
+        .{ .action = .{ .osc52_read = .{ .kind = 'p', .mime = "STRING" } }, .data = "caf\xe9 \xc3\xa9", .expected = "café Ã©" },
+        .{ .action = .{ .osc52_read = .{ .kind = 'p', .mime = "UTF8_STRING" } }, .data = "café €", .expected = "café €" },
+        .{ .action = .{ .kitty_read = "STRING" }, .data = "caf\xe9", .expected = "caf\xe9" },
+    };
+    for (cases) |case| {
+        var fds: [2]posix.fd_t = undefined;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+        clipboard.transfer_fd = fds[0];
+        clipboard.transfer_action = case.action;
+        try std.testing.expectEqual(case.data.len, linux.write(fds[1], case.data.ptr, case.data.len));
+        _ = linux.close(fds[1]);
+        const event = (try clipboard.readTransfer()).?;
+        defer clipboard.finishEvent();
+        switch (event) {
+            .osc52_read => |read| {
+                try std.testing.expectEqual(@as(u8, 'p'), read.kind);
+                try std.testing.expectEqualStrings(case.expected, read.data);
+            },
+            .kitty_read => |read| {
+                try std.testing.expectEqualStrings("STRING", read.mime);
+                try std.testing.expectEqualStrings(case.expected, read.data);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "drag negotiation prefers a supported source action" {
@@ -1155,5 +1201,62 @@ test "drag acceptance never sends an unsupported Wayland preferred action" {
         try std.testing.expectEqual(@as(u32, (16 << 16) | 4), actions[1]); // set_actions
         try std.testing.expectEqual(case[0], actions[2]);
         try std.testing.expectEqual(case[2], actions[3]);
+    }
+}
+
+test "drag negotiation respects the negotiated data offer version" {
+    const linux = std.os.linux;
+    for ([_]u32{ 1, 2, 3 }) |version| {
+        var fds: [2]posix.fd_t = undefined;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            0,
+            &fds,
+        )));
+        defer _ = linux.close(fds[1]);
+        const display = try wl.Display.connectToFd(fds[0]);
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        const proxy = try registry.bind(1, wl.DataOffer, version);
+        var clipboard: Clipboard = .init(std.testing.allocator, null, null);
+        defer clipboard.deinit();
+        const offer = clipboard.createDataOffer(proxy).?;
+        offer.noteMime("text/plain");
+        const Callback = struct {
+            fn motion(_: *anyopaque, _: DndEvent) bool {
+                return true; // Exercise Kitty drag negotiation as well.
+            }
+        };
+        clipboard.setDndCallback(&clipboard, Callback.motion);
+        try std.testing.expectEqual(.SUCCESS, display.flush());
+        var buf: [512]u8 align(4) = undefined;
+        _ = try posix.read(fds[1], &buf);
+
+        dataDeviceListener(undefined, .{ .enter = .{
+            .serial = 17,
+            .surface = undefined,
+            .x = .fromInt(0),
+            .y = .fromInt(0),
+            .id = proxy,
+        } }, &clipboard);
+        clipboard.setDndAcceptance(.copy);
+        try std.testing.expectEqual(.SUCCESS, display.flush());
+        const n = try posix.read(fds[1], &buf);
+        var words = std.mem.bytesAsSlice(u32, buf[0..n]);
+        var accepts: usize = 0;
+        var actions: usize = 0;
+        while (words.len > 0) {
+            try std.testing.expectEqual(proxy.getId(), words[0]);
+            switch (words[1] & 0xffff) {
+                0 => accepts += 1,
+                4 => actions += 1,
+                else => return error.TestUnexpectedResult,
+            }
+            words = words[(words[1] >> 16) / 4 ..];
+        }
+        try std.testing.expectEqual(@as(usize, 2), accepts);
+        try std.testing.expectEqual(@as(usize, if (version >= 3) 3 else 0), actions);
     }
 }
