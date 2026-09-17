@@ -3877,9 +3877,16 @@ fn pumpKittyClipboard(self: *App) void {
                 if (self.clipboard.clear(target, self.last_serial)) .DONE else .ENOSYS
             else status: {
                 const text = for (write.committed.contents) |content| {
-                    if (vt.clipboard.isTextMime(content.mime)) break content.data;
+                    if (vt.clipboard.isTextMime(content.mime)) break content;
                 } else break :status .ENOSYS;
-                const owned = self.alloc.dupeZ(u8, text) catch break :status .EIO;
+                // Selection sources advertise UTF-8 aliases, so STRING bytes
+                // must cross the Latin-1 boundary before claiming the source.
+                const decoded = if (std.mem.eql(u8, text.mime, "STRING"))
+                    clipboard_format.decodeLatin1(self.alloc, text.data) catch break :status .EIO
+                else
+                    null;
+                defer if (decoded) |data| self.alloc.free(data);
+                const owned = self.alloc.dupeZ(u8, decoded orelse text.data) catch break :status .EIO;
                 break :status if (self.clipboard.claim(target, owned, self.last_serial)) .DONE else .ENOSYS;
             };
             self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, status);
@@ -3920,6 +3927,82 @@ fn pumpKittyClipboard(self: *App) void {
             }
         },
     };
+}
+
+test "Kitty writes decode STRING before claiming UTF-8 selections" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[1]);
+    const display = try wl.Display.connectToFd(fds[0]);
+    defer display.disconnect();
+    const registry = try display.getRegistry();
+    defer registry.destroy();
+    // Real client proxies let the pump claim selections without a compositor.
+    const manager = try registry.bind(1, wl.DataDeviceManager, 3);
+    defer manager.destroy();
+    const device = try registry.bind(2, wl.DataDevice, 3);
+    defer device.release();
+    const primary_manager = try registry.bind(3, zwp.PrimarySelectionDeviceManagerV1, 1);
+    defer primary_manager.destroy();
+    const primary_device = try registry.bind(4, zwp.PrimarySelectionDeviceV1, 1);
+    defer primary_device.destroy();
+
+    var output: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(output[0]);
+    defer _ = linux.close(output[1]);
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.clipboard = .init(alloc, manager, primary_manager);
+    defer app.clipboard.deinit();
+    app.clipboard.setDevices(device, primary_device);
+    app.kitty_clipboard = .init(alloc);
+    defer app.kitty_clipboard.deinit();
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = output[1];
+    app.last_serial = 17;
+
+    // C3 A9 must remain two Latin-1 characters even though it is valid UTF-8.
+    const latin1 = "caf\xe9 \xa3\xff \xc3\xa9\n";
+    const utf8 = "café £ÿ Ã©\n";
+    const cases = [_]struct { metadata: []const u8, data: []const u8 }{
+        .{ .metadata = "type=wdata:mime=U1RSSU5H", .data = latin1 },
+        .{ .metadata = "type=wdata:mime=VVRGOF9TVFJJTkc=", .data = utf8 },
+    };
+    for ([_]Clipboard.Target{ .clipboard, .primary }) |target| {
+        for (cases) |case| {
+            try app.kitty_clipboard.handle(.{
+                .metadata = if (target == .primary) "type=write:loc=primary" else "type=write",
+                .payload = null,
+                .terminator = .st,
+            });
+            var payload: [128]u8 = undefined;
+            try app.kitty_clipboard.handle(.{
+                .metadata = case.metadata,
+                .payload = std.base64.standard.Encoder.encode(&payload, case.data),
+                .terminator = .st,
+            });
+            try app.kitty_clipboard.handle(.{ .metadata = "type=wdata", .payload = null, .terminator = .st });
+            app.pumpKittyClipboard();
+            try std.testing.expect(app.kitty_clipboard.front() == null);
+            const source = (if (target == .primary) app.clipboard.primary_source else app.clipboard.clip_source).?;
+            try std.testing.expectEqualStrings(utf8, source.text);
+            try std.testing.expectEqualStrings(latin1, source.latin1.?);
+            var reply: [128]u8 = undefined;
+            const n = try posix.read(output[0], &reply);
+            try std.testing.expectEqualStrings("\x1b]5522;type=write:status=DONE\x1b\\", reply[0..n]);
+        }
+    }
 }
 
 fn finishKittyClipboardRead(
