@@ -5530,6 +5530,43 @@ fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: ScrollbackK
     self.syncHoveredLink(true);
 }
 
+const FixedKeyAction = enum {
+    font_increase,
+    font_decrease,
+    font_reset,
+    copy,
+    search,
+    pipe_output,
+    new_window,
+    paste,
+    next_prompt,
+    previous_prompt,
+    reload_config,
+};
+
+fn fixedKeyAction(event: vt.input.KeyEvent) ?FixedKeyAction {
+    if (!event.mods.ctrl) return null;
+    // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
+    switch (event.unshifted_codepoint) {
+        '=' => return .font_increase,
+        '-' => if (!event.mods.shift) return .font_decrease,
+        '0' => if (!event.mods.shift) return .font_reset,
+        else => {},
+    }
+    if (!event.mods.shift) return null;
+    return switch (event.unshifted_codepoint) {
+        'c' => .copy,
+        'f' => .search,
+        'g' => .pipe_output,
+        'n' => .new_window,
+        'v' => .paste,
+        'x' => .next_prompt,
+        'z' => .previous_prompt,
+        ',' => .reload_config,
+        else => null,
+    };
+}
+
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
@@ -5538,31 +5575,23 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 
     if (scrollbackKeyAction(&self.config, self.term.screens.active_key, event)) |scroll| {
         if (scroll != .passthrough) return self.handleScrollbackKey(event, scroll);
-    } else {
-        // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
-        if (action == .press and event.mods.ctrl) {
-            switch (event.unshifted_codepoint) {
-                '=' => return self.adjustRuntimeFontSize(1),
-                '-' => if (!event.mods.shift) return self.adjustRuntimeFontSize(-1),
-                '0' => if (!event.mods.shift) return self.resetRuntimeFontSize(),
-                else => {},
-            }
-        }
-
-        // Copy/paste bindings take priority over the application.
-        if (action == .press and event.mods.ctrl and event.mods.shift) {
-            switch (event.unshifted_codepoint) {
-                'c' => return self.copyToClipboard(),
-                'f' => return self.startSearch(),
-                'g' => return self.pipeCommandOutput(),
-                'n' => return self.spawnNewWindow(),
-                'v' => return self.beginPaste(.clipboard),
-                'x' => return self.jumpPrompt(1),
-                'z' => return self.jumpPrompt(-1),
-                ',' => return self.reloadConfig(),
-                else => {},
-            }
-        }
+    } else if (fixedKeyAction(event)) |shortcut| {
+        // Match every event so repeats and Kitty key releases cannot leak to
+        // the child, but perform each fixed action only on the initial press.
+        if (action != .press) return;
+        return switch (shortcut) {
+            .font_increase => self.adjustRuntimeFontSize(1),
+            .font_decrease => self.adjustRuntimeFontSize(-1),
+            .font_reset => self.resetRuntimeFontSize(),
+            .copy => self.copyToClipboard(),
+            .search => self.startSearch(),
+            .pipe_output => self.pipeCommandOutput(),
+            .new_window => self.spawnNewWindow(),
+            .paste => self.beginPaste(.clipboard),
+            .next_prompt => self.jumpPrompt(1),
+            .previous_prompt => self.jumpPrompt(-1),
+            .reload_config => self.reloadConfig(),
+        };
     }
 
     const wrote = self.encodeAndWriteKey(event);
@@ -5580,6 +5609,66 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
             self.syncHoveredLink(true);
         }
     }
+}
+
+test "fixed shortcuts consume repeats and releases without sending child input" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.config = .{};
+    defer app.config.keybinds.deinit(alloc);
+    app.search = null;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.keyboard = try .init();
+    defer app.keyboard.deinit();
+    const names: c.xkb_rule_names = .{ .layout = "us" };
+    const keymap = c.xkb_keymap_new_from_names(app.keyboard.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse
+        return error.KeymapParseFailed;
+    app.keyboard.keymap = keymap;
+    app.keyboard.state = c.xkb_state_new(keymap) orelse return error.KeymapParseFailed;
+    app.keyboard.mod_indices.ctrl = c.xkb_keymap_mod_get_index(keymap, c.XKB_MOD_NAME_CTRL);
+    app.keyboard.mod_indices.shift = c.xkb_keymap_mod_get_index(keymap, c.XKB_MOD_NAME_SHIFT);
+    const ctrl = @as(u32, 1) << @intCast(app.keyboard.mod_indices.ctrl);
+    const shift = @as(u32, 1) << @intCast(app.keyboard.mod_indices.shift);
+
+    // Keep a backlog so every emitted byte is observable without a PTY.
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+    app.write_queue_offset = 0;
+    try app.write_queue.appendSlice(alloc, "pending");
+    app.fling_active = false;
+    app.selection_gesture = .init;
+    app.selection_autoscroll_fd = try createTimerFd();
+    defer _ = std.os.linux.close(app.selection_autoscroll_fd);
+
+    app.keyboard.updateMods(ctrl | shift, 0, 0, 0);
+    app.onKey(46, .press); // Copy without a selection is still consumed.
+    try std.testing.expectEqualStrings("pending", app.write_queue.items);
+
+    var stream = app.term.vtStream();
+    defer stream.deinit();
+    for ([_]bool{ false, true }) |kitty| {
+        if (kitty) stream.nextSlice("\x1b[>3u"); // Include key-release reporting.
+        for ([_]u32{ 46, 33, 34, 49, 47, 45, 44, 51, 13, 12, 11 }) |keycode| {
+            app.keyboard.updateMods(if (keycode == 12 or keycode == 11) ctrl else ctrl | shift, 0, 0, 0);
+            for ([_]vt.input.KeyAction{ .repeat, .release }) |action| {
+                app.onKey(keycode, action);
+                try std.testing.expectEqualStrings("pending", app.write_queue.items);
+            }
+        }
+    }
+    stream.nextSlice("\x1b[<u");
+
+    // Ordinary Ctrl+C and an explicit unbind must still reach the child.
+    app.keyboard.updateMods(ctrl, 0, 0, 0);
+    app.onKey(46, .press);
+    try std.testing.expectEqualStrings("pending\x03", app.write_queue.items);
+    try app.config.set(alloc, "keybind", "ctrl+shift+c=unbind");
+    app.keyboard.updateMods(ctrl | shift, 0, 0, 0);
+    app.onKey(46, .repeat);
+    try std.testing.expectEqualStrings("pending\x03\x1b[99;6u", app.write_queue.items);
 }
 
 fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {
