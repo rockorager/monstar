@@ -96,7 +96,7 @@ pub fn connectSession(
     var alternatives = std.mem.splitScalar(u8, addresses, ';');
     while (alternatives.next()) |address| {
         if (address.len == 0) continue;
-        const fd = connectUnixAddress(io, arena, address) catch continue;
+        const fd = connectUnixAddress(arena, address) catch continue;
         var connection: Connection = .{
             .allocator = allocator,
             .io = io,
@@ -105,10 +105,6 @@ pub fn connectSession(
         errdefer connection.deinit();
 
         connection.authenticate() catch {
-            connection.deinit();
-            continue;
-        };
-        connection.setNonblocking() catch {
             connection.deinit();
             continue;
         };
@@ -562,15 +558,7 @@ fn authenticate(self: *Connection) !void {
     try self.writeAuth("BEGIN\r\n", deadline);
 }
 
-fn setNonblocking(self: *Connection) !void {
-    const flags = linux.fcntl(self.fd, linux.F.GETFL, 0);
-    if (linux.errno(flags) != .SUCCESS) return error.ProtocolError;
-    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
-    const rc = linux.fcntl(self.fd, linux.F.SETFL, flags | nonblock);
-    if (linux.errno(rc) != .SUCCESS) return error.ProtocolError;
-}
-
-fn connectUnixAddress(io: std.Io, allocator: std.mem.Allocator, address: []const u8) !posix.fd_t {
+fn connectUnixAddress(allocator: std.mem.Allocator, address: []const u8) !posix.fd_t {
     if (!std.mem.startsWith(u8, address, "unix:")) return error.InvalidAddress;
     var path: ?[]const u8 = null;
     var abstract: ?[]const u8 = null;
@@ -589,9 +577,23 @@ fn connectUnixAddress(io: std.Io, allocator: std.mem.Allocator, address: []const
         @memcpy(storage[1..], name);
         break :value storage;
     };
-    const unix_address = try std.Io.net.UnixAddress.init(socket_path);
-    const network_stream = try unix_address.connect(io);
-    return network_stream.socket.handle;
+    var socket_address: linux.sockaddr.un = .{ .path = @splat(0) };
+    if (socket_path.len > socket_address.path.len) return error.InvalidAddress;
+    @memcpy(socket_address.path[0..socket_path.len], socket_path);
+    // A trailing NUL terminates a filesystem path but changes an abstract name.
+    const address_len: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") +
+        @min(socket_address.path.len, socket_path.len + @intFromBool(path != null)));
+
+    // A Unix stream connect completes immediately unless the listener's accept
+    // queue is full. NONBLOCK makes that case fail with EAGAIN rather than hang
+    // startup before authentication's deadline; try the next address or fallback.
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.AddressUnavailable;
+    const fd: posix.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    if (linux.errno(linux.connect(fd, &socket_address, address_len)) != .SUCCESS)
+        return error.AddressUnavailable;
+    return fd;
 }
 
 fn unescapeAddress(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -686,6 +688,73 @@ test "session address unescaping" {
     defer allocator.free(value);
     try std.testing.expectEqualStrings("/run/user/1000/dbus-bus", value);
     try std.testing.expectError(error.InvalidAddress, unescapeAddress(allocator, "%2"));
+}
+
+test "session connection does not wait for a saturated accept queue" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const socket_path = try std.fmt.allocPrint(arena, "{s}/bus", .{path_buf[0..path_len]});
+    const address = try std.fmt.allocPrint(arena, "unix:path={s}", .{socket_path});
+    const unix_address = try std.Io.net.UnixAddress.init(socket_path);
+    var server = try unix_address.listen(std.testing.io, .{ .kernel_backlog = 0 });
+    defer server.deinit(std.testing.io);
+
+    // Linux admits one pending connection with backlog zero. Leave it pending
+    // so a blocking second connect cannot finish until somebody accepts it.
+    const first = try connectUnixAddress(arena, address);
+    defer _ = linux.close(first);
+    const fork_rc = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+    const pid: posix.pid_t = @intCast(fork_rc);
+    if (pid == 0) {
+        // Bound the regression too: the old blocking implementation dies on
+        // SIGALRM instead of hanging the test suite indefinitely.
+        _ = std.c.alarm(2);
+        var buffer: [1024]u8 = undefined;
+        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+        const fd = connectUnixAddress(fixed.allocator(), address) catch |err| {
+            linux.exit(if (err == error.AddressUnavailable) 0 else 2);
+        };
+        _ = linux.close(fd);
+        linux.exit(1);
+    }
+    var status: u32 = undefined;
+    while (true) {
+        const rc = linux.wait4(pid, &status, 0, null);
+        if (linux.errno(rc) == .INTR) continue;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
+        break;
+    }
+    try std.testing.expectEqual(@as(u32, 0), status);
+    try std.testing.expect(linux.fcntl(first, linux.F.GETFD, 0) & linux.FD_CLOEXEC != 0);
+    const flags: linux.O = @bitCast(@as(u32, @intCast(linux.fcntl(first, linux.F.GETFL, 0))));
+    try std.testing.expect(flags.NONBLOCK);
+}
+
+test "session connection uses the exact abstract socket name" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const name = try std.fmt.allocPrint(arena, "monstar-dbus-abstract-{d}", .{linux.getpid()});
+    const address = try std.fmt.allocPrint(arena, "unix:abstract={s}", .{name});
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
+    const listener: posix.fd_t = @intCast(rc);
+    defer _ = linux.close(listener);
+    var socket_address: linux.sockaddr.un = .{ .path = @splat(0) };
+    @memcpy(socket_address.path[1..][0..name.len], name);
+    // Abstract names are counted bytes, not NUL-terminated strings. Bind via
+    // the kernel so the test cannot inherit the client's address conversion.
+    const address_len: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + name.len);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.bind(listener, @ptrCast(&socket_address), address_len)));
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.listen(listener, 1)));
+    const fd = try connectUnixAddress(arena, address);
+    defer _ = linux.close(fd);
 }
 
 fn testSocketConnection(allocator: std.mem.Allocator) !struct { Connection, posix.fd_t } {
