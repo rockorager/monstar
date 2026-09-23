@@ -755,6 +755,24 @@ test "session connection uses the exact abstract socket name" {
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.listen(listener, 1)));
     const fd = try connectUnixAddress(arena, address);
     defer _ = linux.close(fd);
+
+    const accepted_rc = linux.accept4(listener, null, null, linux.SOCK.CLOEXEC);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(accepted_rc));
+    const accepted: posix.fd_t = @intCast(accepted_rc);
+    defer _ = linux.close(accepted);
+    try std.testing.expectEqual(@as(usize, 3), linux.write(fd, "bus", 3));
+    var received: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), linux.read(accepted, &received, received.len));
+    try std.testing.expectEqualStrings("bus", &received);
+}
+
+test "abstract session addresses reject names that exceed sockaddr capacity" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectError(error.InvalidAddress, connectUnixAddress(
+        arena_state.allocator(),
+        "unix:abstract=" ++ "a" ** 108,
+    ));
 }
 
 fn testSocketConnection(allocator: std.mem.Allocator) !struct { Connection, posix.fd_t } {
