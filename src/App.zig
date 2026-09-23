@@ -2158,22 +2158,64 @@ fn runPipeCommandChild(
     write_fd: posix.fd_t,
 ) noreturn {
     const linux = std.os.linux;
+    std.debug.assert(read_fd >= 0 and write_fd >= 0 and read_fd != write_fd);
     if (pwd) |p| _ = linux.chdir(p.ptr);
-    _ = linux.dup2(read_fd, 0);
-    _ = linux.close(read_fd);
+    // The pipe may occupy standard descriptors when inherited stdio is
+    // closed. Close its writer before installing stdin, never afterwards.
     _ = linux.close(write_fd);
+    if (linux.errno(linux.dup2(read_fd, 0)) != .SUCCESS) linux.exit(126);
+    if (read_fd != 0) {
+        _ = linux.close(read_fd);
+    } else {
+        // dup2(fd, fd) retains CLOEXEC, including for /dev/null below.
+        if (linux.errno(linux.fcntl(0, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
+    }
 
     const devnull = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (linux.errno(devnull) == .SUCCESS) {
-        const fd: posix.fd_t = @intCast(devnull);
-        _ = linux.dup2(fd, 1);
-        _ = linux.dup2(fd, 2);
-        if (fd > 2) _ = linux.close(fd);
+    if (linux.errno(devnull) != .SUCCESS) linux.exit(126);
+    const fd: posix.fd_t = @intCast(devnull);
+    if (linux.errno(linux.dup2(fd, 1)) != .SUCCESS) linux.exit(126);
+    if (linux.errno(linux.dup2(fd, 2)) != .SUCCESS) linux.exit(126);
+    if (fd > 2) {
+        _ = linux.close(fd);
+    } else {
+        if (linux.errno(linux.fcntl(fd, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
     }
 
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command.ptr };
     _ = linux.execve("/bin/sh", &argv, envp);
     linux.exit(127);
+}
+
+test "pipe command preserves input and redirects output with closed inherited descriptors" {
+    const linux = std.os.linux;
+    for (0..8) |closed_mask| {
+        // Isolate descriptor closure from the test runner, then exec a shell
+        // so the checks also catch CLOEXEC left on a standard descriptor.
+        const fork_rc = linux.fork();
+        try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
+        const pid: posix.pid_t = @intCast(fork_rc);
+        if (pid == 0) {
+            for (0..3) |fd| {
+                if (closed_mask & (@as(usize, 1) << @intCast(fd)) != 0)
+                    _ = linux.close(@intCast(fd));
+            }
+            var fds: [2]posix.fd_t = undefined;
+            if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) linux.exit(120);
+            const text = "command output\n";
+            if (linux.write(fds[1], text, text.len) != text.len) linux.exit(121);
+            const envp = [_:null]?[*:0]const u8{};
+            runPipeCommandChild(
+                "IFS= read -r line && test \"$line\" = 'command output' && " ++
+                    "test /dev/null -ef /proc/self/fd/1 && test /dev/null -ef /proc/self/fd/2",
+                &envp,
+                null,
+                fds[0],
+                fds[1],
+            );
+        }
+        try std.testing.expectEqual(@as(u32, 0), try Pty.wait(pid));
+    }
 }
 
 fn writePipeCommandChild(output: []const u8, read_fd: posix.fd_t, write_fd: posix.fd_t) noreturn {
