@@ -505,14 +505,16 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         }
         clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
         if (job.scroll_offset != 0) {
-            try self.renderer.renderScrolled(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height, job.scroll_offset);
+            try self.renderer.renderScrolled(self.state, job.kitty_items, job.preedit, grid_pixels, job.grid_width, job.grid_height, job.scroll_offset);
         } else if (job.kitty_items.len > 0) {
             try self.renderer.renderWithKittyItems(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height);
         } else {
             try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
         }
-        if (job.preedit) |text| {
-            try self.renderer.renderPreedit(self.state, grid_pixels, job.grid_width, job.grid_height, text);
+        if (job.scroll_offset == 0) {
+            if (job.preedit) |text| {
+                try self.renderer.renderPreedit(self.state, grid_pixels, job.grid_width, job.grid_height, text);
+            }
         }
         if (job.link_hint) |uri| {
             try self.renderer.renderLinkHint(self.state, grid_pixels, job.grid_width, job.grid_height, uri);
