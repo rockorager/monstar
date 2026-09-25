@@ -309,12 +309,14 @@ pub fn render(
 
 /// Draw a fractional viewport using one populated below-viewport overscan row.
 /// `offset` is the physical-pixel crop from the top, less than a cell height.
-/// Overlays anchored to the window must be drawn after this call. This is a
-/// full repaint; callers must also repaint fully when returning to offset zero.
+/// Grid-anchored preedit text is cropped with the terminal. Overlays anchored
+/// to the window must be drawn after this call. This is a full repaint; callers
+/// must also repaint fully when returning to offset zero.
 pub fn renderScrolled(
     self: *Renderer,
     state: *const vt.RenderState,
     items: []const KittyRenderItem,
+    preedit: ?[]const u8,
     pixels: []u32,
     width: u31,
     height: u31,
@@ -343,6 +345,9 @@ pub fn renderScrolled(
         try self.renderWithKittyItems(&expanded, items, self.scroll_pixels.items, width, expanded_height);
     } else {
         try self.render(&expanded, self.scroll_pixels.items, width, expanded_height);
+    }
+    if (preedit) |text| {
+        try self.renderPreedit(&expanded, self.scroll_pixels.items, width, expanded_height, text);
     }
     for (0..height) |y| {
         copyPixels(pixels[y * stride ..][0..width], self.scroll_pixels.items[(y + offset) * width ..][0..width]);
@@ -2581,7 +2586,9 @@ test "smooth scroll crops text and overscan without touching stride padding" {
     const height = font.cell_height * 2;
     const expected = try alloc.alloc(u32, @as(usize, width) * font.cell_height * 3);
     defer alloc.free(expected);
+    reference_state.cursor.viewport = .{ .x = 0, .y = 2, .wide_tail = false };
     try renderer.render(&reference_state, expected, width, font.cell_height * 3);
+    try renderer.renderPreedit(&reference_state, expected, width, font.cell_height * 3, "IME");
     const stride = width + 3;
     const pixels = try alloc.alloc(u32, @as(usize, stride) * height);
     defer alloc.free(pixels);
@@ -2593,9 +2600,12 @@ test "smooth scroll crops text and overscan without touching stride padding" {
     try state.update(alloc, &term);
     try std.testing.expectEqual(@as(usize, 3), state.row_data.len);
     try std.testing.expectEqual(@as(u16, 1), state.overscan.below);
+    // Model App's cursor fixup when the active cursor occupies the overscan
+    // row. Its preedit must move and clip with the terminal grid.
+    state.cursor.viewport = .{ .x = 0, .y = 2, .wide_tail = false };
     for ([_]u31{ 1, font.cell_height / 3, font.cell_height - 1 }) |offset| {
         @memset(pixels, 0xdeadbeef);
-        try renderer.renderScrolled(&state, &.{}, pixels, width, height, offset);
+        try renderer.renderScrolled(&state, &.{}, "IME", pixels, width, height, offset);
         for (0..height) |y| {
             try std.testing.expectEqualSlices(u32, expected[(y + offset) * width ..][0..width], pixels[y * stride ..][0..width]);
             for (pixels[y * stride + width ..][0..3]) |pixel| try std.testing.expectEqual(@as(u32, 0xdeadbeef), pixel);
