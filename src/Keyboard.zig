@@ -152,6 +152,7 @@ pub fn resetTransientState(self: *Keyboard) void {
 
 /// Translate a wl_keyboard.key event into a ghostty-vt KeyEvent.
 /// `utf8_buf` backs the returned event's utf8 slice.
+/// Returns null without a keymap or when a key cancels a compose sequence.
 pub fn translate(
     self: *Keyboard,
     utf8_buf: []u8,
@@ -190,7 +191,9 @@ pub fn translate(
                 },
                 c.XKB_COMPOSE_CANCELLED => {
                     c.xkb_compose_state_reset(compose_state);
-                    break :utf8_len 0;
+                    // Swallow the cancelling key like X11. Empty text alone
+                    // still lets shortcuts and terminal encoders use the key.
+                    return null;
                 },
                 else => {},
             }
@@ -938,6 +941,48 @@ test "translate and encode: Spanish Unicode and dead-key composition" {
         var writer: std.Io.Writer = .fixed(&out_buf);
         try vt.input.encodeKey(&writer, event, .{});
         try std.testing.expectEqualStrings("á", writer.buffered());
+    }
+}
+
+test "cancelled compose sequences do not reach the application" {
+    var kb = try testKeyboardWithLayout("es", null);
+    defer kb.deinit();
+    try std.testing.expect(kb.compose_state != null);
+
+    var utf8_buf: [16]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    const cases = [_]struct { keycode: u32, plain: []const u8, kitty: []const u8 }{
+        .{ .keycode = 1, .plain = "\x1b", .kitty = "\x1b[27u" }, // Escape
+        .{ .keycode = 14, .plain = "\x7f", .kitty = "\x7f" }, // Backspace
+        .{ .keycode = 16, .plain = "q", .kitty = "q" }, // No acute-q compose sequence
+    };
+    for ([_]bool{ false, true }) |kitty| {
+        for (cases) |case| {
+            const dead = kb.translate(&utf8_buf, 40, .press).?; // Spanish dead acute
+            try std.testing.expect(dead.composing);
+            _ = kb.translate(&utf8_buf, 40, .release);
+
+            var writer: std.Io.Writer = .fixed(&out_buf);
+            const cancelled = kb.translate(&utf8_buf, case.keycode, .press);
+            if (cancelled) |event| {
+                try vt.input.encodeKey(&writer, event, .{
+                    .kitty_flags = .{ .disambiguate = kitty },
+                });
+            }
+            try std.testing.expectEqualStrings("", writer.buffered());
+            try std.testing.expectEqual(null, cancelled);
+
+            // Cancellation must reset compose state, not swallow the next key.
+            _ = kb.translate(&utf8_buf, case.keycode, .release);
+            const next = kb.translate(&utf8_buf, case.keycode, .press).?;
+            try std.testing.expect(!next.composing);
+            writer = .fixed(&out_buf);
+            try vt.input.encodeKey(&writer, next, .{
+                .kitty_flags = .{ .disambiguate = kitty },
+            });
+            try std.testing.expectEqualStrings(if (kitty) case.kitty else case.plain, writer.buffered());
+            _ = kb.translate(&utf8_buf, case.keycode, .release);
+        }
     }
 }
 
