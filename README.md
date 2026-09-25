@@ -86,6 +86,7 @@ background-opacity = 0.95
 window-padding-x = 8
 window-padding-y = 6
 mouse-scroll-multiplier = precision:1,discrete:3
+smooth-scrolling = true
 ```
 
 Set `font-family` to choose the primary font; the default is Fontconfig's
@@ -131,6 +132,9 @@ Other settings:
   `0` disables the protocol (default `320000000`).
 - **inertial-scrolling** — Whether finger scrolling continues with inertial
   motion after release (default `true`).
+- **smooth-scrolling** — Pixel-level precision/touchpad scrollback movement,
+  including inertial motion (default `true`). Set to `false` for whole-row
+  scrolling. Wheel detents and scrolling sent to applications stay discrete.
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
   `0` disables the flash (default `200`).
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for line

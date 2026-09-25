@@ -112,6 +112,8 @@ kitty_scale_count: usize = 0,
 /// Physical framebuffer row stride. Zero means the visible width, which is
 /// convenient for standalone renderer tests and tightly packed buffers.
 buffer_stride: u31 = 0,
+/// Unclipped grid, including the extra bottom row during precision scrolling.
+scroll_pixels: std.ArrayList(u32) = .empty,
 
 const kitty_scale_cache_max_entries = 32;
 const kitty_scale_cache_max_bytes = 32 * 1024 * 1024;
@@ -216,6 +218,7 @@ pub fn deinit(self: *Renderer) void {
     self.cluster_scratch.deinit(self.alloc);
     self.clearKittyScaleCache();
     self.kitty_scale_cache.deinit(self.alloc);
+    self.scroll_pixels.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -302,6 +305,48 @@ pub fn render(
         );
     }
     if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
+}
+
+/// Draw a fractional viewport using one populated below-viewport overscan row.
+/// `offset` is the physical-pixel crop from the top, less than a cell height.
+/// Overlays anchored to the window must be drawn after this call. This is a
+/// full repaint; callers must also repaint fully when returning to offset zero.
+pub fn renderScrolled(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    items: []const KittyRenderItem,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+    offset: u31,
+) !void {
+    std.debug.assert(offset > 0 and offset < self.font.cell_height);
+    std.debug.assert(state.viewportStart() == 0 and state.overscan.below == 1);
+    const stride = self.pixelStride(width);
+    const expanded_height = height + self.font.cell_height;
+    try self.scroll_pixels.resize(self.alloc, @as(usize, width) * expanded_height);
+
+    // Borrow the snapshot without changing its ownership or viewport contract.
+    // Rendering and clipping the extended grid together keeps glyph overhang,
+    // selection backgrounds, and Kitty z layers on the same pixel lattice.
+    var expanded = state.*;
+    expanded.rows += 1;
+    const track = self.track_cell_damage;
+    self.track_cell_damage = false;
+    const old_stride = self.buffer_stride;
+    self.buffer_stride = width;
+    defer {
+        self.track_cell_damage = track;
+        self.buffer_stride = old_stride;
+    }
+    if (items.len > 0) {
+        try self.renderWithKittyItems(&expanded, items, self.scroll_pixels.items, width, expanded_height);
+    } else {
+        try self.render(&expanded, self.scroll_pixels.items, width, expanded_height);
+    }
+    for (0..height) |y| {
+        copyPixels(pixels[y * stride ..][0..width], self.scroll_pixels.items[(y + offset) * width ..][0..width]);
+    }
 }
 
 /// Full render interleaving kitty placements with the grid by z layer.
@@ -2505,6 +2550,64 @@ fn testSpriteOverlay(kind: enum { preedit, search, link }) !void {
         }
     }
     try std.testing.expect(font_pixels > 0);
+}
+
+test "smooth scroll crops text and overscan without touching stride padding" {
+    const alloc = std.testing.allocator;
+    const text = "\x1b[?25l\x1b[41mAA──AA\r\n\x1b[42mBB──BB\r\n\x1b[44mCC──CC";
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 6, .rows = 2 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(text);
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    // Independent, ordinary three-row viewport supplies the uncropped image.
+    var reference: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 6, .rows = 3 });
+    defer reference.deinit(alloc);
+    var reference_stream = reference.vtStream();
+    defer reference_stream.deinit();
+    reference_stream.nextSlice(text);
+    var reference_state: vt.RenderState = .empty;
+    defer reference_state.deinit(alloc);
+    try reference_state.update(alloc, &reference);
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+    const width = font.cell_width * 6;
+    const height = font.cell_height * 2;
+    const expected = try alloc.alloc(u32, @as(usize, width) * font.cell_height * 3);
+    defer alloc.free(expected);
+    try renderer.render(&reference_state, expected, width, font.cell_height * 3);
+    const stride = width + 3;
+    const pixels = try alloc.alloc(u32, @as(usize, stride) * height);
+    defer alloc.free(pixels);
+    renderer.buffer_stride = stride;
+    try renderer.render(&state, pixels, width, height);
+    state.clean();
+    term.screens.active.pages.scroll(.top);
+    state.overscan_request = .{ .below = 1 };
+    try state.update(alloc, &term);
+    try std.testing.expectEqual(@as(usize, 3), state.row_data.len);
+    try std.testing.expectEqual(@as(u16, 1), state.overscan.below);
+    for ([_]u31{ 1, font.cell_height / 3, font.cell_height - 1 }) |offset| {
+        @memset(pixels, 0xdeadbeef);
+        try renderer.renderScrolled(&state, &.{}, pixels, width, height, offset);
+        for (0..height) |y| {
+            try std.testing.expectEqualSlices(u32, expected[(y + offset) * width ..][0..width], pixels[y * stride ..][0..width]);
+            for (pixels[y * stride + width ..][0..3]) |pixel| try std.testing.expectEqual(@as(u32, 0xdeadbeef), pixel);
+        }
+    }
+    // Returning to a whole-row viewport must not retain the crop or extra row.
+    state.overscan_request = .{};
+    try state.update(alloc, &term);
+    try renderer.render(&state, pixels, width, height);
+    for (0..height) |y| {
+        try std.testing.expectEqualSlices(u32, expected[y * width ..][0..width], pixels[y * stride ..][0..width]);
+    }
 }
 
 test "render a simple grid" {
