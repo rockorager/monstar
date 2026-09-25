@@ -93,6 +93,8 @@ stream: AppStream,
 /// only on the main thread while no render target is checked out, so
 /// the async worker can read it without locks while a job is in flight.
 render_state: vt.RenderState,
+/// Pixel offset paired with render_state, including during synchronized output.
+render_scroll_offset: u31 = 0,
 /// Main-thread scratch for recognizing viewport movement before
 /// RenderState.update consumes Ghostty's row dirtiness.
 scroll_detector: ScrollDetector,
@@ -231,6 +233,8 @@ link_active: bool,
 link_press: ?LinkPress,
 /// Wheel state accumulated between pointer frame events.
 scroll_pixels: f64,
+/// Physical pixels cropped from the top row; always less than cell_height.
+scroll_offset: u31 = 0,
 scroll_frame_pixels: f64,
 scroll_clicks: i32,
 scroll_value120: i32,
@@ -498,11 +502,12 @@ pub fn init(
         startup_padding,
     );
 
-    var term: vt.Terminal = try .init(io, alloc, .{
+    var colors = try config.terminalColors(alloc, .dark);
+    var term: vt.Terminal = vt.Terminal.init(io, alloc, .{
         .cols = startup_size.cols,
         .rows = startup_size.rows,
         .max_scrollback_bytes = config.scrollback_limit,
-        .colors = config.terminalColors(.dark),
+        .colors = colors,
         .default_modes = .{ .grapheme_cluster = true },
         // libghostty-vt defaults to a conservative 10MB, which rejects a
         // single fullscreen image on large displays (a 4K RGBA frame is
@@ -515,7 +520,10 @@ pub fn init(
         // orders of magnitude cheaper to parse. t=t temporary files are
         // only read (and then deleted) from inside the temp dir.
         .kitty_image_loading_limits = .allWithTempDir(tmpDirPath(environ)),
-    });
+    }) catch |err| {
+        colors.palette.deinit(alloc);
+        return err;
+    };
     errdefer term.deinit(alloc);
     try term.resize(alloc, .{
         .cols = startup_size.cols,
@@ -2056,6 +2064,8 @@ pub fn resolveCommandPathZ(
 fn jumpPrompt(self: *App, delta: isize) void {
     const screen = self.term.screens.active;
     if (!screen.semantic_prompt.seen) return;
+    self.stopFling();
+    self.resetSmoothScroll();
     screen.pages.scroll(.{ .delta_prompt = delta });
     self.revealScrollbar();
     self.clearSelection();
@@ -2305,6 +2315,7 @@ fn applyConfig(self: *App, new_config: Config) !void {
         log.warn("config reload resize failed: {}", .{err});
     };
 
+    self.resetSmoothScroll();
     if (!new_config.inertial_scrolling) self.stopFling();
     self.requestFullAsyncRedraw();
 }
@@ -2315,11 +2326,18 @@ fn applyColorDefaults(self: *App) void {
 }
 
 fn applyColorDefaultsForConfig(self: *App, config: Config) void {
-    const colors = config.terminalColors(self.color_scheme);
+    var colors = config.terminalColors(self.alloc, self.color_scheme) catch |err| {
+        log.warn("failed to allocate terminal colors: {}", .{err});
+        return;
+    };
+    defer colors.palette.deinit(self.alloc);
+    self.term.colors.palette.changeDefault(self.alloc, colors.palette.original.*) catch |err| {
+        log.warn("failed to update terminal palette: {}", .{err});
+        return;
+    };
     self.term.colors.background.default = colors.background.default;
     self.term.colors.foreground.default = colors.foreground.default;
     self.term.colors.cursor.default = colors.cursor.default;
-    self.term.colors.palette.changeDefault(colors.palette.original);
 
     self.selection_bg = colorWithRuntimeOverride(
         config.effectiveSelectionBackground(self.color_scheme),
@@ -3288,6 +3306,7 @@ fn dragScrollbar(self: *App) void {
     const geometry = self.currentScrollbarGeometry(scrollbar_hover_alpha) orelse return;
     const pos = self.pointerSurfacePhysical();
     const row = scrollbarRowForThumbY(geometry, pos.y - drag.grab_offset);
+    self.resetSmoothScroll();
     self.term.screens.active.pages.scroll(.{ .row = row });
     self.revealScrollbar();
     self.needs_redraw = true;
@@ -3308,14 +3327,15 @@ fn finishScrollbarDrag(self: *App) bool {
 fn cellAtPointer(self: *App) struct { x: u16, y: u16 } {
     const scale: f64 = @as(f64, @floatFromInt(self.window.scale120)) / 120.0;
     const px: f64 = @max(0, self.pointer_x * scale - @as(f64, @floatFromInt(self.layout.grid_x)));
-    const py: f64 = @max(0, self.pointer_y * scale - @as(f64, @floatFromInt(self.layout.grid_y)));
+    const py: f64 = @max(0, self.pointer_y * scale - @as(f64, @floatFromInt(self.layout.grid_y))) +
+        @as(f64, @floatFromInt(self.scroll_offset));
     const x: u16 = @intFromFloat(@min(
         px / @as(f64, @floatFromInt(self.font.cell_width)),
         @as(f64, @floatFromInt(self.term.cols -| 1)),
     ));
     const y: u16 = @intFromFloat(@min(
         py / @as(f64, @floatFromInt(self.font.cell_height)),
-        @as(f64, @floatFromInt(self.term.rows -| 1)),
+        @as(f64, @floatFromInt(self.term.rows -| @intFromBool(self.scroll_offset == 0))),
     ));
     return .{ .x = x, .y = y };
 }
@@ -3342,7 +3362,8 @@ fn linkCellAtPointer(self: *App) ?vt.Coordinate {
     if (px < grid_x or px >= grid_right or py < grid_y or py >= grid_bottom) return null;
     return .{
         .x = @intFromFloat((px - grid_x) / @as(f64, @floatFromInt(self.font.cell_width))),
-        .y = @intFromFloat((py - grid_y) / @as(f64, @floatFromInt(self.font.cell_height))),
+        .y = @intFromFloat((py - grid_y + @as(f64, @floatFromInt(self.scroll_offset))) /
+            @as(f64, @floatFromInt(self.font.cell_height))),
     };
 }
 
@@ -3404,7 +3425,7 @@ fn linkRange(self: *App, selection: vt.Selection) ?Renderer.LinkRange {
         screen,
         selection.topLeft(screen),
         selection.bottomRight(screen),
-        self.term.rows,
+        self.term.rows +| @intFromBool(self.scroll_offset != 0),
         self.term.cols,
     );
 }
@@ -3715,6 +3736,7 @@ fn fireSelectionAutoscroll(self: *App) void {
     _ = readTimer(self.selection_autoscroll_fd) orelse return;
     if (!self.selecting) return;
 
+    self.resetSmoothScroll();
     const cell = self.cellAtPointer();
     const pos = self.pointerPhysical();
     const selection = self.selection_gesture.autoscrollTick(&self.term, .{
@@ -4356,6 +4378,7 @@ fn syncScrollTarget(self: *App) void {
     self.stopFling();
     self.resetScrollVelocity();
     self.scroll_pixels = 0;
+    self.scroll_offset = 0;
     self.scroll_frame_pixels = 0;
     self.scroll_clicks = 0;
     self.scroll_value120 = 0;
@@ -4401,6 +4424,10 @@ fn finishScrollFrame(self: *App) void {
         const whole = @trunc(total);
         lines = @intFromFloat(whole);
         self.scroll_line_remainder = total - whole;
+    } else if (self.config.smooth_scrolling and self.scroll_target == .viewport and
+        (self.scroll_pixels != 0 or self.scroll_offset != 0))
+    {
+        self.scrollViewportPixels();
     } else if (self.scroll_pixels != 0) {
         // Logical pixels per row: physical cell height descaled.
         const cell: f64 = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
@@ -4411,7 +4438,7 @@ fn finishScrollFrame(self: *App) void {
         lines = @intFromFloat(whole);
         self.scroll_pixels -= whole * cell / multiplier;
     }
-    if (self.scroll_had_value120 or self.scroll_had_discrete) self.scroll_pixels = 0;
+    if (self.scroll_had_value120 or self.scroll_had_discrete) self.resetSmoothScroll();
     self.scroll_frame_pixels = 0;
     self.scroll_clicks = 0;
     self.scroll_value120 = 0;
@@ -4425,6 +4452,46 @@ fn finishScrollFrame(self: *App) void {
         self.startFling();
         self.resetScrollVelocity();
     }
+}
+
+/// Keep the viewport on the first partially visible row, with a nonnegative
+/// remainder. Clamping discards edge overshoot so reversing responds at once.
+fn scrollViewportPixels(self: *App) void {
+    const cell = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
+        @as(f64, @floatFromInt(self.window.scale120));
+    const multiplier = self.precisionScrollScale();
+    const pixels = self.scroll_pixels * multiplier;
+    const whole = @floor(pixels / cell);
+    const pages = &self.term.screens.active.pages;
+    const before = pages.scrollbar();
+    const target = @as(f64, @floatFromInt(before.offset)) + whole;
+    const max_row = before.total - before.len;
+    pages.scroll(.{ .row = @intFromFloat(std.math.clamp(target, 0, @as(f64, @floatFromInt(max_row)))) });
+    self.scroll_pixels = if (target < 0 or target >= @as(f64, @floatFromInt(max_row)))
+        0
+    else
+        (pixels - whole * cell) / multiplier;
+    const old_offset = self.scroll_offset;
+    self.scroll_offset = @intFromFloat(@min(
+        self.scroll_pixels * multiplier * @as(f64, @floatFromInt(self.window.scale120)) / 120.0,
+        @as(f64, @floatFromInt(self.font.cell_height - 1)),
+    ));
+    if (old_offset != self.scroll_offset or before.offset != pages.scrollbar().offset) {
+        if (self.selecting) self.extendSelection();
+        self.revealScrollbar();
+        self.needs_redraw = true;
+        self.syncHoveredLink(true);
+    }
+    if (self.scroll_pixels == 0 and (target < 0 or target >= @as(f64, @floatFromInt(max_row)))) {
+        self.stopFling();
+        self.resetScrollVelocity();
+    }
+}
+
+fn resetSmoothScroll(self: *App) void {
+    self.scroll_pixels = 0;
+    if (self.scroll_offset != 0) self.needs_redraw = true;
+    self.scroll_offset = 0;
 }
 
 fn precisionScrollScale(self: *const App) f64 {
@@ -4508,6 +4575,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     app.pointer_y = 5;
     app.pointer_inside = false;
     app.mouse_button = null;
+    app.selecting = false;
     app.mouse_shape_explicit = false;
     app.selection_gesture = .init;
     app.selection_autoscroll_fd = try createTimerFd();
@@ -4525,6 +4593,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     app.hovered_link = null;
     app.link_active = false;
     app.link_checked_cell = null;
+    app.scroll_offset = 0;
     app.fling_active = false;
     // Force the same initialization used when a new recipient takes over.
     app.scroll_target = .application;
@@ -4673,6 +4742,65 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
     try std.testing.expectEqual(@as(f64, 0), app.scroll_velocity);
     try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
+
+    // Sub-row movement is visible immediately in both directions and at
+    // fractional output scales. Disabling it retains signed quantization.
+    for ([_]u32{ 120, 180 }) |scale| {
+        for ([_]bool{ true, false }) |smooth| {
+            app.config = .{ .smooth_scrolling = smooth, .inertial_scrolling = false };
+            app.window.scale120 = scale;
+            app.resetSmoothScroll();
+            app.term.screens.active.pages.scroll(.{ .row = 5 });
+            pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(-1) } });
+            pointerEvent(app, .frame);
+            try std.testing.expectEqual(@as(usize, if (smooth) 4 else 5), app.term.screens.active.pages.scrollbar().offset);
+            const expected: u31 = if (!smooth) 0 else if (scale == 120) 17 else 15;
+            try std.testing.expectEqual(expected, app.scroll_offset);
+            if (smooth) {
+                // The exposed bottom strip belongs to the overscan row,
+                // not the viewport's last complete row.
+                app.pointer_y = 59 * 120.0 / @as(f64, @floatFromInt(scale));
+                try std.testing.expectEqual(@as(u16, 3), app.cellAtPointer().y);
+                const pin = app.term.screens.active.pages.pin(.{ .viewport = .{ .y = 3 } }).?;
+                try std.testing.expect(app.pinAtPointer().?.eql(pin));
+            }
+            pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 110, .value = .fromDouble(1) } });
+            pointerEvent(app, .frame);
+            try std.testing.expectEqual(@as(usize, 5), app.term.screens.active.pages.scrollbar().offset);
+            try std.testing.expectEqual(@as(u31, 0), app.scroll_offset);
+        }
+    }
+    app.window.scale120 = 120;
+    app.config = .{};
+    for ([_]bool{ false, true }) |bottom| {
+        app.resetSmoothScroll();
+        app.term.screens.active.pages.scroll(if (bottom) .active else .top);
+        const edge = app.term.screens.active.pages.scrollbar().offset;
+        pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(if (bottom) 100 else -100) } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(edge, app.term.screens.active.pages.scrollbar().offset);
+        try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+        pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 110, .value = .fromDouble(if (bottom) -1 else 1) } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(@as(u31, if (bottom) 17 else 3), app.scroll_offset);
+    }
+    // Explicit row navigation must remove the crop and stale remainder.
+    app.handleScrollbackKey(.{ .key = .home, .action = .press }, .top);
+    try std.testing.expectEqual(@as(u31, 0), app.scroll_offset);
+    try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
+
+    // Inertia uses the same pixel path: 500 px/s for 8 ms moves 4 px.
+    app.term.screens.active.pages.scroll(.{ .row = 5 });
+    app.scroll_velocity = -500;
+    app.startFling();
+    try std.testing.expect(app.fling_active);
+    try std.testing.expect(setTimer(app.fling_fd, .{ .it_value = timespecFromNs(1), .it_interval = .{ .sec = 0, .nsec = 0 } }, "test fling"));
+    var fds = [_]posix.pollfd{.{ .fd = app.fling_fd, .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&fds, 1000));
+    app.fireFling();
+    try std.testing.expectEqual(@as(usize, 4), app.term.screens.active.pages.scrollbar().offset);
+    try std.testing.expectEqual(@as(u31, 16), app.scroll_offset);
+    app.stopFling();
 }
 
 test "application fling threshold ignores precision configuration" {
@@ -5106,6 +5234,8 @@ fn applyPendingIme(self: *App) void {
     if (self.ime_pending_commit) |commit| {
         if (commit.len > 0) {
             self.writePty(commit);
+            self.stopFling();
+            self.resetSmoothScroll();
             self.clearSelection();
             if (self.term.screens.active.pages.viewport != .active) {
                 self.term.screens.active.pages.scroll(.active);
@@ -5259,6 +5389,7 @@ fn startSearch(self: *App) void {
         return;
     };
     self.stopFling();
+    self.resetSmoothScroll();
     self.clearSelection();
     self.requestFullAsyncRedraw();
 }
@@ -5443,6 +5574,7 @@ fn scrollToSearchSelection(self: *App) void {
     const match = search.engine.?.selectedMatch() orelse return;
     const screen = search.engine.?.screen;
     if (!searchMatchVisible(screen, match)) {
+        self.resetSmoothScroll();
         screen.pages.scroll(.{ .pin = match.startPin() });
         self.revealScrollbar();
         self.syncHoveredLink(true);
@@ -5558,6 +5690,7 @@ fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: ScrollbackK
     if (event.action == .release) return;
 
     self.stopFling();
+    self.resetSmoothScroll();
     const rows: isize = @intCast(self.term.rows);
     switch (scroll) {
         .lines => |lines| self.term.screens.active.pages.scroll(.{ .delta_row = lines }),
@@ -5614,6 +5747,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     // selection-clear-on-typing behavior).
     if (wrote and action != .release and !event.key.modifier()) {
         self.stopFling();
+        self.resetSmoothScroll();
         self.clearSelection();
         if (self.term.screens.active.pages.viewport != .active) {
             self.term.screens.active.pages.scroll(.active);
@@ -5828,7 +5962,7 @@ fn searchRangeForRender(self: *App) ?Renderer.LinkRange {
         search.engine.?.screen,
         match.startPin(),
         match.endPin(),
-        self.term.rows,
+        self.term.rows +| @intFromBool(self.scroll_offset != 0),
         self.term.cols,
     );
 }
@@ -5844,7 +5978,7 @@ fn searchMatchesForRender(self: *App) !std.ArrayList(bool) {
         self.alloc,
         search.engine.?.screen,
         search.query.items,
-        self.term.rows,
+        self.term.rows +| @intFromBool(self.scroll_offset != 0),
         self.term.cols,
     );
 }
@@ -5863,6 +5997,18 @@ fn searchMatchMask(
     var viewport: vt.search.Viewport = try .init(alloc, query);
     defer viewport.deinit();
     _ = try viewport.update(&screen.pages);
+    // The partial bottom row can cross a page boundary. ViewportSearch
+    // usually includes it already, but only guarantees the whole viewport.
+    if (rows > screen.pages.rows) {
+        if (screen.pages.getTopLeft(.viewport).down(rows - 1)) |bottom| {
+            var pages = viewport.window.meta.iterator(.forward);
+            while (pages.next()) |page| {
+                if (page.node == bottom.node) break;
+            } else {
+                _ = try viewport.window.append(bottom.node);
+            }
+        }
+    }
     while (viewport.next()) |match| {
         const range = highlightRange(
             screen,
@@ -5971,13 +6117,19 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
     var scroll: ?ScrollDetector.Scroll = null;
     var old_cursor: vt.RenderState.Cursor = self.render_state.cursor;
     if (!frozen) {
+        self.syncScrollTarget();
+        if (self.scroll_offset != 0 and
+            (!self.config.smooth_scrolling or scrollbarAtBottom(self.term.screens.active.pages.scrollbar())))
+        {
+            self.resetSmoothScroll();
+        }
         self.tickKittyAnimations();
         const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
         const new_scrollbar = self.currentScrollbarThumb();
         // Detection must precede update(). Both the previous and next frame
         // must be free of overlays because their pixels do not move with
         // terminal rows.
-        if (!self.async_force_full and
+        if (!self.async_force_full and self.scroll_offset == 0 and self.render_scroll_offset == 0 and
             !hyperlink_hints and !self.async_job.hyperlink_hints and
             self.ime_preedit == null and self.async_job.preedit == null and
             self.async_job.link_hint == null and
@@ -5992,7 +6144,24 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             self.render_state.dirty = .full;
         }
         old_cursor = self.render_state.cursor;
+        self.render_state.overscan_request = .{ .below = @intFromBool(self.scroll_offset != 0) };
         try self.render_state.update(self.alloc, &self.term);
+        // Ghostty excludes overscan from cursor.viewport. Our cropped grid
+        // can expose that row, so include its cursor in this render snapshot.
+        if (self.render_state.cursor.viewport == null and self.render_state.overscan.below != 0) {
+            const cursor = self.term.screens.active.cursor;
+            const pin = self.render_state.row_data.items(.pin)[self.render_state.rows];
+            if (pin.node == cursor.page_pin.node and pin.y == cursor.page_pin.y) {
+                const cells = self.render_state.row_data.items(.cells)[self.render_state.rows].items(.raw);
+                self.render_state.cursor.viewport = .{
+                    .x = cursor.x,
+                    .y = self.render_state.rows,
+                    .wide_tail = cursor.x > 0 and cells[cursor.x - 1].wide == .wide,
+                };
+            }
+        }
+        if (self.scroll_offset != self.render_scroll_offset) self.render_state.dirty = .full;
+        self.render_scroll_offset = self.scroll_offset;
         self.dirtyCursorRows(old_cursor);
         // If terminal state (rather than the fade timer) removed the last
         // overlay, redraw its old pixels instead of repairing from a buffer
@@ -6119,6 +6288,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .kitty_items = self.async_job.kitty,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,
+        .scroll_offset = @min(self.render_scroll_offset, self.font.cell_height - 1),
         .repair = repair,
     }) catch |err| {
         self.window.cancelRender(target.buffer);
@@ -6396,7 +6566,7 @@ fn textInputCursorRect(self: *App, state: *const vt.RenderState) Window.TextInpu
     const y_cells: u32 = if (cursor) |cpos| @intCast(cpos.y) else 0;
     return physicalRectToLogical(self.window.scale120, .{
         .x = @intCast(self.layout.grid_x + x_cells * self.font.cell_width),
-        .y = @intCast(self.layout.grid_y + y_cells * self.font.cell_height),
+        .y = @intCast(self.layout.grid_y + (y_cells * self.font.cell_height -| self.render_scroll_offset)),
         .width = @intCast(self.font.cell_width),
         .height = @intCast(self.font.cell_height),
     });
@@ -6502,6 +6672,8 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     const cells_changed = cols != self.term.cols or rows != self.term.rows;
     if (!cells_changed and !pixels_changed and !layout_changed) return;
 
+    self.stopFling();
+    self.resetSmoothScroll();
     if (cells_changed or pixels_changed) {
         if (cells_changed) log.debug("resize to {d}x{d} cells", .{ cols, rows });
         try self.term.resize(self.alloc, .{
@@ -6736,6 +6908,25 @@ test "search match mask includes every visible result" {
     try std.testing.expectEqualSlices(bool, &.{ true, true, true, false, true, true, true, false, false, false }, mask.items[0..10]);
     const no_matches = [_]bool{false} ** 10;
     try std.testing.expectEqualSlices(bool, &no_matches, mask.items[10..20]);
+}
+
+test "search match mask includes overscan across a page boundary" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 2, .max_scrollback_bytes = 1_000_000 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    const pages = &term.screens.active.pages;
+    const capacity = pages.pages.first.?.capacity().rows;
+    for (0..@as(usize, capacity) + 3) |_| stream.nextSlice("hit\r\n");
+    const first = pages.pages.first.?;
+    try std.testing.expect(first.next != null);
+    pages.scroll(.{ .pin = .{ .node = first, .y = first.rows() - 2, .x = 0 } });
+    try std.testing.expect(pages.getTopLeft(.viewport).down(2).?.node != first);
+    var mask = try searchMatchMask(alloc, term.screens.active, "hit", 3, 10);
+    defer mask.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 30), mask.items.len);
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, false, false, false, false, false, false, false }, mask.items[20..30]);
 }
 
 test "stopping the read pipeline preserves final PTY output" {

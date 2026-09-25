@@ -383,6 +383,10 @@ fn writeData(
             try self.finishWriteStatus(state, .EFBIG, terminator);
             return;
         },
+        error.Invalid => {
+            try self.finishWriteStatus(state, .EINVAL, terminator);
+            return;
+        },
     };
     try self.enforceLiveWriteLimit(state, terminator);
 }
@@ -433,6 +437,10 @@ fn commitWrite(
         error.OutOfMemory => {
             try self.finishWriteStatus(state, .EIO, terminator);
             return error.OutOfMemory;
+        },
+        error.Invalid => {
+            try self.finishWriteStatus(state, .EINVAL, terminator);
+            return;
         },
     };
     errdefer committed.deinit(self.alloc);
@@ -774,6 +782,47 @@ test "rejected write commit cleans up live state" {
     try std.testing.expectEqual(clipboard.Status.EBUSY, response.status);
     try std.testing.expectEqualStrings("w", response.id);
     state.retained_bytes = 0;
+}
+
+test "invalid write data aborts transaction with EINVAL" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.handle(.{ .metadata = "type=write:id=invalid-data", .payload = null, .terminator = .st });
+    try state.handle(.{
+        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
+        .payload = "!!!!",
+        .terminator = .bel,
+    });
+
+    try std.testing.expect(state.write_state == null);
+    try std.testing.expectEqual(@as(usize, 1), state.queue.items.len);
+    const status = state.front().?.status;
+    try std.testing.expectEqual(clipboard.Operation.write, status.op);
+    try std.testing.expectEqual(clipboard.Status.EINVAL, status.status);
+    try std.testing.expectEqualStrings("invalid-data", status.id);
+    try std.testing.expectEqual(vt.osc.Terminator.bel, status.terminator);
+}
+
+test "unfinished write base64 aborts commit with EINVAL" {
+    var state: KittyClipboard = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.handle(.{ .metadata = "type=write:id=unfinished", .payload = null, .terminator = .st });
+    try state.handle(.{
+        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
+        .payload = "YQ",
+        .terminator = .st,
+    });
+    try state.handle(.{ .metadata = "type=wdata", .payload = null, .terminator = .bel });
+
+    try std.testing.expect(state.write_state == null);
+    try std.testing.expectEqual(@as(usize, 1), state.queue.items.len);
+    const status = state.front().?.status;
+    try std.testing.expectEqual(clipboard.Operation.write, status.op);
+    try std.testing.expectEqual(clipboard.Status.EINVAL, status.status);
+    try std.testing.expectEqualStrings("unfinished", status.id);
+    try std.testing.expectEqual(vt.osc.Terminator.bel, status.terminator);
 }
 
 test "repeated aliases abort live write storage at retained byte limit" {

@@ -50,8 +50,9 @@ pub const KittyRenderItem = struct {
     viewport: KittyPlacementViewport,
 };
 
-/// Resolve every visible kitty placement (pinned and Unicode-virtual)
-/// into terminal-independent render items, z-sorted. The returned
+/// Resolve kitty placements in the viewport and one overscan row below it
+/// (pinned and Unicode-virtual) into terminal-independent render items,
+/// z-sorted. Renderers clip to their pixel viewport. The returned
 /// slice is owned by the caller; each item's image data still points
 /// into the terminal's storage.
 pub fn collectKittyPlacements(
@@ -203,7 +204,7 @@ fn kittyPlacementViewportAt(
     const placement_height = std.math.add(u32, pixel_size.height, placement.y_offset) catch return null;
     const grid_rows = std.math.divCeil(u32, placement_height, cell_height) catch return null;
     const visible = @as(i64, viewport_row) + grid_rows > 0 and
-        viewport_row < @as(i32, @intCast(terminal.rows));
+        viewport_row <= @as(i32, @intCast(terminal.rows));
 
     const source_x = @min(placement.source_x, image.width);
     const source_y = @min(placement.source_y, image.height);
@@ -236,7 +237,8 @@ fn collectKittyVirtualPlacements(
 ) !void {
     const storage = &terminal.screens.active.kitty_images;
     const top = terminal.screens.active.pages.getTopLeft(.viewport);
-    const bot = terminal.screens.active.pages.getBottomRight(.viewport) orelse return;
+    const viewport_bot = terminal.screens.active.pages.getBottomRight(.viewport) orelse return;
+    const bot = viewport_bot.down(1) orelse viewport_bot;
 
     var virtual_origins: std.AutoHashMapUnmanaged(KittyPlacementKey, struct { x: u32, y: u32 }) = .empty;
     defer virtual_origins.deinit(alloc);

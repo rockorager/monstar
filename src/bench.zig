@@ -36,12 +36,16 @@ pub fn run(init: std.process.Init) !void {
     const width: u31 = font.cell_width * cols;
     const height: u31 = font.cell_height * rows;
 
-    var term: vt.Terminal = try .init(init.io, alloc, .{
+    var colors = try config.terminalColors(alloc, .dark);
+    var term: vt.Terminal = vt.Terminal.init(init.io, alloc, .{
         .cols = cols,
         .rows = rows,
         .max_scrollback_bytes = config.scrollback_limit,
-        .colors = config.terminalColors(.dark),
-    });
+        .colors = colors,
+    }) catch |err| {
+        colors.palette.deinit(alloc);
+        return err;
+    };
     defer term.deinit(alloc);
     term.width_px = width;
     term.height_px = height;
@@ -234,12 +238,16 @@ fn benchFullGrid(
 ) !void {
     const width: u31 = renderer.font.cell_width * bench_cols;
     const height: u31 = renderer.font.cell_height * bench_rows;
-    var term: vt.Terminal = try .init(io, alloc, .{
+    var colors = try config.terminalColors(alloc, .dark);
+    var term: vt.Terminal = vt.Terminal.init(io, alloc, .{
         .cols = bench_cols,
         .rows = bench_rows,
         .max_scrollback_bytes = config.scrollback_limit,
-        .colors = config.terminalColors(.dark),
-    });
+        .colors = colors,
+    }) catch |err| {
+        colors.palette.deinit(alloc);
+        return err;
+    };
     defer term.deinit(alloc);
     term.width_px = width;
     term.height_px = height;
@@ -341,12 +349,16 @@ fn benchShapePrefixChurn(
 ) !void {
     const width: u31 = renderer.font.cell_width * bench_cols;
     const height: u31 = renderer.font.cell_height * bench_rows;
-    var term: vt.Terminal = try .init(io, alloc, .{
+    var colors = try config.terminalColors(alloc, .dark);
+    var term: vt.Terminal = vt.Terminal.init(io, alloc, .{
         .cols = bench_cols,
         .rows = bench_rows,
         .max_scrollback_bytes = config.scrollback_limit,
-        .colors = config.terminalColors(.dark),
-    });
+        .colors = colors,
+    }) catch |err| {
+        colors.palette.deinit(alloc);
+        return err;
+    };
     defer term.deinit(alloc);
     term.width_px = width;
     term.height_px = height;

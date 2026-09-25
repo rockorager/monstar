@@ -119,6 +119,8 @@ image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
 /// Whether finger scrolling continues with inertial motion after release.
 inertial_scrolling: bool = true,
+/// Render precision scrollback movement in pixels rather than whole rows.
+smooth_scrolling: bool = true,
 /// User keybindings, backed by the config arena. Defaults are resolved separately.
 keybinds: std.ArrayList(keybind.Binding) = .empty,
 /// Duration of the post-copy selection flash in milliseconds; 0 disables it.
@@ -262,6 +264,13 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         try keybind.put(&self.keybinds, arena, value);
     } else if (std.mem.eql(u8, key, "inertial-scrolling")) {
         self.inertial_scrolling = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "smooth-scrolling")) {
+        self.smooth_scrolling = if (std.mem.eql(u8, value, "true"))
             true
         else if (std.mem.eql(u8, value, "false"))
             false
@@ -495,7 +504,13 @@ pub fn effectiveCursorText(self: *const Config, color_scheme: vt.device_status.C
 
 /// The terminal color options this config describes: config colors form
 /// the *default* layer, so OSC 10/11/12/4 can still override and reset.
-pub fn terminalColors(self: *const Config, color_scheme: vt.device_status.ColorScheme) vt.Terminal.Colors {
+/// The caller owns the returned palette and must deinit it, unless ownership
+/// is transferred to a successful `vt.Terminal.init` call.
+pub fn terminalColors(
+    self: *const Config,
+    alloc: std.mem.Allocator,
+    color_scheme: vt.device_status.ColorScheme,
+) !vt.Terminal.Colors {
     const themed = colorsForScheme(color_scheme);
     const palette = config_theme.resolvePalette(
         &self.palette,
@@ -509,7 +524,7 @@ pub fn terminalColors(self: *const Config, color_scheme: vt.device_status.ColorS
             .init(rgb)
         else
             .unset,
-        .palette = .init(palette),
+        .palette = try .init(alloc, palette),
     };
 }
 
@@ -736,6 +751,17 @@ test "inertial scrolling accepts booleans" {
     try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "inertial-scrolling", "yes"));
 }
 
+test "smooth scrolling defaults on and accepts booleans independently of inertia" {
+    var config: Config = .{};
+    try std.testing.expect(config.smooth_scrolling);
+    try config.set(std.testing.allocator, "smooth-scrolling", "false");
+    try std.testing.expect(!config.smooth_scrolling and config.inertial_scrolling);
+    try config.set(std.testing.allocator, "inertial-scrolling", "false");
+    try config.set(std.testing.allocator, "smooth-scrolling", "true");
+    try std.testing.expect(config.smooth_scrolling and !config.inertial_scrolling);
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "smooth-scrolling", "yes"));
+}
+
 test "copy highlight duration accepts milliseconds and zero" {
     var config: Config = .{};
     try config.set(std.testing.allocator, "copy-highlight-duration", "350");
@@ -864,7 +890,8 @@ test "invalid window padding keeps the previous value" {
 test "terminal colors from config" {
     var config: Config = .{};
     config.background = .{ .r = 1, .g = 2, .b = 3 };
-    const colors = config.terminalColors(.dark);
+    var colors = try config.terminalColors(std.testing.allocator, .dark);
+    defer colors.palette.deinit(std.testing.allocator);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
     try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
     try std.testing.expectEqual(dark_theme.cursor_color, colors.cursor.get().?);
@@ -874,7 +901,8 @@ test "terminal colors from config" {
 
 test "built-in colors follow color scheme" {
     const config: Config = .{};
-    const light_colors = config.terminalColors(.light);
+    var light_colors = try config.terminalColors(std.testing.allocator, .light);
+    defer light_colors.palette.deinit(std.testing.allocator);
     try std.testing.expectEqual(light_theme.background, light_colors.background.get().?);
     try std.testing.expectEqual(light_theme.foreground, light_colors.foreground.get().?);
     try std.testing.expectEqual(light_theme.foreground, light_theme.cursor_color);
@@ -884,7 +912,8 @@ test "built-in colors follow color scheme" {
     try std.testing.expectEqual(light_theme.copy_highlight, config.effectiveCopyHighlight(.light));
     try std.testing.expectEqual(light_theme.copy_highlight_foreground, config.effectiveCopyHighlightForeground(.light));
 
-    const dark_colors = config.terminalColors(.dark);
+    var dark_colors = try config.terminalColors(std.testing.allocator, .dark);
+    defer dark_colors.palette.deinit(std.testing.allocator);
     try std.testing.expectEqual(dark_theme.background, dark_colors.background.get().?);
     try std.testing.expectEqual(dark_theme.foreground, dark_colors.foreground.get().?);
     try std.testing.expectEqual(dark_theme.foreground, dark_theme.cursor_color);
@@ -907,7 +936,7 @@ test "built-in colors do not replace explicit color overrides" {
         \\copy-highlight-foreground = #0d0e0f
     );
 
-    const colors = config.terminalColors(.dark);
+    const colors = try config.terminalColors(arena, .dark);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, colors.background.get().?);
     try std.testing.expectEqual(dark_theme.foreground, colors.foreground.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, colors.palette.current[1]);
@@ -941,7 +970,8 @@ test "named themes follow color scheme and remain below explicit colors" {
     config.background = .{ .r = 1, .g = 2, .b = 3 };
     config.palette[1] = .{ .r = 4, .g = 5, .b = 6 };
 
-    const light = config.terminalColors(.light);
+    var light = try config.terminalColors(std.testing.allocator, .light);
+    defer light.palette.deinit(std.testing.allocator);
     try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, light.background.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x11, .g = 0x11, .b = 0x11 }, light.foreground.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x22, .g = 0x22, .b = 0x22 }, light.cursor.get().?);
@@ -955,7 +985,8 @@ test "named themes follow color scheme and remain below explicit colors" {
     config.cursor_text = .{ .rgb = .{ .r = 7, .g = 8, .b = 9 } };
     try std.testing.expectEqual(TerminalColor{ .rgb = .{ .r = 7, .g = 8, .b = 9 } }, config.effectiveCursorText(.light).?);
 
-    const dark = config.terminalColors(.dark);
+    var dark = try config.terminalColors(std.testing.allocator, .dark);
+    defer dark.palette.deinit(std.testing.allocator);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf0, .g = 0xf0, .b = 0xf0 }, dark.foreground.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 4, .g = 5, .b = 6 }, dark.palette.current[1]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xe0, .g = 0xe0, .b = 0xe0 }, config.effectiveSelectionForeground(.dark));
@@ -973,8 +1004,12 @@ test "cell cursor colors stay out of the VT default layer" {
     try std.testing.expectEqual(@as(TerminalColor, .cell_background), config.cursor_text.?);
     try std.testing.expectEqual(@as(TerminalColor, .cell_foreground), config.effectiveCursorColor(.dark));
     try std.testing.expectEqual(@as(TerminalColor, .cell_background), config.effectiveCursorText(.dark).?);
-    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.terminalColors(.dark).cursor.get());
-    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.terminalColors(.light).cursor.get());
+    var dark = try config.terminalColors(std.testing.allocator, .dark);
+    defer dark.palette.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), dark.cursor.get());
+    var light = try config.terminalColors(std.testing.allocator, .light);
+    defer light.palette.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), light.cursor.get());
 }
 
 test "named theme cell cursor colors stay below explicit colors" {
@@ -985,7 +1020,9 @@ test "named theme cell cursor colors stay below explicit colors" {
     );
     try std.testing.expectEqual(@as(TerminalColor, .cell_foreground), config.effectiveCursorColor(.light));
     try std.testing.expectEqual(@as(TerminalColor, .cell_background), config.effectiveCursorText(.light).?);
-    try std.testing.expectEqual(@as(?vt.color.RGB, null), config.terminalColors(.light).cursor.get());
+    var light = try config.terminalColors(std.testing.allocator, .light);
+    defer light.palette.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?vt.color.RGB, null), light.cursor.get());
     try std.testing.expectEqual(
         TerminalColor{ .rgb = dark_theme.cursor_color },
         config.effectiveCursorColor(.dark),
@@ -996,7 +1033,9 @@ test "named theme cell cursor colors stay below explicit colors" {
         TerminalColor{ .rgb = .{ .r = 1, .g = 2, .b = 3 } },
         config.effectiveCursorColor(.light),
     );
-    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, config.terminalColors(.light).cursor.get().?);
+    var explicit_light = try config.terminalColors(std.testing.allocator, .light);
+    defer explicit_light.palette.deinit(std.testing.allocator);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 1, .g = 2, .b = 3 }, explicit_light.cursor.get().?);
 }
 
 test "absolute theme file resolves" {
@@ -1018,7 +1057,7 @@ test "absolute theme file resolves" {
 
     var config: Config = .{ .theme = .{ .light = path, .dark = path } };
     try config.resolveThemes(std.testing.io, arena, .empty);
-    const colors = config.terminalColors(.dark);
+    const colors = try config.terminalColors(arena, .dark);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, colors.background.get().?);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xab, .g = 0xcd, .b = 0xef }, colors.palette.current[15]);
 }
@@ -1073,7 +1112,7 @@ test "config and named themes ignore empty and relative XDG_CONFIG_HOME" {
         for ([_]vt.device_status.ColorScheme{ .light, .dark }) |scheme| {
             try std.testing.expectEqual(
                 try config_theme.parseColor(colors[case.location]),
-                config.terminalColors(scheme).background.get().?,
+                (try config.terminalColors(arena, scheme)).background.get().?,
             );
         }
     }

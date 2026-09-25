@@ -75,6 +75,8 @@ pub const Job = struct {
     /// Whole terminal rows by which previous-frame pixels move. Positive
     /// shifts content up; negative shifts it down.
     scroll_shift: ?isize,
+    /// Physical pixels cropped from the overscanned grid's top edge.
+    scroll_offset: u31 = 0,
     /// Work needed to bring a stale target up to the previous committed
     /// frame.
     repair: Repair,
@@ -491,7 +493,7 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     const grid_pixels = gridPixels(job);
     // Overlays draw outside the grid rows that dirty tracking accounts
     // for, so an overlay frame is always a full render with full damage.
-    if (job.hasOverlay()) {
+    if (job.hasOverlay() or job.scroll_offset != 0) {
         // Unless nothing changed at all: clean content plus the same
         // overlays as the previous job reproduce the previous frame,
         // so repair to it instead of re-rendering. Without this a
@@ -502,7 +504,9 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             return;
         }
         clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
-        if (job.kitty_items.len > 0) {
+        if (job.scroll_offset != 0) {
+            try self.renderer.renderScrolled(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height, job.scroll_offset);
+        } else if (job.kitty_items.len > 0) {
             try self.renderer.renderWithKittyItems(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height);
         } else {
             try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
