@@ -5714,27 +5714,29 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     if (scrollbackKeyAction(&self.config, self.term.screens.active_key, event)) |scroll| {
         if (scroll != .passthrough) return self.handleScrollbackKey(event, scroll);
     } else {
+        // Fixed shortcuts fire once, but their matching repeats and releases
+        // must not leak into the application as keyboard-protocol input.
         // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
-        if (action == .press and event.mods.ctrl) {
+        if (event.mods.ctrl) {
             switch (event.unshifted_codepoint) {
-                '=' => return self.adjustRuntimeFontSize(1),
-                '-' => if (!event.mods.shift) return self.adjustRuntimeFontSize(-1),
-                '0' => if (!event.mods.shift) return self.resetRuntimeFontSize(),
+                '=' => return if (action == .press) self.adjustRuntimeFontSize(1),
+                '-' => if (!event.mods.shift) return if (action == .press) self.adjustRuntimeFontSize(-1),
+                '0' => if (!event.mods.shift) return if (action == .press) self.resetRuntimeFontSize(),
                 else => {},
             }
         }
 
         // Copy/paste bindings take priority over the application.
-        if (action == .press and event.mods.ctrl and event.mods.shift) {
+        if (event.mods.ctrl and event.mods.shift) {
             switch (event.unshifted_codepoint) {
-                'c' => return self.copyToClipboard(),
-                'f' => return self.startSearch(),
-                'g' => return self.pipeCommandOutput(),
-                'n' => return self.spawnNewWindow(),
-                'v' => return self.beginPaste(.clipboard),
-                'x' => return self.jumpPrompt(1),
-                'z' => return self.jumpPrompt(-1),
-                ',' => return self.reloadConfig(),
+                'c' => return if (action == .press) self.copyToClipboard(),
+                'f' => return if (action == .press) self.startSearch(),
+                'g' => return if (action == .press) self.pipeCommandOutput(),
+                'n' => return if (action == .press) self.spawnNewWindow(),
+                'v' => return if (action == .press) self.beginPaste(.clipboard),
+                'x' => return if (action == .press) self.jumpPrompt(1),
+                'z' => return if (action == .press) self.jumpPrompt(-1),
+                ',' => return if (action == .press) self.reloadConfig(),
                 else => {},
             }
         }
@@ -5756,6 +5758,87 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
             self.syncHoveredLink(true);
         }
     }
+}
+
+test "fixed shortcuts consume repeats and releases without writing terminal input" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.config = .{};
+    defer app.config.keybinds.deinit(alloc);
+    app.search = null;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+    app.pty.master = fds[1];
+    app.fling_active = false;
+    app.scroll_offset = 0;
+    app.selection_gesture = .init;
+    app.selection_autoscroll_fd = try createTimerFd();
+    defer _ = linux.close(app.selection_autoscroll_fd);
+    app.keyboard = try .init();
+    defer app.keyboard.deinit();
+
+    const names: c.xkb_rule_names = .{ .layout = "us", .options = "" };
+    const keymap = c.xkb_keymap_new_from_names(app.keyboard.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse
+        return error.KeymapParseFailed;
+    defer c.xkb_keymap_unref(keymap);
+    const keymap_text = c.xkb_keymap_get_as_string(keymap, c.XKB_KEYMAP_FORMAT_TEXT_V1) orelse
+        return error.KeymapParseFailed;
+    defer std.c.free(keymap_text);
+    const keymap_size = std.mem.len(keymap_text) + 1;
+    const keymap_fd = try posix.memfd_createZ("shortcut-test", linux.MFD.CLOEXEC);
+    // setKeymap takes ownership of this fd, including on failure.
+    try std.testing.expectEqual(keymap_size, linux.write(keymap_fd, keymap_text, keymap_size));
+    try app.keyboard.setKeymap(keymap_fd, @intCast(keymap_size));
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 29 + 8, c.XKB_KEY_DOWN); // Ctrl
+
+    for ([_]bool{ false, true }) |kitty| {
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        if (kitty) stream.nextSlice("\x1b[>3u"); // Disambiguate and report event types.
+        for ([_]bool{ true, false }) |shift| {
+            _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, if (shift) c.XKB_KEY_DOWN else c.XKB_KEY_UP);
+            const keys: []const u32 = if (shift)
+                &.{ 46, 47, 33, 34, 49, 45, 44, 51, 13 } // C, V, F, G, N, X, Z, comma, equals
+            else
+                &.{ 13, 12, 11 }; // equals, minus, zero
+            for (keys) |key| {
+                for ([_]vt.input.KeyAction{ .repeat, .release }) |action| {
+                    app.onKey(key, action);
+                    var buf: [64]u8 = undefined;
+                    const n = posix.read(fds[0], &buf) catch |err| switch (err) {
+                        error.WouldBlock => 0,
+                        else => return err,
+                    };
+                    try std.testing.expectEqualStrings("", buf[0..n]);
+                }
+            }
+        }
+        if (kitty) stream.nextSlice("\x1b[<u");
+    }
+
+    // An explicit unbind still passes the same repeated shortcut through.
+    try keybind.put(&app.config.keybinds, alloc, "ctrl+shift+c=unbind");
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_DOWN);
+    app.onKey(46, .repeat);
+    var buf: [64]u8 = undefined;
+    const unbound_n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x1b[99;6u", buf[0..unbound_n]);
+    // Ordinary Ctrl+C must also continue reaching the application.
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_UP);
+    app.onKey(46, .repeat);
+    const control_n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x03", buf[0..control_n]);
 }
 
 fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {
