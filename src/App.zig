@@ -4196,6 +4196,7 @@ fn writeTerminalPaste(
         .text => {},
     }
 
+    if (!vt.clipboard.isTextMime(mime)) return;
     // STRING is Latin-1, unlike the other accepted text representations.
     // Decode only ordinary paste; Kitty transfers retain their MIME and bytes.
     const decoded = if (std.mem.eql(u8, mime, "STRING"))
@@ -4203,19 +4204,17 @@ fn writeTerminalPaste(
     else
         null;
     defer if (decoded) |text| self.alloc.free(text);
-    const contents = [_]vt.clipboard.Content{.{
-        .mime = if (decoded != null) "text/plain;charset=utf-8" else mime,
-        .data = decoded orelse data,
-    }};
-    _ = self.stream.handler.terminal_handler.paste(.{
-        .source = source,
-        .contents = .{ .memory = &contents },
-        // Preserve Monstar's existing paste policy. libghostty still applies
-        // bracket framing and xterm control-byte sanitization.
-        .allow_unsafe = true,
-    }) catch |err| {
+
+    // The stream handler emits paste chunks separately, but writePty's queue
+    // limit must accept or reject the whole paste, including both brackets.
+    // Keep libghostty's sanitization and Monstar's allow-unsafe paste policy.
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    vt.input.encodePasteWriter(&writer.writer, decoded orelse data, .fromTerminal(&self.term)) catch |err| {
         log.warn("terminal paste failed: {}", .{err});
+        return;
     };
+    self.writePty(writer.writer.buffered());
 }
 
 test "ordinary STRING pastes and text drops decode Latin-1" {
@@ -4265,6 +4264,48 @@ test "ordinary STRING pastes and text drops decode Latin-1" {
         const drop = try app.formatDropPaste(case.mime, case.data);
         defer alloc.free(drop);
         try std.testing.expectEqualStrings(utf8, drop);
+    }
+}
+
+test "ordinary paste is accepted whole or rejected at the PTY queue limit" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.stream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer app.stream.deinit();
+    app.stream.handler.terminal_handler.effects = .readonly;
+    app.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+
+    // Cross multiple libghostty paste chunks and check independently specified
+    // sanitization and framing, not just the number of queued bytes.
+    const middle = "0123456789abcdef" ** 512;
+    const data = "first\n\x1b" ++ middle ++ "last\n";
+    for ([_]bool{ true, false }) |bracketed| {
+        app.term.modes.set(.bracketed_paste, bracketed);
+        const expected = if (bracketed)
+            "\x1b[200~first\n " ++ middle ++ "last\n\x1b[201~"
+        else
+            "first\r " ++ middle ++ "last\r";
+        for ([_]bool{ true, false }) |fits| {
+            const pending = max_pty_write_queue - expected.len + @intFromBool(!fits);
+            try app.write_queue.resize(alloc, pending + 3);
+            @memset(app.write_queue.items, 'p');
+            app.write_queue_offset = 3;
+            app.writeTerminalPaste(.{ .clipboard = .standard }, "text/plain", data);
+
+            try std.testing.expectEqual(@as(usize, 3), app.write_queue_offset);
+            try std.testing.expectEqual(pending + 3 + if (fits) expected.len else 0, app.write_queue.items.len);
+            try std.testing.expect(std.mem.allEqual(u8, app.write_queue.items[0 .. pending + 3], 'p'));
+            try std.testing.expectEqualStrings(if (fits) expected else "", app.write_queue.items[pending + 3 ..]);
+        }
     }
 }
 
