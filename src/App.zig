@@ -1432,6 +1432,8 @@ fn handleDbusMessage(self: *App, message: *const DbusConnection.Message) void {
             self.handleNotificationActivationToken(message);
         } else if (std.mem.eql(u8, member, "ActionInvoked")) {
             self.handleNotificationActionInvoked(message);
+        } else if (std.mem.eql(u8, member, "NotificationClosed")) {
+            self.handleNotificationClosed(message);
         }
     } else if (std.mem.eql(u8, interface, "org.freedesktop.portal.Settings") and
         std.mem.eql(u8, member, "SettingChanged"))
@@ -1527,6 +1529,17 @@ fn handleNotificationActivationToken(self: *App, message: *const DbusConnection.
     token_slot.* = owned;
 }
 
+fn handleNotificationClosed(self: *App, message: *const DbusConnection.Message) void {
+    if (!std.mem.eql(u8, message.bodySignature(), "uu")) return;
+    var decoder = message.bodyDecoder();
+    const notification_id = decoder.uint32() catch return;
+    _ = decoder.uint32() catch return; // Every close reason invalidates the ID.
+    decoder.end() catch return;
+
+    const notification = self.notifications.fetchRemove(notification_id) orelse return;
+    if (notification.value) |token| self.alloc.free(token);
+}
+
 fn handleNotificationActionInvoked(self: *App, message: *const DbusConnection.Message) void {
     if (!std.mem.eql(u8, message.bodySignature(), "us")) return;
     var decoder = message.bodyDecoder();
@@ -1551,6 +1564,61 @@ fn handleNotificationActionInvoked(self: *App, message: *const DbusConnection.Me
         return;
     };
     if (!requested) log.warn("cannot request attention: xdg-activation is unavailable", .{});
+}
+
+test "closed notifications retire only the matching ID and release its token" {
+    const alloc = std.testing.allocator;
+    const wire = @import("dbus/wire.zig");
+    const cases = [_]struct {
+        id: u32 = 42,
+        reason: u32 = 1,
+        signature: []const u8 = "uu",
+        token: bool = false,
+        closed: bool = true,
+    }{
+        .{}, // Expired without an activation token.
+        .{ .reason = 2, .token = true }, // Dismissed after receiving a token.
+        .{ .reason = 3 }, // Explicitly closed.
+        .{ .reason = 4, .token = true }, // Reserved reason still invalidates the ID.
+        .{ .id = 123, .token = true, .closed = false },
+        .{ .signature = "u", .token = true, .closed = false },
+    };
+    for (cases) |case| {
+        const app = try alloc.create(App);
+        defer alloc.destroy(app);
+        app.alloc = alloc;
+        app.dbus = no_dbus;
+        app.pending_dbus = .empty;
+        app.notifications = .empty;
+        defer app.deinitDbus();
+        try app.notifications.put(alloc, 7, null);
+        try app.notifications.put(alloc, 42, null);
+        if (case.token) app.notifications.getPtr(42).?.* = try alloc.dupe(u8, "activation-token");
+
+        var body: DbusConnection.Encoder = .init(alloc);
+        defer body.deinit();
+        try body.uint32(case.id);
+        if (std.mem.eql(u8, case.signature, "uu")) try body.uint32(case.reason);
+        const data = try wire.encodeMessage(alloc, .{
+            .message_type = .signal,
+            .path = "/org/freedesktop/Notifications",
+            .interface = "org.freedesktop.Notifications",
+            .member = "NotificationClosed",
+            .signature = case.signature,
+        }, 1, body.bytes(), 0);
+        var message = try wire.parseMessage(alloc, data, try alloc.alloc(posix.fd_t, 0));
+        defer message.deinit();
+
+        // A repeated close must neither free a token twice nor remove another ID.
+        for (0..2) |_| {
+            app.handleDbusMessage(&message);
+            try std.testing.expectEqual(!case.closed, app.notifications.contains(42));
+            try std.testing.expect(app.notifications.contains(7));
+            try std.testing.expectEqual(@as(u32, if (case.closed) 1 else 2), app.notifications.count());
+            if (!case.closed and case.token)
+                try std.testing.expectEqualStrings("activation-token", app.notifications.get(42).?.?);
+        }
+    }
 }
 
 fn setNonblocking(fd: posix.fd_t) void {
