@@ -3261,12 +3261,11 @@ fn syncScrollbarHoverFromPointer(self: *App) void {
 
 fn scrollbarThumbUnderPointer(self: *App) ?ScrollbarGeometry {
     if (!self.scrollbarPointerEligible()) return null;
-    const scrollbar = self.term.screens.active.pages.scrollbar();
-    const geometry = scrollbarGeometry(scrollbar, self.layout, self.window.scale120, scrollbar_default_alpha) orelse return null;
+    const geometry = self.currentScrollbarGeometry(scrollbar_default_alpha) orelse return null;
     const pos = self.pointerSurfacePhysical();
     const hit_width = @max(geometry.thumb.width, Window.physicalDimension(scrollbar_hit_width, self.window.scale120));
     const hit_left = self.layout.surface_width -| hit_width;
-    const thumb_bottom = geometry.thumb.y + geometry.thumb.height;
+    const thumb_bottom = geometry.thumb.y + @as(f64, @floatFromInt(geometry.thumb.height));
     if (pos.x < hit_left or pos.x >= self.layout.surface_width or
         pos.y < geometry.thumb.y or pos.y >= thumb_bottom) return null;
     return geometry;
@@ -3288,7 +3287,7 @@ fn beginScrollbarDrag(self: *App) bool {
     self.scrollbar_hovered = false;
     self.scrollbar_drag = .{
         .grab_offset = std.math.clamp(
-            pos.y - @as(f64, @floatFromInt(geometry.thumb.y)),
+            pos.y - geometry.thumb.y,
             0,
             @as(f64, @floatFromInt(geometry.thumb.height)),
         ),
@@ -4751,11 +4750,20 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
             app.window.scale120 = scale;
             app.resetSmoothScroll();
             app.term.screens.active.pages.scroll(.{ .row = 5 });
+            const thumb_before = app.currentScrollbarGeometry(scrollbar_default_alpha).?;
             pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = 100, .value = .fromDouble(-1) } });
             pointerEvent(app, .frame);
             try std.testing.expectEqual(@as(usize, if (smooth) 4 else 5), app.term.screens.active.pages.scrollbar().offset);
             const expected: u31 = if (!smooth) 0 else if (scale == 120) 17 else 15;
             try std.testing.expectEqual(expected, app.scroll_offset);
+            const thumb_after = app.currentScrollbarThumb().?;
+            const moved_rows: f64 = if (!smooth) 0 else if (scale == 120) 0.15 else 0.25;
+            try std.testing.expectApproxEqAbs(
+                moved_rows * @as(f64, @floatFromInt(thumb_before.travel)) /
+                    @as(f64, @floatFromInt(thumb_before.max_offset)),
+                thumb_before.thumb.y - thumb_after.y,
+                0.000001,
+            );
             if (smooth) {
                 // The exposed bottom strip belongs to the overscan row,
                 // not the viewport's last complete row.
@@ -4768,6 +4776,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
             pointerEvent(app, .frame);
             try std.testing.expectEqual(@as(usize, 5), app.term.screens.active.pages.scrollbar().offset);
             try std.testing.expectEqual(@as(u31, 0), app.scroll_offset);
+            try std.testing.expectEqual(thumb_before.thumb.y, app.currentScrollbarThumb().?.y);
         }
     }
     app.window.scale120 = 120;
@@ -4839,10 +4848,12 @@ fn scrollbarShouldRender(
 
 fn scrollbarGeometry(
     scrollbar: vt.PageList.Scrollbar,
+    row_fraction: f64,
     layout: TerminalLayout,
     scale120: u32,
     alpha: u8,
 ) ?ScrollbarGeometry {
+    std.debug.assert(row_fraction >= 0 and row_fraction < 1);
     if (scrollbar.total <= scrollbar.len or layout.surface_width == 0 or layout.grid_height == 0) return null;
 
     const inset = @min(Window.physicalDimension(scrollbar_inset, scale120), layout.grid_height / 2);
@@ -4861,16 +4872,17 @@ fn scrollbarGeometry(
     const thumb_height = @min(track_height, @max(min_height, @max(1, proportional)));
     const travel = track_height - thumb_height;
     const max_offset = scrollbar.total - scrollbar.len;
-    const offset = @min(scrollbar.offset, max_offset);
-    const thumb_offset: u31 = if (travel == 0)
-        0
-    else
-        @intCast((@as(u128, travel) * offset + max_offset / 2) / max_offset);
+    const offset = @min(
+        @as(f64, @floatFromInt(scrollbar.offset)) + row_fraction,
+        @as(f64, @floatFromInt(max_offset)),
+    );
+    const thumb_offset = @as(f64, @floatFromInt(travel)) * offset /
+        @as(f64, @floatFromInt(max_offset));
 
     return .{
         .thumb = .{
             .x = right - width,
-            .y = track_y + thumb_offset,
+            .y = @as(f64, @floatFromInt(track_y)) + thumb_offset,
             .width = width,
             .height = thumb_height,
             .alpha = alpha,
@@ -4897,6 +4909,9 @@ fn scrollbarRowForThumbY(geometry: ScrollbarGeometry, thumb_y: f64) usize {
 fn currentScrollbarGeometry(self: *App, alpha: u8) ?ScrollbarGeometry {
     return scrollbarGeometry(
         self.term.screens.active.pages.scrollbar(),
+        // Match the physical pixel crop used to render the text, while
+        // retaining subpixel precision on the much shorter scrollbar track.
+        @as(f64, @floatFromInt(self.scroll_offset)) / @as(f64, @floatFromInt(self.font.cell_height)),
         self.layout,
         self.window.scale120,
         alpha,
@@ -4906,7 +4921,7 @@ fn currentScrollbarGeometry(self: *App, alpha: u8) ?ScrollbarGeometry {
 fn currentScrollbarThumb(self: *App) ?Renderer.ScrollbarThumb {
     const scrollbar = self.term.screens.active.pages.scrollbar();
     if (!scrollbarShouldRender(scrollbar, self.scrollbar_alpha)) return null;
-    const geometry = scrollbarGeometry(scrollbar, self.layout, self.window.scale120, self.scrollbar_alpha) orelse return null;
+    const geometry = self.currentScrollbarGeometry(self.scrollbar_alpha) orelse return null;
     return geometry.thumb;
 }
 
@@ -6784,16 +6799,16 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
 
 test "scrollbar geometry maps viewport rows across the track" {
     const layout = TerminalLayout.init(100, 100, 10, 10, .{});
-    const top = scrollbarGeometry(.{ .total = 100, .offset = 0, .len = 20 }, layout, 120, scrollbar_default_alpha).?;
-    const middle = scrollbarGeometry(.{ .total = 100, .offset = 40, .len = 20 }, layout, 120, scrollbar_default_alpha).?;
-    const bottom = scrollbarGeometry(.{ .total = 100, .offset = 80, .len = 20 }, layout, 120, scrollbar_default_alpha).?;
+    const top = scrollbarGeometry(.{ .total = 100, .offset = 0, .len = 20 }, 0, layout, 120, scrollbar_default_alpha).?;
+    const middle = scrollbarGeometry(.{ .total = 100, .offset = 40, .len = 20 }, 0, layout, 120, scrollbar_default_alpha).?;
+    const bottom = scrollbarGeometry(.{ .total = 100, .offset = 80, .len = 20 }, 0, layout, 120, scrollbar_default_alpha).?;
 
     try std.testing.expectEqual(@as(u31, 91), top.thumb.x);
     try std.testing.expectEqual(@as(u31, 6), top.thumb.width);
     try std.testing.expectEqual(@as(u31, 24), top.thumb.height);
-    try std.testing.expectEqual(@as(u31, 3), top.thumb.y);
-    try std.testing.expectEqual(@as(u31, 38), middle.thumb.y);
-    try std.testing.expectEqual(@as(u31, 73), bottom.thumb.y);
+    try std.testing.expectEqual(@as(f64, 3), top.thumb.y);
+    try std.testing.expectEqual(@as(f64, 38), middle.thumb.y);
+    try std.testing.expectEqual(@as(f64, 73), bottom.thumb.y);
     try std.testing.expectEqual(@as(usize, 0), scrollbarRowForThumbY(top, 3));
     try std.testing.expectEqual(@as(usize, 40), scrollbarRowForThumbY(top, 38));
     try std.testing.expectEqual(@as(usize, 80), scrollbarRowForThumbY(top, 73));
@@ -6803,7 +6818,22 @@ test "scrollbar geometry maps viewport rows across the track" {
     try std.testing.expect(scrollbarShouldRender(.{ .total = 100, .offset = 80, .len = 20 }, scrollbar_hover_alpha));
     try std.testing.expect(!scrollbarShouldRender(.{ .total = 20, .offset = 0, .len = 20 }, scrollbar_hover_alpha));
     try std.testing.expect(!scrollbarShouldRender(.{ .total = 100, .offset = 40, .len = 20 }, 0));
-    try std.testing.expect(scrollbarGeometry(.{ .total = 20, .offset = 0, .len = 20 }, layout, 120, scrollbar_default_alpha) == null);
+    try std.testing.expect(scrollbarGeometry(.{ .total = 20, .offset = 0, .len = 20 }, 0, layout, 120, scrollbar_default_alpha) == null);
+}
+
+test "scrollbar preserves partial rows and subpixel thumb positions" {
+    const layout = TerminalLayout.init(100, 100, 10, 10, .{});
+    // A 70 px track travel over 80 rows gives 0.875 px per row. Neither
+    // a partial row nor the resulting fraction of a pixel may be rounded.
+    for ([_]struct { row: usize, fraction: f64, y: f64 }{
+        .{ .row = 39, .fraction = 0.75, .y = 37.78125 },
+        .{ .row = 40, .fraction = 0, .y = 38 },
+        .{ .row = 40, .fraction = 0.25, .y = 38.21875 },
+        .{ .row = 80, .fraction = 0.75, .y = 73 },
+    }) |case| {
+        const geometry = scrollbarGeometry(.{ .total = 100, .offset = case.row, .len = 20 }, case.fraction, layout, 120, scrollbar_default_alpha).?;
+        try std.testing.expectEqual(case.y, geometry.thumb.y);
+    }
 }
 
 test "semantic command output extracts most recent completed output" {

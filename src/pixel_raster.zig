@@ -8,7 +8,8 @@ const Font = @import("Font.zig");
 
 pub const ScrollbarThumb = struct {
     x: u31,
-    y: u31,
+    /// Nonnegative physical pixels, including subpixel coverage at the caps.
+    y: f64,
     width: u31,
     height: u31,
     alpha: u8,
@@ -83,19 +84,23 @@ pub fn blendCapsule(
     thumb: ScrollbarThumb,
     color: u32,
 ) void {
+    std.debug.assert(std.math.isFinite(thumb.y) and thumb.y >= 0);
     if (thumb.alpha == 0 or thumb.width == 0 or thumb.height == 0 or
         thumb.x >= buf_width or thumb.y >= buf_height) return;
     std.debug.assert(color >> 24 == 0xff);
 
     const x_end = @min(thumb.x + thumb.width, buf_width);
-    const y_end = @min(thumb.y + thumb.height, buf_height);
+    const bottom = thumb.y + @as(f64, @floatFromInt(thumb.height));
+    // Include the coverage fringe on both sides of fractional cap edges.
+    const y_start: u31 = @intFromFloat(@floor(@max(0, thumb.y - 0.5)));
+    const y_end: u31 = @intFromFloat(@ceil(@min(bottom + 0.5, @as(f64, @floatFromInt(buf_height)))));
     const radius = @as(f64, @floatFromInt(@min(thumb.width, thumb.height))) / 2.0;
     const center_x = @as(f64, @floatFromInt(thumb.x)) +
         @as(f64, @floatFromInt(thumb.width)) / 2.0;
-    const cap_top = @as(f64, @floatFromInt(thumb.y)) + radius;
-    const cap_bottom = @as(f64, @floatFromInt(thumb.y + thumb.height)) - radius;
+    const cap_top = thumb.y + radius;
+    const cap_bottom = bottom - radius;
 
-    for (thumb.y..y_end) |y| {
+    for (y_start..y_end) |y| {
         const py = @as(f64, @floatFromInt(y)) + 0.5;
         const nearest_y = std.math.clamp(py, cap_top, cap_bottom);
         for (thumb.x..x_end) |x| {
@@ -436,6 +441,34 @@ test "scrollbar capsule has antialiased caps and a solid center" {
     try std.testing.expect((pixels[3] & 0xff) > (pixels[2] & 0xff));
     try std.testing.expect(pixels[2 * 8 + 3] != background);
     try std.testing.expect((pixels[2 * 8 + 3] & 0xff) > (pixels[3] & 0xff));
+}
+
+test "scrollbar capsule moves coverage continuously across pixel boundaries" {
+    const background: u32 = 0xff000000;
+    var previous_top: u32 = 0xff;
+    var previous_bottom: u32 = 0;
+    for ([_]f64{ 1.75, 2, 2.25 }) |y| {
+        var pixels = [_]u32{background} ** 80;
+        blendCapsule(&pixels, 8, 8, 10, .{
+            .x = 2,
+            .y = y,
+            .width = 4,
+            .height = 6,
+            .alpha = 160,
+        }, 0xffffffff);
+        const top = pixels[2 * 8 + 3] & 0xff;
+        const bottom = pixels[7 * 8 + 3] & 0xff;
+        try std.testing.expect(top < previous_top);
+        try std.testing.expect(bottom > previous_bottom);
+        try std.testing.expectEqual(blend(0xffffffff, background, 160), pixels[4 * 8 + 3]);
+        // The fractional edge must not be clipped to the integer bounds.
+        if (y < 2) try std.testing.expect(pixels[1 * 8 + 3] != background);
+        if (y > 2) try std.testing.expect(pixels[8 * 8 + 3] != background);
+        try std.testing.expectEqual(background, pixels[3]);
+        try std.testing.expectEqual(background, pixels[9 * 8 + 3]);
+        previous_top = top;
+        previous_bottom = bottom;
+    }
 }
 
 test "default background pixels are premultiplied" {
