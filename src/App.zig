@@ -245,7 +245,7 @@ scroll_time_ms: u32,
 scroll_had_pixels: bool,
 scroll_had_discrete: bool,
 scroll_had_value120: bool,
-scroll_stopped: bool,
+scroll_stop_time_ms: ?u32,
 /// True while the left button is down for terminal-side selection.
 selecting: bool,
 /// True when the active drag should produce a rectangular selection.
@@ -308,6 +308,7 @@ const fling_start_velocity = 150.0;
 const fling_min_velocity = 30.0;
 const fling_max_velocity = 8000.0;
 const velocity_smoothing = 0.75;
+const scroll_velocity_timeout_ms = 200;
 
 const ScrollTarget = enum { viewport, keys, application };
 
@@ -758,7 +759,7 @@ pub fn init(
         .scroll_had_pixels = false,
         .scroll_had_discrete = false,
         .scroll_had_value120 = false,
-        .scroll_stopped = false,
+        .scroll_stop_time_ms = null,
         .selecting = false,
         .selection_rectangle = false,
         .selection_gesture = .init,
@@ -3191,7 +3192,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         },
         .axis_source => |source| self.scroll_source = source.axis_source,
         .axis_stop => |stop| {
-            if (stop.axis == .vertical_scroll) self.scroll_stopped = true;
+            if (stop.axis == .vertical_scroll) self.scroll_stop_time_ms = stop.time;
         },
         // Terminal scrolling follows the compositor-provided logical axis;
         // the physical direction hint does not change that behavior.
@@ -4386,7 +4387,7 @@ fn syncScrollTarget(self: *App) void {
     self.scroll_had_pixels = false;
     self.scroll_had_discrete = false;
     self.scroll_had_value120 = false;
-    self.scroll_stopped = false;
+    self.scroll_stop_time_ms = null;
 }
 
 /// Convert accumulated wheel movement into scrolled lines: wheel clicks
@@ -4446,9 +4447,12 @@ fn finishScrollFrame(self: *App) void {
     self.scroll_had_discrete = false;
     self.scroll_had_value120 = false;
     if (lines != 0) self.scrollLines(lines);
-    if (self.scroll_stopped) {
-        self.scroll_stopped = false;
-        self.startFling();
+    if (self.scroll_stop_time_ms) |stop_time| {
+        self.scroll_stop_time_ms = null;
+        // Holding still before lifting must not launch pre-pause momentum.
+        if (self.last_scroll_time_ms) |last| {
+            if (stop_time -% last <= scroll_velocity_timeout_ms) self.startFling();
+        }
         self.resetScrollVelocity();
     }
 }
@@ -4504,7 +4508,11 @@ fn trackScrollVelocity(self: *App, pixels: f64, time_ms: u32) void {
     defer self.last_scroll_time_ms = time_ms;
     const last = self.last_scroll_time_ms orelse return;
     const dt_ms: f64 = @floatFromInt(time_ms -% last);
-    if (dt_ms <= 0 or dt_ms > 200) return;
+    if (dt_ms > scroll_velocity_timeout_ms) {
+        self.scroll_velocity = 0;
+        return;
+    }
+    if (dt_ms <= 0) return;
     const velocity = pixels * self.precisionScrollScale() / dt_ms * 1000.0;
     self.scroll_velocity = (1 - velocity_smoothing) * self.scroll_velocity + velocity_smoothing * velocity;
 }
@@ -4708,9 +4716,33 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
         try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
     }
 
-    // Exercise the real timer consumer: one 8 ms tick at 3000 px/s is 24 pixels.
     stream.nextSlice("\x1b[?1049l\x1b[?1000h");
     app.syncScrollTarget();
+
+    // Release must use the final motion timestamp, including when both
+    // events share a frame or the Wayland millisecond counter wraps.
+    for ([_]u32{ 100, std.math.maxInt(u32) - 20, std.math.maxInt(u32) - 5 }) |start| {
+        for ([_]u32{ 0, 200, 201, 500 }) |pause| {
+            for ([_]bool{ false, true }) |same_frame| {
+                app.resetScrollVelocity();
+                pointerEvent(app, .{ .axis_source = .{ .axis_source = .finger } });
+                pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = start, .value = .fromDouble(-40) } });
+                pointerEvent(app, .frame);
+                pointerEvent(app, .{ .axis_source = .{ .axis_source = .finger } });
+                pointerEvent(app, .{ .axis = .{ .axis = .vertical_scroll, .time = start +% 10, .value = .fromDouble(-40) } });
+                if (!same_frame) pointerEvent(app, .frame);
+                pointerEvent(app, .{ .axis_stop = .{ .axis = .vertical_scroll, .time = start +% 10 +% pause } });
+                pointerEvent(app, .frame);
+                try std.testing.expectEqual(pause <= 200, app.fling_active);
+                if (app.fling_active) try std.testing.expectEqual(@as(f64, -3000), app.fling_velocity);
+                try std.testing.expectEqual(@as(f64, 0), app.scroll_velocity);
+                try std.testing.expectEqual(@as(?u32, null), app.last_scroll_time_ms);
+                app.stopFling();
+            }
+        }
+    }
+
+    // Exercise the real timer consumer: one 8 ms tick at 3000 px/s is 24 pixels.
     for ([_]f64{ 0.01, 1, 10_000 }) |multiplier| {
         app.config.mouse_scroll_multiplier.precision = multiplier;
         app.scroll_pixels = 0;
@@ -4810,6 +4842,26 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     try std.testing.expectEqual(@as(usize, 4), app.term.screens.active.pages.scrollbar().offset);
     try std.testing.expectEqual(@as(u31, 16), app.scroll_offset);
     app.stopFling();
+}
+
+test "scroll velocity expires across a pause before motion resumes" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.config = .{};
+    app.term.flags.mouse_event = .normal;
+    for ([_]u32{ 200, 201, 500 }) |gap| {
+        app.resetScrollVelocity();
+        app.trackScrollVelocity(40, 100);
+        app.trackScrollVelocity(40, 110);
+        try std.testing.expectEqual(@as(f64, 3000), app.scroll_velocity);
+        // A tiny movement after a pause must not make stale speed fresh.
+        app.trackScrollVelocity(0.1, 110 + gap);
+        try std.testing.expectEqual(@as(f64, if (gap == 200) 750.375 else 0), app.scroll_velocity);
+        if (gap > 200) {
+            app.trackScrollVelocity(-4, 120 + gap);
+            try std.testing.expectEqual(@as(f64, -300), app.scroll_velocity);
+        }
+    }
 }
 
 test "application fling threshold ignores precision configuration" {
