@@ -126,8 +126,9 @@ pub const Damage = union(enum) {
 /// Dimensions are physical pixels.
 pub const ResizeFn = *const fn (ctx: *anyopaque, width: u31, height: u31) anyerror!void;
 
-/// Raw wl_keyboard events, forwarded as-is.
-pub const KeyboardFn = *const fn (ctx: *anyopaque, event: wl.Keyboard.Event) void;
+/// Raw wl_keyboard events, or null when the keyboard is removed. Removal
+/// ends input even if the compositor did not send a leave event first.
+pub const KeyboardFn = *const fn (ctx: *anyopaque, event: ?wl.Keyboard.Event) void;
 
 /// Raw wl_pointer events, forwarded as-is.
 pub const PointerFn = *const fn (ctx: *anyopaque, event: wl.Pointer.Event) void;
@@ -1099,8 +1100,7 @@ fn removeSeat(self: *Window) void {
     if (self.pointer) |pointer| destroyPointer(pointer);
     self.pointer = null;
     self.pointer_enter_serial = null;
-    if (self.keyboard) |keyboard| destroyKeyboard(keyboard);
-    self.keyboard = null;
+    self.removeKeyboard();
     if (self.data_device) |device| destroyDataDevice(device);
     self.data_device = null;
     if (self.primary_device) |device| device.destroy();
@@ -1112,6 +1112,13 @@ fn removeSeat(self: *Window) void {
     self.text_input_rect = null;
     if (self.seat) |seat| destroySeat(seat);
     self.seat = null;
+}
+
+fn removeKeyboard(self: *Window) void {
+    const keyboard = self.keyboard orelse return;
+    destroyKeyboard(keyboard);
+    self.keyboard = null;
+    if (self.keyboard_fn) |callback| callback(self.render_ctx.?, null);
 }
 
 fn notifyClipboardDevices(self: *Window) void {
@@ -1160,8 +1167,7 @@ fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, self: *Window) void {
                     keyboard.setListener(*Window, keyboardListener, self);
                 }
             } else if (!has_keyboard and self.keyboard != null) {
-                destroyKeyboard(self.keyboard.?);
-                self.keyboard = null;
+                self.removeKeyboard();
             }
 
             const has_pointer = caps.capabilities.pointer;
@@ -1202,6 +1208,60 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *Window) void 
 
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) void {
     if (self.keyboard_fn) |keyboard_fn| keyboard_fn(self.render_ctx.?, event);
+}
+
+test "keyboard removal notifies the application without a compositor leave" {
+    const linux = std.os.linux;
+    const Observer = struct {
+        removals: usize = 0,
+
+        fn keyboard(ctx: *anyopaque, event: ?wl.Keyboard.Event) void {
+            const observer: *@This() = @ptrCast(@alignCast(ctx));
+            if (event == null) observer.removals += 1;
+        }
+    };
+    for ([_]bool{ false, true }) |remove_seat| {
+        var fds: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            0,
+            &fds,
+        )));
+        defer _ = linux.close(fds[1]);
+        const display = try wl.Display.connectToFd(fds[0]);
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        const seat = try registry.bind(1, wl.Seat, 5);
+        defer if (!remove_seat) destroySeat(seat);
+        var observer: Observer = .{};
+        var window: Window = undefined;
+        window.seat = seat;
+        window.keyboard = try seat.getKeyboard();
+        window.keyboard_fn = Observer.keyboard;
+        window.render_ctx = &observer;
+        window.pointer = null;
+        window.cursor_shape_device = null;
+        window.data_device = null;
+        window.primary_device = null;
+        window.clipboard_devices_fn = null;
+        window.text_input = null;
+
+        if (remove_seat) {
+            window.removeSeat();
+            window.removeSeat();
+        } else {
+            // An unchanged capability set must not notify or discard the keyboard.
+            seatListener(seat, .{ .capabilities = .{ .capabilities = .{ .keyboard = true } } }, &window);
+            try std.testing.expect(window.keyboard != null);
+            try std.testing.expectEqual(@as(usize, 0), observer.removals);
+            seatListener(seat, .{ .capabilities = .{ .capabilities = .{} } }, &window);
+            seatListener(seat, .{ .capabilities = .{ .capabilities = .{} } }, &window);
+        }
+        try std.testing.expect(window.keyboard == null);
+        try std.testing.expectEqual(@as(usize, 1), observer.removals);
+    }
 }
 
 fn textInputListener(_: *zwp.TextInputV3, event: zwp.TextInputV3.Event, self: *Window) void {

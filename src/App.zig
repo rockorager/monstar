@@ -5237,8 +5237,12 @@ fn pointerPosPhysical(self: *App) vt.input.MouseEncodeEvent.Pos {
 
 /// Window keyboard delegate: track xkb state and encode key presses
 /// into PTY input.
-fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
+fn keyboardEvent(ctx: *anyopaque, maybe_event: ?wl.Keyboard.Event) void {
     const self: *App = @ptrCast(@alignCast(ctx));
+    const event = maybe_event orelse {
+        self.loseKeyboardFocus();
+        return;
+    };
     switch (event) {
         .keymap => |keymap| {
             if (keymap.format != .xkb_v1) {
@@ -5291,16 +5295,61 @@ fn keyboardEvent(ctx: *anyopaque, event: wl.Keyboard.Event) void {
             }
         },
         // Keys held across a focus change must not keep repeating.
-        .leave => {
-            self.cancelRepeat();
-            self.keyboard.resetTransientState();
-            self.setFocus(false);
-        },
+        .leave => self.loseKeyboardFocus(),
         .enter => |enter| {
             self.last_serial = enter.serial;
             self.setFocus(true);
         },
     }
+}
+
+fn loseKeyboardFocus(self: *App) void {
+    self.cancelRepeat();
+    self.keyboard.resetTransientState();
+    self.setFocus(false);
+}
+
+test "keyboard removal cancels repeat and reports focus loss once" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.keyboard = try .init();
+    defer app.keyboard.deinit();
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.term.modes.set(.focus_event, true);
+    app.focused = true;
+    app.async_generation = 0;
+    app.held_frame = null;
+    app.repeat_fd = try createTimerFd();
+    defer _ = linux.close(app.repeat_fd);
+    app.repeat_rate = 25;
+    app.repeat_delay = 500;
+    app.armRepeat(30);
+    var timer: linux.itimerspec = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.timerfd_gettime(app.repeat_fd, &timer)));
+    try std.testing.expect(timer.it_interval.nsec > 0);
+
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    app.pty.master = fds[1];
+    app.write_queue = .empty;
+    app.write_queue_offset = 0;
+    defer app.write_queue.deinit(alloc);
+
+    keyboardEvent(app, null);
+    keyboardEvent(app, null);
+    try std.testing.expectEqual(null, app.repeat_keycode);
+    try std.testing.expect(!app.focused);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.timerfd_gettime(app.repeat_fd, &timer)));
+    try std.testing.expectEqualDeep(disarmed_timer, timer);
+    var buf: [64]u8 = undefined;
+    const n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x1b[O", buf[0..n]);
 }
 
 fn setFocus(self: *App, focused: bool) void {
