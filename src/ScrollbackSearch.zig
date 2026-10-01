@@ -60,11 +60,9 @@ pub fn deinitEngine(self: *ScrollbackSearch, term: *vt.Terminal) void {
 }
 
 pub fn restoreViewport(self: *ScrollbackSearch, term: *vt.Terminal) void {
-    if (term.screens.active_key != self.original_key or
-        !screenValid(term, self.original_key, self.original_generation, self.original_screen))
-    {
-        return;
-    }
+    if (!screenValid(term, self.original_key, self.original_generation, self.original_screen)) return;
+    // Output may switch screens during a search. Restore the saved screen
+    // without changing which screen the running application has activated.
     switch (self.original_viewport) {
         .active => self.original_screen.pages.scroll(.active),
         .top => self.original_screen.pages.scroll(.top),
@@ -80,6 +78,38 @@ pub fn deinit(self: *ScrollbackSearch, alloc: std.mem.Allocator, term: *vt.Termi
         }
     }
     self.query.deinit(alloc);
+}
+
+test "cancel restores the original viewport while another screen is active" {
+    const alloc = std.testing.allocator;
+    for ([_]vt.PageList.Viewport{ .active, .top, .pin }) |original_viewport| {
+        var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+        defer term.deinit(alloc);
+        var stream = term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        const pages = &term.screens.active.pages;
+        pages.scroll(switch (original_viewport) {
+            .active => .active,
+            .top => .top,
+            .pin => .{ .delta_row = -1 },
+        });
+        const original_top_left = pages.getTopLeft(.viewport);
+
+        var search: ScrollbackSearch = try .init(&term);
+        defer search.deinit(alloc, &term);
+        try std.testing.expectEqual(original_viewport, search.original_viewport);
+        pages.scroll(if (original_viewport == .active) .top else .active);
+        try std.testing.expect(std.meta.activeTag(pages.viewport) != std.meta.activeTag(original_viewport));
+
+        _ = try term.switchScreen(.alternate);
+        const alternate_top_left = term.screens.active.pages.getTopLeft(.viewport);
+        search.restoreViewport(&term);
+        try std.testing.expectEqual(.alternate, term.screens.active_key);
+        try std.testing.expectEqual(alternate_top_left, term.screens.active.pages.getTopLeft(.viewport));
+        try std.testing.expectEqual(original_viewport, pages.viewport);
+        try std.testing.expectEqual(original_top_left, pages.getTopLeft(.viewport));
+    }
 }
 
 test "releases an engine after its screen is removed" {
@@ -99,4 +129,5 @@ test "releases an engine after its screen is removed" {
     _ = try term.switchScreen(.primary);
     term.screens.remove(alloc, .alternate);
     try std.testing.expect(!search.engineValid(&term));
+    search.restoreViewport(&term);
 }
