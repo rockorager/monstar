@@ -96,6 +96,47 @@ standard input when
 .B Ctrl+Shift+G
 is pressed.
 The default is unset.
+.SH COMMAND COMPLETION NOTIFICATIONS
+The shell must emit OSC 133 C/D command-start/end markers. Monstar does not
+automatically inject shell integration. These settings do not affect explicit
+OSC 9/777 desktop notifications.
+.TP
+.BI notify-on-command-finish " = never|unfocused|always"
+Choose when completed commands can notify. The default is
+.BR never .
+With
+.BR unfocused ,
+focus is checked when the command finishes. Alternate-screen use does not
+cancel timing, so an editor session can notify when it exits.
+.TP
+.BI notify-on-command-finish-action " = actions"
+Comma-separated
+.B bell
+and
+.B notify
+flags, optionally prefixed with
+.BR no- .
+Each assignment starts from the default: bell enabled, desktop notification
+disabled. For desktop notifications only, use
+.BR no-bell,notify .
+The bell uses the compositor's optional system-bell protocol; desktop
+notifications require D-Bus and a notification service.
+.TP
+.BI notify-on-command-finish-after " = duration"
+Notify only when command duration strictly exceeds this value. The default is
+.BR 5s .
+Use nonnegative integers followed immediately by
+.BR y , w , d , h , m , s , ms , us , "µs" ,
+or
+.BR ns .
+Components may be combined, such as
+.B 1m30s
+or
+.BR "1s 250ms" .
+A bare
+.B 0
+disables the minimum duration; fractional numbers are not accepted.
+Values saturate at the maximum unsigned 64-bit count of nanoseconds.
 .SH FONT SETTINGS
 .TP
 .BI font-family " = family"

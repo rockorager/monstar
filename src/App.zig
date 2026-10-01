@@ -19,6 +19,7 @@ const vt = @import("ghostty-vt");
 const Clipboard = @import("Clipboard.zig");
 const KittyClipboard = @import("KittyClipboard.zig");
 const Config = @import("Config.zig");
+const CommandNotification = @import("CommandNotification.zig");
 const keybind = @import("keybind.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
@@ -180,6 +181,7 @@ pending_dbus: std.ArrayList(PendingDbus) = .empty,
 pending_open_uri: ?[]u8,
 /// A null value means the notification is awaiting its activation token.
 notifications: std.AutoHashMapUnmanaged(u32, ?[]u8),
+command_notification: CommandNotification = .{},
 color_scheme: vt.device_status.ColorScheme,
 /// Standardized XDG desktop preference; scrollbar dismissal snaps instead
 /// of fading when motion should be reduced.
@@ -421,6 +423,7 @@ const AppStreamHandler = struct {
                 self.app.pumpKittyClipboard();
             },
             .show_desktop_notification => self.app.showDesktopNotification(value.title, value.body),
+            .semantic_prompt => self.app.handleCommandNotification(value),
             .mouse_shape => {
                 self.app.mouse_shape_explicit = true;
                 self.app.syncCursorShape();
@@ -976,6 +979,28 @@ fn showDesktopNotification(self: *App, title: []const u8, body: []const u8) void
     };
 }
 
+fn handleCommandNotification(self: *App, command: vt.osc.Command.SemanticPrompt) void {
+    const completion = self.command_notification.update(
+        command,
+        std.Io.Clock.awake.now(self.io).nanoseconds,
+        &self.config,
+        self.focused,
+    ) orelse return;
+    const actions = self.config.notify_on_command_finish_action;
+    if (actions.bell) self.window.ringBell();
+    if (!actions.notify) return;
+
+    const title = if (completion.exit_code == 0) "Command Succeeded" else "Command Failed";
+    var buf: [160]u8 = undefined;
+    const duration: std.Io.Duration = .fromNanoseconds(@divTrunc(completion.duration.nanoseconds, std.time.ns_per_ms) * std.time.ns_per_ms);
+    const body = std.fmt.bufPrint(&buf, "Command took {f} and exited with code {d}.", .{ duration, completion.exit_code }) catch unreachable;
+    // Completion policy already checked focus; `always` must bypass the
+    // focused-window suppression used for explicit OSC 9/777 notifications.
+    self.sendDesktopNotification(title, body) catch |err| {
+        log.warn("failed to send command completion notification: {}", .{err});
+    };
+}
+
 fn reportTaskbarProgress(self: *App, report: vt.osc.Command.ProgressReport) void {
     self.sendTaskbarProgress(report) catch |err| {
         if (err != error.DBusUnavailable) {
@@ -1103,6 +1128,75 @@ fn expireDbusRequests(self: *App) void {
         const pending = self.pending_dbus.orderedRemove(i);
         pending.kind.deinit(self.alloc);
     }
+}
+
+test "OSC 133 completion sends success and failure while always focused" {
+    if (!build_options.enable_dbus) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    var sockets: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &sockets,
+    )));
+    var receiver: DbusConnection = .{ .allocator = alloc, .io = std.testing.io, .fd = sockets[1] };
+    defer receiver.deinit();
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.io = std.testing.io;
+    app.focused = true;
+    app.config = .{
+        .notify_on_command_finish = .always,
+        .notify_on_command_finish_action = .{ .bell = false, .notify = true },
+    };
+    app.command_notification = .{};
+    app.pending_dbus = .empty;
+    app.notifications = .empty;
+    app.dbus = .{ .allocator = alloc, .io = std.testing.io, .fd = sockets[0] };
+    defer app.deinitDbus();
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 20, .rows = 4 });
+    defer app.term.deinit(alloc);
+    var stream: AppStream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer stream.deinit();
+
+    // The completion's `always` policy must not change explicit OSC behavior.
+    stream.nextSlice("\x1b]777;notify;Explicit;Suppressed\x07");
+    try std.testing.expectEqual(@as(usize, 0), app.pending_dbus.items.len);
+    for ([_]struct { end: []const u8, title: []const u8, suffix: []const u8 }{
+        .{ .end = "0\x07", .title = "Command Succeeded", .suffix = "exited with code 0." },
+        .{ .end = "17\x1b\\", .title = "Command Failed", .suffix = "exited with code 17." },
+    }) |case| {
+        stream.nextSlice("\x1b]133;C\x07");
+        try std.testing.expect(app.command_notification.started_ns != null);
+        app.command_notification.started_ns = std.Io.Clock.awake.now(app.io).nanoseconds - 7 * std.time.ns_per_s;
+        stream.nextSlice("\x1b]133;D;");
+        stream.nextSlice(case.end);
+        var message = (try receiver.nextMessage()).?;
+        defer message.deinit();
+        try std.testing.expectEqualStrings("Notify", message.header.member.?);
+        try std.testing.expectEqualStrings("susssasa{sv}i", message.bodySignature());
+        var body = message.bodyDecoder();
+        try std.testing.expectEqualStrings("monstar", try body.string());
+        try std.testing.expectEqual(@as(u32, 0), try body.uint32());
+        try std.testing.expectEqualStrings("", try body.string());
+        try std.testing.expectEqualStrings(case.title, try body.string());
+        const text = try body.string();
+        try std.testing.expect(std.mem.startsWith(u8, text, "Command took "));
+        try std.testing.expect(std.mem.endsWith(u8, text, case.suffix));
+        stream.nextSlice("\x1b]133;D;0\x07");
+        try std.testing.expectEqual(null, try receiver.nextMessage());
+    }
+    app.config.notify_on_command_finish_action.notify = false;
+    stream.nextSlice("\x1b]133;C\x07");
+    app.command_notification.started_ns = std.Io.Clock.awake.now(app.io).nanoseconds - 7 * std.time.ns_per_s;
+    stream.nextSlice("\x1b]133;D;0\x07");
+    try std.testing.expectEqual(null, try receiver.nextMessage());
 }
 
 test "desktop calls return before replies and correlate delayed notifications" {

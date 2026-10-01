@@ -106,6 +106,10 @@ window_padding_y: WindowPadding = .{},
 command: ?Command = null,
 /// Shell command that receives the last semantic command output on stdin.
 pipe_command_output: ?[:0]const u8 = null,
+notify_on_command_finish: NotifyOnCommandFinish = .never,
+notify_on_command_finish_action: CommandFinishAction = .{},
+/// Minimum command duration in nanoseconds; equality does not notify.
+notify_on_command_finish_after: u64 = 5 * std.time.ns_per_s,
 /// Whether newly spawned children should be moved into their own transient
 /// systemd scope. This only affects startup; reloads do not move a live child.
 linux_cgroup: LinuxCgroup = .never,
@@ -147,6 +151,11 @@ copy_highlight_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
 
 pub const LinuxCgroup = enum { never, always };
+pub const NotifyOnCommandFinish = enum { never, unfocused, always };
+pub const CommandFinishAction = struct {
+    bell: bool = true,
+    notify: bool = false,
+};
 
 /// Load the default config file, if any. Strings are allocated in `arena`
 /// and live as long as it does.
@@ -249,6 +258,12 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.command = try parseCommand(arena, value);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
         self.pipe_command_output = try arena.dupeZ(u8, value);
+    } else if (std.mem.eql(u8, key, "notify-on-command-finish")) {
+        self.notify_on_command_finish = std.meta.stringToEnum(NotifyOnCommandFinish, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "notify-on-command-finish-action")) {
+        self.notify_on_command_finish_action = try parseCommandFinishAction(value);
+    } else if (std.mem.eql(u8, key, "notify-on-command-finish-after")) {
+        self.notify_on_command_finish_after = try parseDuration(value);
     } else if (std.mem.eql(u8, key, "linux-cgroup")) {
         self.linux_cgroup = std.meta.stringToEnum(LinuxCgroup, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "scrollback-limit")) {
@@ -318,6 +333,67 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else {
         return error.UnknownKey;
     }
+}
+
+fn parseCommandFinishAction(value: []const u8) error{InvalidValue}!CommandFinishAction {
+    for ([_][]const u8{ "true", "1", "t", "T" }) |name| {
+        if (std.mem.eql(u8, value, name)) return .{ .bell = true, .notify = true };
+    }
+    for ([_][]const u8{ "false", "0", "f", "F" }) |name| {
+        if (std.mem.eql(u8, value, name)) return .{ .bell = false, .notify = false };
+    }
+    // Each assignment starts from the defaults, not the preceding assignment.
+    var result: CommandFinishAction = .{};
+    var tokens = std.mem.splitScalar(u8, value, ',');
+    while (tokens.next()) |token| {
+        var name = std.mem.trim(u8, token, &std.ascii.whitespace);
+        const enabled = !std.mem.startsWith(u8, name, "no-");
+        if (!enabled) name = name[3..];
+        if (std.mem.eql(u8, name, "bell")) {
+            result.bell = enabled;
+        } else if (std.mem.eql(u8, name, "notify")) {
+            result.notify = enabled;
+        } else return error.InvalidValue;
+    }
+    return result;
+}
+
+fn parseDuration(value: []const u8) error{InvalidValue}!u64 {
+    const units = .{
+        .{ "y", 365 * std.time.ns_per_day },
+        .{ "w", std.time.ns_per_week },
+        .{ "d", std.time.ns_per_day },
+        .{ "h", std.time.ns_per_hour },
+        .{ "m", std.time.ns_per_min },
+        .{ "s", std.time.ns_per_s },
+        .{ "ms", std.time.ns_per_ms },
+        .{ "us", std.time.ns_per_us },
+        .{ "µs", std.time.ns_per_us },
+        .{ "ns", 1 },
+    };
+    var rest = std.mem.trim(u8, value, &std.ascii.whitespace);
+    if (std.mem.eql(u8, rest, "0")) return 0;
+    if (rest.len == 0) return error.InvalidValue;
+    var total: u64 = 0;
+    while (rest.len > 0) {
+        var end: usize = 0;
+        while (end < rest.len and std.ascii.isDigit(rest[end])) : (end += 1) {}
+        if (end == 0) return error.InvalidValue;
+        const number = std.fmt.parseUnsigned(u64, rest[0..end], 10) catch return error.InvalidValue;
+        rest = rest[end..];
+        var unit_len: usize = 0;
+        var factor: u64 = 0;
+        inline for (units) |unit| {
+            if (unit[0].len > unit_len and std.mem.startsWith(u8, rest, unit[0])) {
+                unit_len = unit[0].len;
+                factor = unit[1];
+            }
+        }
+        if (unit_len == 0) return error.InvalidValue;
+        total +|= number *| factor;
+        rest = std.mem.trimStart(u8, rest[unit_len..], &std.ascii.whitespace);
+    }
+    return total;
 }
 
 fn parseFontSize(value: []const u8) error{InvalidValue}!FontSize {
@@ -556,6 +632,10 @@ test "defaults" {
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
     try std.testing.expectEqual(@as(?Command, null), config.command);
     try std.testing.expectEqual(@as(?[:0]const u8, null), config.pipe_command_output);
+    try std.testing.expectEqual(.never, config.notify_on_command_finish);
+    try std.testing.expect(config.notify_on_command_finish_action.bell);
+    try std.testing.expect(!config.notify_on_command_finish_action.notify);
+    try std.testing.expectEqual(@as(u64, 5_000_000_000), config.notify_on_command_finish_after);
     try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(usize, 320_000_000), config.image_storage_limit);
@@ -673,6 +753,48 @@ test "parse config" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, config.palette[200].?);
+}
+
+test "command finish settings replace flags atomically and parse durations" {
+    var config: Config = .{};
+    const alloc = std.testing.allocator;
+    try config.applyOverride(alloc, "notify-on-command-finish=unfocused");
+    try std.testing.expectEqual(.unfocused, config.notify_on_command_finish);
+    try config.applyOverride(alloc, "notify-on-command-finish=always");
+    try std.testing.expectEqual(.always, config.notify_on_command_finish);
+    try std.testing.expectError(error.InvalidValue, config.applyOverride(alloc, "notify-on-command-finish=true"));
+    try std.testing.expectEqual(.always, config.notify_on_command_finish);
+
+    for ([_]struct { value: []const u8, bell: bool, notify: bool }{
+        .{ .value = "notify", .bell = true, .notify = true },
+        .{ .value = "no-bell", .bell = false, .notify = false },
+        .{ .value = "no-bell, notify", .bell = false, .notify = true },
+        .{ .value = "notify,no-notify,bell", .bell = true, .notify = false },
+        .{ .value = "false", .bell = false, .notify = false },
+        .{ .value = "true", .bell = true, .notify = true },
+    }) |case| {
+        try config.set(alloc, "notify-on-command-finish-action", case.value);
+        try std.testing.expectEqualDeep(CommandFinishAction{ .bell = case.bell, .notify = case.notify }, config.notify_on_command_finish_action);
+    }
+    for ([_][]const u8{ "notify,", "no-bell,unknown", "true,notify" }) |value| {
+        try std.testing.expectError(error.InvalidValue, config.set(alloc, "notify-on-command-finish-action", value));
+        try std.testing.expectEqualDeep(CommandFinishAction{ .bell = true, .notify = true }, config.notify_on_command_finish_action);
+    }
+
+    for ([_]struct { value: []const u8, ns: u64 }{
+        .{ .value = "0", .ns = 0 },
+        .{ .value = "1m2s 3ms4us5µs6ns", .ns = 62_003_009_006 },
+        .{ .value = "1y2w3d4h", .ns = 33_019_200_000_000_000 },
+        .{ .value = "2s2s", .ns = 4_000_000_000 },
+        .{ .value = "600y", .ns = std.math.maxInt(u64) },
+    }) |case| {
+        try config.set(alloc, "notify-on-command-finish-after", case.value);
+        try std.testing.expectEqual(case.ns, config.notify_on_command_finish_after);
+    }
+    for ([_][]const u8{ "", "5", "-1s", "1.5s", "1 s", "1msjunk", "18446744073709551616ns" }) |value| {
+        try std.testing.expectError(error.InvalidValue, config.set(alloc, "notify-on-command-finish-after", value));
+        try std.testing.expectEqual(std.math.maxInt(u64), config.notify_on_command_finish_after);
+    }
 }
 
 test "unknown override is rejected" {

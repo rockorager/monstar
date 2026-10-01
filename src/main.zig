@@ -379,6 +379,7 @@ test {
     _ = @import("AsyncRaster.zig");
     _ = @import("CellDamageTracker.zig");
     _ = @import("Clipboard.zig");
+    _ = @import("CommandNotification.zig");
     _ = @import("KittyClipboard.zig");
     _ = @import("FrameDamageTracker.zig");
     _ = Config;

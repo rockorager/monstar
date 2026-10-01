@@ -120,6 +120,21 @@ command = fish --login
 # command = direct:fish --no-config
 ```
 
+Command-completion notifications are disabled by default, matching Ghostty:
+`notify-on-command-finish = never`, `notify-on-command-finish-action = bell`,
+and `notify-on-command-finish-after = 5s`. To show desktop notifications for
+commands that finish after more than five seconds while the window is unfocused:
+
+```conf
+notify-on-command-finish = unfocused
+notify-on-command-finish-action = no-bell,notify
+```
+
+Your shell must emit OSC 133 command-start/end markers; Monstar does not inject
+shell integration. Focus is checked at completion, and alternate-screen use
+does not cancel timing. These settings do not affect explicit OSC 9/777
+notifications. See `man 5 monstar` for action flags and duration syntax.
+
 Other settings:
 
 - **app-id** — Wayland app-id and desktop-entry hint for desktop integration
