@@ -14,6 +14,8 @@ const keybind = @import("keybind.zig");
 const log = std.log.scoped(.config);
 const baseline_dpi = 96.0;
 const points_per_inch = 72.0;
+const min_window_width = 10;
+const min_window_height = 4;
 
 fn warn(comptime fmt: []const u8, args: anytype) void {
     if (!builtin.is_test) log.warn(fmt, args);
@@ -101,6 +103,11 @@ adjust_cell_height: ?MetricModifier = null,
 /// both sides; two values are left/right for X and top/bottom for Y.
 window_padding_x: WindowPadding = .{},
 window_padding_y: WindowPadding = .{},
+/// Initial terminal grid size in cells; 0 leaves a dimension unset. Both must
+/// be set to take effect. Nonzero values are clamped to at least 10 columns
+/// and 4 rows. This only affects startup; reloads do not resize the window.
+window_width: u16 = 0,
+window_height: u16 = 0,
 /// Command to run; unset falls back to $SHELL, then /bin/sh. This only
 /// affects startup because reloading does not replace a running child.
 command: ?Command = null,
@@ -254,6 +261,10 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.window_padding_x = try parseWindowPadding(value);
     } else if (std.mem.eql(u8, key, "window-padding-y")) {
         self.window_padding_y = try parseWindowPadding(value);
+    } else if (std.mem.eql(u8, key, "window-width")) {
+        self.window_width = try parseWindowCells(value, min_window_width);
+    } else if (std.mem.eql(u8, key, "window-height")) {
+        self.window_height = try parseWindowCells(value, min_window_height);
     } else if (std.mem.eql(u8, key, "command")) {
         self.command = try parseCommand(arena, value);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
@@ -504,6 +515,11 @@ fn parseWindowPadding(value: []const u8) error{InvalidValue}!WindowPadding {
         .first = first,
         .second = std.fmt.parseInt(u31, trimmed_second, 10) catch return error.InvalidValue,
     };
+}
+
+fn parseWindowCells(value: []const u8, min: u16) error{InvalidValue}!u16 {
+    const cells = std.fmt.parseInt(u16, value, 10) catch return error.InvalidValue;
+    return if (cells == 0) 0 else @max(min, cells);
 }
 
 /// Convert a configured size to physical pixels. Point sizes use the
@@ -1007,6 +1023,34 @@ test "invalid window padding keeps the previous value" {
     );
     try std.testing.expectEqual(WindowPadding{ .first = 3, .second = 7 }, config.window_padding_x);
     try std.testing.expectEqual(WindowPadding{}, config.window_padding_y);
+}
+
+test "window size accepts cells, clamps minimums, and keeps zero unset" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const config = parse(arena,
+        \\window-width = 120
+        \\window-height = 40
+        \\window-width = -1
+        \\window-height = 70000
+    );
+    try std.testing.expectEqual(@as(u16, 120), config.window_width);
+    try std.testing.expectEqual(@as(u16, 40), config.window_height);
+
+    const small = parse(arena,
+        \\window-width = 3
+        \\window-height = 1
+    );
+    try std.testing.expectEqual(@as(u16, 10), small.window_width);
+    try std.testing.expectEqual(@as(u16, 4), small.window_height);
+
+    const unset = parse(arena,
+        \\window-width = 0
+    );
+    try std.testing.expectEqual(@as(u16, 0), unset.window_width);
+    try std.testing.expectEqual(@as(u16, 0), unset.window_height);
 }
 
 test "terminal colors from config" {

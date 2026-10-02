@@ -85,10 +85,20 @@ Print the version identifier and exit.
 .BI \-\-window-size-chars " columns" x rows
 Set the initial terminal grid size in cells.
 Both dimensions must be positive and no greater than 65535.
+Overrides the
+.B window-width
+and
+.B window-height
+configuration settings.
 .TP
 .BI \-\-window-size-pixels " width" x height
 Set the initial window size in physical pixels.
 Both dimensions must be positive.
+Overrides the
+.B window-width
+and
+.B window-height
+configuration settings.
 .TP
 .BI \-\-working-directory " directory"
 Start the child in

@@ -205,6 +205,26 @@ The default is zero.
 Set minimum top and bottom padding in logical pixels.
 One value applies to both sides; two values set top and bottom independently.
 The default is zero.
+.TP
+.BI window-height " = rows"
+Set the initial terminal grid height in cells.
+Takes effect only together with
+.BR window-width .
+The default is zero, which leaves the size unset.
+Values below 4 are raised to 4.
+.TP
+.BI window-width " = columns"
+Set the initial terminal grid width in cells.
+Takes effect only together with
+.BR window-height .
+The default is zero, which leaves the size unset.
+Values below 10 are raised to 10.
+The
+.B \-\-window-size-chars
+and
+.B \-\-window-size-pixels
+options take precedence over both settings.
+Reloading does not resize an existing window.
 .SH STORAGE AND INPUT SETTINGS
 .TP
 .BI copy-highlight-duration " = milliseconds"

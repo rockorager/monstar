@@ -277,12 +277,20 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
             .config_overrides = cli.config_overrides,
             .working_directory = cli.working_directory,
             .title = cli.title,
-            .initial_size = cli.initial_size,
+            .initial_size = initialSize(cli.initial_size, config),
             .hold = cli.hold,
         },
     );
     defer app.deinit();
     try app.run();
+}
+
+/// Command-line sizes take precedence; the configured grid size applies only
+/// when both `window-width` and `window-height` are set.
+fn initialSize(cli_size: App.InitialSize, config: Config) App.InitialSize {
+    if (cli_size != .default) return cli_size;
+    if (config.window_width == 0 or config.window_height == 0) return .default;
+    return .{ .chars = .{ .cols = config.window_width, .rows = config.window_height } };
 }
 
 const ChildCommand = struct {
@@ -447,6 +455,16 @@ test "parse CLI options and config overrides" {
     try std.testing.expectEqualStrings("scrollback-limit=42", cli.config_overrides[2]);
     try std.testing.expectEqual(@as(u16, 100), cli.initial_size.chars.cols);
     try std.testing.expectEqual(@as(u16, 40), cli.initial_size.chars.rows);
+}
+
+test "configured window size applies only when both dimensions are set" {
+    try std.testing.expectEqual(.default, std.meta.activeTag(initialSize(.default, .{ .window_width = 100 })));
+    const configured = initialSize(.default, .{ .window_width = 100, .window_height = 30 });
+    try std.testing.expectEqual(@as(u16, 100), configured.chars.cols);
+    try std.testing.expectEqual(@as(u16, 30), configured.chars.rows);
+
+    const cli = initialSize(.{ .pixels = .{ .width = 800, .height = 600 } }, .{ .window_width = 100, .window_height = 30 });
+    try std.testing.expectEqual(@as(u31, 800), cli.pixels.width);
 }
 
 test "configured shell command runs through sh" {
