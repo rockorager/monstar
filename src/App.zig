@@ -2094,11 +2094,15 @@ fn spawnSystemdRun(
 
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "systemd-run", "--user", "--collect" });
-    if (pwd) |p| {
-        const cwd_arg = try std.fmt.allocPrintSentinel(arena, "--working-directory={s}", .{p}, 0);
-        try argv.append(arena, cwd_arg.ptr);
-    }
+    const cwd_arg: ?[:0]const u8 = if (pwd) |p|
+        try std.fmt.allocPrintSentinel(arena, "--working-directory={s}", .{p}, 0)
+    else
+        null;
+    if (cwd_arg) |arg| try argv.append(arena, arg.ptr);
     try argv.append(arena, exe_path.ptr);
+    // monstar accepts the same flag; passing it there too overrides any
+    // configured working-directory in the new window.
+    if (cwd_arg) |arg| try argv.append(arena, arg.ptr);
     const argv_slice = try argv.toOwnedSliceSentinel(arena, null);
     if (!spawnLauncher(systemd_run, argv_slice.ptr, envp, "systemd-run")) {
         return error.SystemdRunFailed;

@@ -96,6 +96,21 @@ standard input when
 .B Ctrl+Shift+G
 is pressed.
 The default is unset.
+.TP
+.BI working-directory " = path"
+Start the child in
+.IR path ,
+which must be absolute,
+.BR ~ ,
+or begin with
+.BR ~/ .
+When unset, the child inherits Monstar's working directory.
+If the directory cannot be used, Monstar warns and inherits its own directory.
+The
+.B \-\-working-directory
+option overrides this setting, and windows opened with
+.B Ctrl+Shift+N
+start in the current terminal directory instead.
 .SH COMMAND COMPLETION NOTIFICATIONS
 The shell must emit OSC 133 C/D command-start/end markers. Monstar does not
 automatically inject shell integration. These settings do not affect explicit
@@ -219,11 +234,10 @@ Takes effect only together with
 .BR window-height .
 The default is zero, which leaves the size unset.
 Values below 10 are raised to 10.
-The
 .B \-\-window-size-chars
-and
+sets both settings, and
 .B \-\-window-size-pixels
-options take precedence over both settings.
+takes precedence over them.
 Reloading does not resize an existing window.
 .SH STORAGE AND INPUT SETTINGS
 .TP

@@ -108,6 +108,9 @@ window_padding_y: WindowPadding = .{},
 /// and 4 rows. This only affects startup; reloads do not resize the window.
 window_width: u16 = 0,
 window_height: u16 = 0,
+/// Starting directory for the child: an absolute path, `~`, or `~/path`.
+/// Unset inherits Monstar's directory. This only affects startup.
+working_directory: ?[:0]const u8 = null,
 /// Command to run; unset falls back to $SHELL, then /bin/sh. This only
 /// affects startup because reloading does not replace a running child.
 command: ?Command = null,
@@ -265,6 +268,10 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.window_width = try parseWindowCells(value, min_window_width);
     } else if (std.mem.eql(u8, key, "window-height")) {
         self.window_height = try parseWindowCells(value, min_window_height);
+    } else if (std.mem.eql(u8, key, "working-directory")) {
+        const home_relative = std.mem.eql(u8, value, "~") or std.mem.startsWith(u8, value, "~/");
+        if (!home_relative and !std.fs.path.isAbsolute(value)) return error.InvalidValue;
+        self.working_directory = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "command")) {
         self.command = try parseCommand(arena, value);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
@@ -1051,6 +1058,21 @@ test "window size accepts cells, clamps minimums, and keeps zero unset" {
     );
     try std.testing.expectEqual(@as(u16, 0), unset.window_width);
     try std.testing.expectEqual(@as(u16, 0), unset.window_height);
+}
+
+test "working directory accepts absolute and home-relative paths" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const config = parse(arena,
+        \\working-directory = ~/src
+        \\working-directory = src
+        \\working-directory = ~user/src
+    );
+    try std.testing.expectEqualStrings("~/src", config.working_directory.?);
+    try std.testing.expectEqualStrings("/srv/work", parse(arena, "working-directory = /srv/work").working_directory.?);
+    try std.testing.expectEqualStrings("~", parse(arena, "working-directory = ~").working_directory.?);
 }
 
 test "terminal colors from config" {

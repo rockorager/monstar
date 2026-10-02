@@ -45,8 +45,8 @@ const CliOptions = struct {
     action: CliAction = .run,
     config_path: ?[:0]const u8 = null,
     config_overrides: []const []const u8 = &.{},
-    working_directory: ?[:0]const u8 = null,
     title: [:0]const u8 = "monstar",
+    /// Only `--window-size-pixels`; cell sizes become config overrides.
     initial_size: App.InitialSize = .default,
     hold: bool = false,
     command_mode: CommandMode = .shell,
@@ -91,8 +91,8 @@ const CliParser = struct {
                 continue;
             } else if (try self.pathOption(arg, "--title", &self.cli.title)) {
                 continue;
-            } else if (try self.pathOption(arg, "--working-directory", &self.cli.working_directory)) {
-                continue;
+            } else if (try self.longValue(arg, "--working-directory")) |value| {
+                try self.setWorkingDirectory(value);
             } else if (std.mem.eql(u8, arg, "--hold")) {
                 self.cli.hold = true;
             } else if (try self.configOption(arg, "--app-id", "app-id")) {
@@ -103,10 +103,10 @@ const CliParser = struct {
                 try self.appendRawOverride(try self.nextValue());
             } else if (std.mem.startsWith(u8, arg, "-o") and arg.len > 2) {
                 try self.appendRawOverride(arg[2..]);
-            } else if (try self.initialSizeOption(arg, "--window-size-chars", .chars)) {
-                continue;
-            } else if (try self.initialSizeOption(arg, "--window-size-pixels", .pixels)) {
-                continue;
+            } else if (try self.longValue(arg, "--window-size-chars")) |value| {
+                try self.setWindowSizeChars(value);
+            } else if (try self.longValue(arg, "--window-size-pixels")) |value| {
+                self.cli.initial_size = try parseInitialPixels(value);
             } else {
                 // Keep bare words reserved for future subcommands. Commands
                 // must use `-e` or `--` so option parsing stays extensible.
@@ -148,18 +148,36 @@ const CliParser = struct {
         return false;
     }
 
-    const SizeKind = enum { chars, pixels };
+    /// Value of `--long VALUE` or `--long=VALUE`, or null if `arg` is not `long`.
+    fn longValue(self: *CliParser, arg: []const u8, long: []const u8) CliError!?[]const u8 {
+        if (std.mem.eql(u8, arg, long)) return try self.nextValue();
+        return self.optionValue(arg, long);
+    }
 
-    fn initialSizeOption(self: *CliParser, arg: []const u8, long: []const u8, kind: SizeKind) CliError!bool {
-        const value = value: {
-            if (std.mem.eql(u8, arg, long)) break :value try self.nextValue();
-            break :value self.optionValue(arg, long) orelse return false;
+    /// Check the directory now so a bad flag fails at launch, and make it
+    /// absolute so the override matches the config key's contract.
+    fn setWorkingDirectory(self: *CliParser, value: []const u8) CliError!void {
+        const path = if (std.fs.path.isAbsolute(value))
+            try self.arena.dupeZ(u8, value)
+        else path: {
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const rc = std.os.linux.getcwd(&cwd_buf, cwd_buf.len);
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.InvalidCli;
+            const cwd = std.mem.sliceTo(&cwd_buf, 0);
+            break :path try std.fmt.allocPrintSentinel(self.arena, "{s}/{s}", .{ cwd, value }, 0);
         };
-        self.cli.initial_size = switch (kind) {
-            .chars => try parseInitialChars(value),
-            .pixels => try parseInitialPixels(value),
-        };
-        return true;
+        try validateWorkingDirectory(path);
+        try self.appendOverride("working-directory", path);
+    }
+
+    /// Cell sizes are config overrides; clear any earlier pixel size so the
+    /// last size flag wins.
+    fn setWindowSizeChars(self: *CliParser, value: []const u8) CliError!void {
+        const dims = try parseDimensions(value);
+        if (dims.a > std.math.maxInt(u16) or dims.b > std.math.maxInt(u16)) return error.InvalidCli;
+        try self.appendOverride("window-width", try std.fmt.allocPrint(self.arena, "{d}", .{dims.a}));
+        try self.appendOverride("window-height", try std.fmt.allocPrint(self.arena, "{d}", .{dims.b}));
+        self.cli.initial_size = .default;
     }
 
     fn nextValue(self: *CliParser) CliError![:0]const u8 {
@@ -183,12 +201,6 @@ const CliParser = struct {
         try self.overrides.append(self.arena, override);
     }
 };
-
-fn parseInitialChars(value: []const u8) CliError!App.InitialSize {
-    const dims = try parseDimensions(value);
-    if (dims.a > std.math.maxInt(u16) or dims.b > std.math.maxInt(u16)) return error.InvalidCli;
-    return .{ .chars = .{ .cols = @intCast(dims.a), .rows = @intCast(dims.b) } };
-}
 
 fn parseInitialPixels(value: []const u8) CliError!App.InitialSize {
     const dims = try parseDimensions(value);
@@ -259,9 +271,9 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
         config.applyOverride(arena, override) catch return error.InvalidCli;
     }
     try config.resolveThemes(init.io, arena, init.minimal.environ);
-    if (cli.working_directory) |cwd| try validateWorkingDirectory(cwd);
+    const working_directory = try resolveWorkingDirectory(arena, init.minimal.environ, config.working_directory);
 
-    const command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command, cli.working_directory);
+    const command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command, working_directory);
     const envp = try buildEnvp(init.io, arena, init.minimal.environ);
 
     const app = try App.init(
@@ -275,7 +287,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
         .{
             .config_path = cli.config_path,
             .config_overrides = cli.config_overrides,
-            .working_directory = cli.working_directory,
+            .working_directory = working_directory,
             .title = cli.title,
             .initial_size = initialSize(cli.initial_size, config),
             .hold = cli.hold,
@@ -291,6 +303,29 @@ fn initialSize(cli_size: App.InitialSize, config: Config) App.InitialSize {
     if (cli_size != .default) return cli_size;
     if (config.window_width == 0 or config.window_height == 0) return .default;
     return .{ .chars = .{ .cols = config.window_width, .rows = config.window_height } };
+}
+
+/// Expand `~` and check the configured directory. An unusable directory
+/// warns and inherits ours so a stale config cannot prevent startup;
+/// `--working-directory` was already checked during argument parsing.
+fn resolveWorkingDirectory(
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    configured: ?[:0]const u8,
+) error{OutOfMemory}!?[:0]const u8 {
+    const value = configured orelse return null;
+    const path = if (value[0] == '~') path: {
+        const home = environ.getPosix("HOME") orelse {
+            log.warn("working-directory {s}: HOME is unset; ignoring", .{value});
+            return null;
+        };
+        break :path try std.fmt.allocPrintSentinel(arena, "{s}{s}", .{ home, value[1..] }, 0);
+    } else value;
+    validateWorkingDirectory(path) catch {
+        log.warn("working-directory {s} is not an accessible directory; ignoring", .{path});
+        return null;
+    };
+    return path;
 }
 
 const ChildCommand = struct {
@@ -444,17 +479,63 @@ test "parse CLI options and config overrides" {
 
     try std.testing.expectEqualStrings("/tmp/monstar.conf", cli.config_path.?);
     try std.testing.expectEqualStrings("Scratch", cli.title);
-    try std.testing.expectEqualStrings("/tmp", cli.working_directory.?);
     try std.testing.expect(cli.hold);
     try std.testing.expectEqual(.exec, cli.command_mode);
     try std.testing.expectEqualStrings("env", cli.command[0]);
     try std.testing.expectEqualStrings("A=B", cli.command[1]);
-    try std.testing.expectEqual(@as(usize, 3), cli.config_overrides.len);
-    try std.testing.expectEqualStrings("app-id=com.example.monstar", cli.config_overrides[0]);
-    try std.testing.expectEqualStrings("font-family=Iosevka", cli.config_overrides[1]);
-    try std.testing.expectEqualStrings("scrollback-limit=42", cli.config_overrides[2]);
-    try std.testing.expectEqual(@as(u16, 100), cli.initial_size.chars.cols);
-    try std.testing.expectEqual(@as(u16, 40), cli.initial_size.chars.rows);
+    const overrides = [_][]const u8{
+        "app-id=com.example.monstar",
+        "font-family=Iosevka",
+        "scrollback-limit=42",
+        "window-width=100",
+        "window-height=40",
+        "working-directory=/tmp",
+    };
+    try std.testing.expectEqual(overrides.len, cli.config_overrides.len);
+    for (overrides, cli.config_overrides) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectEqual(.default, std.meta.activeTag(cli.initial_size));
+}
+
+test "the last window size flag wins" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pixels_last = try parseCli(arena, &.{ "--window-size-chars=100x40", "--window-size-pixels=800x600" });
+    try std.testing.expectEqual(@as(u31, 800), pixels_last.initial_size.pixels.width);
+
+    const chars_last = try parseCli(arena, &.{ "--window-size-pixels=800x600", "--window-size-chars=100x40" });
+    try std.testing.expectEqual(.default, std.meta.activeTag(chars_last.initial_size));
+    try std.testing.expectEqualStrings("window-width=100", chars_last.config_overrides[0]);
+}
+
+test "working directory flag is checked and made absolute" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cli = try parseCli(arena, &.{"--working-directory=."});
+    const override = cli.config_overrides[0];
+    try std.testing.expect(std.mem.startsWith(u8, override, "working-directory=/"));
+    try std.testing.expect(std.mem.endsWith(u8, override, "/."));
+
+    var config: Config = .{};
+    try config.applyOverride(arena, override);
+    try std.testing.expectError(error.InvalidCli, parseCli(arena, &.{"--working-directory=/nonexistent/monstar"}));
+}
+
+test "configured working directory expands home and ignores unusable paths" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const envp = [_:null]?[*:0]const u8{"HOME=/tmp"};
+    const environ: std.process.Environ = .{ .block = .{ .slice = &envp } };
+    try std.testing.expectEqualStrings("/tmp", (try resolveWorkingDirectory(arena, environ, "~")).?);
+    try std.testing.expectEqualStrings("/", (try resolveWorkingDirectory(arena, environ, "/")).?);
+    try std.testing.expectEqual(null, try resolveWorkingDirectory(arena, environ, "~/nonexistent-monstar"));
+    try std.testing.expectEqual(null, try resolveWorkingDirectory(arena, .empty, "~"));
+    try std.testing.expectEqual(null, try resolveWorkingDirectory(arena, environ, null));
 }
 
 test "configured window size applies only when both dimensions are set" {

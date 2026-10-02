@@ -141,7 +141,12 @@ Other settings:
   (default `dev.rockorager.monstar`).
 - **window-width / window-height** — Initial terminal grid size in cells.
   Both must be set; values below 10 columns or 4 rows are raised to that
-  minimum. `--window-size-chars` and `--window-size-pixels` take precedence.
+  minimum. `--window-size-chars` sets both; `--window-size-pixels` takes
+  precedence.
+- **working-directory** — Starting directory for the child: an absolute path,
+  `~`, or `~/path`. Unusable directories are ignored with a warning.
+  `--working-directory` overrides it, and `Ctrl+Shift+N` windows start in the
+  current terminal directory.
 - **pipe-command-output** — Shell command that receives the last command's
   output on stdin when `Ctrl+Shift+G` is pressed.
 - **scrollback-limit** — Terminal page storage in bytes, including the active

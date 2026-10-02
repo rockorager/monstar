@@ -83,27 +83,32 @@ The default is
 Print the version identifier and exit.
 .TP
 .BI \-\-window-size-chars " columns" x rows
-Set the initial terminal grid size in cells.
-Both dimensions must be positive and no greater than 65535.
-Overrides the
+Set the initial terminal grid size in cells by overriding the
 .B window-width
 and
 .B window-height
 configuration settings.
+Both dimensions must be positive and no greater than 65535; sizes below 10
+columns or 4 rows are raised to that minimum.
 .TP
 .BI \-\-window-size-pixels " width" x height
 Set the initial window size in physical pixels.
 Both dimensions must be positive.
-Overrides the
+Takes precedence over the
 .B window-width
 and
 .B window-height
 configuration settings.
+When both size options are given, the last one wins.
 .TP
 .BI \-\-working-directory " directory"
 Start the child in
-.IR directory .
-The directory must exist and be accessible.
+.I directory
+by overriding the
+.B working-directory
+configuration setting.
+The directory must exist and be accessible; a relative path is resolved
+against the current directory.
 .TP
 .BI \-\- " command..."
 Join the remaining words with spaces and run the result through
