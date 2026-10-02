@@ -133,7 +133,8 @@ image_storage_limit: usize = 320 * 1000 * 1000,
 mouse_scroll_multiplier: MouseScrollMultiplier = .{},
 /// Whether finger scrolling continues with inertial motion after release.
 inertial_scrolling: bool = true,
-/// Render precision scrollback movement in pixels rather than whole rows.
+/// Render scrollback movement in pixels rather than whole rows, easing
+/// mouse wheel steps.
 smooth_scrolling: bool = true,
 /// User keybindings, backed by the config arena. Defaults are resolved separately.
 keybinds: std.ArrayList(keybind.Binding) = .empty,

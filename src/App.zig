@@ -194,10 +194,13 @@ repeat_keycode: ?u32,
 /// From wl_keyboard.repeat_info: characters per second and delay in ms.
 repeat_rate: i32,
 repeat_delay: i32,
-/// Kinetic touchpad scrolling after a finger-axis sequence stops.
+/// Scroll animation timer: kinetic touchpad scrolling after a finger-axis
+/// sequence stops, and eased wheel scrolling. Armed while either is active.
 fling_fd: posix.fd_t,
 fling_active: bool,
 fling_velocity: f64,
+/// Logical content pixels of wheel movement not yet eased onto the viewport.
+wheel_scroll_pixels: f64,
 scroll_velocity: f64,
 last_scroll_time_ms: ?u32,
 /// Safety timer for DEC mode 2026 synchronized output.
@@ -309,6 +312,8 @@ const fling_interval_ms = 8;
 const fling_start_velocity = 150.0;
 const fling_min_velocity = 30.0;
 const fling_max_velocity = 8000.0;
+/// Wheel easing time constant; a three-row detent settles in about 120 ms.
+const wheel_scroll_time_constant_ms = 25.0;
 const velocity_smoothing = 0.75;
 const scroll_velocity_timeout_ms = 200;
 
@@ -727,6 +732,7 @@ pub fn init(
         .fling_fd = fling_fd,
         .fling_active = false,
         .fling_velocity = 0,
+        .wheel_scroll_pixels = 0,
         .scroll_velocity = 0,
         .last_scroll_time_ms = null,
         .sync_output_fd = sync_output_fd,
@@ -4542,6 +4548,7 @@ fn syncScrollTarget(self: *App) void {
     // Remainders and kinetic motion belong to the previous recipient. In
     // particular, raw precision pixels must not acquire the new scale.
     self.stopFling();
+    self.stopWheelScroll();
     self.resetScrollVelocity();
     self.scroll_pixels = 0;
     self.scroll_offset = 0;
@@ -4578,18 +4585,20 @@ fn finishScrollFrame(self: *App) void {
         self.config.mouse_scroll_multiplier.discrete;
 
     var lines: i32 = 0;
-    if (self.scroll_had_value120) {
-        const wheel_ticks = @as(f64, @floatFromInt(self.scroll_value120)) / 120.0;
-        const total = wheel_ticks * discrete_multiplier + self.scroll_line_remainder;
-        const whole = @trunc(total);
-        lines = @intFromFloat(whole);
-        self.scroll_line_remainder = total - whole;
-    } else if (self.scroll_had_discrete) {
-        const total = @as(f64, @floatFromInt(self.scroll_clicks)) * discrete_multiplier +
-            self.scroll_line_remainder;
-        const whole = @trunc(total);
-        lines = @intFromFloat(whole);
-        self.scroll_line_remainder = total - whole;
+    if (self.scroll_had_value120 or self.scroll_had_discrete) {
+        const wheel_ticks = if (self.scroll_had_value120)
+            @as(f64, @floatFromInt(self.scroll_value120)) / 120.0
+        else
+            @as(f64, @floatFromInt(self.scroll_clicks));
+        if (self.config.smooth_scrolling and self.scroll_target == .viewport) {
+            self.queueWheelScroll(wheel_ticks * discrete_multiplier);
+        } else {
+            const total = wheel_ticks * discrete_multiplier + self.scroll_line_remainder;
+            const whole = @trunc(total);
+            lines = @intFromFloat(whole);
+            self.scroll_line_remainder = total - whole;
+            self.resetSmoothScroll();
+        }
     } else if (self.config.smooth_scrolling and self.scroll_target == .viewport and
         (self.scroll_pixels != 0 or self.scroll_offset != 0))
     {
@@ -4604,7 +4613,6 @@ fn finishScrollFrame(self: *App) void {
         lines = @intFromFloat(whole);
         self.scroll_pixels -= whole * cell / multiplier;
     }
-    if (self.scroll_had_value120 or self.scroll_had_discrete) self.resetSmoothScroll();
     self.scroll_frame_pixels = 0;
     self.scroll_clicks = 0;
     self.scroll_value120 = 0;
@@ -4630,7 +4638,8 @@ fn scrollViewportPixels(self: *App) void {
         @as(f64, @floatFromInt(self.window.scale120));
     const multiplier = self.precisionScrollScale();
     const pixels = self.scroll_pixels * multiplier;
-    const whole = @floor(pixels / cell);
+    // Tolerate float drift so eased steps summing to whole rows land on them.
+    const whole = @floor(pixels / cell + 1e-6);
     const pages = &self.term.screens.active.pages;
     const before = pages.scrollbar();
     const target = @as(f64, @floatFromInt(before.offset)) + whole;
@@ -4639,7 +4648,7 @@ fn scrollViewportPixels(self: *App) void {
     self.scroll_pixels = if (target < 0 or target >= @as(f64, @floatFromInt(max_row)))
         0
     else
-        (pixels - whole * cell) / multiplier;
+        @max(pixels - whole * cell, 0) / multiplier;
     const old_offset = self.scroll_offset;
     self.scroll_offset = @intFromFloat(@min(
         self.scroll_pixels * multiplier * @as(f64, @floatFromInt(self.window.scale120)) / 120.0,
@@ -4653,11 +4662,13 @@ fn scrollViewportPixels(self: *App) void {
     }
     if (self.scroll_pixels == 0 and (target < 0 or target >= @as(f64, @floatFromInt(max_row)))) {
         self.stopFling();
+        self.stopWheelScroll();
         self.resetScrollVelocity();
     }
 }
 
 fn resetSmoothScroll(self: *App) void {
+    self.stopWheelScroll();
     self.scroll_pixels = 0;
     if (self.scroll_offset != 0) self.needs_redraw = true;
     self.scroll_offset = 0;
@@ -4703,15 +4714,51 @@ fn startFling(self: *App) void {
 fn stopFling(self: *App) void {
     if (!self.fling_active) return;
     self.fling_active = false;
-    _ = setTimer(self.fling_fd, disarmed_timer, "fling");
+    if (self.wheel_scroll_pixels == 0) _ = setTimer(self.fling_fd, disarmed_timer, "fling");
+}
+
+/// Queue wheel movement in viewport rows for easing onto the viewport. A
+/// reversal drops the unfinished distance so the new direction responds at once.
+fn queueWheelScroll(self: *App, rows: f64) void {
+    std.debug.assert(self.scroll_target == .viewport);
+    const cell = @as(f64, @floatFromInt(self.font.cell_height)) * 120.0 /
+        @as(f64, @floatFromInt(self.window.scale120));
+    const pixels = rows * cell;
+    const armed = self.fling_active or self.wheel_scroll_pixels != 0;
+    if (self.wheel_scroll_pixels * pixels < 0) self.wheel_scroll_pixels = 0;
+    self.wheel_scroll_pixels += pixels;
+    if (armed or self.wheel_scroll_pixels == 0) return;
+    const interval = timespecFromNs(fling_interval_ms * std.time.ns_per_ms);
+    const spec: std.os.linux.itimerspec = .{ .it_value = interval, .it_interval = interval };
+    if (!setTimer(self.fling_fd, spec, "wheel scroll")) self.wheel_scroll_pixels = 0;
+}
+
+fn stopWheelScroll(self: *App) void {
+    if (self.wheel_scroll_pixels == 0) return;
+    self.wheel_scroll_pixels = 0;
+    if (!self.fling_active) _ = setTimer(self.fling_fd, disarmed_timer, "wheel scroll");
+}
+
+/// Move the share of queued wheel distance that an exponential ease covers in
+/// `dt_ms`, finishing once less than half a pixel would remain.
+fn stepWheelScroll(self: *App, dt_ms: f64) void {
+    var step = self.wheel_scroll_pixels * (1 - @exp(-dt_ms / wheel_scroll_time_constant_ms));
+    if (@abs(self.wheel_scroll_pixels - step) < 0.5) step = self.wheel_scroll_pixels;
+    self.wheel_scroll_pixels -= step;
+    if (self.wheel_scroll_pixels == 0 and !self.fling_active) {
+        _ = setTimer(self.fling_fd, disarmed_timer, "wheel scroll");
+    }
+    self.scroll_pixels += step / self.precisionScrollScale();
+    self.finishScrollFrame();
 }
 
 fn fireFling(self: *App) void {
     self.syncScrollTarget();
     const expirations = readTimer(self.fling_fd) orelse return;
+    const dt_ms: f64 = @floatFromInt(fling_interval_ms * expirations);
+    if (self.wheel_scroll_pixels != 0) self.stepWheelScroll(dt_ms);
     if (!self.fling_active) return;
 
-    const dt_ms: f64 = @floatFromInt(fling_interval_ms * expirations);
     self.scroll_pixels += self.fling_velocity * dt_ms / 1000.0 / self.precisionScrollScale();
     self.finishScrollFrame();
 
@@ -4768,6 +4815,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     app.link_checked_cell = null;
     app.scroll_offset = 0;
     app.fling_active = false;
+    app.wheel_scroll_pixels = 0;
     // Force the same initialization used when a new recipient takes over.
     app.scroll_target = .application;
     app.syncScrollTarget();
@@ -4824,9 +4872,11 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     try std.testing.expectEqualStrings("\x1b[<64;1;1M", app.write_queue.items[1..]);
     try std.testing.expectEqual(@as(f64, 0), app.scroll_pixels);
 
-    // Local scrolling moves history instead of writing PTY input.
+    // Local scrolling moves history instead of writing PTY input. Whole-row
+    // scrolling applies wheel movement at once; eased wheels are tested below.
     stream.nextSlice("\x1b[?1049l\x1b[?1003l");
     for (0..30) |_| stream.nextSlice("line\r\n");
+    app.config.smooth_scrolling = false;
     app.config.mouse_scroll_multiplier = .{ .discrete = 3, .precision = 2 };
     const offset = app.term.screens.active.pages.scrollbar().offset;
     app.write_queue.shrinkRetainingCapacity(1);
@@ -5008,6 +5058,55 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     try std.testing.expectEqual(@as(usize, 4), app.term.screens.active.pages.scrollbar().offset);
     try std.testing.expectEqual(@as(u31, 16), app.scroll_offset);
     app.stopFling();
+
+    // Detents and hi-res wheel steps ease their full distance through
+    // sub-row positions, then settle row-aligned.
+    for ([_]i32{ -120, 40, -40 }) |value120| {
+        app.resetSmoothScroll();
+        app.term.screens.active.pages.scroll(.{ .row = 10 });
+        pointerEvent(app, .{ .axis_value120 = .{ .axis = .vertical_scroll, .value120 = value120 } });
+        pointerEvent(app, .frame);
+        try std.testing.expectEqual(@as(usize, 10), app.term.screens.active.pages.scrollbar().offset);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(value120)) / 120 * 3 * 20, app.wheel_scroll_pixels);
+        var ticks: usize = 0;
+        while (app.wheel_scroll_pixels != 0) : (ticks += 1) {
+            try std.testing.expect(ticks < 50);
+            try std.testing.expect(setTimer(app.fling_fd, .{ .it_value = timespecFromNs(1), .it_interval = .{ .sec = 0, .nsec = 0 } }, "test wheel"));
+            var tick_fds = [_]posix.pollfd{.{ .fd = app.fling_fd, .events = posix.POLL.IN, .revents = 0 }};
+            try std.testing.expectEqual(@as(usize, 1), try posix.poll(&tick_fds, 1000));
+            app.fireFling();
+            if (ticks == 0) try std.testing.expect(app.scroll_offset != 0);
+        }
+        try std.testing.expect(ticks > 1);
+        const rows = @divExact(value120 * 3, 120);
+        try std.testing.expectEqual(@as(usize, @intCast(10 + rows)), app.term.screens.active.pages.scrollbar().offset);
+        try std.testing.expectEqual(@as(u31, 0), app.scroll_offset);
+    }
+
+    // Reversal drops the unfinished distance; explicit navigation, edges,
+    // and recipient changes cancel the animation.
+    app.term.screens.active.pages.scroll(.{ .row = 10 });
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -2 } });
+    pointerEvent(app, .frame);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(@as(f64, 60), app.wheel_scroll_pixels);
+    app.handleScrollbackKey(.{ .key = .home, .action = .press }, .top);
+    try std.testing.expectEqual(@as(f64, 0), app.wheel_scroll_pixels);
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = -1 } });
+    pointerEvent(app, .frame);
+    try std.testing.expectEqual(@as(f64, -60), app.wheel_scroll_pixels);
+    app.stepWheelScroll(fling_interval_ms);
+    try std.testing.expectEqual(@as(f64, 0), app.wheel_scroll_pixels);
+    try std.testing.expectEqual(@as(usize, 0), app.term.screens.active.pages.scrollbar().offset);
+    app.term.screens.active.pages.scroll(.{ .row = 10 });
+    pointerEvent(app, .{ .axis_discrete = .{ .axis = .vertical_scroll, .discrete = 1 } });
+    pointerEvent(app, .frame);
+    stream.nextSlice("\x1b[?1000h");
+    app.write_queue.shrinkRetainingCapacity(1);
+    app.fireFling();
+    try std.testing.expectEqual(@as(f64, 0), app.wheel_scroll_pixels);
+    try std.testing.expectEqualStrings("", app.write_queue.items[1..]);
 }
 
 test "scroll velocity expires across a pause before motion resumes" {
@@ -5037,6 +5136,7 @@ test "application fling threshold ignores precision configuration" {
     app.term.flags.mouse_event = .normal;
     app.fling_fd = try createTimerFd();
     defer _ = std.os.linux.close(app.fling_fd);
+    app.wheel_scroll_pixels = 0;
     for ([_]f64{ 0.01, 1, 10_000 }) |multiplier| {
         app.config.mouse_scroll_multiplier.precision = multiplier;
         for ([_]f64{ -4, -1, 1, 4 }) |pixels| {
@@ -6074,6 +6174,7 @@ test "fixed shortcuts consume repeats and releases without writing terminal inpu
     app.pty.master = fds[1];
     app.fling_active = false;
     app.scroll_offset = 0;
+    app.wheel_scroll_pixels = 0;
     app.selection_gesture = .init;
     app.selection_autoscroll_fd = try createTimerFd();
     defer _ = linux.close(app.selection_autoscroll_fd);
@@ -7182,6 +7283,7 @@ test "search Enter waits for results without blocking and can be cancelled or ed
         app.scrollbar_hovered = false;
         app.scrollbar_reveal_hovered = false;
         app.scroll_offset = 0;
+        app.wheel_scroll_pixels = 0;
         app.async_generation = 0;
         app.held_frame = null;
         app.ime_preedit = null;
