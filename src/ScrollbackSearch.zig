@@ -11,6 +11,8 @@ engine: ?vt.search.Screen = null,
 engine_key: vt.ScreenSet.Key = .primary,
 engine_generation: usize = 0,
 complete: bool = true,
+/// Enter arrived before a match; finish once a result or completion is known.
+accept_pending: bool = false,
 original_screen: *vt.Screen,
 original_key: vt.ScreenSet.Key,
 original_generation: usize,

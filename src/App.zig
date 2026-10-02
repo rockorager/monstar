@@ -5680,6 +5680,11 @@ fn finishSearch(self: *App, accept: bool) void {
         {
             if (search.engine.?.selectedMatch()) |match| {
                 accepted = .init(match.startPin(), match.endPin(), false);
+            } else if (!search.complete) {
+                // History is searched incrementally. Keep Enter pending
+                // rather than discarding it or blocking on the whole search.
+                search.accept_pending = true;
+                return;
             }
         } else if (!accept) {
             search.restoreViewport(&self.term);
@@ -5704,6 +5709,7 @@ fn finishSearch(self: *App, accept: bool) void {
 
 fn rebuildSearch(self: *App) void {
     const search = if (self.search) |*value| value else return;
+    search.accept_pending = false;
     search.deinitEngine(&self.term);
     self.stopSearchTimer();
     if (search.query.items.len == 0) {
@@ -5810,6 +5816,10 @@ fn fireSearch(self: *App) void {
     }
     self.ensureSearchSelection();
 
+    if (self.search.?.accept_pending) {
+        self.finishSearch(true);
+        if (self.search == null) return;
+    }
     search = &self.search.?;
     const after_selected: ?usize = if (search.engine.?.selected) |selected| selected.idx else null;
     if (before_matches != search.engine.?.matchesLen() or
@@ -7140,6 +7150,94 @@ test "search backspace removes one UTF-8 codepoint" {
     try std.testing.expectEqualStrings("a", query.items);
     try std.testing.expect(truncateLastUtf8(&query));
     try std.testing.expect(!truncateLastUtf8(&query));
+}
+
+test "search Enter waits for results without blocking and can be cancelled or edited" {
+    const alloc = std.testing.allocator;
+    const Case = enum { active, history, missing, cancel, edit };
+    for (std.enums.values(Case)) |case| {
+        const app = try alloc.create(App);
+        defer alloc.destroy(app);
+        app.alloc = alloc;
+        app.term = try .init(std.testing.io, alloc, .{ .cols = 24, .rows = 3, .max_scrollback_bytes = 1_000_000 });
+        defer app.term.deinit(alloc);
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("prefix needle suffix\r\n");
+        if (case != .active) {
+            for (0..2000) |_| stream.nextSlice("unrelated history\r\n");
+        }
+        app.search = try .init(&app.term);
+        defer if (app.search) |*search| search.deinit(alloc, &app.term);
+        app.search_fd = try createTimerFd();
+        defer _ = std.os.linux.close(app.search_fd);
+        app.scrollbar_fd = try createTimerFd();
+        defer _ = std.os.linux.close(app.scrollbar_fd);
+        app.scrollbar_alpha = 0;
+        app.scrollbar_drag = null;
+        app.scrollbar_hovered = false;
+        app.scrollbar_reveal_hovered = false;
+        app.scroll_offset = 0;
+        app.async_generation = 0;
+        app.held_frame = null;
+        app.ime_preedit = null;
+        app.ime_pending_preedit = null;
+        app.ime_pending_commit = null;
+        app.pointer_inside = false;
+        app.link_active = false;
+        app.hovered_link = null;
+        app.mouse_shape_explicit = false;
+        app.keyboard = try .init();
+        defer app.keyboard.deinit();
+        app.clipboard = .init(alloc, null, null);
+        defer app.clipboard.deinit();
+        app.last_serial = 0;
+        app.window = try alloc.create(Window);
+        defer alloc.destroy(app.window);
+        app.window.cursor_shape = .text;
+        app.window.pointer_enter_serial = null;
+
+        app.appendSearchText(if (case == .missing) "absent" else "needle");
+        try std.testing.expectEqual(case == .active, app.search.?.engine.?.selectedMatch() != null);
+        // No timer dispatch between the last character and Enter: only the
+        // active page has been searched, not the older history pages.
+        app.handleSearchKey(.{ .key = .enter, .action = .press });
+        if (case != .active) try std.testing.expect(app.search != null);
+
+        if (case == .cancel) {
+            app.handleSearchKey(.{ .key = .escape, .action = .press });
+        } else if (case == .edit) {
+            app.handleSearchKey(.{ .key = .backspace, .action = .press });
+        }
+
+        // Drive the actual timer handler, with a bounded wait rather than
+        // synchronously searching all history when Enter arrives.
+        var wakes: usize = 0;
+        while (app.search != null and !app.search.?.complete and wakes < 1000) : (wakes += 1) {
+            var fds = [_]posix.pollfd{.{ .fd = app.search_fd, .events = posix.POLL.IN, .revents = 0 }};
+            try std.testing.expectEqual(@as(usize, 1), try posix.poll(&fds, 1000));
+            app.fireSearch();
+        }
+        try std.testing.expect(wakes < 1000);
+        switch (case) {
+            .active, .history => {
+                try std.testing.expectEqual(null, app.search);
+                const selected = app.selectionText() orelse return error.TestExpectedSelection;
+                defer alloc.free(selected);
+                try std.testing.expectEqualStrings("needle", selected);
+            },
+            .missing, .cancel => {
+                try std.testing.expectEqual(null, app.search);
+                try std.testing.expectEqual(null, app.term.screens.active.selection);
+            },
+            .edit => {
+                try std.testing.expect(app.search != null);
+                try std.testing.expect(app.search.?.complete);
+                try std.testing.expectEqualStrings("needl", app.search.?.query.items);
+                try std.testing.expectEqual(null, app.term.screens.active.selection);
+            },
+        }
+    }
 }
 
 test "scrollback keys require supported modifiers on the primary screen" {
