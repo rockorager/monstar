@@ -67,6 +67,15 @@ fn matchScheme(text: []const u8, start: usize, scheme: Scheme) ?Match {
     var end = payload_start;
     while (end < text.len) {
         const byte = text[end];
+        if (byte >= 0x80) {
+            const len = std.unicode.utf8ByteSequenceLength(byte) catch break;
+            if (len > text.len - end) break;
+            const view = std.unicode.Utf8View.init(text[end..][0..len]) catch break;
+            var it = view.iterator();
+            if (isUnicodeWhitespace(it.nextCodepoint().?)) break;
+            end += len;
+            continue;
+        }
         if (byte == '%') {
             if (end + 2 >= text.len or
                 !std.ascii.isHex(text[end + 1]) or
@@ -86,9 +95,23 @@ fn matchScheme(text: []const u8, start: usize, scheme: Scheme) ?Match {
 fn hasLeftBoundary(text: []const u8, start: usize) bool {
     if (start == 0) return true;
     const byte = text[start - 1];
-    return byte < 0x80 and
-        !std.ascii.isAlphanumeric(byte) and
+    if (byte >= 0x80) {
+        var previous = start - 1;
+        while (previous > 0 and text[previous] & 0xc0 == 0x80) previous -= 1;
+        const view = std.unicode.Utf8View.init(text[previous..start]) catch return false;
+        var it = view.iterator();
+        return isUnicodeWhitespace(it.nextCodepoint().?);
+    }
+    return !std.ascii.isAlphanumeric(byte) and
         byte != '_' and byte != '+' and byte != '-' and byte != '.';
+}
+
+fn isUnicodeWhitespace(cp: u21) bool {
+    // Non-ASCII Unicode White_Space; ASCII delimiters are handled separately.
+    return switch (cp) {
+        0x0085, 0x00a0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
+        else => false,
+    };
 }
 
 fn isAuthorityStart(byte: u8) bool {
@@ -236,4 +259,31 @@ test "automatic link ranges and next link" {
 test "automatic links accept UTF-8 and valid percent escapes" {
     try expectMatch("https://example.com/東京?q=%E2%9C%93", "https://example.com/東京?q=%E2%9C%93");
     try expectMatch("https://example.com/ok%zz", "https://example.com/ok");
+}
+
+test "automatic links stop at Unicode whitespace" {
+    inline for (.{ "\u{a0}", "\u{2003}", "\u{202f}", "\u{3000}" }) |space| {
+        try expectMatch("https://example.com/東京" ++ space ++ "next", "https://example.com/東京");
+    }
+}
+
+test "automatic links start after Unicode whitespace" {
+    inline for (.{ "\u{a0}", "\u{2003}", "\u{202f}", "\u{3000}" }) |space| {
+        try expectMatch("see" ++ space ++ "https://example.com/東京", "https://example.com/東京");
+    }
+    // Non-ASCII letters are not a boundary, and escaped spaces remain URI data.
+    try std.testing.expectEqual(null, find("éhttps://example.com", 0));
+    try expectMatch("https://example.com/a%C2%A0b", "https://example.com/a%C2%A0b");
+}
+
+test "automatic links keep byte offsets across Unicode separators" {
+    const text = "\u{2003}https://example.com/🙂\u{a0}mailto:u@example.net";
+    const first = find(text, 0).?;
+    try std.testing.expectEqual(@as(usize, 3), first.start);
+    try std.testing.expectEqual(@as(usize, 27), first.end);
+    try std.testing.expectEqualStrings("https://example.com/🙂", text[first.start..first.end]);
+    const second = find(text, first.end).?;
+    try std.testing.expectEqual(@as(usize, 29), second.start);
+    try std.testing.expectEqualStrings("mailto:u@example.net", text[second.start..second.end]);
+    try std.testing.expectEqual(null, find(text, second.end));
 }
