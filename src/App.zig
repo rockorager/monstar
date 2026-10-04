@@ -4368,6 +4368,7 @@ fn writeTerminalPaste(
         .text => {},
     }
 
+    if (!vt.clipboard.isTextMime(mime)) return;
     // STRING is Latin-1, unlike the other accepted text representations.
     // Decode only ordinary paste; Kitty transfers retain their MIME and bytes.
     const decoded = if (std.mem.eql(u8, mime, "STRING"))
@@ -4375,19 +4376,22 @@ fn writeTerminalPaste(
     else
         null;
     defer if (decoded) |text| self.alloc.free(text);
-    const contents = [_]vt.clipboard.Content{.{
-        .mime = if (decoded != null) "text/plain;charset=utf-8" else mime,
-        .data = decoded orelse data,
-    }};
-    _ = self.stream.handler.terminal_handler.paste(.{
-        .source = source,
-        .contents = .{ .memory = &contents },
-        // Preserve Monstar's existing paste policy. libghostty still applies
-        // bracket framing and xterm control-byte sanitization.
-        .allow_unsafe = true,
-    }) catch |err| {
+    const text = decoded orelse data;
+    // The stream handler emits 4096-byte writes, but the bounded PTY queue
+    // can reject a later chunk (including the closing bracket). Encode the
+    // entire paste first so writePty accepts or rejects it atomically.
+    var writer = std.Io.Writer.Allocating.initCapacity(
+        self.alloc,
+        text.len + vt.input.max_paste_frame_size,
+    ) catch |err| {
         log.warn("terminal paste failed: {}", .{err});
+        return;
     };
+    defer writer.deinit();
+    // Preserve the existing allow-unsafe policy while retaining libghostty's
+    // bracket framing, control-byte sanitization, and newline conversion.
+    vt.input.encodePasteWriter(&writer.writer, text, .fromTerminal(&self.term)) catch unreachable;
+    self.writePty(writer.written());
 }
 
 test "ordinary STRING pastes and text drops decode Latin-1" {
@@ -4438,6 +4442,64 @@ test "ordinary STRING pastes and text drops decode Latin-1" {
         defer alloc.free(drop);
         try std.testing.expectEqualStrings(utf8, drop);
     }
+}
+
+test "terminal paste is atomic at the PTY backlog limit" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.stream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer app.stream.deinit();
+    app.stream.handler.terminal_handler.effects = .readonly;
+    app.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
+    app.write_queue = try .initCapacity(alloc, max_pty_write_queue);
+    defer app.write_queue.deinit(alloc);
+    app.write_queue_offset = 0;
+    app.pty.master = -1; // The existing backlog must keep all input queued.
+
+    // Cross libghostty's streaming boundary and require both sanitization
+    // and newline handling, rather than just checking the output length.
+    const data = try alloc.alloc(u8, 8192);
+    defer alloc.free(data);
+    @memset(data, 'x');
+    data[0] = '\x1b';
+    data[4095] = '\n';
+    data[data.len - 1] = '!';
+    for ([_]bool{ false, true }) |bracketed| {
+        app.term.modes.set(.bracketed_paste, bracketed);
+        const prefix = if (bracketed) "\x1b[200~" else "";
+        const suffix = if (bracketed) "\x1b[201~" else "";
+        const expected = try std.mem.concat(alloc, u8, &.{ prefix, data, suffix });
+        defer alloc.free(expected);
+        expected[prefix.len] = ' ';
+        expected[prefix.len + 4095] = if (bracketed) '\n' else '\r';
+
+        for ([_]i32{ -1, 0, 1 }) |headroom| {
+            const available: usize = @intCast(@as(i32, @intCast(expected.len)) + headroom);
+            const pending = max_pty_write_queue - available;
+            app.write_queue.items.len = pending;
+            @memset(app.write_queue.items, 'q');
+            app.writeTerminalPaste(.{ .clipboard = .standard }, "text/plain", data);
+
+            try std.testing.expectEqual(pending + (if (headroom < 0) @as(usize, 0) else expected.len), app.write_queue.items.len);
+            try std.testing.expect(std.mem.allEqual(u8, app.write_queue.items[0..pending], 'q'));
+            if (headroom >= 0) try std.testing.expectEqualStrings(expected, app.write_queue.items[pending..]);
+        }
+    }
+
+    app.write_queue.items.len = 1;
+    app.write_queue.items[0] = 'q';
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    app.alloc = failing.allocator();
+    app.writeTerminalPaste(.text, "text/plain", data);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("q", app.write_queue.items);
 }
 
 fn kittyClipboardTarget(target: Clipboard.Target) KittyClipboard.Target {
