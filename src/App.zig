@@ -6167,7 +6167,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 
     if (scrollbackKeyAction(&self.config, self.term.screens.active_key, event)) |scroll| {
         if (scroll != .passthrough) return self.handleScrollbackKey(event, scroll);
-    } else {
+    } else if (!event.mods.alt and !event.mods.super) {
         // Fixed shortcuts fire once, but their matching repeats and releases
         // must not leak into the application as keyboard-protocol input.
         // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
@@ -6214,7 +6214,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     }
 }
 
-test "fixed shortcuts consume repeats and releases without writing terminal input" {
+test "fixed shortcuts consume repeats and releases only with matching modifiers" {
     const alloc = std.testing.allocator;
     const linux = std.os.linux;
     var fds: [2]posix.fd_t = undefined;
@@ -6280,6 +6280,47 @@ test "fixed shortcuts consume repeats and releases without writing terminal inpu
             }
         }
         if (kitty) stream.nextSlice("\x1b[<u");
+    }
+
+    // Extra Alt/Super modifiers belong to applications, including all event
+    // types requested by the Kitty keyboard protocol. Modifier numbers are
+    // 1 + Shift(1) + Alt(2) + Ctrl(4) + Super(8).
+    {
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[>3u");
+        defer stream.nextSlice("\x1b[<u");
+        for ([_]struct { key: u32, extra: u32, shift: bool, codepoint: u8, modifier: u8 }{
+            .{ .key = 12, .extra = 56, .shift = false, .codepoint = '-', .modifier = 7 },
+            .{ .key = 13, .extra = 125, .shift = false, .codepoint = '=', .modifier = 13 },
+            .{ .key = 46, .extra = 56, .shift = true, .codepoint = 'c', .modifier = 8 },
+            .{ .key = 47, .extra = 125, .shift = true, .codepoint = 'v', .modifier = 14 },
+        }) |case| {
+            _ = c.xkb_state_update_key(app.keyboard.state.?, case.extra + 8, c.XKB_KEY_DOWN);
+            defer _ = c.xkb_state_update_key(app.keyboard.state.?, case.extra + 8, c.XKB_KEY_UP);
+            if (case.shift) _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_DOWN);
+            defer if (case.shift) {
+                _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_UP);
+            };
+            for ([_]vt.input.KeyAction{ .repeat, .release, .press }) |action| {
+                app.onKey(case.key, action);
+                var buf: [64]u8 = undefined;
+                const n = posix.read(fds[0], &buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                var expected_buf: [64]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&expected_buf, "\x1b[{d};{d}{s}u", .{
+                    case.codepoint, case.modifier,
+                    switch (action) {
+                        .press => "",
+                        .repeat => ":2",
+                        .release => ":3",
+                    },
+                });
+                try std.testing.expectEqualStrings(expected, buf[0..n]);
+            }
+        }
     }
 
     // An explicit unbind still passes the same repeated shortcut through.
