@@ -294,6 +294,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
         },
     );
     defer app.deinit();
+    app.window.initial_activation_token = init.minimal.environ.getPosix("XDG_ACTIVATION_TOKEN");
     try app.run();
 }
 
@@ -397,6 +398,8 @@ fn buildEnvp(
         const value = std.mem.span(e);
         if (std.mem.startsWith(u8, value, "TERM=")) continue;
         if (std.mem.startsWith(u8, value, "COLORTERM=")) continue;
+        // The launcher token belongs to our window, not the shell or its children.
+        if (std.mem.startsWith(u8, value, "XDG_ACTIVATION_TOKEN=")) continue;
         if (std.mem.startsWith(u8, value, "TERMINFO=")) has_terminfo = true;
         try list.append(arena, e);
     }
@@ -414,6 +417,32 @@ fn buildEnvp(
     }
     const slice = try list.toOwnedSliceSentinel(arena, null);
     return slice.ptr;
+}
+
+test "shell environment excludes the launch activation token" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const envp = [_:null]?[*:0]const u8{
+        "XDG_ACTIVATION_TOKEN=launcher-token",
+        "TERM=old-terminal",
+        "COLORTERM=old-color",
+        "TERMINFO=/custom/terminfo",
+        "KEEP=value",
+    };
+    const environ: std.process.Environ = .{ .block = .{ .slice = &envp } };
+    const child = try buildEnvp(std.testing.io, arena_state.allocator(), environ);
+    const expected = [_][]const u8{
+        "TERMINFO=/custom/terminfo",
+        "KEEP=value",
+        "TERM=monstar",
+        "COLORTERM=truecolor",
+    };
+    const actual = std.mem.span(child);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, entry| {
+        try std.testing.expectEqualStrings(want, std.mem.span(entry.?));
+    }
+    try std.testing.expectEqualStrings("launcher-token", environ.getPosix("XDG_ACTIVATION_TOKEN").?);
 }
 
 test {

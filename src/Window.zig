@@ -28,6 +28,9 @@ wm_base: *xdg.WmBase,
 activation: ?*xdg.ActivationV1,
 activation_token: ?*xdg.ActivationTokenV1,
 activation_token_purpose: ?ActivationTokenPurpose,
+/// Launcher token, borrowed until the first buffer commit. Activate only once
+/// the surface is mapped so compositors can resolve its toplevel.
+initial_activation_token: ?[:0]const u8,
 attention_token: ?*xdg.ActivationTokenV1,
 system_bell: ?*xdg.SystemBellV1,
 toplevel_icon_manager: ?*xdg.ToplevelIconManagerV1,
@@ -367,6 +370,7 @@ pub fn create(
         .activation = globals.activation,
         .activation_token = null,
         .activation_token_purpose = null,
+        .initial_activation_token = null,
         .attention_token = null,
         .system_bell = globals.system_bell,
         .toplevel_icon_manager = globals.toplevel_icon_manager,
@@ -888,6 +892,82 @@ pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
     }
     self.surface.commit();
     buffer.busy = true;
+    if (self.initial_activation_token) |token| {
+        self.initial_activation_token = null;
+        if (token.len > 0) self.activate(token);
+    }
+}
+
+test "launcher activation follows the first buffer commit exactly once" {
+    const linux = std.os.linux;
+    for ([_]bool{ false, true }) |supported| {
+        for ([_]?[:0]const u8{ null, "", "launcher-token" }) |token| {
+            var fds: [2]std.posix.fd_t = undefined;
+            try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+                linux.AF.UNIX,
+                linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+                0,
+                &fds,
+            )));
+            defer _ = linux.close(fds[1]);
+            const display = try wl.Display.connectToFd(fds[0]);
+            defer display.disconnect();
+            const registry = try display.getRegistry();
+            defer registry.destroy();
+            const compositor = try registry.bind(1, wl.Compositor, 4);
+            defer compositor.destroy();
+            const shm = try registry.bind(2, wl.Shm, 1);
+            defer shm.destroy();
+            const activation = try registry.bind(3, xdg.ActivationV1, 1);
+            defer activation.destroy();
+            const surface = try compositor.createSurface();
+            defer surface.destroy();
+            const buffer = try Buffer.create(std.testing.allocator, shm, 1, 1, .xrgb8888);
+            defer buffer.destroy(std.testing.allocator);
+
+            var window: Window = undefined;
+            window.surface = surface;
+            window.activation = if (supported) activation else null;
+            window.initial_activation_token = token;
+            window.buffer_format = .xrgb8888;
+            window.frame_counter = 0;
+            window.frame_pending = false;
+            window.viewport = null;
+            for (0..2) |_| {
+                buffer.rendering = true;
+                try window.commitRender(buffer, .full);
+                try std.testing.expectEqual(null, window.initial_activation_token);
+            }
+            try std.testing.expectEqual(.SUCCESS, display.flush());
+
+            // Inspect real libwayland wire requests, including their order.
+            var bytes: [4096]u8 = undefined;
+            const n = try std.posix.read(fds[1], &bytes);
+            var offset: usize = 0;
+            var commits: usize = 0;
+            var activations: usize = 0;
+            while (offset < n) {
+                const object = std.mem.readInt(u32, bytes[offset..][0..4], .native);
+                const header = std.mem.readInt(u32, bytes[offset + 4 ..][0..4], .native);
+                const opcode = header & 0xffff;
+                const size = header >> 16;
+                try std.testing.expect(size >= 8 and size <= n - offset);
+                if (object == surface.getId() and opcode == 6) commits += 1;
+                if (object == activation.getId() and opcode == 2) {
+                    activations += 1;
+                    try std.testing.expectEqual(@as(usize, 1), commits);
+                    const length = std.mem.readInt(u32, bytes[offset + 8 ..][0..4], .native);
+                    try std.testing.expectEqualStrings("launcher-token\x00", bytes[offset + 12 ..][0..length]);
+                    const target = offset + 12 + std.mem.alignForward(usize, length, 4);
+                    try std.testing.expectEqual(surface.getId(), std.mem.readInt(u32, bytes[target..][0..4], .native));
+                }
+                offset += size;
+            }
+            try std.testing.expectEqual(@as(usize, 2), commits);
+            const expected: usize = if (supported and token != null and token.?.len > 0) 1 else 0;
+            try std.testing.expectEqual(expected, activations);
+        }
+    }
 }
 
 fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window) void {
