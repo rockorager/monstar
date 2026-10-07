@@ -2110,36 +2110,75 @@ fn spawnSystemdRun(
     // configured working-directory in the new window.
     if (cwd_arg) |arg| try argv.append(arena, arg.ptr);
     const argv_slice = try argv.toOwnedSliceSentinel(arena, null);
-    if (!spawnLauncher(systemd_run, argv_slice.ptr, envp, "systemd-run")) {
+    // The user manager can stall; never wait for systemd-run on the UI thread.
+    if (!spawnDetached(systemd_run, argv_slice.ptr, envp, null, "systemd-run")) {
         return error.SystemdRunFailed;
     }
 }
 
-fn spawnLauncher(
-    path: [*:0]const u8,
-    argv: [*:null]const ?[*:0]const u8,
-    envp: [*:null]const ?[*:0]const u8,
-    label: []const u8,
-) bool {
+test "new window launch returns while systemd-run is still waiting" {
     const linux = std.os.linux;
+    const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var gate: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&gate, .{ .CLOEXEC = true })));
+    defer _ = linux.close(gate[0]);
+    defer _ = linux.close(gate[1]);
+    var progress: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&progress, .{ .CLOEXEC = true })));
+    defer _ = linux.close(progress[0]);
+    defer _ = linux.close(progress[1]);
+    // Only the launcher stub's two pipe ends survive exec.
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(gate[0], linux.F.SETFD, 0)));
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(progress[1], linux.F.SETFD, 0)));
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "systemd-run",
+        .data = try std.fmt.allocPrint(arena,
+            \\#!/bin/sh
+            \\printf s > /proc/self/fd/{d}
+            \\read -r gate < /proc/self/fd/{d}
+            \\printf f > /proc/self/fd/{d}
+            \\
+        , .{ progress[1], gate[0], progress[1] }),
+        .flags = .{ .permissions = .fromMode(0o700) },
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path_env = try std.fmt.allocPrintSentinel(arena, "PATH={s}", .{path_buf[0..path_len]}, 0);
+    const envp = [_:null]?[*:0]const u8{path_env.ptr};
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.environ = .{ .block = .{ .slice = &envp } };
 
     const fork_rc = linux.fork();
-    if (linux.errno(fork_rc) != .SUCCESS) {
-        log.err("{s} fork failed: {}", .{ label, linux.errno(fork_rc) });
-        return false;
-    }
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_rc));
     const pid: posix.pid_t = @intCast(fork_rc);
-
     if (pid == 0) {
-        const empty_mask = posix.sigemptyset();
-        posix.sigprocmask(linux.SIG.SETMASK, &empty_mask, null);
-        _ = linux.execve(path, argv, envp);
-        linux.exit(127);
+        // A blocking launcher must fail rather than hang the test suite.
+        _ = std.c.alarm(2);
+        var buffer: [8192]u8 = undefined;
+        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+        app.spawnSystemdRun(fixed.allocator(), &envp, "/test/monstar", null) catch linux.exit(1);
+        linux.exit(0);
     }
-
-    var status: u32 = undefined;
-    _ = linux.wait4(pid, &status, 0, null);
-    return waitStatusExitedZero(status);
+    // Release the stub even if an assertion fails, including on the old path.
+    defer _ = linux.write(gate[1], "go\n", 3);
+    const status = try Pty.wait(pid);
+    var polls = [_]posix.pollfd{.{ .fd = progress[0], .events = posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&polls, 2000));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(progress[0], &byte));
+    try std.testing.expectEqual(@as(u8, 's'), byte[0]);
+    try std.testing.expectEqual(@as(usize, 3), linux.write(gate[1], "go\n", 3));
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&polls, 2000));
+    try std.testing.expectEqual(@as(usize, 1), try posix.read(progress[0], &byte));
+    try std.testing.expectEqual(@as(u8, 'f'), byte[0]);
+    try std.testing.expectEqual(@as(u32, 0), status);
 }
 
 fn spawnDetached(
