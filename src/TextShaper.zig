@@ -183,9 +183,9 @@ pub fn shapeRun(self: *TextShaper, face_index: u16, style: Font.FaceStyle) ![]Sh
 /// Replaces .notdef glyphs in a freshly shaped run by re-resolving the failing
 /// clusters against further fallback candidates and re-shaping each in
 /// isolation. Cluster origins snap to their cells at draw time, so per-cluster
-/// splices cannot disturb the rest of the run. Frees `shaped` and returns the
-/// corrected run; clusters no candidate can shape keep their original .notdef
-/// glyphs.
+/// splices cannot disturb the rest of the run. On success, frees `shaped` and
+/// returns the corrected run; on error, the caller retains `shaped`. Clusters
+/// no candidate can shape keep their original .notdef glyphs.
 fn repairNotdefClusters(
     self: *TextShaper,
     shaped: []ShapedGlyph,
@@ -248,8 +248,9 @@ fn repairNotdefClusters(
         i = end;
     }
 
+    const result = try out.toOwnedSlice(self.alloc);
     self.alloc.free(shaped);
-    return out.toOwnedSlice(self.alloc);
+    return result;
 }
 
 /// Shapes `cps` as one isolated cluster with `face_index`, appending the
@@ -308,6 +309,44 @@ test "cache separates identical runs by fallback style" {
 
     try std.testing.expectEqual(@as(usize, 2), shaper.readStats().cache_misses);
     try std.testing.expectEqual(@as(usize, 0), shaper.readStats().cache_hits);
+}
+
+test "missing glyph repair preserves ownership on allocation failure" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, null);
+    defer font.deinit(alloc);
+    // A Unicode noncharacter has no fallback face, so repair must retain tofu.
+    try std.testing.expect(!font.face(0).hasCodepoint(0x10ffff));
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing: std.testing.FailingAllocator = .init(alloc, .{
+            .fail_index = fail_index,
+            // Force toOwnedSlice to allocate instead of shrinking in place.
+            .resize_fail_index = 0,
+        });
+        var shaper: TextShaper = try .init(alloc, &font);
+        defer shaper.deinit();
+        try shaper.beginKey(0, .regular);
+        try shaper.appendKeyCodepoints(0, 0x10ffff, &.{});
+        shaper.alloc = failing.allocator();
+
+        const shaped = shaper.shape(0, .regular, 1) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 0), shaper.cache.count());
+            // A failed repair must leave the shaper usable for the next frame.
+            shaper.alloc = alloc;
+            const retried = try shaper.shape(0, .regular, 1);
+            try std.testing.expectEqual(@as(usize, 1), retried.len);
+            try std.testing.expectEqual(@as(u32, 0), retried[0].glyph);
+            continue;
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 1), shaped.len);
+        try std.testing.expectEqual(@as(u32, 0), shaped[0].glyph);
+        break;
+    }
 }
 
 test "normal and repair shaping retain fractional metrics with identity transform" {
