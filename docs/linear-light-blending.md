@@ -19,6 +19,27 @@ required. Background fills retain their specified encoded colors. Encoded RGB
 interpolation remains for constructing faint/search styling colors, not for
 pixel composition.
 
+## Text weight correction
+
+Uncorrected linear-light blending changes perceived glyph weight: antialiased
+edges of light text on dark backgrounds come out much brighter, and dark text
+on light backgrounds thinner, than fonts are designed to look. Pixel fonts
+such as Monocraft looked bold and blurry next to other terminals
+([issue #66](https://github.com/rockorager/monstar/issues/66)).
+
+Text coverage masks therefore pass through Ghostty's `linear-corrected`
+adjustment before blending: compute the foreground and background luminances,
+blend those luminances in encoded space, and choose the coverage whose
+linear-light blend reaches that luminance. Gray text then matches
+encoded-space blending, colored text matches its luminance, and color mixing
+still happens in linear light. Per-pair constants live in the coverage cache;
+each miss interpolates the decode table instead of calling `pow`, and the
+corrected coverage is quantized to 8 bits. This added roughly 10% to
+full-screen `--bench` redraws. Images, full-color glyphs, and the scrollbar
+blend uncorrected.
+
+## Origin
+
 The decode-table approach follows cnt0's proposal in
 [PR #58](https://github.com/rockorager/monstar/pull/58), motivated by
 [issue #57](https://github.com/rockorager/monstar/issues/57). The original
@@ -47,8 +68,9 @@ Unhinted, darkening-off, and encoded-space experiment modes are not supported.
 - Four bytes per framebuffer pixel, rather than eight for a 16-bit linear
   RGBA framebuffer: 11.7 MB versus 23.3 MB at 2400x1216, per buffer.
 - A shared 512-byte decode table and 64 KiB encode table.
-- A 33.25 KiB thread-local cache: 32 foreground/background pairs, each with
-  256 possible coverage results and validity bits. Results are populated
+- A 34 KiB thread-local cache: 32 foreground/background pairs, each with
+  text-correction constants, 256 possible coverage results, and validity
+  bits. Results are populated
   lazily; collisions invalidate the slot. Pixels with another destination
   color take the uncached path.
 - Every blend rounds back to encoded 8-bit storage. Repeated transparency

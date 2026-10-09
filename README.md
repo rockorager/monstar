@@ -382,6 +382,7 @@ zig build test
 
 Rendering uses exact-sRGB linear-light blending with 8-bit framebuffers and
 fractional grayscale text with light hinting and native Adobe CFF stem darkening.
+Text coverage is corrected so glyph weight matches encoded-space blending.
 No rendering build switch or compositor color management is needed. See
 [linear-light blending](docs/linear-light-blending.md) for precision, memory,
 and benchmark tradeoffs.

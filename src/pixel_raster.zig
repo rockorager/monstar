@@ -1,6 +1,8 @@
 //! ARGB8888 filling and glyph rasterization with linear-light composition.
 //! Storage stays encoded and premultiplied; blends use piecewise sRGB and
 //! 16-bit linear intermediates. Each blend requantizes to 8-bit storage.
+//! Text coverage is corrected first so glyph weight matches encoded-space
+//! blending; images and other shapes blend uncorrected.
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
@@ -249,6 +251,7 @@ fn blitBgraGlyphAsAlpha(
 ) void {
     const clip = clipGlyph(g, x0, y0, buf_width, buf_height, clip_x) orelse return;
     const px_start: usize = @intCast(x0 + @as(i32, @intCast(clip.gx_start)));
+    const fg = decodeRgb(color);
     for (clip.gy_start..clip.gy_end) |gy| {
         const src = g.bitmap[(gy * g.width + clip.gx_start) * 4 ..];
         const py: usize = @intCast(y0 + @as(i32, @intCast(gy)));
@@ -256,7 +259,7 @@ fn blitBgraGlyphAsAlpha(
         for (dst, 0..) |*pixel, i| {
             const alpha = src[i * 4 + 3];
             if (alpha == 0) continue;
-            pixel.* = blend(color, pixel.*, alpha);
+            pixel.* = blendText(color, fg, pixel.*, alpha);
         }
     }
 }
@@ -300,6 +303,7 @@ fn decodeRgb(color: u32) [3]u32 {
 const CoverageCache = struct {
     foreground: u32 = 0,
     background: u32 = 0,
+    text: TextCorrection = .disabled,
     valid: [4]u64 = @splat(0),
     pixels: [256]u32 = undefined,
 };
@@ -314,6 +318,7 @@ fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) 
     if (cache.foreground != color or cache.background != background) {
         cache.foreground = color;
         cache.background = background;
+        cache.text = .init(fg, background);
         cache.valid = @splat(0);
     }
     for (dst, coverage) |*pixel, cov| {
@@ -324,14 +329,14 @@ fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) 
             const bit = @as(u64, 1) << @as(u6, @truncate(cov));
             const valid = &cache.valid[cov >> 6];
             if (valid.* & bit == 0) {
-                cache.pixels[cov] = blendDecoded(color, fg, background, cov);
+                cache.pixels[cov] = blendDecoded(color, fg, background, cache.text.apply(cov));
                 valid.* |= bit;
             }
             pixel.* = cache.pixels[cov];
         } else {
             // Overlapping glyphs and images may change the destination
             // within a span. Never substitute the assumed background.
-            pixel.* = blendDecoded(color, fg, pixel.*, cov);
+            pixel.* = blendText(color, fg, pixel.*, cov);
         }
     }
 }
@@ -339,6 +344,70 @@ fn blendAlphaSpan(noalias dst: []u32, noalias coverage: []const u8, color: u32) 
 fn blend(fg: u32, bg: u32, alpha: u8) u32 {
     std.debug.assert(fg >> 24 == 255);
     return blendDecoded(fg, decodeRgb(fg), bg, alpha);
+}
+
+fn blendText(fg: u32, fg_linear: [3]u32, bg: u32, coverage: u8) u32 {
+    return blendDecoded(fg, fg_linear, bg, TextCorrection.init(fg_linear, bg).apply(coverage));
+}
+
+/// Corrects text coverage so a linear-light blend reaches the luminance an
+/// encoded-space blend would. Uncorrected linear-light edges make
+/// light-on-dark text heavier and dark-on-light text thinner than fonts are
+/// designed to look; mixing in linear light still keeps colored edges from
+/// darkening. This follows Ghostty's `linear-corrected` alpha blending.
+/// Construct once per foreground/background pair; `apply` runs on every
+/// coverage-cache miss, so it uses integer table lookups rather than pow.
+const TextCorrection = struct {
+    fg_encoded: u32,
+    bg_encoded: u32,
+    /// Background luminance in 16-bit linear light, scaled by 255.
+    bg_scaled: i64,
+    /// 2^32 / (fg - bg luminance); zero disables correction.
+    inv_span: i64,
+
+    const disabled: TextCorrection = .{ .fg_encoded = 0, .bg_encoded = 0, .bg_scaled = 0, .inv_span = 0 };
+
+    fn init(fg_linear: [3]u32, bg: u32) TextCorrection {
+        const bg_alpha = bg >> 24;
+        // A fully transparent destination has no color to match against.
+        if (bg_alpha == 0) return .disabled;
+        const fg_l = luminance(fg_linear);
+        const bg_l = luminance(if (bg_alpha == 255) decodeRgb(bg) else .{
+            decode[unassociate(bg >> 16 & 0xff, bg_alpha)],
+            decode[unassociate(bg >> 8 & 0xff, bg_alpha)],
+            decode[unassociate(bg & 0xff, bg_alpha)],
+        });
+        const span = @as(i32, @intCast(fg_l)) - @as(i32, @intCast(bg_l));
+        // Nearly equal luminances (within 0.001) make the mapping ill-conditioned.
+        if (@abs(span) <= 65) return .disabled;
+        return .{
+            .fg_encoded = encode[fg_l],
+            .bg_encoded = encode[bg_l],
+            .bg_scaled = @as(i64, bg_l) * 255,
+            .inv_span = @divTrunc(@as(i64, 1) << 32, span),
+        };
+    }
+
+    fn apply(self: TextCorrection, coverage: u8) u8 {
+        if (self.inv_span == 0 or coverage == 0 or coverage == 255) return coverage;
+        // Blend the encoded luminances, then decode by interpolating between
+        // adjacent table entries.
+        const cov: u32 = coverage;
+        const target_encoded = self.fg_encoded * cov + self.bg_encoded * (255 - cov);
+        const index = target_encoded / 255;
+        const lo: i64 = decode[index];
+        const hi: i64 = decode[@min(index + 1, 255)];
+        const target_scaled = lo * 255 + (hi - lo) * (target_encoded % 255);
+        // (target - bg) / (fg - bg), already scaled to [0, 255], rounded.
+        const corrected = ((target_scaled - self.bg_scaled) * self.inv_span + (1 << 31)) >> 32;
+        return @intCast(std.math.clamp(corrected, 0, 255));
+    }
+};
+
+/// Rec. 709 relative luminance of 16-bit linear-light channels, in [0, 65535].
+fn luminance(rgb: [3]u32) u32 {
+    // The weights sum to 65536, so grays keep their exact channel value.
+    return @intCast((13933 * @as(u64, rgb[0]) + 46871 * @as(u64, rgb[1]) + 4732 * @as(u64, rgb[2]) + 32768) >> 16);
 }
 
 fn blendDecoded(fg: u32, fg_linear: [3]u32, bg: u32, alpha: u8) u32 {
@@ -500,7 +569,7 @@ test "blendAlphaSpan matches scalar blend" {
                     (@as(u32, random.intRangeAtMost(u8, 0, bg_alpha)) << 8) |
                     random.intRangeAtMost(u8, 0, bg_alpha);
                 g.* = bg;
-                w.* = if (cov.* == 0) bg else blend(color, bg, cov.*);
+                w.* = if (cov.* == 0) bg else blendText(color, decodeRgb(color), bg, cov.*);
             }
             blendAlphaSpan(got[0..len], coverage[0..len], color);
             try std.testing.expectEqualSlices(u32, want[0..len], got[0..len]);
@@ -620,8 +689,9 @@ test "linear-light glyph clipping and image color preservation" {
     const glyph: Font.Glyph = .{ .bitmap = &bitmap, .width = 3, .height = 2, .bearing_x = 0, .bearing_y = 0 };
     var pixels = [_]u32{0xff000000} ** 12;
     blitGlyph(&pixels, 4, 3, 3, &glyph, -1, 1, 0xffffffff, false, .{ .start = 0, .end = 1 });
-    try std.testing.expectEqual(@as(u32, 0xffbcbcbc), pixels[4]);
-    try std.testing.expectEqual(referenceLinearLightBlend(0xffffffff, 0xff000000, 192), pixels[8]);
+    // Corrected text coverage keeps gray edges at their encoded-space values.
+    try std.testing.expectEqual(@as(u32, 0xff808080), pixels[4]);
+    try std.testing.expectEqual(@as(u32, 0xffc0c0c0), pixels[8]);
     for (pixels, 0..) |pixel, i| {
         if (i != 4 and i != 8) try std.testing.expectEqual(@as(u32, 0xff000000), pixel);
     }
@@ -654,7 +724,7 @@ test "linear-light coverage cache preserves exact blends across backgrounds and 
                         }
                     }
                     for (&want, got, coverage) |*expected, bg, cov| {
-                        expected.* = blend(foreground, bg, cov);
+                        expected.* = blendText(foreground, decodeRgb(foreground), bg, cov);
                     }
                     blendAlphaSpan(&got, &coverage, foreground);
                     try std.testing.expectEqualSlices(u32, &want, &got);
@@ -663,4 +733,26 @@ test "linear-light coverage cache preserves exact blends across backgrounds and 
         }
     }
     blendAlphaSpan(&.{}, &.{}, 0xff123456);
+}
+
+test "text edges keep encoded-space weight in both polarities" {
+    // Issue #66: uncorrected linear-light edges of light-on-dark pixel fonts
+    // were up to 40 levels brighter than encoded-space blending.
+    const light: vt.color.RGB = .{ .r = 0xd3, .g = 0xc6, .b = 0xaa };
+    const dark: vt.color.RGB = .{ .r = 0x1e, .g = 0x25, .b = 0x28 };
+    for ([_][2]vt.color.RGB{ .{ light, dark }, .{ dark, light } }) |pair| {
+        var coverage: [256]u8 = undefined;
+        for (&coverage, 0..) |*cov, i| cov.* = @intCast(i);
+        var pixels: [256]u32 = @splat(argb(pair[1]));
+        blendAlphaSpan(&pixels, &coverage, argb(pair[0]));
+        for (pixels, coverage) |got, cov| {
+            const want = argb(blendRgb(pair[0], pair[1], cov));
+            inline for (.{ 16, 8, 0 }) |shift| {
+                const channel: i32 = @intCast(got >> shift & 0xff);
+                const expected: i32 = @intCast(want >> shift & 0xff);
+                // Luminance matches; per-channel color mixing may differ slightly.
+                try std.testing.expect(@abs(channel - expected) <= 6);
+            }
+        }
+    }
 }
