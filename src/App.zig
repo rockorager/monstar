@@ -18,6 +18,7 @@ const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
 const Clipboard = @import("Clipboard.zig");
 const KittyClipboard = @import("KittyClipboard.zig");
+const KittyDrag = @import("KittyDrag.zig");
 const Config = @import("Config.zig");
 const CommandNotification = @import("CommandNotification.zig");
 const keybind = @import("keybind.zig");
@@ -267,6 +268,7 @@ active_screen: vt.ScreenSet.Key,
 last_serial: u32,
 clipboard: Clipboard,
 kitty_clipboard: KittyClipboard,
+kitty_drag: KittyDrag,
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
     '│',
@@ -410,6 +412,22 @@ const AppStreamHandler = struct {
         // TerminalStream effect contract and through Monstar's poll loop.
         switch (action) {
             .clipboard_contents, .kitty_clipboard => {},
+            .kitty_dnd => {
+                const was_dragging = self.app.kitty_drag.source != null;
+                if (!self.app.kitty_drag.handle(value)) self.terminal_handler.vt(action, value);
+                if (!was_dragging and self.app.kitty_drag.source != null) {
+                    // A native drag takes the pointer grab, so no release
+                    // event is guaranteed to reach the terminal window.
+                    if (self.app.mouse_button) |button| self.app.sendMouseEvent(.{
+                        .action = .release,
+                        .button = button,
+                        .mods = self.app.keyboard.currentMods(),
+                        .pos = self.app.pointerPosPhysical(),
+                    });
+                    self.app.mouse_button = null;
+                    self.app.cancelDrag();
+                }
+            },
             else => self.terminal_handler.vt(action, value),
         }
         switch (action) {
@@ -458,6 +476,7 @@ const AppStreamHandler = struct {
             },
             .full_reset => {
                 self.app.kitty_clipboard.reset();
+                self.app.kitty_drag.reset();
                 self.app.mouse_shape_explicit = false;
                 self.app.in_band_reports = false;
                 self.app.syncCursorShape();
@@ -778,6 +797,15 @@ pub fn init(
         .last_serial = 0,
         .clipboard = .init(alloc, window.data_manager, window.primary_manager),
         .kitty_clipboard = .init(alloc),
+        .kitty_drag = undefined,
+    };
+    self.kitty_drag = .{
+        .alloc = alloc,
+        .clipboard = &self.clipboard,
+        .window = window,
+        .font = &self.font,
+        .ctx = self,
+        .write_fn = writeDragResponse,
     };
     self.stream = .init(.{
         .allocator = alloc,
@@ -1745,6 +1773,7 @@ pub fn deinit(self: *App) void {
     self.clearImeText();
     if (self.search) |*search| search.deinit(self.alloc, &self.term);
     self.kitty_clipboard.deinit();
+    self.kitty_drag.deinit();
     self.clipboard.deinit();
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
@@ -1826,6 +1855,7 @@ pub fn run(self: *App) !void {
     while (self.window.running and (!self.child_exited or self.hold)) {
         self.expireDbusRequests();
         self.expireClipboardTransfers();
+        self.kitty_drag.expire();
         self.syncScrollbackCompression();
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
@@ -1878,7 +1908,9 @@ pub fn run(self: *App) !void {
                 if (connection.hasPendingWrites()) dbus_fd.events |= posix.POLL.OUT;
             }
         }
-        const clipboard_timeout = self.clipboard.pollTimeoutMs();
+        const selection_timeout = self.clipboard.pollTimeoutMs();
+        const drag_timeout = self.kitty_drag.pollTimeoutMs();
+        const clipboard_timeout = if (selection_timeout < 0) drag_timeout else if (drag_timeout < 0) selection_timeout else @min(selection_timeout, drag_timeout);
         const dbus_timeout = self.dbusPollTimeoutMs();
         const timeout = if (clipboard_timeout < 0) dbus_timeout else if (dbus_timeout < 0) clipboard_timeout else @min(clipboard_timeout, dbus_timeout);
         const ready = posix.poll(&fds, timeout) catch {
@@ -3292,6 +3324,11 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
+            if (self.keyboard.currentMods().shift or self.keyboard.currentMods().ctrl) {
+                self.kitty_drag.release();
+            } else {
+                self.kitty_drag.motion(self.pointer_x, self.pointer_y);
+            }
             if (self.scrollbar_drag != null) {
                 self.dragScrollbar();
                 return;
@@ -3339,6 +3376,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             self.last_serial = button.serial;
             if (button.state == .pressed) self.stopFling();
             if (button.button == 272) { // BTN_LEFT
+                if (button.state == .released) self.kitty_drag.release();
                 if (button.state == .pressed and self.beginScrollbarDrag()) return;
                 if (button.state == .released and self.finishScrollbarDrag()) return;
             }
@@ -3381,6 +3419,10 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                     },
                     else => {},
                 }
+                const mods = self.keyboard.currentMods();
+                if (button.state == .pressed and !mods.shift and !mods.ctrl and self.linkCellAtPointer() != null) {
+                    self.kitty_drag.press(button.serial, self.pointer_x, self.pointer_y, self.kittyDndMove(self.pointer_x, self.pointer_y, .{}));
+                }
                 return;
             }
 
@@ -3409,6 +3451,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         // the physical direction hint does not change that behavior.
         .axis_relative_direction => {},
         .leave => {
+            self.kitty_drag.release();
             self.pointer_inside = false;
             self.syncScrollbarHover();
             self.syncHoveredLink(false);
@@ -3994,7 +4037,13 @@ fn clipboardDevicesChanged(
     primary_device: ?*zwp.PrimarySelectionDeviceV1,
 ) void {
     const self: *App = @ptrCast(@alignCast(ctx));
+    if (data_device == null) self.kitty_drag.reset();
     self.clipboard.setDevices(data_device, primary_device);
+}
+
+fn writeDragResponse(ctx: *anyopaque, data: []const u8) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    self.writePty(data);
 }
 
 /// The current selection's text, allocated, or null if nothing selected.

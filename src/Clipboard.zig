@@ -88,6 +88,7 @@ transfer_action: TransferAction,
 transfer_deadline_ms: i64,
 outgoing: [max_outgoing_transfers]?OutgoingTransfer,
 outgoing_bytes: usize,
+drag_error: ?DragError = null,
 dnd_ctx: ?*anyopaque,
 dnd_fn: ?DndFn,
 
@@ -106,7 +107,10 @@ const OutgoingTransfer = struct {
     data: []u8,
     offset: usize,
     deadline_ms: i64,
+    kind: enum { selection, drag, completed_drag },
 };
+
+pub const DragError = enum { io, timed_out };
 
 const TransferOffer = union(enum) {
     clipboard: *DataOffer,
@@ -267,32 +271,70 @@ pub fn deinit(self: *Clipboard) void {
 }
 
 fn sendSelection(self: *Clipboard, text: []const u8, fd: posix.fd_t) void {
+    self.queueOutgoing(text, fd, false) catch {};
+}
+
+/// Queue drag data, consuming fd even on failure. Drag pre-sends have a
+/// separate 64 MiB protocol minimum, while selection limits stay unchanged.
+pub fn sendDragData(self: *Clipboard, data: []const u8, fd: posix.fd_t) !void {
+    return self.queueOutgoing(data, fd, true);
+}
+
+fn queueOutgoing(self: *Clipboard, text: []const u8, fd: posix.fd_t, drag: bool) !void {
+    errdefer _ = std.os.linux.close(fd);
     const slot = for (&self.outgoing, 0..) |transfer, i| {
         if (transfer == null) break i;
     } else {
-        _ = std.os.linux.close(fd);
-        return;
+        return error.TooManyResources;
     };
-    if (text.len > max_outgoing_bytes -| self.outgoing_bytes) {
-        _ = std.os.linux.close(fd);
-        return;
+    const limit: usize = if (drag) 64 * 1024 * 1024 else max_outgoing_bytes;
+    var queued_bytes: usize = 0;
+    for (self.outgoing) |transfer| if (transfer) |item| {
+        if ((item.kind != .selection) == drag) queued_bytes += item.data.len;
+    };
+    if (text.len > limit -| queued_bytes) {
+        return error.TooManyResources;
     }
-    const owned = self.alloc.dupe(u8, text) catch {
-        _ = std.os.linux.close(fd);
-        return;
-    };
-    setNonblocking(fd) catch {
-        self.alloc.free(owned);
-        _ = std.os.linux.close(fd);
-        return;
-    };
+    const owned = try self.alloc.dupe(u8, text);
+    errdefer self.alloc.free(owned);
+    setNonblocking(fd) catch return error.TransferFailed;
     self.outgoing[slot] = .{
         .fd = fd,
         .data = owned,
         .offset = 0,
         .deadline_ms = monotonicMs() + transfer_timeout_ms,
+        .kind = if (drag) .drag else .selection,
     };
     self.outgoing_bytes += owned.len;
+}
+
+/// Cancel transfers owned by the active drag, preserving completed sessions.
+pub fn cancelDragTransfers(self: *Clipboard) void {
+    for (self.outgoing, 0..) |transfer, i| if (transfer) |item| {
+        if (item.kind == .drag) self.closeOutgoing(i);
+    };
+    self.drag_error = null;
+}
+
+/// Completed transfers may drain without reporting errors to a later drag.
+pub fn finishDragTransfers(self: *Clipboard) void {
+    for (&self.outgoing) |*transfer| if (transfer.*) |*item| {
+        if (item.kind == .drag) item.kind = .completed_drag;
+    };
+    self.drag_error = null;
+}
+
+pub fn takeDragError(self: *Clipboard) ?DragError {
+    const err = self.drag_error;
+    self.drag_error = null;
+    return err;
+}
+
+fn failOutgoing(self: *Clipboard, i: usize, err: DragError) void {
+    if (self.outgoing[i]) |transfer| {
+        if (transfer.kind == .drag) self.drag_error = err;
+    }
+    self.closeOutgoing(i);
 }
 
 pub fn pollOutgoing(self: *Clipboard, fds: *[max_outgoing_transfers]posix.pollfd) void {
@@ -307,7 +349,7 @@ pub fn dispatchOutgoing(self: *Clipboard, fds: *const [max_outgoing_transfers]po
         const transfer = &(self.outgoing[i] orelse continue);
         if (poll_fd.fd != transfer.fd or poll_fd.revents == 0) continue;
         if (poll_fd.revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
-            self.closeOutgoing(i);
+            self.failOutgoing(i, .io);
             continue;
         }
         if (poll_fd.revents & posix.POLL.OUT == 0) continue;
@@ -320,7 +362,7 @@ pub fn dispatchOutgoing(self: *Clipboard, fds: *const [max_outgoing_transfers]po
                 if (transfer.offset == transfer.data.len) self.closeOutgoing(i);
             },
             .INTR, .AGAIN => {},
-            else => self.closeOutgoing(i),
+            else => self.failOutgoing(i, .io),
         }
     }
 }
@@ -340,7 +382,7 @@ pub fn expireTransfers(self: *Clipboard) bool {
     const incoming_expired = self.transfer_fd >= 0 and self.transfer_deadline_ms <= now;
     if (incoming_expired) self.abortTransfer();
     for (self.outgoing, 0..) |transfer, i| {
-        if (transfer) |item| if (item.deadline_ms <= now) self.closeOutgoing(i);
+        if (transfer) |item| if (item.deadline_ms <= now) self.failOutgoing(i, .timed_out);
     }
     return incoming_expired;
 }
@@ -868,7 +910,7 @@ fn setNonblocking(fd: posix.fd_t) !void {
         return error.FcntlFailed;
 }
 
-fn monotonicMs() i64 {
+pub fn monotonicMs() i64 {
     var ts: std.os.linux.timespec = undefined;
     if (std.os.linux.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
