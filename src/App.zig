@@ -18,6 +18,7 @@ const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
 const Clipboard = @import("Clipboard.zig");
 const KittyClipboard = @import("KittyClipboard.zig");
+const KittyDrag = @import("KittyDrag.zig");
 const Config = @import("Config.zig");
 const CommandNotification = @import("CommandNotification.zig");
 const keybind = @import("keybind.zig");
@@ -60,6 +61,18 @@ const LinkPress = struct {
     button: u32,
     action: LinkAction,
 };
+
+/// A left press that may become a Kitty drag-out gesture.
+const DragPress = struct {
+    serial: u32,
+    x: f64,
+    y: f64,
+    /// Whether the gesture crossed the threshold and asked the client.
+    requested: bool = false,
+};
+
+/// Logical pixels the pointer must travel before a press becomes a drag.
+const drag_threshold = 8;
 
 const PendingDbus = struct {
     serial: u32,
@@ -236,6 +249,7 @@ link_checked_cell: ?vt.Coordinate,
 link_active: bool,
 /// A link click acts only if release occurs over the original cell.
 link_press: ?LinkPress,
+drag_press: ?DragPress,
 /// Wheel state accumulated between pointer frame events.
 scroll_pixels: f64,
 /// Physical pixels cropped from the top row; always less than cell_height.
@@ -267,6 +281,7 @@ active_screen: vt.ScreenSet.Key,
 last_serial: u32,
 clipboard: Clipboard,
 kitty_clipboard: KittyClipboard,
+kitty_drag: KittyDrag,
 const selection_word_boundaries = [_]u21{
     0,   ' ', '\t', '\'', '"',
     '│',
@@ -410,6 +425,8 @@ const AppStreamHandler = struct {
         // TerminalStream effect contract and through Monstar's poll loop.
         switch (action) {
             .clipboard_contents, .kitty_clipboard => {},
+            // libghostty implements only drops and refuses drag-out.
+            .kitty_dnd => if (!self.app.handleKittyDrag(value)) self.terminal_handler.vt(action, value),
             else => self.terminal_handler.vt(action, value),
         }
         switch (action) {
@@ -458,6 +475,8 @@ const AppStreamHandler = struct {
             },
             .full_reset => {
                 self.app.kitty_clipboard.reset();
+                self.app.kitty_drag.reset();
+                self.app.clipboard.cancelDrag();
                 self.app.mouse_shape_explicit = false;
                 self.app.in_band_reports = false;
                 self.app.syncCursorShape();
@@ -757,6 +776,7 @@ pub fn init(
         .link_checked_cell = null,
         .link_active = false,
         .link_press = null,
+        .drag_press = null,
         .scroll_pixels = 0,
         .scroll_frame_pixels = 0,
         .scroll_clicks = 0,
@@ -778,6 +798,7 @@ pub fn init(
         .last_serial = 0,
         .clipboard = .init(alloc, window.data_manager, window.primary_manager),
         .kitty_clipboard = .init(alloc),
+        .kitty_drag = .init(alloc),
     };
     self.stream = .init(.{
         .allocator = alloc,
@@ -803,6 +824,7 @@ pub fn init(
     effects.drag_and_drop = effectDragAndDrop;
     self.stream.handler.terminal_handler.effects = effects;
     self.clipboard.setDndCallback(self, dndEvent);
+    self.clipboard.setDragCallback(self, dragSourceEvent);
 
     self.initDbus();
     window.setCallbacks(
@@ -1745,6 +1767,7 @@ pub fn deinit(self: *App) void {
     self.clearImeText();
     if (self.search) |*search| search.deinit(self.alloc, &self.term);
     self.kitty_clipboard.deinit();
+    self.kitty_drag.deinit();
     self.clipboard.deinit();
     self.write_queue.deinit(self.alloc);
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
@@ -3292,6 +3315,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
+            self.updateDragPress();
             if (self.scrollbar_drag != null) {
                 self.dragScrollbar();
                 return;
@@ -3339,6 +3363,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
             self.last_serial = button.serial;
             if (button.state == .pressed) self.stopFling();
             if (button.button == 272) { // BTN_LEFT
+                if (button.state == .released) self.endDragPress();
                 if (button.state == .pressed and self.beginScrollbarDrag()) return;
                 if (button.state == .released and self.finishScrollbarDrag()) return;
             }
@@ -3381,6 +3406,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
                     },
                     else => {},
                 }
+                if (button.state == .pressed) self.armDragPress(button.serial);
                 return;
             }
 
@@ -3409,6 +3435,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         // the physical direction hint does not change that behavior.
         .axis_relative_direction => {},
         .leave => {
+            self.endDragPress();
             self.pointer_inside = false;
             self.syncScrollbarHover();
             self.syncHoveredLink(false);
@@ -4582,6 +4609,103 @@ fn dndEvent(ctx: *anyopaque, event: Clipboard.DndEvent) bool {
     }
     self.writePty(writer.writer.buffered());
     return true;
+}
+
+/// Handle drag-out commands, which libghostty refuses. False means the
+/// command belongs to libghostty.
+fn handleKittyDrag(self: *App, command: vt.osc.Command.KittyDndProtocol) bool {
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    const action = self.kitty_drag.handle(&writer.writer, command) catch |err| {
+        log.warn("Kitty drag-out reply failed: {}", .{err});
+        return true;
+    };
+    switch (action) {
+        .forward => return false,
+        .handled => {},
+        .start_drag => self.startKittyDrag(&writer.writer) catch |err| {
+            log.warn("Kitty drag-out reply failed: {}", .{err});
+        },
+        .cancel_drag => self.clipboard.cancelDrag(),
+    }
+    self.writePty(writer.writer.buffered());
+    return true;
+}
+
+fn startKittyDrag(self: *App, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    // Only a held press requests an offer, and its release ends the offer.
+    const press = self.drag_press.?;
+    std.debug.assert(press.requested);
+    const operations = self.kitty_drag.operations;
+    self.clipboard.startDrag(
+        self.kitty_drag.offer.?,
+        .{ .copy = operations.copy, .move = operations.move },
+        self.window.surface,
+        press.serial,
+    ) catch |err| return self.kitty_drag.dragFailed(writer, switch (err) {
+        error.Unsupported => .EPERM,
+        error.OutOfMemory => .ENOMEM,
+    });
+    self.drag_press = null;
+    // The native drag takes the pointer grab, so neither the application
+    // nor the selection will see this button's release. The press became
+    // a drag, so the selection it started goes too.
+    if (self.mouse_button) |button| self.sendMouseEvent(.{
+        .action = .release,
+        .button = button,
+        .mods = self.keyboard.currentMods(),
+        .pos = self.pointerPosPhysical(),
+    });
+    self.mouse_button = null;
+    self.clearSelection();
+    try self.kitty_drag.dragStarted(writer);
+}
+
+/// Track a left press that may become a drag-out gesture. Shift and Ctrl
+/// keep their selection meanings.
+fn armDragPress(self: *App, serial: u32) void {
+    if (!self.kitty_drag.wantsGesture()) return;
+    const mods = self.keyboard.currentMods();
+    if (mods.shift or mods.ctrl or self.linkCellAtPointer() == null) return;
+    self.drag_press = .{ .serial = serial, .x = self.pointer_x, .y = self.pointer_y };
+}
+
+fn updateDragPress(self: *App) void {
+    const press = if (self.drag_press) |*press| press else return;
+    if (press.requested or !self.kitty_drag.wantsGesture()) return;
+    const dx = self.pointer_x - press.x;
+    const dy = self.pointer_y - press.y;
+    if (dx * dx + dy * dy <= drag_threshold * drag_threshold) return;
+    press.requested = true;
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    self.kitty_drag.requestDrag(&writer.writer, self.kittyDndMove(self.pointer_x, self.pointer_y, .{})) catch return;
+    self.writePty(writer.writer.buffered());
+}
+
+fn endDragPress(self: *App) void {
+    const press = self.drag_press orelse return;
+    self.drag_press = null;
+    if (!press.requested) return;
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    self.kitty_drag.endGesture(&writer.writer) catch return;
+    self.writePty(writer.writer.buffered());
+}
+
+fn dragSourceEvent(ctx: *anyopaque, event: Clipboard.DragEvent) void {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    var writer: std.Io.Writer.Allocating = .init(self.alloc);
+    defer writer.deinit();
+    const drag = &self.kitty_drag;
+    (switch (event) {
+        .target => |index| drag.targetChanged(&writer.writer, index),
+        .action => |action| drag.actionChanged(&writer.writer, if (action.move) .move else if (action.copy) .copy else .none),
+        .dropped => drag.dropped(&writer.writer),
+        .finished => |end| drag.finished(&writer.writer, end.cancelled),
+        .request => |index| drag.requestData(&writer.writer, index),
+    }) catch return;
+    self.writePty(writer.writer.buffered());
 }
 
 fn writeKittyDndDrop(

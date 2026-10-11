@@ -1,6 +1,7 @@
-//! Owns Wayland clipboard, primary-selection, drag-and-drop, and their
-//! bounded, nonblocking transfers: one incoming pipe and a small outgoing
-//! pool, all with deadlines. Application policy remains with App.
+//! Owns Wayland clipboard, primary-selection, drag-and-drop in both
+//! directions, and their bounded, nonblocking transfers: one incoming pipe
+//! and a small outgoing pool, all with deadlines. Application policy
+//! remains with App.
 
 const Clipboard = @This();
 
@@ -10,6 +11,7 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const clipboard_format = @import("clipboard_format.zig");
+const DragOffer = @import("DragOffer.zig");
 
 const log = std.log.scoped(.app);
 
@@ -70,6 +72,21 @@ pub const DndEvent = union(enum) {
 
 pub const DndFn = *const fn (ctx: *anyopaque, event: DndEvent) bool;
 
+/// Progress of an outgoing drag started with `startDrag`. Indices refer to
+/// the drag's `DragOffer` items.
+pub const DragEvent = union(enum) {
+    /// A drop target would accept this item.
+    target: usize,
+    action: DndOperations,
+    dropped,
+    /// The drag ended. Queued transfers continue.
+    finished: struct { cancelled: bool },
+    /// A drop target asked for an item whose data is still pending.
+    request: usize,
+};
+
+pub const DragFn = *const fn (ctx: *anyopaque, event: DragEvent) void;
+
 alloc: std.mem.Allocator,
 data_manager: ?*wl.DataDeviceManager,
 data_device: ?*wl.DataDevice,
@@ -87,9 +104,13 @@ transfer_buf: std.ArrayList(u8),
 transfer_action: TransferAction,
 transfer_deadline_ms: i64,
 outgoing: [max_outgoing_transfers]?OutgoingTransfer,
+/// Bytes copied for selection transfers; drag transfers share their offer.
 outgoing_bytes: usize,
 dnd_ctx: ?*anyopaque,
 dnd_fn: ?DndFn,
+drag_source: ?*DragSource,
+drag_ctx: ?*anyopaque,
+drag_fn: ?DragFn,
 
 const TransferAction = union(enum) {
     terminal: struct {
@@ -103,9 +124,52 @@ const TransferAction = union(enum) {
 
 const OutgoingTransfer = struct {
     fd: posix.fd_t,
-    data: []u8,
+    source: union(enum) {
+        /// Selection text copied for this transfer.
+        owned: []u8,
+        /// Drag data, which may still be arriving from the client.
+        drag: struct {
+            offer: *DragOffer,
+            index: usize,
+            /// Data length when the deadline was last refreshed.
+            seen: usize,
+        },
+    },
     offset: usize,
+    /// Drag transfers refresh this on progress, since their data can be
+    /// large and arrive slowly; selection transfers keep a fixed deadline.
     deadline_ms: i64,
+
+    fn data(self: *const OutgoingTransfer) []const u8 {
+        return switch (self.source) {
+            .owned => |text| text,
+            .drag => |drag| drag.offer.items.items[drag.index].data.items,
+        };
+    }
+
+    fn finished(self: *const OutgoingTransfer) bool {
+        if (self.offset < self.data().len) return false;
+        return switch (self.source) {
+            .owned => true,
+            .drag => |drag| drag.offer.items.items[drag.index].state == .complete,
+        };
+    }
+};
+
+/// Heap context for the native side of an outgoing drag. Transfers hold
+/// their own offer references, so they outlive the source.
+const DragSource = struct {
+    clipboard: *Clipboard,
+    source: *wl.DataSource,
+    offer: *DragOffer,
+
+    fn destroy(self: *DragSource) void {
+        const clipboard = self.clipboard;
+        if (clipboard.drag_source == self) clipboard.drag_source = null;
+        self.source.destroy();
+        self.offer.release();
+        clipboard.alloc.destroy(self);
+    }
 };
 
 const TransferOffer = union(enum) {
@@ -250,12 +314,16 @@ pub fn init(
         .outgoing_bytes = 0,
         .dnd_ctx = null,
         .dnd_fn = null,
+        .drag_source = null,
+        .drag_ctx = null,
+        .drag_fn = null,
     };
 }
 
 pub fn deinit(self: *Clipboard) void {
     self.abortTransfer();
     for (0..max_outgoing_transfers) |i| self.closeOutgoing(i);
+    if (self.drag_source) |source| source.destroy();
     self.transfer_buf.deinit(self.alloc);
     if (self.clip_offer) |offer| offer.destroy();
     if (self.clip_pending_offer) |offer| offer.destroy();
@@ -266,10 +334,15 @@ pub fn deinit(self: *Clipboard) void {
     if (self.primary_source) |source| source.destroy();
 }
 
+fn freeOutgoingSlot(self: *const Clipboard) ?usize {
+    for (self.outgoing, 0..) |transfer, i| {
+        if (transfer == null) return i;
+    }
+    return null;
+}
+
 fn sendSelection(self: *Clipboard, text: []const u8, fd: posix.fd_t) void {
-    const slot = for (&self.outgoing, 0..) |transfer, i| {
-        if (transfer == null) break i;
-    } else {
+    const slot = self.freeOutgoingSlot() orelse {
         _ = std.os.linux.close(fd);
         return;
     };
@@ -288,18 +361,50 @@ fn sendSelection(self: *Clipboard, text: []const u8, fd: posix.fd_t) void {
     };
     self.outgoing[slot] = .{
         .fd = fd,
-        .data = owned,
+        .source = .{ .owned = owned },
         .offset = 0,
         .deadline_ms = monotonicMs() + transfer_timeout_ms,
     };
     self.outgoing_bytes += owned.len;
 }
 
+/// Serve an advertised drag item, including data the client has not sent
+/// yet. Each transfer fails alone, so one closed pipe ends one read.
+fn sendDragItem(self: *Clipboard, offer: *DragOffer, mime: []const u8, fd: posix.fd_t) void {
+    const index = offer.advertisedIndex(mime) orelse {
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    const item = &offer.items.items[index];
+    const slot = self.freeOutgoingSlot() orelse {
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    if (item.state == .failed) {
+        _ = std.os.linux.close(fd);
+        return;
+    }
+    setNonblocking(fd) catch {
+        _ = std.os.linux.close(fd);
+        return;
+    };
+    self.outgoing[slot] = .{
+        .fd = fd,
+        .source = .{ .drag = .{ .offer = offer.retain(), .index = index, .seen = item.data.items.len } },
+        .offset = 0,
+        .deadline_ms = monotonicMs() + transfer_timeout_ms,
+    };
+    if (item.state == .pending) self.reportDrag(.{ .request = index });
+}
+
+/// Writable is only interesting while data is waiting; otherwise poll
+/// reports just errors and hangups.
 pub fn pollOutgoing(self: *Clipboard, fds: *[max_outgoing_transfers]posix.pollfd) void {
-    for (self.outgoing, 0..) |transfer, i| fds[i] = if (transfer) |item|
-        .{ .fd = item.fd, .events = posix.POLL.OUT, .revents = 0 }
-    else
-        .{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 };
+    for (&self.outgoing, 0..) |*transfer, i| fds[i] = if (transfer.*) |*item| .{
+        .fd = item.fd,
+        .events = if (item.offset < item.data().len) posix.POLL.OUT else 0,
+        .revents = 0,
+    } else .{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 };
 }
 
 pub fn dispatchOutgoing(self: *Clipboard, fds: *const [max_outgoing_transfers]posix.pollfd) void {
@@ -311,13 +416,15 @@ pub fn dispatchOutgoing(self: *Clipboard, fds: *const [max_outgoing_transfers]po
             continue;
         }
         if (poll_fd.revents & posix.POLL.OUT == 0) continue;
-        const remaining = transfer.data[transfer.offset..];
+        const remaining = transfer.data()[transfer.offset..];
+        if (remaining.len == 0) continue;
         const amount = @min(remaining.len, max_write_per_dispatch);
         const rc = writeWithoutSigpipe(transfer.fd, remaining[0..amount]);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => {
                 transfer.offset += rc;
-                if (transfer.offset == transfer.data.len) self.closeOutgoing(i);
+                if (transfer.source == .drag) transfer.deadline_ms = monotonicMs() + transfer_timeout_ms;
+                if (transfer.finished()) self.closeOutgoing(i);
             },
             .INTR, .AGAIN => {},
             else => self.closeOutgoing(i),
@@ -334,13 +441,31 @@ pub fn pollTimeoutMs(self: *const Clipboard) i32 {
     return @intCast(@min(@max(end - monotonicMs(), 0), std.math.maxInt(i32)));
 }
 
-/// Expires stale transfers. True means an incoming transfer was aborted.
+/// Expires stale transfers and retires drag transfers whose data finished
+/// or failed since the last call. True means an incoming transfer was
+/// aborted.
 pub fn expireTransfers(self: *Clipboard) bool {
     const now = monotonicMs();
     const incoming_expired = self.transfer_fd >= 0 and self.transfer_deadline_ms <= now;
     if (incoming_expired) self.abortTransfer();
-    for (self.outgoing, 0..) |transfer, i| {
-        if (transfer) |item| if (item.deadline_ms <= now) self.closeOutgoing(i);
+    for (&self.outgoing, 0..) |*slot, i| {
+        const transfer = &(slot.* orelse continue);
+        switch (transfer.source) {
+            .owned => {},
+            .drag => |*drag| {
+                const item = &drag.offer.items.items[drag.index];
+                if (item.state == .failed or transfer.finished()) {
+                    self.closeOutgoing(i);
+                    continue;
+                }
+                // Data arriving from the client counts as progress.
+                if (item.data.items.len > drag.seen) {
+                    drag.seen = item.data.items.len;
+                    transfer.deadline_ms = now + transfer_timeout_ms;
+                }
+            },
+        }
+        if (transfer.deadline_ms <= now) self.closeOutgoing(i);
     }
     return incoming_expired;
 }
@@ -356,8 +481,13 @@ pub fn osc52ReadKind(self: *const Clipboard) ?u8 {
 fn closeOutgoing(self: *Clipboard, i: usize) void {
     if (self.outgoing[i]) |transfer| {
         _ = std.os.linux.close(transfer.fd);
-        self.outgoing_bytes -= transfer.data.len;
-        self.alloc.free(transfer.data);
+        switch (transfer.source) {
+            .owned => |text| {
+                self.outgoing_bytes -= text.len;
+                self.alloc.free(text);
+            },
+            .drag => |drag| drag.offer.release(),
+        }
         self.outgoing[i] = null;
     }
 }
@@ -396,6 +526,45 @@ pub fn setDndAcceptance(self: *Clipboard, operation: enum { none, copy, move }) 
     offer.offer.accept(offer.enter_serial, mime);
     if (offer.offer.getVersion() >= wl.DataOffer.set_actions_since_version)
         offer.offer.setActions(allowed, preferred);
+}
+
+pub fn setDragCallback(self: *Clipboard, ctx: *anyopaque, callback: DragFn) void {
+    self.drag_ctx = ctx;
+    self.drag_fn = callback;
+}
+
+/// Start a native drag serving `offer`'s advertised items, replacing any
+/// current drag. `serial` must be the press whose implicit grab is still
+/// active; a stale one surfaces later as a cancelled event.
+pub fn startDrag(
+    self: *Clipboard,
+    offer: *DragOffer,
+    actions: DndOperations,
+    origin: *wl.Surface,
+    serial: u32,
+) error{ Unsupported, OutOfMemory }!void {
+    const manager = self.data_manager orelse return error.Unsupported;
+    const device = self.data_device orelse return error.Unsupported;
+    // Version 3 negotiates copy or move and reports the end of the drop.
+    if (manager.getVersion() < wl.DataSource.set_actions_since_version) return error.Unsupported;
+    const source = manager.createDataSource() catch return error.OutOfMemory;
+    errdefer source.destroy();
+    const ctx = try self.alloc.create(DragSource);
+    ctx.* = .{ .clipboard = self, .source = source, .offer = offer.retain() };
+    for (offer.items.items) |item| {
+        if (item.advertised) source.offer(item.mime.ptr);
+    }
+    source.setActions(.{ .copy = actions.copy, .move = actions.move });
+    source.setListener(*DragSource, dragSourceListener, ctx);
+    if (self.drag_source) |old| old.destroy();
+    self.drag_source = ctx;
+    device.startDrag(source, origin, null, serial);
+}
+
+/// End the current native drag without reporting it. Queued transfers
+/// still complete.
+pub fn cancelDrag(self: *Clipboard) void {
+    if (self.drag_source) |source| source.destroy();
 }
 
 /// Takes ownership of `text` on every path.
@@ -712,6 +881,27 @@ fn dataSourceListener(_: *wl.DataSource, event: wl.DataSource.Event, ctx: *Sourc
         .cancelled => ctx.destroy(),
         else => {},
     }
+}
+
+fn dragSourceListener(_: *wl.DataSource, event: wl.DataSource.Event, ctx: *DragSource) void {
+    const clipboard = ctx.clipboard;
+    switch (event) {
+        .send => |send| clipboard.sendDragItem(ctx.offer, std.mem.span(send.mime_type), send.fd),
+        .target => |target| if (target.mime_type) |mime| {
+            if (ctx.offer.advertisedIndex(std.mem.span(mime))) |index| clipboard.reportDrag(.{ .target = index });
+        },
+        .action => |action| clipboard.reportDrag(.{ .action = dndOperations(action.dnd_action) }),
+        .dnd_drop_performed => clipboard.reportDrag(.dropped),
+        .dnd_finished, .cancelled => {
+            ctx.destroy();
+            clipboard.reportDrag(.{ .finished = .{ .cancelled = event == .cancelled } });
+        },
+    }
+}
+
+fn reportDrag(self: *Clipboard, event: DragEvent) void {
+    const callback = self.drag_fn orelse return;
+    callback(self.drag_ctx orelse return, event);
 }
 
 fn primarySourceListener(
@@ -1078,6 +1268,78 @@ test "outgoing limits, timeout, and teardown close transfers" {
     try std.testing.expect(clipboard.outgoing[0] == null);
     for (readers[0..max_outgoing_transfers]) |fd| _ = linux.close(fd);
     clipboard.deinit();
+}
+
+test "drag transfers stream arriving data, outlive the session, and fail alone" {
+    const linux = std.os.linux;
+    const alloc = std.testing.allocator;
+    var clipboard: Clipboard = .init(alloc, null, null);
+    defer clipboard.deinit();
+    const Requests = struct {
+        indices: [4]usize = undefined,
+        len: usize = 0,
+
+        fn record(ctx: *anyopaque, event: DragEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.indices[self.len] = event.request;
+            self.len += 1;
+        }
+    };
+    var requests: Requests = .{};
+    clipboard.setDragCallback(&requests, Requests.record);
+
+    const offer = try DragOffer.create(alloc);
+    try offer.append("text/plain", true);
+    try offer.append("text/uri-list", false);
+    try offer.append("image/png", true);
+
+    var plain: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&plain, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer _ = linux.close(plain[0]);
+    var hidden: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&hidden, .{ .CLOEXEC = true })));
+    defer _ = linux.close(hidden[0]);
+    var png: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&png, .{ .CLOEXEC = true })));
+    defer _ = linux.close(png[0]);
+
+    clipboard.sendDragItem(offer, "text/plain", plain[1]);
+    clipboard.sendDragItem(offer, "image/png", png[1]);
+    // Unadvertised items are refused at once.
+    clipboard.sendDragItem(offer, "text/uri-list", hidden[1]);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(hidden[0], &buf));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, requests.indices[0..requests.len]);
+
+    const pump = struct {
+        fn run(c: *Clipboard) !void {
+            _ = c.expireTransfers();
+            var polls: [max_outgoing_transfers]posix.pollfd = undefined;
+            c.pollOutgoing(&polls);
+            _ = try posix.poll(&polls, 0);
+            c.dispatchOutgoing(&polls);
+        }
+    }.run;
+
+    // Pending data is served as it arrives.
+    try offer.items.items[0].data.appendSlice(alloc, "ab");
+    try pump(&clipboard);
+    try std.testing.expectEqualStrings("ab", buf[0..try posix.read(plain[0], &buf)]);
+
+    // Arriving data counts as progress, so a past deadline does not expire it.
+    clipboard.outgoing[0].?.deadline_ms = monotonicMs() - 1;
+    try offer.items.items[0].data.appendSlice(alloc, "c");
+    try pump(&clipboard);
+    try std.testing.expectEqualStrings("c", buf[0..try posix.read(plain[0], &buf)]);
+
+    // The session drops its reference; the transfer finishes with EOF.
+    offer.items.items[0].state = .complete;
+    offer.items.items[2].state = .failed;
+    offer.release();
+    try pump(&clipboard);
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(plain[0], &buf));
+    try std.testing.expectEqual(@as(usize, 0), try posix.read(png[0], &buf));
+    for (clipboard.outgoing) |transfer| try std.testing.expect(transfer == null);
 }
 
 test "incoming deadline preserves OSC 52 kind until expiry" {

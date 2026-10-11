@@ -453,6 +453,7 @@ test {
     _ = @import("Clipboard.zig");
     _ = @import("CommandNotification.zig");
     _ = @import("KittyClipboard.zig");
+    _ = @import("KittyDrag.zig");
     _ = @import("FrameDamageTracker.zig");
     _ = Config;
     _ = Font;
