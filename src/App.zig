@@ -19,6 +19,8 @@ const vt = @import("ghostty-vt");
 const Clipboard = @import("Clipboard.zig");
 const KittyClipboard = @import("KittyClipboard.zig");
 const KittyDrag = @import("KittyDrag.zig");
+const DragIcon = @import("DragIcon.zig");
+const drag_preview = @import("drag_preview.zig");
 const Config = @import("Config.zig");
 const CommandNotification = @import("CommandNotification.zig");
 const keybind = @import("keybind.zig");
@@ -4627,6 +4629,7 @@ fn handleKittyDrag(self: *App, command: vt.osc.Command.KittyDndProtocol) bool {
             log.warn("Kitty drag-out reply failed: {}", .{err});
         },
         .cancel_drag => self.clipboard.cancelDrag(),
+        .change_image => self.clipboard.showDragIcon(self.kitty_drag.image_index),
     }
     self.writePty(writer.writer.buffered());
     return true;
@@ -4636,16 +4639,24 @@ fn startKittyDrag(self: *App, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     // Only a held press requests an offer, and its release ends the offer.
     const press = self.drag_press.?;
     std.debug.assert(press.requested);
+    const icon = self.createDragIcon() catch |err| return self.kitty_drag.dragFailed(writer, switch (err) {
+        error.TooLarge => .EFBIG,
+        error.InvalidImage, error.InvalidData => .EINVAL,
+        error.OutOfMemory => .ENOMEM,
+        else => .EIO,
+    });
     const operations = self.kitty_drag.operations;
     self.clipboard.startDrag(
         self.kitty_drag.offer.?,
         .{ .copy = operations.copy, .move = operations.move },
         self.window.surface,
+        icon,
         press.serial,
     ) catch |err| return self.kitty_drag.dragFailed(writer, switch (err) {
         error.Unsupported => .EPERM,
         error.OutOfMemory => .ENOMEM,
     });
+    self.clipboard.showDragIcon(self.kitty_drag.image_index);
     self.drag_press = null;
     // The native drag takes the pointer grab, so neither the application
     // nor the selection will see this button's release. The press became
@@ -4659,6 +4670,45 @@ fn startKittyDrag(self: *App, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     self.mouse_button = null;
     self.clearSelection();
     try self.kitty_drag.dragStarted(writer);
+}
+
+/// Render the client's drag images; null when it sent none.
+fn createDragIcon(self: *App) !?*DragIcon {
+    const images = self.kitty_drag.images.items;
+    if (images.len == 0) return null;
+    var pixels: std.ArrayList(drag_preview.Pixels) = .empty;
+    defer {
+        for (pixels.items) |rendered| rendered.deinit(self.alloc);
+        pixels.deinit(self.alloc);
+    }
+    try pixels.ensureTotalCapacity(self.alloc, images.len);
+    // Text renders at the window's scale; client pixels map one-to-one to
+    // logical pixels, so they appear the size the client chose.
+    const scale: u31 = if (self.window.compositor.getVersion() >= wl.Surface.set_buffer_scale_since_version)
+        @intCast((self.window.scale120 + 119) / 120)
+    else
+        1;
+    for (images) |image| pixels.appendAssumeCapacity(switch (image.format) {
+        0 => try drag_preview.text(self.alloc, .{
+            .font_family = self.config.font_family,
+            .font_size = self.effectiveFontSize(),
+            .adjust_cell_height = self.config.adjust_cell_height,
+            .foreground = self.effectiveForeground(),
+            .background = self.term.colors.background.get() orelse .{ .r = 0, .g = 0, .b = 0 },
+        }, image.data.items, image.width, image.height, image.opacity, scale),
+        24 => try drag_preview.fromRgb(self.alloc, image.width, image.height, 3, image.data.items),
+        32 => try drag_preview.fromRgb(self.alloc, image.width, image.height, 4, image.data.items),
+        100 => png: {
+            // The header matched these dimensions; bound the decode by them.
+            if (@as(u64, image.width) * image.height > drag_preview.max_pixels) return error.TooLarge;
+            const decoded = try decodePng(self.alloc, image.data.items);
+            defer self.alloc.free(decoded.data);
+            if (decoded.width != image.width or decoded.height != image.height) return error.InvalidImage;
+            break :png try drag_preview.fromRgb(self.alloc, decoded.width, decoded.height, 4, decoded.data);
+        },
+        else => unreachable,
+    });
+    return try DragIcon.create(self.alloc, self.window.compositor, self.window.shm, pixels.items);
 }
 
 /// Track a left press that may become a drag-out gesture. Shift and Ctrl

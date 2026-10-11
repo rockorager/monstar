@@ -11,6 +11,7 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const clipboard_format = @import("clipboard_format.zig");
+const DragIcon = @import("DragIcon.zig");
 const DragOffer = @import("DragOffer.zig");
 
 const log = std.log.scoped(.app);
@@ -162,11 +163,13 @@ const DragSource = struct {
     clipboard: *Clipboard,
     source: *wl.DataSource,
     offer: *DragOffer,
+    icon: ?*DragIcon,
 
     fn destroy(self: *DragSource) void {
         const clipboard = self.clipboard;
         if (clipboard.drag_source == self) clipboard.drag_source = null;
         self.source.destroy();
+        if (self.icon) |icon| icon.destroy();
         self.offer.release();
         clipboard.alloc.destroy(self);
     }
@@ -534,15 +537,18 @@ pub fn setDragCallback(self: *Clipboard, ctx: *anyopaque, callback: DragFn) void
 }
 
 /// Start a native drag serving `offer`'s advertised items, replacing any
-/// current drag. `serial` must be the press whose implicit grab is still
-/// active; a stale one surfaces later as a cancelled event.
+/// current drag. Takes ownership of `icon` on every path; show a preview
+/// with `showDragIcon`. `serial` must be the press whose implicit grab is
+/// still active; a stale one surfaces later as a cancelled event.
 pub fn startDrag(
     self: *Clipboard,
     offer: *DragOffer,
     actions: DndOperations,
     origin: *wl.Surface,
+    icon: ?*DragIcon,
     serial: u32,
 ) error{ Unsupported, OutOfMemory }!void {
+    errdefer if (icon) |owned| owned.destroy();
     const manager = self.data_manager orelse return error.Unsupported;
     const device = self.data_device orelse return error.Unsupported;
     // Version 3 negotiates copy or move and reports the end of the drop.
@@ -550,7 +556,7 @@ pub fn startDrag(
     const source = manager.createDataSource() catch return error.OutOfMemory;
     errdefer source.destroy();
     const ctx = try self.alloc.create(DragSource);
-    ctx.* = .{ .clipboard = self, .source = source, .offer = offer.retain() };
+    ctx.* = .{ .clipboard = self, .source = source, .offer = offer.retain(), .icon = icon };
     for (offer.items.items) |item| {
         if (item.advertised) source.offer(item.mime.ptr);
     }
@@ -558,7 +564,14 @@ pub fn startDrag(
     source.setListener(*DragSource, dragSourceListener, ctx);
     if (self.drag_source) |old| old.destroy();
     self.drag_source = ctx;
-    device.startDrag(source, origin, null, serial);
+    device.startDrag(source, origin, if (icon) |owned| owned.surface else null, serial);
+}
+
+/// Show the current drag's preview at `index`; out of range hides it.
+pub fn showDragIcon(self: *Clipboard, index: usize) void {
+    const source = self.drag_source orelse return;
+    const icon = source.icon orelse return;
+    icon.show(index);
 }
 
 /// End the current native drag without reporting it. Queued transfers

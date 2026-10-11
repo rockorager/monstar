@@ -9,7 +9,7 @@
 //! (the native drag started and t=E;OK was sent) → idle. A protocol error
 //! replies t=E with a POSIX error name and ends the session.
 //!
-//! Drag images are validated but not shown yet.
+//! Drag images are kept until the drag starts, when App renders them.
 
 const KittyDrag = @This();
 
@@ -47,7 +47,10 @@ operations: dnd.Operations = .{},
 offer: ?*DragOffer = null,
 /// Parallel to `offer.items`.
 streams: std.ArrayList(Stream) = .empty,
+/// Validated once the drag starts and freed by `dragStarted`.
 images: std.ArrayList(Image) = .empty,
+/// The image to show; out of range shows none.
+image_index: usize = 0,
 data_bytes: usize = 0,
 image_bytes: usize = 0,
 
@@ -61,10 +64,14 @@ const Stream = struct {
     requested: bool = false,
 };
 
-const Image = struct {
+pub const Image = struct {
+    /// 0 is UTF-8 text, 24 RGB, 32 RGBA, and 100 PNG.
     format: u8,
+    /// Pixel size, or for text a font scale of width / height.
     width: u32,
     height: u32,
+    /// Text background opacity in 1024ths.
+    opacity: u32,
     data: std.ArrayList(u8) = .empty,
     decoder: Base64Stream = .{},
 };
@@ -80,6 +87,8 @@ pub const Action = enum {
     start_drag,
     /// The session ended; cancel the native drag.
     cancel_drag,
+    /// Show `image_index` instead of the current drag image.
+    change_image,
 };
 
 pub fn init(alloc: std.mem.Allocator) KittyDrag {
@@ -163,9 +172,11 @@ pub fn endGesture(self: *KittyDrag, writer: *std.Io.Writer) std.Io.Writer.Error!
     }
 }
 
+/// The native drag started with images rendered from `images`.
 pub fn dragStarted(self: *KittyDrag, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     std.debug.assert(self.phase == .offered);
     self.phase = .dragging;
+    self.clearImages();
     try dnd.encodeError(writer, .drag, .{}, self.client_id, .OK, "", self.terminator);
 }
 
@@ -218,8 +229,7 @@ fn process(self: *KittyDrag, meta: dnd.Metadata, payload: []const u8) Error!Acti
             try self.presentData(meta, payload)
         else
             try self.presentImage(meta, payload),
-        // Without previews, image changes (x >= 0) have nothing to change.
-        .start_drag => if (meta.cell_x == -1) return self.start(),
+        .start_drag => return if (meta.cell_x == -1) self.start() else self.changeImage(meta.cell_x),
         .drag_event => try self.receiveData(meta, payload),
         .drag_error => return self.receiveError(meta),
         // The terminal never requests remote file data.
@@ -313,6 +323,7 @@ fn presentImage(self: *KittyDrag, meta: dnd.Metadata, payload: []const u8) Error
             .format = @intCast(meta.cell_y),
             .width = @intCast(@max(meta.pixel_x, 0)),
             .height = @intCast(@max(meta.pixel_y, 0)),
+            .opacity = meta.operation,
         });
     } else if (index + 1 != self.images.items.len) return error.Invalid;
     const image = &self.images.items[index];
@@ -337,8 +348,17 @@ fn start(self: *KittyDrag) Error!Action {
         self.image_bytes += try image.decoder.finish(self.alloc, &image.data, max_image_bytes - self.image_bytes);
         if (!validImage(image)) return error.Invalid;
     }
-    self.clearImages();
     return .start_drag;
+}
+
+fn changeImage(self: *KittyDrag, index: i32) Error!Action {
+    if (index < 0) return error.Invalid;
+    switch (self.phase) {
+        .idle, .requested => return .handled,
+        .offered, .dragging => {},
+    }
+    self.image_index = @intCast(index);
+    return if (self.phase == .dragging) .change_image else .handled;
 }
 
 fn receiveData(self: *KittyDrag, meta: dnd.Metadata, payload: []const u8) Error!void {
@@ -410,6 +430,7 @@ fn endSession(self: *KittyDrag) void {
     self.clearImages();
     self.text.clearRetainingCapacity();
     self.phase = .idle;
+    self.image_index = 0;
     self.data_bytes = 0;
 }
 
@@ -764,8 +785,18 @@ test "drag images are validated when the drag starts" {
     @memset(png[header.len..], 0);
     _ = try h.send("t=p:x=-1", "4p6Q");
     _ = try h.send("t=p:x=-2:y=100:X=3:Y=2", std.base64.standard.Encoder.encode(&png_b64, &png));
+    // Choosing an image before the start applies when the drag starts.
+    try testing.expectEqual(Action.handled, try h.send("t=P:x=1", null));
     try testing.expectEqual(Action.start_drag, try h.send("t=P:x=-1", null));
     try h.expectOutput("");
+    // App renders the images between start_drag and dragStarted.
+    try testing.expectEqual(@as(usize, 2), h.drag.images.items.len);
+    try testing.expectEqual(@as(usize, 1), h.drag.image_index);
+    try testing.expectEqualStrings("\u{2790}", h.drag.images.items[0].data.items);
+    try h.drag.dragStarted(&h.out.writer);
+    try testing.expectEqual(@as(usize, 0), h.drag.images.items.len);
+    try testing.expectEqual(Action.change_image, try h.send("t=P:x=5", null));
+    try testing.expectEqual(@as(usize, 5), h.drag.image_index);
 }
 
 test "base64 streams reject data after padding and a dangling character" {
