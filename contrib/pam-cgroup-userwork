@@ -1,0 +1,15 @@
+#!/bin/sh
+
+[ "$PAM_TYPE" = "open_session" ] || exit 0
+
+uid=$(id -u "$PAM_USER")
+dir=/sys/fs/cgroup/userwork/$uid
+
+if [ ! -d "$dir" ]; then
+    mkdir -p "$dir"
+    echo "+memory +pids" > "$dir/cgroup.subtree_control"
+    chown "$uid:$uid" "$dir"
+fi
+
+echo "$PPID" > "$dir/cgroup.procs" 2>/dev/null || true
+

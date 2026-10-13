@@ -53,6 +53,7 @@ Visual and interaction settings apply to the running window.
 The
 .BR command ,
 .BR linux-cgroup ,
+.BR linux-cgroup-path ,
 and
 .B scrollback-limit
 settings describe resources created at startup and do not replace or move an
@@ -80,15 +81,21 @@ and then
 .B /bin/sh
 are used.
 .TP
-.BI linux-cgroup " = never|always"
-Choose whether each newly spawned child is moved into a separate transient
-systemd scope.
-The default is
-.BR never .
-With
-.BR always ,
-Monstar falls back to its inherited cgroup if the session bus or systemd scope
-creation is unavailable.
+.BI linux-cgroup " = never|if-available|cgroupfs|systemd|always"
+Choose whether each newly spawned child is moved into a separate cgroup, and
+by which mechanism. The default is
+.BR if-available .
+See
+.B CGROUP OPTIONS
+for the meaning of each value.
+.TP
+.BI linux-cgroup-path " = path"
+Base directory within the cgroup v2 mount delegated at login; the cgroupfs
+mechanism creates scope cgroups under
+.IR path / <uid> .
+See
+.B CGROUP OPTIONS
+for details.
 .TP
 .BI pipe-command-output " = command"
 Set a shell command that receives the last OSC 133-delimited command output on
@@ -111,6 +118,62 @@ The
 option overrides this setting, and windows opened with
 .B Ctrl+Shift+N
 start in the current terminal directory instead.
+.SH CGROUP OPTIONS
+These options control isolation of spawned children (the shell, and windows
+opened with
+.BR Ctrl+Shift+N )
+into their own cgroups.
+.PP
+The
+.B linux-cgroup
+setting chooses whether each newly spawned child is moved into a separate
+cgroup, and by which mechanism: systemd, or direct manipulations with cgroupfs.
+It accepts the following values:
+.TP
+.B never
+Disables cgroup usage entirely.
+.TP
+.B if-available
+Default value. Uses a systemd scope when systemd is available, otherwise cgroupfs 
+when a writable base exists, otherwise no cgroups at all.
+.TP
+.B cgroupfs
+Manipulates cgroups directly. This requires a writable base
+cgroup with the appropriate permissions. Without systemd, such cgroup is not 
+created automatically; see
+.IR contrib/pam-cgroup-userwork
+in Monstar sources on how to create such cgroup without systemd.
+Also, Monstar creates directories named "app-monstar-transient-<pid>.scope" in
+the aforementioned base cgroup. Make sure that no other software creates such
+directories. Use a different base (adjust the 
+.IR contrib/pam-cgroup-userwork
+script and/or set 
+.B linux-cgroup-path
+in Monstar config) if needed.
+If a suitable writable base is not found then Monstar will fail to start.
+.TP
+.B systemd
+Uses systemd to manipulate cgroups. If systemd is not detected then Monstar
+will fail to start.
+.TP
+.B always
+Uses a systemd scope when systemd is available, otherwise cgroupfs when a
+writable base exists, otherwise fails to start.
+.PP
+The
+.BI linux-cgroup-path " = path"
+setting sets the base directory within the cgroup v2 mount delegated at
+login, e.g.
+.IR /userwork ;
+the cgroupfs mechanism creates scope cgroups under
+.IR path / <uid> .
+It must be an absolute path. When unset, Monstar's own cgroup from
+/proc/self/cgroup is used. Only relevant when the cgroupfs mechanism is
+selected by Monstar, i.e. either
+.BR cgroupfs
+or
+.BR if-available
+are selected, and systemd is not detected in the latter case.
 .SH COMMAND COMPLETION NOTIFICATIONS
 The shell must emit OSC 133 C/D command-start/end markers. Monstar does not
 automatically inject shell integration. These settings do not affect explicit

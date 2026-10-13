@@ -191,6 +191,12 @@ hold: bool,
 /// `void` when built with `-Ddbus=false`.
 dbus: DbusHandle,
 dbus_fd: posix.fd_t,
+/// Isolation mechanism probed once at startup per the linux-cgroup
+/// policy: systemd scopes or direct cgroupfs writes; null (linux-cgroup
+/// is never, or if-available found nothing) runs children in the
+/// inherited cgroup. New windows (Ctrl+Shift+N) use whichever backend
+/// was probed.
+cgroup_backend: ?cgroup.Backend,
 pending_dbus: std.ArrayList(PendingDbus) = .empty,
 /// URI held while the compositor creates a token for activating its handler.
 pending_open_uri: ?[]u8,
@@ -583,7 +589,8 @@ pub fn init(
     // its own systemd scope before it execs. Filter and fd wiring happen
     // in initDbus once the App has a stable address. With -Ddbus=false,
     // dbus_connection is always the sole `void` value and every dependent
-    // feature below (notifications, portals, cgroup isolation) is inert.
+    // feature below (notifications, portals) is inert; cgroup isolation
+    // then relies on the cgroupfs backend alone.
     var dbus_connection: DbusHandle = if (build_options.enable_dbus) connection: {
         break :connection DbusConnection.connectSession(io, alloc, environ) catch |err| {
             log.warn("session dbus unavailable; desktop integration disabled: {}", .{err});
@@ -602,29 +609,46 @@ pub fn init(
     });
     errdefer pty.deinit();
 
-    // When enabled, move the child into its own transient systemd scope
-    // before it can exec. The gate holds the child so grandchildren cannot
+    // Probe the isolation backend once, per the linux-cgroup policy: a
+    // systemd scope manager over the session bus, or direct cgroupfs
+    // writes when a cgroup subtree was delegated to us (see contrib/).
+    // The backend also decides how new windows (Ctrl+Shift+N) are
+    // launched. Null disables isolation; the strict policies (cgroupfs,
+    // systemd, always) treat that as a startup failure.
+    const cgroup_backend: ?cgroup.Backend = switch (config.linux_cgroup) {
+        .never => null,
+        .@"if-available" => cgroup.probe(&dbus_connection, config.linux_cgroup_path),
+        .cgroupfs => cgroup.probeCgroupfs(config.linux_cgroup_path) orelse {
+            log.err("linux-cgroup=cgroupfs: no writable cgroupfs base (delegate a subtree, see contrib/pam-cgroup-userwork)", .{});
+            return error.CgroupUnavailable;
+        },
+        .systemd => cgroup.probeSystemd(&dbus_connection) orelse {
+            log.err("linux-cgroup=systemd: systemd backend unavailable (requires systemd and a session bus connection)", .{});
+            return error.CgroupUnavailable;
+        },
+        .always => cgroup.probe(&dbus_connection, config.linux_cgroup_path) orelse {
+            log.err("linux-cgroup=always: neither the systemd nor the cgroupfs backend is available", .{});
+            return error.CgroupUnavailable;
+        },
+    };
+
+    // With a backend selected, move the child into its own cgroup before
+    // it can exec. The gate holds the child so grandchildren cannot
     // escape the scope; on failure, releasing the gate lets it proceed
-    // un-isolated. Only the request is sent here: systemd's reply and the
-    // pid migration land while we set up the window, and the gate is
-    // released once both are confirmed below. Always false with
-    // -Ddbus=false, since scope creation is a systemd1 D-Bus call.
-    const use_cgroup_scope = if (build_options.enable_dbus)
-        config.linux_cgroup == .always and dbus_connection != null and cgroup.systemdBooted()
-    else
-        false;
+    // un-isolated. Only the request is initiated here: systemd's reply
+    // and the pid migration land while we set up the window, and the
+    // gate is released once both are confirmed below.
+    const isolate_child = cgroup_backend != null;
     const child_pid = try pty.spawn(path, argv, envp, .{
         .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
-        .gate_child = use_cgroup_scope,
+        .gate_child = isolate_child,
     });
     var pending_scope: ?cgroup.Pending = null;
-    if (build_options.enable_dbus) {
-        if (use_cgroup_scope) {
-            pending_scope = cgroup.startMoveIntoScope(&dbus_connection.?, @intCast(child_pid)) catch blk: {
-                log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
-                break :blk null;
-            };
-        }
+    if (isolate_child) {
+        pending_scope = cgroup_backend.?.startMoveIntoScope(@intCast(child_pid)) catch blk: {
+            log.warn("cgroup isolation unavailable; child stays in our cgroup", .{});
+            break :blk null;
+        };
     }
     // On error paths the errdefer'd pty.deinit releases the gate.
     errdefer if (pending_scope) |pending| pending.cancel();
@@ -741,6 +765,7 @@ pub fn init(
         .hold = options.hold,
         .dbus = dbus_connection,
         .dbus_fd = -1,
+        .cgroup_backend = cgroup_backend,
         .pending_open_uri = null,
         .notifications = .empty,
         .color_scheme = .dark,
@@ -802,6 +827,9 @@ pub fn init(
         .kitty_clipboard = .init(alloc),
         .kitty_drag = .init(alloc),
     };
+    // The probed systemd backend points at the stack-local connection;
+    // retarget it at the connection's final home in self.
+    if (self.cgroup_backend) |*backend| backend.retargetConnection(&self.dbus);
     self.stream = .init(.{
         .allocator = alloc,
         .handler = .{
@@ -2091,8 +2119,12 @@ fn reloadConfig(self: *App) void {
 }
 
 /// Ctrl+Shift+N: spawn an independent monstar window in the shell's
-/// current directory through the user service manager so the new window
-/// is not adopted by this monstar's launcher.
+/// current directory. The probed cgroup backend decides how: through the
+/// user service manager (systemd-run) under systemd so the new window is
+/// not adopted by this monstar's launcher, or a detached spawn that moves
+/// itself into a cgroupfs scope before exec when a delegated cgroup
+/// subtree is available (see contrib/). With no backend the window is
+/// spawned un-isolated.
 fn spawnNewWindow(self: *App) void {
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena_state.deinit();
@@ -2109,9 +2141,50 @@ fn spawnNewWindow(self: *App) void {
     };
     const exe_path = resolveCommandPathZ(arena, self.environ, "monstar", null) catch "monstar";
 
-    self.spawnSystemdRun(arena, envp, exe_path, pwd) catch |err| {
+    if (self.cgroup_backend) |*backend| {
+        switch (backend.*) {
+            .systemd => self.spawnSystemdRun(arena, envp, exe_path, pwd) catch |err| {
+                log.warn("systemd-run launch failed ({}); spawning detached", .{err});
+                spawnDetachedWindow(null, arena, envp, exe_path, pwd) catch |spawn_err| {
+                    log.err("new window launch failed: {}", .{spawn_err});
+                };
+            },
+            .cgroupfs => |*fs| spawnDetachedWindow(fs.*, arena, envp, exe_path, pwd) catch |err| {
+                log.err("new window launch failed: {}", .{err});
+            },
+        }
+        return;
+    }
+    spawnDetachedWindow(null, arena, envp, exe_path, pwd) catch |err| {
         log.err("new window launch failed: {}", .{err});
     };
+}
+
+/// Detached launch without a user service manager: double-fork the new
+/// window directly. With a cgroupfs backend the final child moves itself
+/// into a scope before exec; otherwise it runs in the inherited cgroup.
+fn spawnDetachedWindow(
+    scope: ?cgroup.CgroupfsBackend,
+    arena: std.mem.Allocator,
+    envp: [*:null]const ?[*:0]const u8,
+    exe_path: [:0]const u8,
+    pwd: ?[:0]const u8,
+) !void {
+    var argv: std.ArrayList(?[*:0]const u8) = .empty;
+    try argv.append(arena, exe_path.ptr);
+    // Mirror the systemd-run path: the flag overrides any configured
+    // working-directory in the new window.
+    if (pwd) |p| {
+        const cwd_arg = try std.fmt.allocPrintSentinel(arena, "--working-directory={s}", .{p}, 0);
+        try argv.append(arena, cwd_arg.ptr);
+    }
+    const argv_slice = try argv.toOwnedSliceSentinel(arena, null);
+    // Sweep scopes left behind by exited windows; the new window's own
+    // scope survives because it is populated by the time it matters.
+    if (scope) |*fs| fs.sweepStaleScopes();
+    if (!spawnDetached(exe_path.ptr, argv_slice.ptr, envp, pwd, "monstar", scope)) {
+        return error.SpawnFailed;
+    }
 }
 
 fn spawnSystemdRun(
@@ -2136,7 +2209,7 @@ fn spawnSystemdRun(
     if (cwd_arg) |arg| try argv.append(arena, arg.ptr);
     const argv_slice = try argv.toOwnedSliceSentinel(arena, null);
     // The user manager can stall; never wait for systemd-run on the UI thread.
-    if (!spawnDetached(systemd_run, argv_slice.ptr, envp, null, "systemd-run")) {
+    if (!spawnDetached(systemd_run, argv_slice.ptr, envp, null, "systemd-run", null)) {
         return error.SystemdRunFailed;
     }
 }
@@ -2212,6 +2285,7 @@ fn spawnDetached(
     envp: [*:null]const ?[*:0]const u8,
     pwd: ?[:0]const u8,
     label: []const u8,
+    scope: ?cgroup.CgroupfsBackend,
 ) bool {
     const linux = std.os.linux;
 
@@ -2235,6 +2309,9 @@ fn spawnDetached(
         if (linux.errno(detached_rc) != .SUCCESS) linux.exit(127);
         if (detached_rc != 0) linux.exit(0);
 
+        // cgroupfs scope isolation happens here, not in the parent: the
+        // double fork means the final pid is known only to this child.
+        if (scope) |fs| fs.moveSelfIntoScope();
         if (pwd) |p| _ = linux.chdir(p.ptr);
         _ = linux.execve(path, argv, envp);
         linux.exit(127); // exec failed
@@ -3827,7 +3904,7 @@ fn openUriXdg(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !voi
     const uri_z = try arena.dupeZ(u8, uri);
     const envp = try self.spawnEnvp(arena, null, activation_token);
     const argv = [_:null]?[*:0]const u8{ "xdg-open", uri_z.ptr };
-    if (!spawnDetached(xdg_open.ptr, &argv, envp, null, "xdg-open")) {
+    if (!spawnDetached(xdg_open.ptr, &argv, envp, null, "xdg-open", null)) {
         return error.SpawnFailed;
     }
 }

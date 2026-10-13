@@ -120,9 +120,17 @@ notify_on_command_finish: NotifyOnCommandFinish = .never,
 notify_on_command_finish_action: CommandFinishAction = .{},
 /// Minimum command duration in nanoseconds; equality does not notify.
 notify_on_command_finish_after: u64 = 5 * std.time.ns_per_s,
-/// Whether newly spawned children should be moved into their own transient
-/// systemd scope. This only affects startup; reloads do not move a live child.
-linux_cgroup: LinuxCgroup = .never,
+/// Whether newly spawned children are moved into their own cgroup, and by
+/// which mechanism: a transient systemd scope over the session bus, or a
+/// cgroupfs child directory under a delegated subtree (see
+/// linux-cgroup-path). This only affects startup; reloads do not move a
+/// live child.
+linux_cgroup: LinuxCgroup = .@"if-available",
+/// Base directory within the cgroup v2 mount delegated at login, e.g.
+/// "/userwork"; the cgroupfs backend creates scope cgroups under
+/// <base>/<uid>. Unset uses Monstar's own cgroup from /proc/self/cgroup.
+/// This only affects startup.
+linux_cgroup_path: ?[:0]const u8 = null,
 /// Logical terminal page storage in bytes, including the active screen. This
 /// only affects startup because libghostty-vt does not resize live scrollback.
 scrollback_limit: usize = 50_000_000,
@@ -161,7 +169,19 @@ copy_highlight: ?vt.color.RGB = null,
 copy_highlight_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
 
-pub const LinuxCgroup = enum { never, always };
+pub const LinuxCgroup = enum {
+    /// No cgroup usage at all.
+    never,
+    /// systemd scopes when available, else cgroupfs, else no cgroups.
+    @"if-available",
+    /// cgroupfs only; startup fails when unavailable.
+    cgroupfs,
+    /// systemd scopes only; startup fails when unavailable.
+    systemd,
+    /// systemd scopes when available, else cgroupfs; startup fails when
+    /// neither is available.
+    always,
+};
 pub const NotifyOnCommandFinish = enum { never, unfocused, always };
 pub const CommandFinishAction = struct {
     bell: bool = true,
@@ -285,6 +305,9 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.notify_on_command_finish_after = try parseDuration(value);
     } else if (std.mem.eql(u8, key, "linux-cgroup")) {
         self.linux_cgroup = std.meta.stringToEnum(LinuxCgroup, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "linux-cgroup-path")) {
+        if (!std.fs.path.isAbsolute(value)) return error.InvalidValue;
+        self.linux_cgroup_path = try arena.dupeZ(u8, value);
     } else if (std.mem.eql(u8, key, "scrollback-limit")) {
         self.scrollback_limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "image-storage-limit")) {
@@ -660,7 +683,8 @@ test "defaults" {
     try std.testing.expect(config.notify_on_command_finish_action.bell);
     try std.testing.expect(!config.notify_on_command_finish_action.notify);
     try std.testing.expectEqual(@as(u64, 5_000_000_000), config.notify_on_command_finish_after);
-    try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
+    try std.testing.expectEqual(LinuxCgroup.@"if-available", config.linux_cgroup);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), config.linux_cgroup_path);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(usize, 320_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
@@ -711,6 +735,7 @@ test "parse config" {
         \\command = /usr/bin/fish --login
         \\pipe-command-output = cat > /tmp/monstar-output
         \\linux-cgroup = always
+        \\linux-cgroup-path = /userwork
         \\scrollback-limit = 50000000
         \\image-storage-limit = 50000000
         \\mouse-scroll-multiplier = precision:1.5,discrete:5
@@ -747,6 +772,7 @@ test "parse config" {
     try std.testing.expectEqualStrings("/usr/bin/fish --login", config.command.?.shell);
     try std.testing.expectEqualStrings("cat > /tmp/monstar-output", config.pipe_command_output.?);
     try std.testing.expectEqual(LinuxCgroup.always, config.linux_cgroup);
+    try std.testing.expectEqualStrings("/userwork", config.linux_cgroup_path.?);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1.5), config.mouse_scroll_multiplier.precision);
@@ -777,6 +803,36 @@ test "parse config" {
     try std.testing.expectEqual(vt.color.RGB{ .r = 0xf7, .g = 0x76, .b = 0x8e }, config.palette[1].?);
     try std.testing.expectEqual(@as(?vt.color.RGB, null), config.palette[2]);
     try std.testing.expectEqual(vt.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 }, config.palette[200].?);
+}
+
+test "linux-cgroup accepts all policy values" {
+    var config: Config = .{};
+    const alloc = std.testing.allocator;
+    for ([_]struct { value: []const u8, expected: LinuxCgroup }{
+        .{ .value = "never", .expected = .never },
+        .{ .value = "if-available", .expected = .@"if-available" },
+        .{ .value = "cgroupfs", .expected = .cgroupfs },
+        .{ .value = "systemd", .expected = .systemd },
+        .{ .value = "always", .expected = .always },
+    }) |case| {
+        try config.set(alloc, "linux-cgroup", case.value);
+        try std.testing.expectEqual(case.expected, config.linux_cgroup);
+    }
+    try std.testing.expectError(error.InvalidValue, config.set(alloc, "linux-cgroup", "sometimes"));
+    try std.testing.expectEqual(.always, config.linux_cgroup);
+}
+
+test "linux-cgroup-path requires an absolute path" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var config: Config = .{};
+    try config.set(arena_state.allocator(), "linux-cgroup-path", "/userwork");
+    try std.testing.expectEqualStrings("/userwork", config.linux_cgroup_path.?);
+    try std.testing.expectError(
+        error.InvalidValue,
+        config.set(arena_state.allocator(), "linux-cgroup-path", "userwork/1000"),
+    );
+    try std.testing.expectEqualStrings("/userwork", config.linux_cgroup_path.?);
 }
 
 test "command finish settings replace flags atomically and parse durations" {
