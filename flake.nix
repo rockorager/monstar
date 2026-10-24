@@ -31,10 +31,10 @@
             version = "1.1.0";
             src = self;
 
-            nativeBuildInputs = [ pkgs.zig pkgs.pkg-config pkgs.ncurses ];
+            nativeBuildInputs = [ pkgs.zig_0_16 pkgs.pkg-config pkgs.ncurses ];
             buildInputs = buildInputs pkgs;
 
-            zigDeps = pkgs.zig.fetchDeps {
+            zigDeps = pkgs.zig_0_16.fetchDeps {
               inherit (finalAttrs) src pname version;
               fetchAll = true;
               hash = "sha256-O9qvv/Mag7ATJYNACN2DeB8q/HRhm52IHQVk6F9M20c=";
@@ -86,7 +86,7 @@
         in
         {
           default = pkgs.mkShell {
-            nativeBuildInputs = [ pkgs.zig pkgs.pkg-config pkgs.ncurses ];
+            nativeBuildInputs = [ pkgs.zig_0_16 pkgs.pkg-config pkgs.ncurses ];
             buildInputs = buildInputs pkgs;
           };
         });
