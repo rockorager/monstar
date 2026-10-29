@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
         "dbus",
         "Enable native D-Bus desktop integration: notifications, xdg-desktop-portal, systemd cgroup isolation (default: true)",
     ) orelse true;
+    const embed_nerd_font = b.option(
+        bool,
+        "embed-nerd-font",
+        "Embed Nerd Font symbols for deterministic icons; disable to use system fonts only (default: true)",
+    ) orelse true;
 
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
@@ -63,6 +68,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "enable_dbus", enable_dbus);
+    build_options.addOption(bool, "embed_nerd_font", embed_nerd_font);
     root_module.addOptions("build_options", build_options);
     root_module.addAnonymousImport("monstar-terminfo-source", .{
         .root_source_file = b.path("dist/monstar.terminfo"),

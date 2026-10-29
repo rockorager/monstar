@@ -12,6 +12,7 @@
 const Font = @This();
 
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @import("c");
 const uucode = @import("uucode");
 const Config = @import("Config.zig");
@@ -26,7 +27,11 @@ pub const sprite_face_index: u16 = std.math.maxInt(u16);
 /// Bundled Nerd Font symbols (MIT licensed, see assets/): icon glyphs
 /// render identically everywhere without requiring an installed patched
 /// font. Consulted after the primary face, before system fallbacks.
-const embedded_symbols = @embedFile("assets/SymbolsNerdFontMono-Regular.ttf");
+const symbols_filename = "SymbolsNerdFontMono-Regular.ttf";
+const embedded_symbols: []const u8 = if (build_options.embed_nerd_font)
+    @embedFile("assets/" ++ symbols_filename)
+else
+    "";
 
 /// Marks a sort-list candidate that failed to load.
 const failed_face = std.math.maxInt(u16);
@@ -892,7 +897,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     }
 
     // The embedded symbols face; not fatal if it somehow fails.
-    const embedded_face: ?u16 = embedded: {
+    const embedded_face: ?u16 = if (build_options.embed_nerd_font) embedded: {
         var embedded = Face.loadMemory(ft_lib, embedded_symbols, size_px, .{
             .cell_width = cell_width,
             .cell_height = cell_height,
@@ -904,7 +909,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         errdefer embedded.deinit(alloc);
         try faces.append(alloc, embedded);
         break :embedded @intCast(faces.items.len - 1);
-    };
+    } else null;
 
     var primary_faces: [style_count]u16 = @splat(0);
     inline for (comptime std.enums.values(FaceStyle)) |style| {

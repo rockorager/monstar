@@ -92,7 +92,9 @@ smooth-scrolling = true
 Set `font-family` to choose the primary font; the default is Fontconfig's
 standard `monospace` family. Fontconfig normally selects matching bold and
 italic faces and supplies language and emoji fallbacks automatically. Monstar
-also bundles Nerd Font symbols.
+also embeds Nerd Font symbols by default for deterministic icons. Build with
+`-Dembed-nerd-font=false` to reduce the executable size and rely solely on
+external fonts instead.
 
 For explicit control over separate bold, italic, bold-italic, or ordered
 fallback families, define a virtual family such as `Monstar Custom` in
