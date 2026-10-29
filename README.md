@@ -386,6 +386,9 @@ zig build fmt
 zig build test
 ```
 
+Development builds can include the headless rendering benchmarks with
+`-Dbenchmarks=true`, which enables `monstar --bench`.
+
 Rendering uses exact-sRGB linear-light blending with 8-bit framebuffers and
 fractional grayscale text with light hinting and native Adobe CFF stem darkening.
 Text coverage is corrected so glyph weight matches encoded-space blending.

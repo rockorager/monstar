@@ -26,7 +26,10 @@ pub fn main(init: std.process.Init) !void {
     };
     switch (cli.action) {
         .run => {},
-        .bench => return @import("bench.zig").run(init),
+        .bench => {
+            if (build_options.enable_benchmarks) return @import("bench.zig").run(init);
+            unreachable;
+        },
         .help => return printUsage(init),
         .version => return printVersion(init),
     }
@@ -70,7 +73,7 @@ const CliParser = struct {
     fn parse(self: *CliParser) CliError!CliOptions {
         while (self.index < self.args.len) : (self.index += 1) {
             const arg = self.args[self.index];
-            if (std.mem.eql(u8, arg, "--bench")) {
+            if (build_options.enable_benchmarks and std.mem.eql(u8, arg, "--bench")) {
                 self.cli.action = .bench;
                 return self.cli;
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {

@@ -5,7 +5,7 @@ sRGB transfer function. Ordinary builds use this policy; there is no blending
 mode switch or runtime configuration key.
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dbenchmarks=true
 zig build test
 ./zig-out/bin/monstar --bench
 ```
@@ -81,7 +81,7 @@ Unhinted, darkening-off, and encoded-space experiment modes are not supported.
 Run `--bench` with a release build and fixed CPU, font, and configuration:
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dbenchmarks=true
 taskset -c 2 ./zig-out/bin/monstar --bench
 ```
 

@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
         "embed-nerd-font",
         "Embed Nerd Font symbols for deterministic icons; disable to use system fonts only (default: true)",
     ) orelse true;
+    const enable_benchmarks = b.option(
+        bool,
+        "benchmarks",
+        "Enable the development --bench rendering benchmarks (default: false)",
+    ) orelse false;
 
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
@@ -69,6 +74,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "enable_dbus", enable_dbus);
     build_options.addOption(bool, "embed_nerd_font", embed_nerd_font);
+    build_options.addOption(bool, "enable_benchmarks", enable_benchmarks);
     root_module.addOptions("build_options", build_options);
     root_module.addAnonymousImport("monstar-terminfo-source", .{
         .root_source_file = b.path("dist/monstar.terminfo"),
