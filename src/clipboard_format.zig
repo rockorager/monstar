@@ -108,7 +108,7 @@ pub fn osc7Path(arena: std.mem.Allocator, url: []const u8) std.mem.Allocator.Err
 
     const path = try uri.path.toRawMaybeAlloc(arena);
     if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null) return null;
-    return try arena.dupeZ(u8, path);
+    return try arena.dupeSentinel(u8, path, 0);
 }
 
 /// Format a hyperlink for the clipboard, reducing plain local file URIs to
@@ -117,13 +117,13 @@ pub fn osc7Path(arena: std.mem.Allocator, url: []const u8) std.mem.Allocator.Err
 pub fn formatLinkCopy(alloc: std.mem.Allocator, url: []const u8) ![:0]u8 {
     // A filesystem path cannot retain a document anchor or query. Check the
     // encoded URI so %3F and %23 in filenames still become literal path bytes.
-    if (std.mem.indexOfAny(u8, url, "?#") != null) return alloc.dupeZ(u8, url);
+    if (std.mem.indexOfAny(u8, url, "?#") != null) return alloc.dupeSentinel(u8, url, 0);
 
     var arena_state: std.heap.ArenaAllocator = .init(alloc);
     defer arena_state.deinit();
 
     const path = try osc7Path(arena_state.allocator(), url);
-    return alloc.dupeZ(u8, path orelse url);
+    return alloc.dupeSentinel(u8, path orelse url, 0);
 }
 
 pub fn formatUriListDrop(alloc: std.mem.Allocator, data: []const u8) ![]u8 {

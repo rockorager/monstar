@@ -266,9 +266,9 @@ pub fn applyOverride(self: *Config, arena: std.mem.Allocator, text: []const u8) 
 
 pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []const u8) SetError!void {
     if (std.mem.eql(u8, key, "app-id")) {
-        self.app_id = try arena.dupeZ(u8, value);
+        self.app_id = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "font-family")) {
-        self.font_family = try arena.dupeZ(u8, value);
+        self.font_family = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "font-size")) {
         self.font_size = try parseFontSize(value);
     } else if (std.mem.eql(u8, key, "adjust-cell-height")) {
@@ -294,11 +294,11 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
     } else if (std.mem.eql(u8, key, "working-directory")) {
         const home_relative = std.mem.eql(u8, value, "~") or std.mem.startsWith(u8, value, "~/");
         if (!home_relative and !std.fs.path.isAbsolute(value)) return error.InvalidValue;
-        self.working_directory = try arena.dupeZ(u8, value);
+        self.working_directory = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "command")) {
         self.command = try parseCommand(arena, value);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
-        self.pipe_command_output = try arena.dupeZ(u8, value);
+        self.pipe_command_output = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "notify-on-command-finish")) {
         self.notify_on_command_finish = std.meta.stringToEnum(NotifyOnCommandFinish, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "notify-on-command-finish-action")) {
@@ -484,11 +484,11 @@ fn parseCommand(arena: std.mem.Allocator, value: []const u8) SetError!Command {
     if (text.len == 0) return error.InvalidValue;
 
     return switch (mode) {
-        .shell => .{ .shell = try arena.dupeZ(u8, text) },
+        .shell => .{ .shell = try arena.dupeSentinel(u8, text, 0) },
         .direct => direct: {
             var args: std.ArrayList([:0]const u8) = .empty;
             var tokens = std.mem.tokenizeAny(u8, text, " \t");
-            while (tokens.next()) |arg| try args.append(arena, try arena.dupeZ(u8, arg));
+            while (tokens.next()) |arg| try args.append(arena, try arena.dupeSentinel(u8, arg, 0));
             if (args.items.len == 0) return error.InvalidValue;
             break :direct .{ .direct = try args.toOwnedSlice(arena) };
         },
@@ -1281,7 +1281,7 @@ test "absolute theme file resolves" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const path = try arena.dupeZ(u8, path_buf[0..path_len]);
+    const path = try arena.dupeSentinel(u8, path_buf[0..path_len], 0);
 
     var config: Config = .{ .theme = .{ .light = path, .dark = path } };
     try config.resolveThemes(std.testing.io, arena, .empty);

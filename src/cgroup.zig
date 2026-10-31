@@ -83,7 +83,7 @@ pub fn startMoveIntoScope(connection: *DbusConnection, pid: u32) Error!Pending {
 /// convention (app-<app>-<unique>.scope) so desktop tools recognize it.
 fn fmtScope(buf: []u8, pid: u32) [:0]const u8 {
     std.debug.assert(buf.len > scope_name_max);
-    return std.fmt.bufPrintZ(buf, scope_prefix ++ "{d}" ++ scope_suffix, .{pid}) catch unreachable;
+    return std.mem.printSentinel(buf, scope_prefix ++ "{d}" ++ scope_suffix, .{pid}, 0) catch unreachable;
 }
 
 fn startTransientUnit(connection: *DbusConnection, name: [:0]const u8, pid: u32) Error!u32 {
@@ -144,7 +144,7 @@ fn waitForMigration(pid: u32, name: []const u8) Error!void {
 
 fn readCgroupFile(buf: []u8, pid: u32) ?[]const u8 {
     var path_buf: [32]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cgroup", .{pid}) catch
+    const path = std.mem.printSentinel(&path_buf, "/proc/{d}/cgroup", .{pid}, 0) catch
         unreachable; // 32 bytes always fits "/proc/" + u32 + "/cgroup"
 
     const open_rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);

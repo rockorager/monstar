@@ -29,8 +29,8 @@ rm -rf "$STAGING_DIR" dist/monstar-*.tar.gz \
   packaging/arch/PKGBUILD packaging/arch/PKGBUILD.source packaging/arch/PKGBUILD.git
 mkdir -p "$STAGING_DIR/${ARCHIVE_ROOT}"
 
-# Build stripped ReleaseFast release prefix
-zig build -Doptimize=ReleaseFast -Dstrip=true -Dcpu=baseline --prefix "$STAGING_DIR/${ARCHIVE_ROOT}"
+# Build stripped fast release prefix
+zig build -Doptimize=fast -Dstrip=true -Dcpu=baseline --prefix "$STAGING_DIR/${ARCHIVE_ROOT}"
 
 EXPECTED_VERSION="monstar ${VERSION}"
 ACTUAL_VERSION=$("$STAGING_DIR/${ARCHIVE_ROOT}/bin/monstar" --version)

@@ -93,7 +93,7 @@ pub fn readStats(self: *const TextShaper) ShapeStats {
 
 pub fn beginKey(self: *TextShaper, face_index: u16, style: Font.FaceStyle) !void {
     self.key.clearRetainingCapacity();
-    try self.key.appendSlice(self.alloc, &.{ face_index, @intFromEnum(style) });
+    try self.key.appendSlice(self.alloc, &.{ face_index, @backingInt(style) });
 }
 
 pub fn appendKeyCodepoints(self: *TextShaper, cluster: u32, cp: u21, grapheme: []const u21) !void {
@@ -113,7 +113,7 @@ pub fn keyItems(self: *const TextShaper) []const u32 {
 pub fn shape(self: *TextShaper, face_index: u16, style: Font.FaceStyle, shaped_cells: usize) ![]const ShapedGlyph {
     std.debug.assert(self.key.items.len >= key_header_len);
     std.debug.assert(self.key.items[0] == face_index);
-    std.debug.assert(self.key.items[1] == @intFromEnum(style));
+    std.debug.assert(self.key.items[1] == @backingInt(style));
     if (self.cache.get(std.mem.sliceAsBytes(self.key.items))) |cached| {
         // Steady-state rendering overwhelmingly reuses shaped runs. Keeping
         // the miss path out of line also keeps Renderer.drawRun compact.
@@ -134,7 +134,7 @@ pub fn shapeRun(self: *TextShaper, face_index: u16, style: Font.FaceStyle) ![]Sh
     const key = self.key.items;
     std.debug.assert(key.len >= key_header_len);
     std.debug.assert(key[0] == face_index);
-    std.debug.assert(key[1] == @intFromEnum(style));
+    std.debug.assert(key[1] == @backingInt(style));
     const face = self.font.face(face_index);
 
     c.hb_buffer_clear_contents(self.hb_buf);

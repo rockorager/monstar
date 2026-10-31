@@ -141,7 +141,7 @@ pub fn parse(arena: std.mem.Allocator, value: []const u8) error{ InvalidValue, O
     if (trimmed.len == 0) return error.InvalidValue;
 
     if (std.mem.indexOfAny(u8, trimmed, ",:=") == null) {
-        const name = try arena.dupeZ(u8, trimmed);
+        const name = try arena.dupeSentinel(u8, trimmed, 0);
         return .{ .light = name, .dark = name };
     }
 
@@ -157,10 +157,10 @@ pub fn parse(arena: std.mem.Allocator, value: []const u8) error{ InvalidValue, O
         if (name.len == 0) return error.InvalidValue;
         if (std.mem.eql(u8, kind, "light")) {
             if (light != null) return error.InvalidValue;
-            light = try arena.dupeZ(u8, name);
+            light = try arena.dupeSentinel(u8, name, 0);
         } else if (std.mem.eql(u8, kind, "dark")) {
             if (dark != null) return error.InvalidValue;
-            dark = try arena.dupeZ(u8, name);
+            dark = try arena.dupeSentinel(u8, name, 0);
         } else {
             return error.InvalidValue;
         }
@@ -214,7 +214,7 @@ pub fn loadOverrides(
     name: []const u8,
 ) error{OutOfMemory}!?ThemeOverrides {
     if (std.fs.path.isAbsolute(name)) {
-        const path = try arena.dupeZ(u8, name);
+        const path = try arena.dupeSentinel(u8, name, 0);
         if (readFile(arena, path)) |text| return parseOverrides(text);
         warn("theme '{s}' could not be read", .{name});
         return null;

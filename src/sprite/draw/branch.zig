@@ -398,7 +398,7 @@ fn branchNode(
     var ctx = canvas.getContext();
     defer ctx.deinit();
     ctx.setSource(.{ .opaque_pattern = .{
-        .pixel = .{ .alpha8 = .{ .a = @intFromEnum(Shade.on) } },
+        .pixel = .{ .alpha8 = .{ .a = @backingInt(Shade.on) } },
     } });
     ctx.setLineWidth(float_thick);
 
@@ -485,7 +485,7 @@ fn fadingLine(
                     canvas.pixel(
                         @intCast(x),
                         @intCast(y),
-                        @enumFromInt(@as(u8, @intFromFloat(@round(color)))),
+                        @fromBackingInt(@intCast(@as(u8, @intFromFloat(@round(color))))),
                     );
                 }
                 color += inc;
@@ -497,7 +497,7 @@ fn fadingLine(
                     canvas.pixel(
                         @intCast(x),
                         @intCast(y),
-                        @enumFromInt(@as(u8, @intFromFloat(@round(color)))),
+                        @fromBackingInt(@intCast(@as(u8, @intFromFloat(@round(color))))),
                     );
                 }
                 color += inc;

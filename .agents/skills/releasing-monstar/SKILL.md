@@ -120,7 +120,7 @@ Run checks in this order:
 ```sh
 zig build test --summary all
 zig build --summary all
-zig build -Doptimize=ReleaseFast --summary all
+zig build -Doptimize=fast --summary all
 zig build fmt
 ```
 
@@ -151,7 +151,7 @@ git tag -s vX.Y.Z -m "Monstar X.Y.Z"
 Build from the tagged commit and verify the stable identifier:
 
 ```sh
-zig build -Doptimize=ReleaseFast --summary all
+zig build -Doptimize=fast --summary all
 ./zig-out/bin/monstar --version
 ```
 

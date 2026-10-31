@@ -199,7 +199,7 @@ pub fn encodeMessage(allocator: std.mem.Allocator, metadata: Metadata, serial: u
     const out = try allocator.alloc(u8, total);
     errdefer allocator.free(out);
     out[0] = 'l';
-    out[1] = @intFromEnum(metadata.message_type);
+    out[1] = @backingInt(metadata.message_type);
     out[2] = metadata.flags;
     out[3] = 1;
     std.mem.writeInt(u32, out[4..8], @intCast(body.len), .little);
@@ -283,7 +283,7 @@ pub fn parseMessage(allocator: std.mem.Allocator, data: []u8, fds: []std.posix.f
     const body_offset = try alignForward(16 + fields_len, 8);
     for (data[16 + fields_len .. body_offset]) |v| if (v != 0) return error.InvalidMessage;
     var d: Decoder = .{ .data = data[16 .. 16 + fields_len], .endian = endian, .base_offset = 16 };
-    var h: Header = .{ .message_type = @enumFromInt(data[1]), .flags = data[2], .serial = readU32(data[8..12], endian) };
+    var h: Header = .{ .message_type = @fromBackingInt(@intCast(data[1])), .flags = data[2], .serial = readU32(data[8..12], endian) };
     if (h.serial == 0) return error.InvalidMessage;
     var seen: u16 = 0;
     while (!d.finished()) {
@@ -629,7 +629,7 @@ test "invalid values and oversized prefix" {
     defer e.deinit();
     try std.testing.expectError(error.InvalidObjectPath, e.objectPath("bad"));
     try std.testing.expectError(error.InvalidSignature, e.signature("a"));
-    var h = [_]u8{ 'l', 1, 0, 1 } ++ [_]u8{0} ** 12;
+    var h = [_]u8{ 'l', 1, 0, 1 } ++ @as([12]u8, @splat(0));
     std.mem.writeInt(u32, h[4..8], @intCast(max_message_size), .little);
     try std.testing.expectError(error.MessageTooLarge, messageLength(&h));
 }

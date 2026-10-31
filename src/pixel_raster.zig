@@ -472,7 +472,7 @@ fn blendPremultipliedBgraSpan(noalias dst: []u32, noalias src: []const u8) void 
 
 test "fillRect clips to a view while honoring framebuffer stride" {
     const untouched: u32 = 0x12345678;
-    var pixels = [_]u32{untouched} ** 15;
+    var pixels: [15]u32 = @splat(untouched);
     fillRect(&pixels, 5, 2, 2, 0, 0, 2, 2, 0xffabcdef);
     try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[0]);
     try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[1]);
@@ -495,7 +495,7 @@ test "blendRgb faint dims foreground toward background" {
 
 test "scrollbar capsule has antialiased caps and a solid center" {
     const background: u32 = 0xff000000;
-    var pixels = [_]u32{background} ** 48;
+    var pixels: [48]u32 = @splat(background);
     blendCapsule(&pixels, 8, 8, 6, .{
         .x = 2,
         .y = 0,
@@ -517,7 +517,7 @@ test "scrollbar capsule moves coverage continuously across pixel boundaries" {
     var previous_top: u32 = 0xff;
     var previous_bottom: u32 = 0;
     for ([_]f64{ 1.75, 2, 2.25 }) |y| {
-        var pixels = [_]u32{background} ** 80;
+        var pixels: [80]u32 = @splat(background);
         blendCapsule(&pixels, 8, 8, 10, .{
             .x = 2,
             .y = y,
@@ -687,7 +687,7 @@ fn referenceLinearLightBlend(fg: u32, bg: u32, alpha: u8) u32 {
 test "linear-light glyph clipping and image color preservation" {
     var bitmap = [_]u8{ 255, 128, 0, 64, 192, 255 };
     const glyph: Font.Glyph = .{ .bitmap = &bitmap, .width = 3, .height = 2, .bearing_x = 0, .bearing_y = 0 };
-    var pixels = [_]u32{0xff000000} ** 12;
+    var pixels: [12]u32 = @splat(0xff000000);
     blitGlyph(&pixels, 4, 3, 3, &glyph, -1, 1, 0xffffffff, false, .{ .start = 0, .end = 1 });
     // Corrected text coverage keeps gray edges at their encoded-space values.
     try std.testing.expectEqual(@as(u32, 0xff808080), pixels[4]);
@@ -697,7 +697,7 @@ test "linear-light glyph clipping and image color preservation" {
     }
     try std.testing.expectEqual(@as(u32, 0xff804020), blendPixel(0, &.{ 128, 64, 32, 255 }));
     try std.testing.expectEqual(@as(u32, 0x80402010), blendPixel(0, &.{ 128, 64, 32, 128 }));
-    var emoji = [_]u32{0} ** 3;
+    var emoji: [3]u32 = @splat(0);
     blendPremultipliedBgraSpan(&emoji, &.{ 32, 64, 128, 255, 16, 32, 64, 128, 255, 255, 255, 128 });
     try std.testing.expectEqualSlices(u32, &.{ 0xff804020, 0x80402010, 0x80808080 }, &emoji);
 }

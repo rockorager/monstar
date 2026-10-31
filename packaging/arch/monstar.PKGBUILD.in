@@ -18,7 +18,7 @@ depends=(
 makedepends=(
   'ncurses'
   'wayland-protocols>=1.49'
-  'zig>=0.16.0'
+  'zig>=0.17.0'
 )
 optdepends=(
   'noto-fonts-emoji: emoji support'
@@ -42,7 +42,7 @@ build() {
   DESTDIR="$srcdir/monstar-build" zig build \
     --prefix /usr \
     --build-id=sha1 \
-    -Doptimize=ReleaseFast \
+    -Doptimize=fast \
     -Dcpu=baseline
 }
 

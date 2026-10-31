@@ -38,7 +38,7 @@ pub fn open(size: posix.winsize) Error!Pty {
     try check(linux.ioctl(master, linux.T.IOCGPTN, @intFromPtr(&pts_num)));
 
     var path_buf: [32]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/dev/pts/{d}", .{pts_num}) catch
+    const path = std.mem.printSentinel(&path_buf, "/dev/pts/{d}", .{pts_num}, 0) catch
         unreachable; // 32 bytes always fits "/dev/pts/" + u32
 
     const slave = openRw(path) orelse return error.PtyFailed;
@@ -163,17 +163,17 @@ pub fn setWinsize(self: *Pty, size: posix.winsize) Error!void {
 
 /// Wait for the child to exit; returns its wait status.
 pub fn wait(pid: posix.pid_t) Error!u32 {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     try check(linux.wait4(pid, &status, 0, null));
-    return status;
+    return @bitCast(status);
 }
 
 /// Reap the child if it has exited; null while it is still running.
 pub fn tryWait(pid: posix.pid_t) Error!?u32 {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     const rc = linux.wait4(pid, &status, linux.W.NOHANG, null);
     return switch (linux.errno(rc)) {
-        .SUCCESS => if (rc == 0) null else status,
+        .SUCCESS => if (rc == 0) null else @bitCast(status),
         .CHILD => 0,
         else => |err| {
             log.err("wait4 failed: {}", .{err});

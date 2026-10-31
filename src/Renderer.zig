@@ -638,7 +638,7 @@ fn cellFingerprint(
         else
             0,
         .visual = visual,
-        .cursor_style = if (cursor_here) @intCast(@intFromEnum(state.cursor.visual_style)) else 0,
+        .cursor_style = if (cursor_here) @intCast(@backingInt(state.cursor.visual_style)) else 0,
     };
 }
 
@@ -1901,7 +1901,7 @@ pub fn backgroundPixel(self: *const Renderer, rgb: vt.color.RGB) u32 {
 
 test "kitty unscaled blit converts rgb and clips" {
     const untouched: u32 = 0xff111111;
-    var pixels = [_]u32{untouched} ** 9; // 3x3 framebuffer
+    var pixels: [9]u32 = @splat(untouched); // 3x3 framebuffer
     const image: KittyImage = .{
         .width = 2,
         .height = 2,
@@ -1941,7 +1941,7 @@ test "kitty unscaled blit converts rgb and clips" {
 
 test "kitty unscaled blit honors rgba alpha" {
     const bg: u32 = 0xff111111;
-    var pixels = [_]u32{bg} ** 4; // 2x2 framebuffer
+    var pixels: [4]u32 = @splat(bg); // 2x2 framebuffer
     const image: KittyImage = .{
         .width = 2,
         .height = 2,
@@ -2038,7 +2038,7 @@ test "scaled kitty placement reuses cached rgba variant" {
         .source_width = 2,
         .source_height = 2,
     };
-    var pixels = [_]u32{0xff000000} ** 9;
+    var pixels: [9]u32 = @splat(0xff000000);
 
     try renderer.renderKittyPlacement(&pixels, 3, 3, image, viewport);
     const first = pixels;
@@ -2070,7 +2070,8 @@ test "scaled kitty cache protects a stable working set of 33 across frames" {
         .source_width = 1,
         .source_height = 1,
     };
-    const expected = [_]u8{ 23, 47, 89, 255 } ** 4;
+    const pixel = [_]u8{ 23, 47, 89, 255 };
+    const expected = pixel ++ pixel ++ pixel ++ pixel;
 
     for (1..4) |frame| {
         renderer.kitty_frame = frame;
@@ -2131,7 +2132,7 @@ test "copyOpaqueRgbSpan matches scalar conversion across vector boundaries" {
     for (&source, 0..) |*byte, i| byte.* = @truncate(i * 37 + 11);
 
     for ([_]usize{ 0, 1, 5, 6, 15, 16, 17, 23 }) |len| {
-        var actual = [_]u32{0} ** 23;
+        var actual: [23]u32 = @splat(0);
         const rgb = source[3..][0 .. len * 3];
         copyOpaqueRgbSpan(actual[0..len], rgb);
         for (actual[0..len], 0..) |pixel, i| {
@@ -2192,7 +2193,7 @@ test "emoji keycap grapheme selects emoji fallback face" {
 
     try renderer.text_shaper.beginKey(keycap_face, .regular);
     try renderer.text_shaper.appendKeyCodepoints(0, raws[0].content.codepoint.data, graphemes[0]);
-    try testing.expectEqualSlices(u32, &.{ keycap_face, @intFromEnum(Font.FaceStyle.regular), 0, '1', 0, 0xFE0F, 0, 0x20E3 }, renderer.text_shaper.keyItems());
+    try testing.expectEqualSlices(u32, &.{ keycap_face, @backingInt(Font.FaceStyle.regular), 0, '1', 0, 0xFE0F, 0, 0x20E3 }, renderer.text_shaper.keyItems());
     try testing.expect(try renderer.shapeKeyHasColorGlyph(keycap_face));
 
     try renderer.render(&state, pixels, width, height);

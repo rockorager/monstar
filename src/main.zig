@@ -130,7 +130,7 @@ const CliParser = struct {
             return true;
         }
         if (self.optionValue(arg, long)) |value| {
-            out.* = try self.arena.dupeZ(u8, value);
+            out.* = try self.arena.dupeSentinel(u8, value, 0);
             return true;
         }
         return false;
@@ -158,7 +158,7 @@ const CliParser = struct {
     /// absolute so the override matches the config key's contract.
     fn setWorkingDirectory(self: *CliParser, value: []const u8) CliError!void {
         const path = if (std.fs.path.isAbsolute(value))
-            try self.arena.dupeZ(u8, value)
+            try self.arena.dupeSentinel(u8, value, 0)
         else path: {
             var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
             const rc = std.os.linux.getcwd(&cwd_buf, cwd_buf.len);
@@ -661,7 +661,7 @@ test "direct commands search PATH in the child working directory" {
     });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    const cwd = try arena.dupeZ(u8, path_buf[0..path_len]);
+    const cwd = try arena.dupeSentinel(u8, path_buf[0..path_len], 0);
     const cases = [_]struct { path: [:0]const u8, exit_code: u32 }{
         .{ .path = "PATH=bin", .exit_code = 42 },
         .{ .path = "PATH=bin:.", .exit_code = 42 },
@@ -753,7 +753,7 @@ test "working directory needs search permission but not read permission" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
-    const path = try std.testing.allocator.dupeZ(u8, path_buf[0..path_len]);
+    const path = try std.testing.allocator.dupeSentinel(u8, path_buf[0..path_len], 0);
     defer std.testing.allocator.free(path);
 
     try std.testing.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.chmod(path, 0o111)));

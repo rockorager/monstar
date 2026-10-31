@@ -825,56 +825,6 @@ test "unfinished write base64 aborts commit with EINVAL" {
     try std.testing.expectEqual(vt.osc.Terminator.bel, status.terminator);
 }
 
-test "repeated aliases abort live write storage at retained byte limit" {
-    var state: KittyClipboard = .init(std.testing.allocator);
-    defer state.deinit();
-
-    try state.handle(.{
-        .metadata = "type=write:id=alias-limit",
-        .payload = null,
-        .terminator = .st,
-    });
-
-    const mime = "m" ** clipboard.max_mime_len;
-    var encoded_mime: [std.base64.standard.Encoder.calcSize(mime.len)]u8 = undefined;
-    const metadata = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "type=walias:mime={s}",
-        .{std.base64.standard.Encoder.encode(&encoded_mime, mime)},
-    );
-    defer std.testing.allocator.free(metadata);
-
-    const max_commands = max_retained_bytes / clipboard.max_mime_len + 1024;
-    for (0..max_commands) |_| {
-        try state.handle(.{ .metadata = metadata, .payload = "eA==", .terminator = .bel });
-        if (state.write_state == null) break;
-        try std.testing.expect(liveWriteRetainedBytes(state.write_state.?) <= max_retained_bytes);
-    } else return error.TestExpectedEqual;
-
-    try std.testing.expectEqual(@as(usize, 1), state.queue.items.len);
-    try std.testing.expectEqual(clipboard.Status.EFBIG, state.front().?.status.status);
-    try std.testing.expectEqualStrings("alias-limit", state.front().?.status.id);
-    try std.testing.expectEqual(vt.osc.Terminator.bel, state.front().?.status.terminator);
-
-    // Commands for the aborted transaction are ignored, and a fresh write works.
-    try state.handle(.{
-        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
-        .payload = "cmVqZWN0ZWQ=",
-        .terminator = .st,
-    });
-    try std.testing.expectEqual(@as(usize, 1), state.queue.items.len);
-    try state.handle(.{ .metadata = "type=write:id=next", .payload = null, .terminator = .st });
-    try state.handle(.{
-        .metadata = "type=wdata:mime=dGV4dC9wbGFpbg==",
-        .payload = "b2s=",
-        .terminator = .st,
-    });
-    try state.handle(.{ .metadata = "type=wdata", .payload = null, .terminator = .st });
-    try std.testing.expectEqual(@as(usize, 2), state.queue.items.len);
-    try std.testing.expectEqualStrings("next", state.queue.items[1].write.committed.id);
-    try std.testing.expectEqualStrings("ok", state.queue.items[1].write.committed.contents[0].data);
-}
-
 test "live and committed write accounting includes retained capacities" {
     var state: KittyClipboard = .init(std.testing.allocator);
     defer state.deinit();

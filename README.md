@@ -32,7 +32,7 @@ Install the current development version on Arch Linux from the
 Build and install Monstar from source into `~/.local`:
 
 ```sh
-zig build -Doptimize=ReleaseFast install --prefix "$HOME/.local"
+zig build -Doptimize=fast install --prefix "$HOME/.local"
 ```
 
 The command installs the executable, desktop entry, app icon, manual pages,
@@ -371,7 +371,7 @@ presentation or input latency.
 
 Building requires:
 
-- Zig 0.16
+- Zig 0.17
 - ncurses (`tic`)
 - Wayland 1.25 core schema
 - `wayland-protocols` 1.49

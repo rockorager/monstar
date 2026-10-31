@@ -123,13 +123,13 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/terminfo_gen.zig"),
                 .target = b.graph.host,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
             }),
         });
         terminfo_gen.root_module.addImport("ghostty-terminfo", b.createModule(.{
             .root_source_file = terminfo_root,
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }));
 
         const generate_terminfo = b.addRunArtifact(terminfo_gen);
@@ -142,11 +142,12 @@ pub fn build(b: *std.Build) void {
 
         // Preserve tic's alias symlinks, which InstallDir does not yet copy.
         const make_terminfo_dir = std.Build.Step.Run.create(b, "make terminfo install directory");
-        make_terminfo_dir.addArgs(&.{ "mkdir", "-p", b.getInstallPath(.prefix, "share/terminfo") });
+        make_terminfo_dir.addArgs(&.{ "mkdir", "-p" });
+        make_terminfo_dir.addDirectoryArg2(installPath("share/terminfo"), .{});
         const install_terminfo = std.Build.Step.Run.create(b, "install terminfo");
         install_terminfo.addArgs(&.{ "cp", "-R" });
         install_terminfo.addFileArg(terminfo_dir);
-        install_terminfo.addArg(b.getInstallPath(.prefix, "share"));
+        install_terminfo.addDirectoryArg2(installPath("share"), .{});
         install_terminfo.step.dependOn(&make_terminfo_dir.step);
         b.getInstallStep().dependOn(&install_terminfo.step);
     }
@@ -155,8 +156,8 @@ pub fn build(b: *std.Build) void {
         .name = "monstar",
         .root_module = root_module,
         .version = std.SemanticVersion.parse(version) catch unreachable,
-        // uucode's generated tables crash the x86_64 self-hosted backend on
-        // Zig 0.16. Ghostty uses LLVM for the same reason.
+        // uucode's generated tables crash the x86_64 self-hosted backend.
+        // Ghostty uses LLVM for the same reason.
         .use_llvm = true,
     });
     root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image_resize.c") });
@@ -177,19 +178,21 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    const run_cmd = b.addRunArtifact(exe);
+    // The install prefix is only known at make time, so pass prefix-relative
+    // environment through env(1) instead of setEnvironmentVariable. The shell
+    // inherits TERMINFO, so it must stay valid after a directory change.
+    const run_cmd = b.addSystemCommand(&.{"env"});
+    run_cmd.addDirectoryArg2(installPath("share/monstar"), .{
+        .prefix = "MONSTAR_RESOURCES_DIR=",
+        .make_absolute = true,
+    });
+    run_cmd.addDirectoryArg2(installPath("share/terminfo"), .{
+        .prefix = "TERMINFO=",
+        .make_absolute = true,
+    });
+    run_cmd.addArtifactArg2(exe, .{});
+    run_cmd.addPassthruArgs();
     run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.setEnvironmentVariable(
-        "MONSTAR_RESOURCES_DIR",
-        b.getInstallPath(.prefix, "share/monstar"),
-    );
-    run_cmd.setEnvironmentVariable(
-        "TERMINFO",
-        b.getInstallPath(.prefix, "share/terminfo"),
-    );
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
 
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);
@@ -202,18 +205,29 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
-    const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" }, .check = true });
+    const fmt_check = b.addFmt(.{
+        .paths = &.{ b.path("src"), b.path("build.zig"), b.path("build.zig.zon") },
+        .check = true,
+    });
     fmt_step.dependOn(&fmt_check.step);
     test_step.dependOn(fmt_step);
 }
 
+fn installPath(sub_path: []const u8) std.Build.LazyPath {
+    return .{ .relative = .{ .base = .install_prefix, .sub_path = sub_path } };
+}
+
 fn versionString(b: *std.Build) []const u8 {
     const release = b.fmt("{f}", .{release_version});
+    // Git state is not a configure cache input, so a cached configuration
+    // would keep reporting the version of an older checkout.
+    b.graph.poisonCache();
+    const build_root = b.root.toString(b.allocator) catch @panic("OOM");
     var code: u8 = undefined;
     const git_prefix_raw = b.runAllowFail(&.{
         "git",
         "-C",
-        b.build_root.path orelse ".",
+        build_root,
         "rev-parse",
         "--show-prefix",
     }, &code, .ignore) catch return release;
@@ -225,7 +239,7 @@ fn versionString(b: *std.Build) []const u8 {
     const raw = b.runAllowFail(&.{
         "git",
         "-C",
-        b.build_root.path orelse ".",
+        build_root,
         "describe",
         "--tags",
         "--long",
@@ -243,7 +257,7 @@ fn versionString(b: *std.Build) []const u8 {
         const count_raw = b.runAllowFail(&.{
             "git",
             "-C",
-            b.build_root.path orelse ".",
+            build_root,
             "rev-list",
             "--count",
             "HEAD",

@@ -1384,7 +1384,7 @@ fn openUriPortal(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !
     if (self.dbus == null) return error.PortalUnavailable;
     const owned_uri = try self.alloc.dupe(u8, uri);
     errdefer self.alloc.free(owned_uri);
-    const owned_token = if (activation_token) |token| try self.alloc.dupeZ(u8, token) else null;
+    const owned_token = if (activation_token) |token| try self.alloc.dupeSentinel(u8, token, 0) else null;
     errdefer if (owned_token) |token| self.alloc.free(token);
     const kind: PendingDbus.Kind = .{ .open_uri = .{ .uri = owned_uri, .token = owned_token } };
 
@@ -1492,7 +1492,7 @@ test "local file and directory links open the target rather than reveal its pare
         try std.testing.expectEqualStrings("sha{sv}", message.bodySignature());
         try std.testing.expectEqual(@as(usize, 1), message.fds.len);
         var fd_path_buf: [64]u8 = undefined;
-        const fd_path = try std.fmt.bufPrintZ(&fd_path_buf, "/proc/self/fd/{d}", .{message.fds[0]});
+        const fd_path = try std.mem.printSentinel(&fd_path_buf, "/proc/self/fd/{d}", .{message.fds[0]}, 0);
         var target: [std.fs.max_path_bytes]u8 = undefined;
         const n = linux.readlinkat(linux.AT.FDCWD, fd_path, &target, target.len);
         try std.testing.expectEqual(.SUCCESS, linux.errno(n));
@@ -1730,7 +1730,7 @@ fn handleNotificationActionInvoked(self: *App, message: *const DbusConnection.Me
 
     if (notification.value) |token| {
         if (token.len > 0) {
-            const token_z = self.alloc.dupeZ(u8, token) catch return;
+            const token_z = self.alloc.dupeSentinel(u8, token, 0) catch return;
             defer self.alloc.free(token_z);
             self.window.activate(token_z);
             return;
@@ -1882,7 +1882,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
-    } ++ [_]posix.pollfd{.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }} ** Clipboard.max_outgoing_transfers;
+    } ++ @as([Clipboard.max_outgoing_transfers]posix.pollfd, @splat(.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }));
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
     const pty_write_fd = &fds[2];
@@ -2084,8 +2084,8 @@ fn drainSignals(self: *App) !void {
         const n = posix.read(self.signal_fd, std.mem.asBytes(&info)) catch break;
         if (n == 0) break;
         switch (info.signo) {
-            @intFromEnum(std.os.linux.SIG.CHLD) => saw_sigchld = true,
-            @intFromEnum(std.os.linux.SIG.USR1) => saw_sigusr1 = true,
+            @backingInt(std.os.linux.SIG.CHLD) => saw_sigchld = true,
+            @backingInt(std.os.linux.SIG.USR1) => saw_sigusr1 = true,
             else => {},
         }
     }
@@ -2324,9 +2324,9 @@ fn spawnDetached(
     }
 
     // Reap the intermediate child; it exits right after the second fork.
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     _ = linux.wait4(pid, &status, 0, null);
-    return waitStatusExitedZero(status);
+    return waitStatusExitedZero(@bitCast(status));
 }
 
 fn waitStatusExitedZero(status: u32) bool {
@@ -2476,7 +2476,7 @@ fn spawnPipeCommand(
         linux.exit(0);
     }
 
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     _ = linux.wait4(pid, &status, 0, null);
 }
 
@@ -3967,7 +3967,7 @@ fn openUriXdg(self: *App, uri: []const u8, activation_token: ?[:0]const u8) !voi
 
     const xdg_open = try resolveCommandPathZ(arena, self.environ, "xdg-open", null);
 
-    const uri_z = try arena.dupeZ(u8, uri);
+    const uri_z = try arena.dupeSentinel(u8, uri, 0);
     const envp = try self.spawnEnvp(arena, null, activation_token);
     const argv = [_:null]?[*:0]const u8{ "xdg-open", uri_z.ptr };
     if (!spawnDetached(xdg_open.ptr, &argv, envp, null, "xdg-open")) {
@@ -4333,7 +4333,7 @@ fn pumpKittyClipboard(self: *App) void {
                 else
                     null;
                 defer if (decoded) |data| self.alloc.free(data);
-                const owned = self.alloc.dupeZ(u8, decoded orelse text.data) catch break :status .EIO;
+                const owned = self.alloc.dupeSentinel(u8, decoded orelse text.data, 0) catch break :status .EIO;
                 break :status if (self.clipboard.claim(target, owned, self.last_serial)) .DONE else .ENOSYS;
             };
             self.writeKittyClipboardStatus(.write, write.committed.id, write.terminator, status);
@@ -7967,7 +7967,7 @@ test "search match mask includes every visible result" {
 
     try std.testing.expectEqual(@as(usize, 20), mask.items.len);
     try std.testing.expectEqualSlices(bool, &.{ true, true, true, false, true, true, true, false, false, false }, mask.items[0..10]);
-    const no_matches = [_]bool{false} ** 10;
+    const no_matches: [10]bool = @splat(false);
     try std.testing.expectEqualSlices(bool, &no_matches, mask.items[10..20]);
 }
 

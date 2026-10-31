@@ -101,7 +101,7 @@ pub const FaceStyle = enum(u2) {
     }
 };
 
-const style_count = std.meta.fields(FaceStyle).len;
+const style_count = std.enums.values(FaceStyle).len;
 
 /// Immutable Fontconfig results. Rasterizers need independent FreeType,
 /// HarfBuzz, and glyph-cache state, but can safely share these read-only
@@ -126,15 +126,14 @@ pub const Discovery = struct {
                 if (sort_set) |set| c.FcFontSetDestroy(set);
             }
         }
-        inline for (std.meta.fields(FaceStyle)) |field| {
-            const style: FaceStyle = @enumFromInt(field.value);
-            sort_sets_opt[field.value] = try fontSort(family, size_px, style);
+        inline for (comptime std.enums.values(FaceStyle)) |style| {
+            sort_sets_opt[@backingInt(style)] = try fontSort(family, size_px, style);
         }
         var sort_sets: [style_count]*c.FcFontSet = undefined;
         for (sort_sets_opt, 0..) |sort_set, i| sort_sets[i] = sort_set.?;
 
         const alloc = std.heap.smp_allocator;
-        const family_copy = try alloc.dupeZ(u8, family);
+        const family_copy = try alloc.dupeSentinel(u8, family, 0);
         errdefer alloc.free(family_copy);
         const self = try alloc.create(Discovery);
         self.* = .{
@@ -540,7 +539,7 @@ const ClusterFaceKey = struct {
 
 const ClusterFaceContext = struct {
     pub fn hash(_: ClusterFaceContext, key: ClusterFaceKey) u64 {
-        var hasher = std.hash.Wyhash.init(@intFromEnum(key.style));
+        var hasher = std.hash.Wyhash.init(@backingInt(key.style));
         hasher.update(std.mem.sliceAsBytes(key.cps));
         return hasher.final();
     }
@@ -783,8 +782,8 @@ fn loadPrimaryStyle(
     size_px: f64,
     metrics: GlyphMetrics,
 ) ?u16 {
-    const regular = sort_sets[@intFromEnum(FaceStyle.regular)].*.fonts[0];
-    const styled = sort_sets[@intFromEnum(style)].*.fonts[0];
+    const regular = sort_sets[@backingInt(FaceStyle.regular)].*.fonts[0];
+    const styled = sort_sets[@backingInt(style)].*.fonts[0];
     if (samePatternFace(regular, styled)) return null;
 
     const new_face = loadFromPattern(ft_lib, styled, size_px, metrics) catch return null;
@@ -851,7 +850,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     }
     {
         // Preserve integer grid geometry independently of fractional outlines.
-        var primary = try loadFromPattern(ft_lib, sort_sets[@intFromEnum(FaceStyle.regular)].*.fonts[0], @round(size_px), .{});
+        var primary = try loadFromPattern(ft_lib, sort_sets[@backingInt(FaceStyle.regular)].*.fonts[0], @round(size_px), .{});
         errdefer primary.deinit(alloc);
         try faces.append(alloc, primary);
     }
@@ -908,22 +907,20 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     };
 
     var primary_faces: [style_count]u16 = @splat(0);
-    inline for (std.meta.fields(FaceStyle)) |field| {
-        const style: FaceStyle = @enumFromInt(field.value);
+    inline for (comptime std.enums.values(FaceStyle)) |style| {
         if (style == .regular) continue;
         if (loadPrimaryStyle(alloc, &faces, ft_lib, sort_sets, style, size_px, .{
             .cell_width = cell_width,
             .cell_height = cell_height,
             .baseline = baseline,
         })) |idx| {
-            primary_faces[field.value] = idx;
+            primary_faces[@backingInt(style)] = idx;
         }
     }
     var primary_ascii: [style_count]bool = undefined;
-    inline for (std.meta.fields(FaceStyle)) |field| {
-        const style: FaceStyle = @enumFromInt(field.value);
-        const face_idx = primary_faces[@intFromEnum(style)];
-        primary_ascii[field.value] = faceCoversPrintableAscii(&faces.items[face_idx]);
+    inline for (comptime std.enums.values(FaceStyle)) |style| {
+        const face_idx = primary_faces[@backingInt(style)];
+        primary_ascii[@backingInt(style)] = faceCoversPrintableAscii(&faces.items[face_idx]);
     }
 
     log.info("loaded primary face ({s}) cell {d}x{d} baseline {d}, {d} fallback candidates", .{
@@ -931,7 +928,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         cell_width,
         cell_height,
         baseline,
-        sort_sets[@intFromEnum(FaceStyle.regular)].*.nfont - 1,
+        sort_sets[@backingInt(FaceStyle.regular)].*.nfont - 1,
     });
 
     // Sprite metrics. Line thickness follows the font's underline
@@ -1221,7 +1218,7 @@ pub const ClusterCandidates = struct {
                 },
                 .styled_primary => {
                     self.stage = .primary;
-                    const idx = self.font.primary_faces[@intFromEnum(self.style)];
+                    const idx = self.font.primary_faces[@backingInt(self.style)];
                     if (idx != 0 and self.covers(idx)) {
                         if (self.take(idx)) |taken| return taken;
                     }
@@ -1269,7 +1266,7 @@ pub const ClusterCandidates = struct {
 
     fn nextSortCandidate(self: *ClusterCandidates, alloc: std.mem.Allocator, color_only: bool) ?u16 {
         const font = self.font;
-        const sort_set = font.discovery_data.sort_sets[@intFromEnum(self.style)];
+        const sort_set = font.discovery_data.sort_sets[@backingInt(self.style)];
         const nfont: usize = @intCast(sort_set.*.nfont);
         const start: usize = if (self.style == .regular) 1 else 0;
         var i: usize = @max(self.sort_index, start);
@@ -1306,9 +1303,9 @@ pub fn clusterCandidates(self: *Font, cps: []const u21, style: FaceStyle) Cluste
 /// and emoji-presentation signals prefer color faces.
 pub fn faceForCluster(self: *Font, alloc: std.mem.Allocator, cps: []const u21, style: FaceStyle) u16 {
     std.debug.assert(cps.len > 0);
-    const primary_idx = self.primary_faces[@intFromEnum(style)];
+    const primary_idx = self.primary_faces[@backingInt(style)];
     const base = cps[0];
-    if (cps.len == 1 and base >= 0x20 and base < 0x7f and self.primary_ascii[@intFromEnum(style)])
+    if (cps.len == 1 and base >= 0x20 and base < 0x7f and self.primary_ascii[@backingInt(style)])
         return primary_idx;
 
     const info: ClusterInfo = .init(cps);
@@ -1374,7 +1371,7 @@ fn loadFallbackAt(
     style: FaceStyle,
     sort_index: usize,
 ) ?u16 {
-    const pattern = self.discovery_data.sort_sets[@intFromEnum(style)].*.fonts[sort_index];
+    const pattern = self.discovery_data.sort_sets[@backingInt(style)].*.fonts[sort_index];
     const key: SortFaceKey = .{ .style = style, .sort_index = @intCast(sort_index) };
 
     if (self.sort_faces.get(key)) |loaded| {
@@ -1498,7 +1495,7 @@ test "styled primary faces are selected when available" {
     var font: Font = try .init(alloc, "monospace", 16, .{});
     defer font.deinit(alloc);
 
-    const bold_idx = font.primary_faces[@intFromEnum(FaceStyle.bold)];
+    const bold_idx = font.primary_faces[@backingInt(FaceStyle.bold)];
     if (bold_idx == 0) return error.SkipZigTest;
     try std.testing.expectEqual(bold_idx, font.faceForCluster(alloc, &.{'A'}, .bold));
 }

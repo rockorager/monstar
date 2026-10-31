@@ -50,7 +50,7 @@ pub fn release(self: *DragOffer) void {
 
 /// Copies `mime`.
 pub fn append(self: *DragOffer, mime: []const u8, advertised: bool) std.mem.Allocator.Error!void {
-    const owned = try self.alloc.dupeZ(u8, mime);
+    const owned = try self.alloc.dupeSentinel(u8, mime, 0);
     errdefer self.alloc.free(owned);
     try self.items.append(self.alloc, .{ .mime = owned, .advertised = advertised });
 }

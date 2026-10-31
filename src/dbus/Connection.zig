@@ -723,14 +723,14 @@ test "session connection does not wait for a saturated accept queue" {
         _ = linux.close(fd);
         linux.exit(1);
     }
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     while (true) {
         const rc = linux.wait4(pid, &status, 0, null);
         if (linux.errno(rc) == .INTR) continue;
         try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
         break;
     }
-    try std.testing.expectEqual(@as(u32, 0), status);
+    try std.testing.expectEqual(@as(i32, 0), status);
     try std.testing.expect(linux.fcntl(first, linux.F.GETFD, 0) & linux.FD_CLOEXEC != 0);
     const flags: linux.O = @bitCast(@as(u32, @intCast(linux.fcntl(first, linux.F.GETFL, 0))));
     try std.testing.expect(flags.NONBLOCK);
@@ -771,7 +771,7 @@ test "abstract session addresses reject names that exceed sockaddr capacity" {
     defer arena_state.deinit();
     try std.testing.expectError(error.InvalidAddress, connectUnixAddress(
         arena_state.allocator(),
-        "unix:abstract=" ++ "a" ** 108,
+        "unix:abstract=" ++ @as([108]u8, @splat('a')),
     ));
 }
 

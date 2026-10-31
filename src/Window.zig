@@ -1606,7 +1606,7 @@ fn toplevelListener(_: *xdg.Toplevel, event: xdg.Toplevel.Event, self: *Window) 
 }
 
 fn toplevelState(states: anytype, needle: xdg.Toplevel.State) bool {
-    const raw_needle: u32 = @intCast(@intFromEnum(needle));
+    const raw_needle: u32 = @intCast(@backingInt(needle));
     for (states.slice(u32)) |state| {
         if (state == raw_needle) return true;
     }

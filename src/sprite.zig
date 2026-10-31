@@ -58,8 +58,8 @@ const ranges: []const Range = ranges: {
 
     var range_count = 0;
     for (structs) |s| {
-        for (@typeInfo(s).@"struct".decls) |decl| {
-            if (!std.mem.startsWith(u8, decl.name, "draw")) continue;
+        for (@typeInfo(s).@"struct".decl_names) |decl_name| {
+            if (!std.mem.startsWith(u8, decl_name, "draw")) continue;
             range_count += 1;
         }
     }
@@ -67,17 +67,17 @@ const ranges: []const Range = ranges: {
     var r: [range_count]Range = undefined;
     var i = 0;
     for (structs) |s| {
-        for (@typeInfo(s).@"struct".decls) |decl| {
-            if (!std.mem.startsWith(u8, decl.name, "draw")) continue;
+        for (@typeInfo(s).@"struct".decl_names) |decl_name| {
+            if (!std.mem.startsWith(u8, decl_name, "draw")) continue;
 
-            const sep = std.mem.indexOfScalar(u8, decl.name, '_') orelse decl.name.len;
-            const min = std.fmt.parseInt(u21, decl.name[4..sep], 16) catch unreachable;
-            const max = if (sep == decl.name.len)
+            const sep = std.mem.indexOfScalar(u8, decl_name, '_') orelse decl_name.len;
+            const min = std.fmt.parseInt(u21, decl_name[4..sep], 16) catch unreachable;
+            const max = if (sep == decl_name.len)
                 min
             else
-                std.fmt.parseInt(u21, decl.name[sep + 1 ..], 16) catch unreachable;
+                std.fmt.parseInt(u21, decl_name[sep + 1 ..], 16) catch unreachable;
 
-            r[i] = .{ .min = min, .max = max, .draw = @field(s, decl.name) };
+            r[i] = .{ .min = min, .max = max, .draw = @field(s, decl_name) };
             i += 1;
         }
     }
@@ -306,10 +306,10 @@ test "render box drawing sprites" {
 
 test "render decorations" {
     const alloc = std.testing.allocator;
-    inline for (@typeInfo(Decoration).@"enum".fields) |field| {
+    inline for (comptime std.enums.values(Decoration)) |decoration| {
         const g = try renderDecoration(
             alloc,
-            @field(Decoration, field.name),
+            decoration,
             test_metrics,
             15,
         );

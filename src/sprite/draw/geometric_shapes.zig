@@ -139,7 +139,7 @@ pub fn cornerTriangleShade(
     try canvas.fillPath(
         path.wrapped_path,
         .{},
-        @enumFromInt(@intFromEnum(shade)),
+        @fromBackingInt(@intCast(@backingInt(shade))),
     );
 }
 

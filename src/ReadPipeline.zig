@@ -294,7 +294,7 @@ fn parkUntilQuit(self: *ReadPipeline) void {
 
 fn gatherMain(self: *ReadPipeline) void {
     // Best-effort thread name for debugging; matches Ghostty's.
-    _ = linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr("io-gather"), 0, 0, 0);
+    _ = linux.prctl(@backingInt(linux.PR.SET_NAME), @intFromPtr("io-gather"), 0, 0, 0);
 
     while (true) {
         // Claim the next slot. A full ring means parsing is behind:

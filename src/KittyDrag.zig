@@ -193,7 +193,7 @@ pub fn targetChanged(self: *KittyDrag, writer: *std.Io.Writer, index: usize) std
 
 pub fn actionChanged(self: *KittyDrag, writer: *std.Io.Writer, operation: dnd.Operation) std.Io.Writer.Error!void {
     if (self.phase != .dragging) return;
-    try self.event(writer, "t=e:x=2:o={d}", .{@intFromEnum(operation)});
+    try self.event(writer, "t=e:x=2:o={d}", .{@backingInt(operation)});
 }
 
 pub fn dropped(self: *KittyDrag, writer: *std.Io.Writer) std.Io.Writer.Error!void {

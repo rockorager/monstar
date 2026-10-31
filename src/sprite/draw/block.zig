@@ -139,7 +139,7 @@ pub fn blockShade(
         .y = @intCast(y),
         .width = @intCast(w),
         .height = @intCast(h),
-    }, @as(sprite.Color, @enumFromInt(@intFromEnum(shade))));
+    }, @as(sprite.Color, @fromBackingInt(@intCast(@backingInt(shade)))));
 }
 
 pub fn fullBlockShade(
@@ -152,7 +152,7 @@ pub fn fullBlockShade(
         0,
         @intCast(metrics.cell_width),
         @intCast(metrics.cell_height),
-        @as(sprite.Color, @enumFromInt(@intFromEnum(shade))),
+        @as(sprite.Color, @fromBackingInt(@intCast(@backingInt(shade)))),
     );
 }
 
