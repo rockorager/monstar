@@ -32,6 +32,9 @@ const check = Dispatch.check;
 pub const canvas_format = vk.VK_FORMAT_B8G8R8A8_SRGB;
 const canvas_unorm_format = vk.VK_FORMAT_B8G8R8A8_UNORM;
 const slot_count = 2;
+/// Frames whose GPU timestamps stay readable: telemetry reads a frame's
+/// queries when the compositor reports it presented, a few frames later.
+const timed_frames = 16;
 const vert_spv align(4) = @embedFile("shaders/canvas.vert.spv").*;
 const frag_spv align(4) = @embedFile("shaders/canvas.frag.spv").*;
 
@@ -74,7 +77,9 @@ const Slot = struct {
     ops: Buffer = .{},
     staging: Buffer = .{},
     done_value: u64 = 0,
-    timestamps: bool = false,
+    /// Frame whose render timestamps this slot wrote and has not read; 0 if
+    /// none.
+    timed_seq: u64 = 0,
 };
 
 pub const Stats = struct {
@@ -127,6 +132,8 @@ slot_index: usize = 0,
 list: GpuDrawList,
 /// Timeline value of the latest submitted frame; presentation waits on it.
 last_frame_value: u64 = 0,
+/// Number of the latest submitted frame, counting from 1.
+frame_seq: u64 = 0,
 stats: Stats = .{},
 
 /// Load Vulkan and build every size-independent resource. This takes tens of
@@ -474,7 +481,7 @@ fn createStaticResources(self: *VulkanRenderer) !void {
         const query_info: vk.VkQueryPoolCreateInfo = .{
             .sType = vk.VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .queryType = vk.VK_QUERY_TYPE_TIMESTAMP,
-            .queryCount = 2 * slot_count,
+            .queryCount = 4 * timed_frames,
         };
         try check(d.vkCreateQueryPool(self.device, &query_info, null, &self.query_pool));
     }
@@ -751,11 +758,47 @@ pub fn cancelFrame(self: *VulkanRenderer) void {
     self.list.abortFrame();
 }
 
-/// The canvas holding the latest submitted frame, and the timeline value
-/// after which it is complete.
-pub fn presentable(self: *const VulkanRenderer) struct { image: vk.VkImage, width: u32, height: u32, value: u64 } {
+/// The canvas holding the latest submitted frame, the timeline value after
+/// which it is complete, and its frame number (see `frameGpuNs`).
+pub fn presentable(self: *const VulkanRenderer) struct { image: vk.VkImage, width: u32, height: u32, value: u64, seq: u64 } {
     const canvas = self.canvases[self.current];
-    return .{ .image = canvas.image, .width = canvas.width, .height = canvas.height, .value = self.last_frame_value };
+    return .{ .image = canvas.image, .width = canvas.width, .height = canvas.height, .value = self.last_frame_value, .seq = self.frame_seq };
+}
+
+/// First of the four timestamp queries of frame `seq`: render begin and end,
+/// then presentation copy begin and end.
+fn frameQueries(seq: u64) u32 {
+    return @intCast((seq % timed_frames) * 4);
+}
+
+/// Record the presentation copy's timestamps for frame `seq` into `cmd`;
+/// `end` false writes the start, true the end.
+pub fn writeCopyTimestamp(self: *VulkanRenderer, cmd: vk.VkCommandBuffer, seq: u64, end: bool) void {
+    if (self.query_pool == null or seq == 0) return;
+    const base = frameQueries(seq) + 2;
+    if (!end) {
+        self.d.vkCmdResetQueryPool(cmd, self.query_pool, base, 2);
+        self.d.vkCmdWriteTimestamp2(cmd, vk.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, self.query_pool, base);
+    } else {
+        self.d.vkCmdWriteTimestamp2(cmd, vk.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, self.query_pool, base + 1);
+    }
+}
+
+/// GPU time of frame `seq` (rasterization plus its presentation copy) in
+/// ns, or null when unavailable. Valid only for a frame whose copy was
+/// submitted, within `timed_frames` frames. Waits for that GPU work: some
+/// compositors (headless wlroots) report a frame presented before it
+/// finished. Safe on the main thread while the worker records later frames.
+pub fn frameGpuNs(self: *VulkanRenderer, seq: u64) ?u64 {
+    if (self.query_pool == null or seq == 0 or seq + timed_frames <= @atomicLoad(u64, &self.frame_seq, .acquire)) return null;
+    // Value and availability for each of the four queries.
+    var results: [8]u64 = undefined;
+    const flags = vk.VK_QUERY_RESULT_64_BIT | vk.VK_QUERY_RESULT_WAIT_BIT | vk.VK_QUERY_RESULT_WITH_AVAILABILITY_BIT;
+    const rc = self.d.vkGetQueryPoolResults(self.device, self.query_pool, frameQueries(seq), 4, @sizeOf(@TypeOf(results)), &results, 16, flags);
+    if (rc != vk.VK_SUCCESS and rc != vk.VK_NOT_READY) return null;
+    for (0..4) |i| if (results[2 * i + 1] == 0) return null;
+    const ticks = (results[2] -% results[0]) +% (results[6] -% results[4]);
+    return @intFromFloat(@as(f64, @floatFromInt(ticks)) * self.timestamp_period);
 }
 
 /// Rasterize the recorded frame into the canvas.
@@ -825,7 +868,8 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
         .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     try check(d.vkBeginCommandBuffer(cmd, &begin));
-    const query_base: u32 = @intCast(self.slot_index * 2);
+    const seq = self.frame_seq + 1;
+    const query_base = frameQueries(seq);
     if (self.query_pool != null) {
         d.vkCmdResetQueryPool(cmd, self.query_pool, query_base, 2);
         d.vkCmdWriteTimestamp2(cmd, vk.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, self.query_pool, query_base);
@@ -902,7 +946,7 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
     }
     if (self.query_pool != null) {
         d.vkCmdWriteTimestamp2(cmd, vk.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, self.query_pool, query_base + 1);
-        slot.timestamps = true;
+        slot.timed_seq = seq;
     }
     try check(d.vkEndCommandBuffer(cmd));
 
@@ -918,6 +962,7 @@ pub fn submitFrame(self: *VulkanRenderer) !void {
     }
     slot.done_value = value;
     self.last_frame_value = value;
+    @atomicStore(u64, &self.frame_seq, seq, .release);
     self.slot_index = (self.slot_index + 1) % slot_count;
     self.canvas_valid = true;
     self.stats.ops += list.ops.items.len;
@@ -1051,11 +1096,11 @@ fn updateDescriptors(self: *VulkanRenderer, slot: *const Slot) void {
 }
 
 fn readTimestamps(self: *VulkanRenderer, slot: *Slot) void {
-    if (!slot.timestamps) return;
-    slot.timestamps = false;
-    const slot_index = (@intFromPtr(slot) - @intFromPtr(&self.slots[0])) / @sizeOf(Slot);
+    if (slot.timed_seq == 0) return;
+    const seq = slot.timed_seq;
+    slot.timed_seq = 0;
     var values: [2]u64 = undefined;
-    if (self.d.vkGetQueryPoolResults(self.device, self.query_pool, @intCast(slot_index * 2), 2, @sizeOf(@TypeOf(values)), &values, 8, vk.VK_QUERY_RESULT_64_BIT) != vk.VK_SUCCESS) return;
+    if (self.d.vkGetQueryPoolResults(self.device, self.query_pool, frameQueries(seq), 2, @sizeOf(@TypeOf(values)), &values, 8, vk.VK_QUERY_RESULT_64_BIT) != vk.VK_SUCCESS) return;
     const ns: u64 = @intFromFloat(@as(f64, @floatFromInt(values[1] -% values[0])) * self.timestamp_period);
     self.stats.frames += 1;
     self.stats.gpu_ns += ns;

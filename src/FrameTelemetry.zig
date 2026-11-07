@@ -2,7 +2,7 @@
 //!
 //! Each line of the output file is one JSON object. `start` opens the file,
 //! `path` names the effective renderer and presentation path whenever it
-//! changes, `clock` reports the wp_presentation clock, `key` marks wl_keyboard
+//! changes (a Vulkan renderer may start on the CPU path and switch), `clock` reports the wp_presentation clock, `key` marks wl_keyboard
 //! key presses as Monstar receives them, and `frame` describes one committed
 //! frame once the compositor reports it presented or discarded. All times
 //! are CLOCK_MONOTONIC nanoseconds; presentation timestamps use the
@@ -35,13 +35,25 @@ presentation_path: []const u8 = "",
 /// result came back. Monstar renders at most one frame at a time.
 render_start: u64 = 0,
 render_done: u64 = 0,
+/// Reads a committed frame's GPU time; set while a GPU renderer draws.
+gpu_time: ?GpuTime = null,
+/// Token that `gpu_time` takes for the next commit; 0 for none.
+gpu_token: u64 = 0,
 last_presented: u64 = 0,
 next_id: u64 = 1,
 next_slot: usize = 0,
 slots: [slot_count]Slot = @splat(.{}),
 
+/// GPU time in ns of the frame identified by `token`, or null when the
+/// renderer cannot tell. Called when the frame's feedback arrives.
+pub const GpuTime = struct {
+    ctx: *anyopaque,
+    read: *const fn (ctx: *anyopaque, token: u64) ?u64,
+};
+
 const Slot = struct {
     owner: ?*FrameTelemetry = null,
+    gpu_token: u64 = 0,
     feedback: ?*wp.PresentationFeedback = null,
     id: u64 = 0,
     start: u64 = 0,
@@ -114,6 +126,11 @@ pub fn renderFinished(self: *FrameTelemetry) void {
     self.render_done = now();
 }
 
+/// Identify the GPU work of the next commit for `gpu_time`.
+pub fn setGpuToken(self: *FrameTelemetry, token: u64) void {
+    self.gpu_token = token;
+}
+
 pub fn keyPressed(self: *FrameTelemetry, key: u32) void {
     self.print("{{\"ev\":\"key\",\"t\":{d},\"key\":{d}}}\n", .{ now(), key });
 }
@@ -135,10 +152,12 @@ pub fn beforeCommit(self: *FrameTelemetry, surface: *wl.Surface, width: u32, hei
         .commit = now(),
         .width = width,
         .height = height,
+        .gpu_token = self.gpu_token,
     };
     self.next_id += 1;
     self.render_start = 0;
     self.render_done = 0;
+    self.gpu_token = 0;
     const presentation = self.presentation orelse {
         self.writeFrame(slot, .{ .lost = {} });
         return;
@@ -204,9 +223,16 @@ fn presentationListener(_: *wp.Presentation, event: wp.Presentation.Event, self:
 
 fn writeFrame(self: *FrameTelemetry, slot: *const Slot, outcome: Outcome) void {
     var buf: [384]u8 = undefined;
-    const head = std.fmt.bufPrint(&buf, "{{\"ev\":\"frame\",\"id\":{d},\"start\":{d},\"render_done\":{d},\"commit\":{d},\"w\":{d},\"h\":{d}", .{
+    var head = std.fmt.bufPrint(&buf, "{{\"ev\":\"frame\",\"id\":{d},\"start\":{d},\"render_done\":{d},\"commit\":{d},\"w\":{d},\"h\":{d}", .{
         slot.id, slot.start, slot.done, slot.commit, slot.width, slot.height,
     }) catch unreachable;
+    if (outcome == .presented and slot.gpu_token != 0) {
+        if (self.gpu_time) |gpu| {
+            if (gpu.read(gpu.ctx, slot.gpu_token)) |ns| {
+                head = buf[0 .. head.len + (std.fmt.bufPrint(buf[head.len..], ",\"gpu_ns\":{d}", .{ns}) catch unreachable).len];
+            }
+        }
+    }
     const tail = switch (outcome) {
         .presented => |p| tail: {
             const missed = missedRefreshes(slot.start, self.last_presented, p.time, p.refresh);
@@ -255,4 +281,29 @@ test "missed refreshes count only frames pending at the previous presentation" {
     try std.testing.expectEqual(@as(u64, 0), missedRefreshes(p0 - 1, p0, p0 + 3 * r, 0));
     try std.testing.expectEqual(@as(u64, 0), missedRefreshes(p0 - 1, 0, p0 + 3 * r, r));
     try std.testing.expectEqual(@as(u64, 0), missedRefreshes(0, p0, p0 + 3 * r, r));
+}
+
+test "presented frames with a GPU token report the renderer's GPU time" {
+    const rc = linux.memfd_create("telemetry-test", 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(rc));
+    var telemetry: FrameTelemetry = .{ .alloc = std.testing.allocator, .fd = @intCast(rc) };
+    defer _ = linux.close(telemetry.fd);
+    const Fake = struct {
+        fn read(_: *anyopaque, token: u64) ?u64 {
+            return if (token == 7) 512_000 else null;
+        }
+    };
+    var ctx: u8 = 0;
+    telemetry.gpu_time = .{ .ctx = &ctx, .read = Fake.read };
+    const presented: Outcome = .{ .presented = .{ .time = 5, .refresh = 0, .msc = 0, .flags = 0 } };
+    telemetry.writeFrame(&.{ .id = 1, .gpu_token = 7 }, presented);
+    telemetry.writeFrame(&.{ .id = 2, .gpu_token = 7 }, .discarded);
+    telemetry.writeFrame(&.{ .id = 3, .gpu_token = 8 }, presented);
+    telemetry.writeFrame(&.{ .id = 4 }, presented);
+
+    var buf: [1024]u8 = undefined;
+    const n = linux.pread(telemetry.fd, &buf, buf.len, 0);
+    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, ",\"gpu_ns\":512000,\"present\":5") != null);
+    for (0..3) |_| try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "gpu_ns") == null);
 }

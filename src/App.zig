@@ -1833,6 +1833,7 @@ pub fn deinit(self: *App) void {
     if (self.async_raster_loader) |*loader| loader.deinit();
     if (self.async_raster) |*async_raster| async_raster.deinit();
     // The swapchain and VkSurface must go before the wl_surface.
+    if (self.window.telemetry) |telemetry| telemetry.gpu_time = null;
     self.vulkan.deinit(self.alloc);
     self.frame_damage.deinit();
     self.async_job.deinit(self.alloc, &self.kitty_cache);
@@ -7494,6 +7495,7 @@ fn presentVulkanFrame(self: *App, width: u31, height: u31, damage: Window.Damage
         .rects => |rects| rects,
     };
     try presenter.copy(acquired, copy);
+    if (self.window.telemetry) |telemetry| telemetry.setGpuToken(self.vulkan.renderer.?.presentable().seq);
     // The swapchain commits the surface; queue the state that commit carries.
     try self.window.beginExternalCommit(width, height);
     try presenter.present(acquired, switch (damage) {
@@ -7551,9 +7553,15 @@ fn adoptVulkan(self: *App, renderer: *VulkanRenderer) void {
     };
     self.vulkan.renderer = renderer;
     self.vulkan.presenter = presenter;
+    if (self.window.telemetry) |telemetry| telemetry.gpu_time = .{ .ctx = renderer, .read = readVulkanGpuTime };
     self.vulkan.shm_leftover = self.window.buffers.items.len > 0;
     self.async_force_full = true;
     self.frame_damage.invalidate();
+}
+
+fn readVulkanGpuTime(ctx: *anyopaque, token: u64) ?u64 {
+    const renderer: *VulkanRenderer = @ptrCast(@alignCast(ctx));
+    return renderer.frameGpuNs(token);
 }
 
 const VulkanState = struct {

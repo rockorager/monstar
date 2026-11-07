@@ -61,6 +61,44 @@ class MissedRefreshTest(unittest.TestCase):
         self.assertEqual(stats["missed_refreshes"], 3)
         self.assertEqual(stats["refresh_source"], "presentation")
 
+    def test_frame_stats_collects_gpu_time_when_reported(self):
+        events = [frame(1, 1, 5 * MS, 20 * MS, gpu_ns=450_000), frame(2, 2, 30 * MS, 40 * MS),
+                  frame(3, 3, 35 * MS, 60 * MS, gpu_ns=1_250_000)]
+        self.assertEqual(metrics.frame_stats(events, 0, 50 * MS)["gpu_ms"], [0.45, 1.25])
+
+
+def path(t, renderer, presentation):
+    return {"ev": "path", "t": t, "renderer": renderer, "presentation": presentation}
+
+
+class PathTest(unittest.TestCase):
+    VULKAN = {"renderer": "vulkan"}
+    CPU = {"renderer": "cpu"}
+
+    def test_cpu_first_handoff_is_not_a_mismatch(self):
+        cpu = {"renderer": "cpu", "presentation": "dmabuf"}
+        shm = {"renderer": "cpu", "presentation": "shm"}
+        vk = {"renderer": "vulkan", "presentation": "swapchain"}
+        f = metrics.path_mismatches
+        self.assertEqual(f([cpu, shm, vk], self.VULKAN, self.CPU), [])
+        self.assertEqual(f([vk], self.VULKAN, self.CPU), [])
+        # Never reaching Vulkan, or falling back after it, is a mismatch.
+        self.assertEqual(f([cpu], self.VULKAN, self.CPU), [cpu])
+        self.assertEqual(f([vk, cpu], self.VULKAN, self.CPU), [cpu])
+        # Configs without a handoff accept only their own path.
+        self.assertEqual(f([shm, cpu], {"presentation": "dmabuf"}), [shm])
+
+    def test_first_frame_on_expected_path(self):
+        base = 1000 * MS
+        # Feedback for the last CPU frame arrives after the path switch, so
+        # file order alone would misattribute it; commit times decide.
+        events = [path(base, "cpu", "dmabuf"), frame(1, base, base + 1 * MS, base + 10 * MS),
+                  path(base + 12 * MS, "vulkan", "swapchain"), frame(2, base + 5, base + 11 * MS, base + 27 * MS),
+                  frame(3, base + 6, base + 13 * MS, base + 44 * MS), frame(4, base + 7, base + 30 * MS, base + 60 * MS)]
+        self.assertEqual(metrics.first_presented_on(events, self.VULKAN)["id"], 3)
+        self.assertEqual(metrics.first_presented_on(events, self.CPU)["id"], 1)
+        self.assertIsNone(metrics.first_presented_on(events[:2], self.VULKAN))
+
 
 class LatencyTest(unittest.TestCase):
     def test_matches_first_frame_after_receipt_and_skips_unmeasured(self):
@@ -131,7 +169,8 @@ def run_doc(label, id_, w):
         return {"seconds": 10.0, "power": {"package_w": power, "package_j": power * 10},
                 "cpu": {"client_pct": 5.0, "compositor_pct": 3.0, "workload_pct": 1.0},
                 "frames": {"presented": presented, "missed_refreshes": missed, "late_frames": missed,
-                           "interval_ms": intervals, "render_ms": [1.0, 2.0], "commit_to_present_ms": [9.0]},
+                           "interval_ms": intervals, "render_ms": [1.0, 2.0], "gpu_ms": [0.4, 0.6],
+                           "commit_to_present_ms": [9.0]},
                 "memory": {"client": {"rss_kb": 51200}, "compositor": {"rss_kb": 102400}}}
     return {
         "schema": report.SCHEMA, "id": id_,
@@ -147,7 +186,10 @@ def run_doc(label, id_, w):
                    "runs": [run(w, 600, 0, [16.7] * 99 + [33.4]), run(w + 1, 590, 10, [16.7] * 100),
                             run(w - 1, 600, 0, [16.7])]}],
         "startup": [{"key": "s", "compositor": "sway", "config": "cpu", "cache": "warm",
-                     "first_present_ms": [40.0, 50.0, 45.0], "first_commit_ms": [30.0, 40.0, 35.0], "failures": 0}],
+                     "first_present_ms": [40.0, 50.0, 45.0], "first_commit_ms": [30.0, 40.0, 35.0], "failures": 0},
+                    {"key": "v", "compositor": "sway", "config": "vulkan", "cache": "warm",
+                     "first_present_ms": [40.0, 41.0, 42.0], "first_commit_ms": [30.0, 31.0, 32.0],
+                     "handoff_ms": [62.0, None, 60.0], "failures": 0}],
     }
 
 
@@ -166,6 +208,12 @@ class ReportTest(unittest.TestCase):
         self.assertIn("| timbot | sway | cpu | tiled | log-60 | yes (10/1790) |", md)
         self.assertIn("vulkan (no vulkan)", md)
         self.assertIn("| timbot | sway | cpu | warm | 3 | 45.0 |", md)
+        self.assertEqual(s["gpu_ms"]["p50"], 0.4)
+        # Render p50/p99, then GPU p50/p99 per frame.
+        self.assertIn("| 1.00 / 2.00 | 0.40 / 0.60 |", md)
+        # Handoff pools launches that switched; CPU configs have none.
+        self.assertIn("| timbot | sway | vulkan | warm | 3 | 41.0 | 42.0 | 40.0 | 42.0 | 60.0 | 0 |", md)
+        self.assertIn("| timbot | sway | cpu | warm | 3 | 45.0 | 50.0 | 40.0 | 50.0 | — | 0 |", md)
 
     def test_keeps_up_fails_over_threshold(self):
         doc = run_doc("m", "a", 5.0)

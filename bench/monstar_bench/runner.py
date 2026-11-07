@@ -18,7 +18,9 @@ APP_ID = "monstar-bench"
 CONFIGS = {
     "cpu": {"overrides": ["renderer=cpu", "presentation=shm"], "expect": {"renderer": "cpu", "presentation": "shm"}},
     "udmabuf": {"overrides": ["renderer=cpu", "presentation=dmabuf"], "expect": {"renderer": "cpu", "presentation": "dmabuf"}},
-    "vulkan": {"overrides": ["renderer=vulkan"], "expect": {"renderer": "vulkan"}},
+    # vulkan-startup = cpu-first (the default) presents CPU frames until
+    # Vulkan is ready; only frames after that handoff are measured.
+    "vulkan": {"overrides": ["renderer=vulkan"], "expect": {"renderer": "vulkan"}, "handoff_from": {"renderer": "cpu"}},
 }
 STATES = ("tiled", "fullscreen")
 FIRST_FRAME_TIMEOUT = 15.0
@@ -34,7 +36,7 @@ def log(msg):
 
 
 def path_matches(effective, expect):
-    return bool(effective) and all(effective.get(k) == v for k, v in expect.items())
+    return metrics.path_ok(effective, expect)
 
 
 def accepted_override(monstar, override):
@@ -118,9 +120,9 @@ class Bench:
         for name in wanted:
             spec = CONFIGS[name]
             accepted = [o for o in spec["overrides"] if accepted_override(self.monstar, o)]
-            effective, warnings = self.probe_path(accepted)
+            effective, warnings = self.probe_path(accepted, spec)
             entry = {"overrides": accepted, "rejected": [o for o in spec["overrides"] if o not in accepted],
-                     "expect": spec["expect"], "effective": effective}
+                     "expect": spec["expect"], "handoff_from": spec.get("handoff_from"), "effective": effective}
             if path_matches(effective, spec["expect"]):
                 entry["status"] = "ok"
             else:
@@ -130,13 +132,15 @@ class Bench:
             log(f"config {name}: {entry['status']}" + (f" ({entry.get('reason')})" if entry.get("reason") else ""))
         return out
 
-    def probe_path(self, overrides):
+    def probe_path(self, overrides, spec):
         """The path Monstar presents through with `overrides`, and the
         warnings it logged (such as why dma-buf fell back to wl_shm)."""
         run_dir = self.new_run_dir("probe")
         proc, telemetry = self.launch(overrides, ["sleep", "60"], {}, run_dir)
         try:
             frame = self.wait_first_frame(proc, telemetry)
+            if frame and spec.get("handoff_from"):
+                self.wait_handoff(proc, telemetry, spec)
             path = metrics.telemetry_path_info(metrics.read_telemetry(telemetry))[0] if frame else None
         finally:
             self.close_monstar(proc)
@@ -175,6 +179,20 @@ class Bench:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             frame = metrics.first_presented(metrics.read_telemetry(telemetry))
+            if frame:
+                return frame
+            if proc.poll() is not None:
+                return None
+            time.sleep(0.005)
+        return None
+
+    def wait_handoff(self, proc, telemetry, spec, timeout=FIRST_FRAME_TIMEOUT):
+        """The first frame presented through the config's expected path. With
+        `handoff_from` that can follow frames on another path; otherwise it is
+        the first frame when Monstar presents through the right path."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = metrics.first_presented_on(metrics.read_telemetry(telemetry), spec["expect"])
             if frame:
                 return frame
             if proc.poll() is not None:
@@ -333,6 +351,10 @@ class Bench:
         try:
             if not self.wait_first_frame(proc, telemetry):
                 raise RuntimeError(f"Monstar presented no frame; see {run_dir / 'monstar.log'}")
+            # Measurement starts after the handoff, so no CPU frame of a
+            # cpu-first Vulkan start falls inside it.
+            if spec.get("handoff_from") and not self.wait_handoff(proc, telemetry, spec):
+                raise RuntimeError(f"Monstar never switched to {spec['expect']}; see {run_dir / 'monstar.log'}")
             win = self.apply_state(state)
             time.sleep(workload.settle)
             sample = self.measure(proc, workload, telemetry, run_dir, gate)
@@ -353,7 +375,7 @@ class Bench:
                      for ev in events if ev["ev"] == "path"]
             if clock not in (None, metrics.CLOCK_MONOTONIC):
                 sample["warning"] = f"presentation clock {clock} is not CLOCK_MONOTONIC; timings are not comparable"
-            mismatched = [p for p in paths if not path_matches(p, spec["expect"])]
+            mismatched = metrics.path_mismatches(paths, spec["expect"], spec.get("handoff_from"))
             if mismatched:
                 sample["paths"] = paths
                 sample["warning"] = f"Monstar presented through {mismatched[0]}, not {spec['expect']}"
@@ -375,7 +397,7 @@ class Bench:
 
     def startup(self, config, cache_state, launches):
         spec = self.results["configs"][config]
-        samples, first_commit, failures = [], [], 0
+        samples, first_commit, handoff, failures = [], [], [], 0
         if cache_state == "warm":
             launches += 1  # the first launch warms the cache and is dropped
         for i in range(launches):
@@ -387,6 +409,7 @@ class Bench:
             proc, telemetry = self.launch(spec["overrides"], ["bash", "--noprofile", "--norc", "-i"],
                                           {"PS1": "monstar-bench$ ", "HISTFILE": "/dev/null"}, run_dir)
             frame = self.wait_first_frame(proc, telemetry)
+            switched = self.wait_handoff(proc, telemetry, spec) if frame and spec.get("handoff_from") else None
             self.close_monstar(proc)
             time.sleep(0.5)
             if cache_state == "warm" and i == 0:
@@ -396,7 +419,12 @@ class Bench:
                 continue
             samples.append(round((frame["present"] - t0) / 1e6, 3))
             first_commit.append(round((frame["commit"] - t0) / 1e6, 3))
-        return {"first_present_ms": samples, "first_commit_ms": first_commit, "failures": failures}
+            if spec.get("handoff_from"):
+                handoff.append(round((switched["present"] - t0) / 1e6, 3) if switched else None)
+        out = {"first_present_ms": samples, "first_commit_ms": first_commit, "failures": failures}
+        if spec.get("handoff_from"):
+            out["handoff_ms"] = handoff
+        return out
 
     # Matrix ------------------------------------------------------------------
 

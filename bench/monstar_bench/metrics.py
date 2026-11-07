@@ -145,6 +145,42 @@ def first_presented(events):
     return None
 
 
+def path_ok(path, want):
+    return bool(path) and all(path.get(k) == v for k, v in want.items())
+
+
+def path_mismatches(paths, expect, handoff_from=None):
+    """Paths in `paths` (in order) that break `expect`. A config with
+    `handoff_from` may present through that path until it reaches the
+    expected one: Vulkan's cpu-first startup shows CPU frames meanwhile. A run
+    that never reaches it mismatches with every path."""
+    out, waiting, arrived = [], [], False
+    for path in paths:
+        if path_ok(path, expect):
+            arrived = True
+        elif handoff_from and not arrived and path_ok(path, handoff_from):
+            waiting.append(path)
+        else:
+            out.append(path)
+    return out if arrived else waiting + out
+
+
+def first_presented_on(events, expect):
+    """First presented frame committed while Monstar's path matched `expect`
+    (the Vulkan handoff with cpu-first startup). Monstar logs a `path` event
+    just before the first commit on a new path; frame lines follow later, when
+    the compositor's feedback arrives."""
+    switches = [(ev["t"], path_ok(ev, expect)) for ev in events if ev["ev"] == "path"]
+    best = None
+    for ev in events:
+        if ev["ev"] != "frame" or "present" not in ev:
+            continue
+        on = [ok for t, ok in switches if t <= ev["commit"]]
+        if on and on[-1] and (best is None or ev["commit"] < best["commit"]):
+            best = ev
+    return best
+
+
 def missed_refreshes(start, previous, present, refresh):
     """Mirror of FrameTelemetry.missedRefreshes, for compositors that report
     refresh 0 (headless outputs): refreshes skipped before `present` when the
@@ -162,7 +198,7 @@ def frame_stats(events, t0, t1, mode_refresh_ns=None):
     refresh = statistics.median(reported) if reported else (mode_refresh_ns or 0)
     source = "presentation" if reported else ("output-mode" if mode_refresh_ns else None)
     missed = 0
-    intervals, render, latency = [], [], []
+    intervals, render, latency, gpu = [], [], [], []
     previous = None
     for ev in presented:
         if previous is not None:
@@ -174,6 +210,8 @@ def frame_stats(events, t0, t1, mode_refresh_ns=None):
         if ev["start"] and ev["render_done"]:
             render.append((ev["render_done"] - ev["start"]) / 1e6)
         latency.append((ev["present"] - ev["commit"]) / 1e6)
+        if ev.get("gpu_ns") is not None:
+            gpu.append(ev["gpu_ns"] / 1e6)
         previous = ev
     late = sum(1 for a, b in zip(presented, presented[1:])
                if (b.get("missed", 0) if reported else missed_refreshes(b["start"], a["present"], b["present"], refresh)))
@@ -187,6 +225,7 @@ def frame_stats(events, t0, t1, mode_refresh_ns=None):
         "refresh_source": source,
         "interval_ms": [round(x, 3) for x in intervals],
         "render_ms": [round(x, 3) for x in render],
+        "gpu_ms": [round(x, 3) for x in gpu],
         "commit_to_present_ms": [round(x, 3) for x in latency],
         "size": [presented[-1]["w"], presented[-1]["h"]] if presented else None,
     }

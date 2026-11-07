@@ -60,12 +60,17 @@ Configs are selected with `-o` overrides that every rendering path honors:
 | --- | --- | --- |
 | cpu | `renderer=cpu`, `presentation=shm` | CPU raster, wl_shm |
 | udmabuf | `renderer=cpu`, `presentation=dmabuf` | CPU raster, linux-dmabuf |
-| vulkan | `renderer=vulkan` | Vulkan renderer |
+| vulkan | `renderer=vulkan` | Vulkan renderer, swapchain |
 
 The tool first checks which overrides the build accepts, then launches it and
 reads the renderer and presentation path Monstar reports. A config whose path
 does not match (an unknown key, or a fallback) is skipped and listed with the
 reason. Builds without the keys run only the path they present through.
+
+With the default `vulkan-startup = cpu-first`, the vulkan config shows CPU
+frames until Vulkan is ready and then switches to the swapchain. That handoff
+is expected: steady-state measurement starts only after it, and startup
+records both the first frame and the handoff (the first Vulkan frame).
 
 Each config runs tiled and fullscreen with these workloads (pins in
 `monstar_bench/pins.py`, LazyVim plugin commits in `pins/lazy-lock.json`):
@@ -106,6 +111,8 @@ times in CLOCK_MONOTONIC ns:
 {"ev":"key","t":...,"key":30}
 {"ev":"frame","id":2,"start":...,"render_done":...,"commit":...,"w":1276,"h":697,
  "present":...,"refresh":16666666,"msc":1234,"flags":7,"missed":0}
+{"ev":"frame","id":3,"start":...,"render_done":...,"commit":...,"w":1276,"h":697,"gpu_ns":512000,
+ "present":...,"refresh":16666666,"msc":1235,"flags":15,"missed":0}
 {"ev":"frame","id":1,"start":...,"render_done":...,"commit":...,"w":800,"h":600,"discarded":true}
 ```
 
@@ -114,7 +121,9 @@ result came back, `commit` the `wl_surface.commit`, and `present`/`refresh`/
 `msc`/`flags` the `wp_presentation_feedback.presented` event. `missed` counts
 refreshes skipped before this frame while it was already rendering when the
 previous frame reached the screen; a continuous stream should advance one
-refresh per frame. Renderers other than the CPU path must call
+refresh per frame. `gpu_ns`, present only for GPU-rendered frames that were
+presented, is the frame's GPU time from timestamp queries: rasterization plus
+the copy into the presented buffer. Renderers other than the CPU path must call
 `FrameTelemetry.notePath` with their actual renderer and presentation and use
 the same hooks (`renderSubmitted`, `renderFinished`, `beforeCommit`).
 
@@ -129,7 +138,8 @@ session  {compositor, version, mode (own|nested|headless), pid,
           display {output, width, height, refresh_hz, scale, make, model}}
 monstar  {binary, version, commit, dirty}
 pins, cache (system tool paths)
-configs  {cpu|udmabuf|vulkan: {status ok|skipped, reason, overrides, rejected, expect, effective}}
+configs  {cpu|udmabuf|vulkan: {status ok|skipped, reason, overrides, rejected, expect, handoff_from,
+          effective}}
 settings {repetitions, states, workloads, skipped_workloads, input, durations_s,
           startup_launches, baseline_s, font, keeps_up_max_missed_pct}
 measurements {name: {status ok|unavailable|fake|unused, privileged, source}}
@@ -137,14 +147,15 @@ baseline {runs [{package_w, package_j, seconds, compositor_pct}], summary}
 cells [{key "compositor/config/state/workload", compositor, config, state, workload,
         duration_s, errors [], runs [RUN], summary SUMMARY}]
 startup [{key, compositor, config, cache cold|warm, first_present_ms [], first_commit_ms [],
-          failures, summary}]
+          handoff_ms [] (configs with handoff_from; null where no handoff happened), failures,
+          summary}]
 ```
 
 Each `RUN` keeps raw samples: `seconds`; `power {package_w, package_j,
 dgpu_w?, gpu_busy_pct?}`; `cpu {client_pct, compositor_pct, workload_pct}` (%
 of one core); `frames {committed, presented, discarded, missed_refreshes,
 late_frames, refresh_ms, refresh_source, interval_ms [], render_ms [],
-commit_to_present_ms [], size}`; `memory {client, compositor: {rss_kb, pss_kb,
+gpu_ms [], commit_to_present_ms [], size}`; `memory {client, compositor: {rss_kb, pss_kb,
 peak_rss_kb}}`; `gpu {client_engine_ms, client_memory_kb}` from DRM fdinfo;
 `latency {key_to_present_ms [], key_to_commit_ms [], key_to_receive_ms [],
 key_to_flip_ms [] | null, keys, unmatched, input}`; `flood {wall_s, bytes,
@@ -153,7 +164,7 @@ mb_per_s, complete}`; `window`, `effective`, `kms_flips`, `kms_fbs`,
 
 `SUMMARY` holds medians with min/max across repetitions (`package_w`,
 `package_delta_w`, `client_cpu_pct`, ...), pooled percentiles (`frame_interval_ms`,
-`render_ms`, `latency.key_to_present_ms`, ...), `missed_refreshes`,
+`render_ms`, `gpu_ms`, `latency.key_to_present_ms`, ...), `missed_refreshes`,
 `missed_pct` and `keeps_up` (missed ≤ 1% of frames). Summaries are recomputed
 from the raw runs by `report` and `merge`. A merged file is
 `{"schema": "monstar-bench-merged/1", "runs": [result, ...]}`, deduplicated by

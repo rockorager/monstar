@@ -55,6 +55,7 @@ def summarize_cell(cell, baseline_w):
         "missed_pct": round(100 * missed / (presented + missed), 3) if presented + missed else None,
         "frame_interval_ms": dist(pooled("frames", "interval_ms")),
         "render_ms": dist(pooled("frames", "render_ms")),
+        "gpu_ms": dist(pooled("frames", "gpu_ms")),
         "commit_to_present_ms": dist(pooled("frames", "commit_to_present_ms")),
         "client_rss_mb": spread(kb_to_mb(col("memory", "client", "rss_kb"))),
         "client_pss_mb": spread(kb_to_mb(col("memory", "client", "pss_kb"))),
@@ -130,6 +131,8 @@ def finalize(result):
     for entry in result.get("startup", []):
         entry["summary"] = {"first_present_ms": dist(entry["first_present_ms"]),
                             "first_commit_ms": dist(entry["first_commit_ms"])}
+        if "handoff_ms" in entry:
+            entry["summary"]["handoff_ms"] = dist([v for v in entry["handoff_ms"] if v is not None])
     return result
 
 
@@ -243,10 +246,10 @@ def render_markdown(doc):
     out.append("Medians across repetitions; frame and latency percentiles pool every frame or key. "
                "ΔW is package power above the idle-system baseline.\n")
     header = ["Machine", "Compositor", "Config", "State", "Workload", "Keeps up (missed/frames)", "p99 frame ms",
-              "Pkg W", "ΔW", "dGPU W", "Client CPU %", "Comp CPU %", "Render p50/p99 ms", "Key→screen p50/p99 ms",
+              "Pkg W", "ΔW", "dGPU W", "Client CPU %", "Comp CPU %", "Render p50/p99 ms", "GPU p50/p99 ms", "Key→screen p50/p99 ms",
               "Client RSS MB", "Notes"]
     out.append("| " + " | ".join(header) + " |")
-    out.append("|" + "|".join(["---"] * 5 + ["---:"] * 10 + ["---"]) + "|")
+    out.append("|" + "|".join(["---"] * 5 + ["---:"] * 11 + ["---"]) + "|")
     for run in runs:
         for cell in run.get("cells", []):
             s = cell.get("summary") or {}
@@ -254,18 +257,22 @@ def render_markdown(doc):
             row = [machine_name(run), cell["compositor"], cell["config"], cell["state"], cell["workload"],
                    keeps_up(s), fmt(_get(s, "frame_interval_ms", "p99")), fmt(s.get("package_w"), 2),
                    fmt(s.get("package_delta_w"), 2), fmt(s.get("dgpu_w"), 2), fmt(s.get("client_cpu_pct")),
-                   fmt(s.get("compositor_cpu_pct")), pair(s.get("render_ms"), digits=2), pair(lat),
+                   fmt(s.get("compositor_cpu_pct")), pair(s.get("render_ms"), digits=2),
+                   pair(s.get("gpu_ms"), digits=2), pair(lat),
                    fmt(s.get("client_rss_mb"), 0), notes_for(cell, s)]
             out.append("| " + " | ".join(row) + " |")
     startup = [(run, e) for run in runs for e in run.get("startup", [])]
     if startup:
         out.append("\n### Startup (launch to first presented frame)\n")
-        out.append("| Machine | Compositor | Config | Cache | n | p50 ms | p90 ms | min ms | max ms | failed |")
-        out.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|")
+        out.append("Handoff is launch to the first frame through the config's own path: a cpu-first Vulkan "
+                   "start shows CPU frames until then.\n")
+        out.append("| Machine | Compositor | Config | Cache | n | p50 ms | p90 ms | min ms | max ms | Handoff p50 ms "
+                   "| failed |")
+        out.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
         for run, e in startup:
             d = _get(e, "summary", "first_present_ms")
             vals = [fmt(d and d["p50"]), fmt(d and d["p90"]), fmt(d and min(e["first_present_ms"])),
-                    fmt(d and d["max"])]
+                    fmt(d and d["max"]), fmt(_get(e, "summary", "handoff_ms", "p50"))]
             out.append(f"| {machine_name(run)} | {e['compositor']} | {e['config']} | {e['cache']} | "
                        f"{len(e['first_present_ms'])} | " + " | ".join(vals) + f" | {e['failures']} |")
     return "\n".join(out) + "\n"

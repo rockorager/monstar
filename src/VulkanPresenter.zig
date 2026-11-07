@@ -240,6 +240,7 @@ pub fn copy(self: *VulkanPresenter, acquired: Acquired, rects_or_full: ?[]const 
         .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     try check(d.vkBeginCommandBuffer(cmd, &begin));
+    r.writeCopyTimestamp(cmd, canvas.seq, false);
     const full = rects_or_full == null or acquired.age == 0;
     r.barrier(cmd, &.{.{
         .sType = vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
@@ -288,6 +289,7 @@ pub fn copy(self: *VulkanPresenter, acquired: Acquired, rects_or_full: ?[]const 
         .image = self.images[index],
         .subresourceRange = VulkanRenderer.color_range,
     }});
+    r.writeCopyTimestamp(cmd, canvas.seq, true);
     try check(d.vkEndCommandBuffer(cmd));
 
     const acquire_slot = (self.acquire_index - 1) % self.acquire_semaphores.len;
