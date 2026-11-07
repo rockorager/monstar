@@ -16,6 +16,7 @@ const wayland = @import("wayland");
 const wl = wayland.client.wl;
 const zwp = wayland.client.zwp;
 const vt = @import("ghostty-vt");
+const wuffs = @import("wuffs");
 const Clipboard = @import("Clipboard.zig");
 const KittyClipboard = @import("KittyClipboard.zig");
 const KittyDrag = @import("KittyDrag.zig");
@@ -859,31 +860,18 @@ pub fn init(
 }
 
 fn decodePng(alloc: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.sys.Image {
-    var width: c_int = 0;
-    var height: c_int = 0;
-    var channels: c_int = 0;
-    const decoded = c.stbi_load_from_memory(
-        data.ptr,
-        @intCast(data.len),
-        &width,
-        &height,
-        &channels,
-        4,
-    ) orelse return error.InvalidData;
-    defer c.stbi_image_free(decoded);
-
-    if (width <= 0 or height <= 0) return error.InvalidData;
-    const pixel_count = std.math.mul(usize, @intCast(width), @intCast(height)) catch return error.InvalidData;
-    const len = std.math.mul(usize, pixel_count, 4) catch return error.InvalidData;
-    const out = try alloc.alloc(u8, len);
-    errdefer alloc.free(out);
-
-    @memcpy(out, decoded[0..len]);
-    return .{
-        .width = @intCast(width),
-        .height = @intCast(height),
-        .data = out,
+    // Kitty's graphics protocol limits both image dimensions to 10,000
+    // pixels. Check IHDR before Wuffs allocates the pixels.
+    if (data.len >= 24) {
+        const width = std.mem.readInt(u32, data[16..20], .big);
+        const height = std.mem.readInt(u32, data[20..24], .big);
+        if (width > 10_000 or height > 10_000) return error.InvalidData;
+    }
+    const decoded = wuffs.png.decode(alloc, data) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.WuffsError, error.Overflow => return error.InvalidData,
     };
+    return .{ .width = decoded.width, .height = decoded.height, .data = decoded.data };
 }
 
 /// Window scale delegate: reload the font at the physical pixel size so
@@ -3354,7 +3342,7 @@ test "kitty PNG direct transmit installs decoded RGBA image" {
     var command: std.Io.Writer.Allocating = .init(alloc);
     defer command.deinit();
     try command.writer.print("\x1b_Ga=T,f=100,i=7;{s}\x1b\\", .{
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=",
     });
 
     var stream = term.vtStream();

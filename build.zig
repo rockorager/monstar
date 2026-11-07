@@ -89,7 +89,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Font stack: fontconfig (discovery) + FreeType (rasterization) +
-    // HarfBuzz (shaping) + stb image helpers, imported through one
+    // HarfBuzz (shaping) + stb image resizing, imported through one
     // translated C header.
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
@@ -128,6 +128,13 @@ pub fn build(b: *std.Build) void {
             "uucode",
             ghostty_vt.import_table.get("uucode") orelse
                 @panic("ghostty-vt does not provide uucode"),
+        );
+        // ghostty-vt links Wuffs for Kitty graphics but leaves its PNG
+        // decoder unset in library builds; Monstar installs it.
+        root_module.addImport(
+            "wuffs",
+            ghostty_vt.import_table.get("wuffs") orelse
+                @panic("ghostty-vt does not provide wuffs"),
         );
 
         const terminfo_gen = b.addExecutable(.{
@@ -172,8 +179,11 @@ pub fn build(b: *std.Build) void {
         // Ghostty uses LLVM for the same reason.
         .use_llvm = true,
     });
+    // C dependencies such as Ghostty's Wuffs build as one section per file
+    // otherwise, so the linker kept their unused decoders.
+    exe.link_function_sections = true;
+    exe.link_data_sections = true;
     root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image_resize.c") });
-    root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image.c") });
 
     b.installArtifact(exe);
     b.installFile("dist/dev.rockorager.monstar.desktop", "share/applications/dev.rockorager.monstar.desktop");
