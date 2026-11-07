@@ -32,6 +32,11 @@ FONT_ZIP = ("https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304
             "6f6376c6ed2960ea8a963cd7387ec9d76e3f629125bc33d1fdcd7eb7012f7bbf")
 FONT_FILES = ("fonts/ttf/JetBrainsMono-Regular.ttf", "fonts/ttf/JetBrainsMono-Bold.ttf",
               "fonts/ttf/JetBrainsMono-Italic.ttf", "fonts/ttf/JetBrainsMono-BoldItalic.ttf")
+# Fallback for the half-width katakana of tte's matrix effect, which
+# JetBrains Mono lacks (Monstar embeds Nerd Font symbols itself).
+FALLBACK_FONT_ZIP = ("https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/11_NotoSansMonoCJKjp.zip",
+                     "6c8faf475ce78fa37486dd5d8920e4bb4450b1b0f3c497edf3ba2d25cf52ab78")
+FALLBACK_FONT_FILES = ("NotoSansMonoCJKjp-Regular.otf",)
 FONT_FAMILY = "JetBrains Mono"
 FONT_SIZE = "12"
 
@@ -56,6 +61,7 @@ def manifest():
         "tte_effect": TTE_EFFECT,
         "omarchy": OMARCHY_COMMIT,
         "font": FONT_ZIP[1],
+        "fallback_font": FALLBACK_FONT_ZIP[1],
         "corpus": [CORPUS_SEED, CORPUS_LINES, CORPUS_COLUMNS, FLOOD_COPIES],
         "btop_update_ms": BTOP_UPDATE_MS,
     }

@@ -163,17 +163,17 @@ def install_file(url, sha, dest):
 
 
 def install_font(cache):
-    url, sha = pins.FONT_ZIP
-    data = fetch(url, sha)
     shutil.rmtree(cache.fonts, ignore_errors=True)
     cache.fonts.mkdir(parents=True)
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        for name in pins.FONT_FILES:
-            (cache.fonts / Path(name).name).write_bytes(archive.read(name))
+    for (url, sha), files in ((pins.FONT_ZIP, pins.FONT_FILES), (pins.FALLBACK_FONT_ZIP, pins.FALLBACK_FONT_FILES)):
+        with zipfile.ZipFile(io.BytesIO(fetch(url, sha))) as archive:
+            for name in files:
+                (cache.fonts / Path(name).name).write_bytes(archive.read(name))
+    # Only the pinned fonts: no system configuration or fonts, so fallback
+    # glyphs come from the same files on every machine.
     cache.fontconfig.write_text(f"""<?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
-  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
   <dir>{cache.fonts}</dir>
   <cachedir>{cache.root / "fontconfig-cache"}</cachedir>
 </fontconfig>

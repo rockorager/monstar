@@ -94,6 +94,11 @@ during measurement. Each repetition starts with an idle-system baseline (no
 Monstar window) for ΔW. Startup runs separately: launch to first presented
 frame, cold (page cache dropped) and warm, tiled.
 
+Monstar runs with JetBrains Mono 12 and a private fontconfig that sees only
+the pinned fonts: JetBrains Mono, plus Noto Sans Mono CJK JP as the fallback
+for the half-width katakana of tte's `matrix` effect. Nerd Font icons come from
+Monstar's embedded symbols font. No system fonts are used.
+
 Keys come from uinput (through libinput) in your own session, and from the
 compositor's virtual-keyboard protocol in nested/headless sessions. Both use a
 US layout.
