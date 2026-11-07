@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -81,7 +82,7 @@ class Bench:
         self.monstar = monstar
         self.out_path = out_path
         self.results = results
-        self.work = Path(tempfile.mkdtemp(prefix="monstar-bench-", dir=session.env.get("XDG_RUNTIME_DIR")))
+        self.work = Path(tempfile.mkdtemp(prefix="monstar-bench-"))
         self.gpus = sensors.gpus()
         self.sampler = sensors.GpuSampler(self.gpus)
         self.keyboard = None
@@ -268,8 +269,20 @@ class Bench:
         rapl0 = self.helper.call("rapl")
         t0 = rapl0["t"]
         sent = []
+        player = None
         if workload.schedule:
-            sent = keys.play(self.keyboard, workload.schedule(workload.duration), start_ns=t0)
+            # Typing runs beside the sampling loop so KMS planes are sampled
+            # during input-driven workloads too.
+            failure = []
+
+            def type_keys():
+                try:
+                    sent.extend(keys.play(self.keyboard, workload.schedule(workload.duration), start_ns=t0))
+                except Exception as exc:  # re-raised on the measuring thread
+                    failure.append(exc)
+
+            player = threading.Thread(target=type_keys)
+            player.start()
         end = t0 + int(workload.duration * 1e9)
         next_plane = t0
         while True:
@@ -283,8 +296,19 @@ class Bench:
                 planes.append(self.helper.call("planes")["cards"])
                 next_plane = now + int(workload.duration * 1e9 / KMS_PLANE_SAMPLES)
             time.sleep(0.005 if workload.until_done else min(0.05, max(0.0, (end - now) / 1e9)))
+        if player:
+            player.join()
         rapl1 = self.helper.call("rapl")
         t1 = rapl1["t"]
+        error = failure[0] if player and failure else None
+        if proc.poll() is not None and not result_file.exists():
+            error = RuntimeError(f"Monstar exited during the measurement (status {proc.returncode}); "
+                                 f"see {run_dir / 'monstar.log'}")
+        if error:
+            if self.kms_flips:
+                self.helper.call("vblank_stop")
+            self.sampler.stop()
+            raise error
         family1 = metrics.children(client)
         ticks1 = self.snapshot([client, comp] + family1)
         gpu = self.sampler.stop()
