@@ -85,7 +85,7 @@ Each config runs tiled and fullscreen with these workloads (pins in
 | nvim-insert | same, at line 6000 | a C line typed at ~9 keys/s; latency |
 | screensaver | Omarchy's tte loop (Omarchy 7644b56, tte 0.15.0, `matrix`) | itself |
 | log-10/60/500 | colored log lines at a fixed rate | itself |
-| cat-flood | `cat` of the corpus 64 times (~440 MB) | until done |
+| cat-flood | `cat` of the corpus 256 times (~1.8 GB) | until done |
 
 Cells are 10 s after a settle period; workloads that start themselves wait on a
 FIFO so measurement begins in steady state. Workloads run in a private network

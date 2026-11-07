@@ -39,8 +39,9 @@ FONT_SIZE = "12"
 CORPUS_SEED = 1
 CORPUS_LINES = 20000
 CORPUS_COLUMNS = 180
-# The flood cats the corpus this many times (about 440 MB).
-FLOOD_COPIES = 64
+# The flood cats the corpus this many times (about 1.8 GB, ~10 s at the
+# ~180 MB/s a Ryzen 7640HS laptop reaches; 440 MB lasted only 2.4 s).
+FLOOD_COPIES = 256
 
 BTOP_UPDATE_MS = 100
 
