@@ -1,5 +1,6 @@
-//! A wl_shm-backed pixel buffer and its mapped pool storage. Rows are padded
-//! to `stride_alignment` bytes.
+//! A CPU-writable pixel buffer backed by a memfd sealed against shrinking.
+//! The compositor receives it as a LINEAR dma-buf when Udmabuf can wrap the
+//! memfd, and as wl_shm otherwise. Both paths share one padded row layout.
 
 const ShmBuffer = @This();
 
@@ -8,6 +9,7 @@ const linux = std.os.linux;
 const posix = std.posix;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
+const Udmabuf = @import("Udmabuf.zig");
 
 /// Row pitch alignment in bytes. GPUs import LINEAR buffers only with aligned
 /// pitches; 256 bytes satisfies amdgpu, the strictest common driver. wl_shm
@@ -18,6 +20,10 @@ wl_buffer: *wl.Buffer,
 pool: *wl.ShmPool,
 fd: posix.fd_t,
 data: []align(std.heap.page_size_min) u8,
+/// Null presents through wl_shm only.
+udmabuf: ?*Udmabuf,
+/// dma-buf view of all of `data`, recreated when the pool grows.
+udmabuf_fd: ?posix.fd_t,
 width: u31,
 height: u31,
 /// Row pitch in pixels; at least `width`.
@@ -37,6 +43,7 @@ pub const Format = enum {
 pub fn create(
     alloc: std.mem.Allocator,
     shm: *wl.Shm,
+    udmabuf: ?*Udmabuf,
     width: u31,
     height: u31,
     format: Format,
@@ -45,9 +52,12 @@ pub fn create(
     const dimensions = try bufferDimensions(width, height);
     const capacity = try grownBufferCapacity(0, dimensions.size);
 
-    const fd = try posix.memfd_create("monstar-shm", linux.MFD.CLOEXEC);
+    const fd = try posix.memfd_create("monstar-shm", linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
     errdefer _ = linux.close(fd);
     if (linux.errno(linux.ftruncate(fd, @intCast(capacity))) != .SUCCESS) return error.ShmFailed;
+    // udmabuf requires this seal, and it keeps a compositor mapping of the
+    // pool from faulting: the pool only ever grows.
+    if (linux.errno(linux.fcntl(fd, linux.F.ADD_SEALS, linux.F.SEAL_SHRINK)) != .SUCCESS) return error.ShmFailed;
 
     const data = try posix.mmap(
         null,
@@ -61,7 +71,11 @@ pub fn create(
 
     const pool = try shm.createPool(fd, @intCast(capacity));
     errdefer pool.destroy();
-    const wl_buffer = try pool.createBuffer(0, width, height, dimensions.stride, shmFormat(format));
+    const udmabuf_fd = if (udmabuf) |value| value.wrap(fd, capacity) else null;
+    errdefer if (udmabuf_fd) |value| {
+        _ = linux.close(value);
+    };
+    const wl_buffer = try createWlBuffer(pool, udmabuf, udmabuf_fd, width, height, dimensions.stride, format);
     errdefer wl_buffer.destroy();
 
     const self = try alloc.create(ShmBuffer);
@@ -70,6 +84,8 @@ pub fn create(
         .pool = pool,
         .fd = fd,
         .data = data,
+        .udmabuf = udmabuf,
+        .udmabuf_fd = udmabuf_fd,
         .width = width,
         .height = height,
         .stride = dimensions.stridePixels(),
@@ -100,9 +116,12 @@ pub fn reshape(self: *ShmBuffer, width: u31, height: u31, format: Format) !void 
         self.pool.resize(@intCast(capacity));
         posix.munmap(self.data);
         self.data = data;
+        // A udmabuf covers a fixed range; the grown tail needs a new one.
+        if (self.udmabuf_fd) |fd| _ = linux.close(fd);
+        self.udmabuf_fd = if (self.udmabuf) |udmabuf| udmabuf.wrap(self.fd, capacity) else null;
     }
 
-    const wl_buffer = try self.pool.createBuffer(0, width, height, dimensions.stride, shmFormat(format));
+    const wl_buffer = try createWlBuffer(self.pool, self.udmabuf, self.udmabuf_fd, width, height, dimensions.stride, format);
     wl_buffer.setListener(*ShmBuffer, bufferListener, self);
     self.wl_buffer.destroy();
     self.wl_buffer = wl_buffer;
@@ -118,7 +137,25 @@ pub fn destroy(self: *ShmBuffer, alloc: std.mem.Allocator) void {
     self.pool.destroy();
     posix.munmap(self.data);
     _ = linux.close(self.fd);
+    if (self.udmabuf_fd) |fd| _ = linux.close(fd);
     alloc.destroy(self);
+}
+
+/// Prefer the dma-buf view of the pool and fall back to wl_shm when there is
+/// none or the compositor cannot import it.
+fn createWlBuffer(
+    pool: *wl.ShmPool,
+    udmabuf: ?*Udmabuf,
+    udmabuf_fd: ?posix.fd_t,
+    width: u31,
+    height: u31,
+    stride: i32,
+    format: Format,
+) !*wl.Buffer {
+    if (udmabuf_fd) |fd| {
+        if (udmabuf.?.createBuffer(fd, width, height, @intCast(stride), format)) |buffer| return buffer;
+    }
+    return pool.createBuffer(0, width, height, stride, shmFormat(format));
 }
 
 /// Rows of `stride` pixels; columns at and beyond `width` are not displayed.

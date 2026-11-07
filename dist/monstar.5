@@ -86,11 +86,13 @@ Visual and interaction settings apply to the running window.
 The
 .BR command ,
 .BR linux-cgroup ,
+.BR presentation ,
 .BR scrollback-limit ,
 and
 .B term
 settings describe resources created at startup and do not replace or move an
-existing child or resize existing scrollback storage.
+existing child, change how the open window presents frames, or resize existing
+scrollback storage.
 .SH GENERAL SETTINGS
 .TP
 .BI app-id " = string"
@@ -123,6 +125,19 @@ With
 .BR always ,
 Monstar falls back to its inherited cgroup if the session bus or systemd scope
 creation is unavailable.
+.TP
+.BI presentation " = auto|shm|dmabuf"
+Choose how rendered frames reach the compositor.
+The default,
+.BR auto ,
+shares each frame's memory with the compositor as a dma-buf created through
+.IR /dev/udmabuf ,
+which spares the compositor a copy on every frame, and falls back to wl_shm
+when the device is unavailable or the compositor cannot import the buffer.
+.B dmabuf
+behaves the same but logs a warning when it falls back.
+.B shm
+always uses wl_shm.
 .TP
 .BI pipe-command-output " = command"
 Set a shell command that receives the last OSC 133-delimited command output on

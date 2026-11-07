@@ -645,7 +645,7 @@ pub fn init(
     // space) while we respond to queries embedded in that output.
     setNonblocking(pty.master);
 
-    const window = try Window.create(alloc, config.app_id, options.title, startup_size.window);
+    const window = try Window.create(alloc, config.app_id, options.title, startup_size.window, config.presentation);
     errdefer window.destroy();
     window.setBufferAlpha(config.background_opacity < 255);
     window.setBackgroundBlur(config.background_blur and config.background_opacity < 255);

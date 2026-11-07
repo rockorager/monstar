@@ -31,7 +31,9 @@ pub fn create(
     var created: usize = 0;
     errdefer for (previews[0..created]) |preview| preview.buffer.destroy(alloc);
     for (pixels, previews) |src, *preview| {
-        const buffer = try ShmBuffer.create(alloc, shm, src.width, src.height, .argb8888);
+        // Drag previews are attached once, so wl_shm's copy costs nothing
+        // per frame.
+        const buffer = try ShmBuffer.create(alloc, shm, null, src.width, src.height, .argb8888);
         const dst = buffer.pixels();
         for (0..src.height) |y| {
             @memcpy(dst[y * buffer.stride ..][0..src.width], src.argb[y * src.width ..][0..src.width]);

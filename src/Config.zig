@@ -138,6 +138,8 @@ notify_on_command_finish_after: u64 = 5 * std.time.ns_per_s,
 /// Whether newly spawned children should be moved into their own transient
 /// systemd scope. This only affects startup; reloads do not move a live child.
 linux_cgroup: LinuxCgroup = .never,
+/// How CPU-rendered frames reach the compositor. This only affects startup.
+presentation: Presentation = .auto,
 /// Logical terminal page storage in bytes, including the active screen. This
 /// only affects startup because libghostty-vt does not resize live scrollback.
 scrollback_limit: usize = 50_000_000,
@@ -177,6 +179,10 @@ copy_highlight_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
 
 pub const LinuxCgroup = enum { never, always };
+/// `auto` presents frames as udmabuf-backed dma-bufs and quietly falls back to
+/// wl_shm; `dmabuf` does the same but warns when it falls back; `shm` always
+/// uses wl_shm.
+pub const Presentation = enum { auto, shm, dmabuf };
 pub const NotifyOnCommandFinish = enum { never, unfocused, always };
 pub const CommandFinishAction = struct {
     bell: bool = true,
@@ -397,6 +403,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.notify_on_command_finish_after = try parseDuration(value);
     } else if (std.mem.eql(u8, key, "linux-cgroup")) {
         self.linux_cgroup = std.meta.stringToEnum(LinuxCgroup, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "presentation")) {
+        self.presentation = std.meta.stringToEnum(Presentation, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "scrollback-limit")) {
         self.scrollback_limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "image-storage-limit")) {
@@ -773,6 +781,7 @@ test "defaults" {
     try std.testing.expect(!config.notify_on_command_finish_action.notify);
     try std.testing.expectEqual(@as(u64, 5_000_000_000), config.notify_on_command_finish_after);
     try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
+    try std.testing.expectEqual(Presentation.auto, config.presentation);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(usize, 320_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);

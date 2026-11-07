@@ -1,10 +1,12 @@
 //! Wayland window: display connection, global binding, an xdg_toplevel
-//! surface, and wl_shm buffer management for CPU rendering.
+//! surface, and buffer management for CPU rendering.
 
 const Window = @This();
 
 const std = @import("std");
+const Config = @import("Config.zig");
 const ShmBuffer = @import("ShmBuffer.zig");
+const Udmabuf = @import("Udmabuf.zig");
 const wayland = @import("wayland");
 const ext = wayland.client.ext;
 const wl = wayland.client.wl;
@@ -24,6 +26,8 @@ registry: *wl.Registry,
 registry_state: *Globals,
 compositor: *wl.Compositor,
 shm: *wl.Shm,
+/// Null when the compositor lacks linux-dmabuf v3 or presentation is `shm`.
+udmabuf: ?*Udmabuf,
 wm_base: *xdg.WmBase,
 activation: ?*xdg.ActivationV1,
 activation_token: ?*xdg.ActivationTokenV1,
@@ -171,12 +175,13 @@ const ActivationTokenPurpose = enum {
 
 const BufferFormat = ShmBuffer.Format;
 
-/// A wl_shm backed pixel buffer. `busy` prevents mutable reuse while the
-/// compositor owns it, but the mapping remains readable; wl_buffer.release
-/// clears the flag. `rendering` reserves it for one checked-out RenderTarget.
-/// `frame` records its latest commitRender attempt for age bookkeeping; 0
-/// means no attempt has been recorded. A failed commit attempt or a later
-/// canceled render can leave that record unrelated to displayed contents.
+/// A memfd-backed pixel buffer shown through linux-dmabuf or wl_shm. `busy`
+/// prevents mutable reuse while the compositor owns it, but the mapping
+/// remains readable; wl_buffer.release clears the flag. `rendering` reserves
+/// it for one checked-out RenderTarget. `frame` records its latest
+/// commitRender attempt for age bookkeeping; 0 means no attempt has been
+/// recorded. A failed commit attempt or a later canceled render can leave
+/// that record unrelated to displayed contents.
 pub const Buffer = ShmBuffer;
 
 /// Called when the output scale changed, before the resize/draw that
@@ -211,6 +216,7 @@ const Globals = struct {
     window: ?*Window = null,
     compositor: ?*wl.Compositor = null,
     shm: ?*wl.Shm = null,
+    dmabuf: ?*zwp.LinuxDmabufV1 = null,
     wm_base: ?*xdg.WmBase = null,
     activation: ?*xdg.ActivationV1 = null,
     system_bell: ?*xdg.SystemBellV1 = null,
@@ -253,6 +259,7 @@ pub fn create(
     app_id: [:0]const u8,
     title: [:0]const u8,
     initial_size: InitialSize,
+    presentation: Config.Presentation,
 ) !*Window {
     const display = try wl.Display.connect(null);
     errdefer display.disconnect();
@@ -268,6 +275,21 @@ pub fn create(
     const compositor = globals.compositor orelse return error.NoWlCompositor;
     const shm = globals.shm orelse return error.NoWlShm;
     const wm_base = globals.wm_base orelse return error.NoXdgWmBase;
+    const udmabuf: ?*Udmabuf = udmabuf: {
+        const manager = globals.dmabuf orelse {
+            if (presentation == .dmabuf) log.warn("compositor lacks linux-dmabuf v3; presenting with wl_shm", .{});
+            break :udmabuf null;
+        };
+        if (presentation == .shm) {
+            manager.destroy();
+            break :udmabuf null;
+        }
+        break :udmabuf Udmabuf.create(alloc, display, manager, presentation == .dmabuf) catch |err| {
+            manager.destroy();
+            return err;
+        };
+    };
+    errdefer if (udmabuf) |value| value.destroy(alloc);
 
     const surface = try compositor.createSurface();
     const xdg_surface = try wm_base.getXdgSurface(surface);
@@ -366,6 +388,7 @@ pub fn create(
         .registry_state = globals,
         .compositor = compositor,
         .shm = shm,
+        .udmabuf = udmabuf,
         .wm_base = wm_base,
         .activation = globals.activation,
         .activation_token = null,
@@ -457,6 +480,7 @@ pub fn destroy(self: *Window) void {
     self.registry_state.window = null;
     for (self.buffers.items) |buffer| buffer.destroy(self.alloc);
     self.buffers.deinit(self.alloc);
+    if (self.udmabuf) |udmabuf| udmabuf.destroy(self.alloc);
     if (self.fractional_scale) |fs| fs.destroy();
     if (self.viewport) |viewport| viewport.destroy();
     if (self.cursor_shape_device) |device| device.destroy();
@@ -924,7 +948,7 @@ test "launcher activation follows the first buffer commit exactly once" {
             defer activation.destroy();
             const surface = try compositor.createSurface();
             defer surface.destroy();
-            const buffer = try Buffer.create(std.testing.allocator, shm, 1, 1, .xrgb8888);
+            const buffer = try Buffer.create(std.testing.allocator, shm, null, 1, 1, .xrgb8888);
             defer buffer.destroy(std.testing.allocator);
 
             var window: Window = undefined;
@@ -984,8 +1008,8 @@ fn frameListener(frame_cb: *wl.Callback, event: wl.Callback.Event, self: *Window
     }
 }
 
-/// Return a free shm buffer of the requested size, reshaping a released slot
-/// when possible so interactive resizing does not rebuild its shm storage.
+/// Return a free buffer of the requested size, reshaping a released slot when
+/// possible so interactive resizing does not rebuild its storage.
 fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
     var available: ?*Buffer = null;
     var matching: ?*Buffer = null;
@@ -1004,7 +1028,7 @@ fn acquireBuffer(self: *Window, width: u31, height: u31) !*Buffer {
         return buffer;
     }
 
-    const buffer = try Buffer.create(self.alloc, self.shm, width, height, self.buffer_format);
+    const buffer = try Buffer.create(self.alloc, self.shm, self.udmabuf, width, height, self.buffer_format);
     errdefer buffer.destroy(self.alloc);
     try self.buffers.append(self.alloc, buffer);
     return buffer;
@@ -1046,6 +1070,11 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
             } else if (std.mem.orderZ(u8, global.interface, wl.Shm.interface.name) == .eq) {
                 if (globals.shm == null)
                     globals.shm = registry.bind(global.name, wl.Shm, @min(global.version, wl.Shm.generated_version)) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, zwp.LinuxDmabufV1.interface.name) == .eq) {
+                // Version 3 advertises LINEAR support through modifier
+                // events; later versions replace them with feedback objects.
+                if (globals.dmabuf == null and global.version >= 3)
+                    globals.dmabuf = registry.bind(global.name, zwp.LinuxDmabufV1, 3) catch return;
             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
                 if (globals.wm_base == null)
                     globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, xdg.WmBase.generated_version)) catch return;
