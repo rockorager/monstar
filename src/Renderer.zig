@@ -1914,7 +1914,6 @@ test "kitty unscaled blit converts rgb and clips" {
     const viewport: KittyPlacementViewport = .{
         .viewport_col = 0,
         .viewport_row = 0,
-        .visible = true,
         .offset_x = 0,
         .offset_y = 0,
         .pixel_width = 2,
@@ -1954,7 +1953,6 @@ test "kitty unscaled blit honors rgba alpha" {
     const viewport: KittyPlacementViewport = .{
         .viewport_col = 0,
         .viewport_row = 0,
-        .visible = true,
         .offset_x = 0,
         .offset_y = 0,
         .pixel_width = 2,
@@ -1991,7 +1989,6 @@ test "kitty placement clips offsets above signed 32-bit range" {
     const viewport: KittyPlacementViewport = .{
         .viewport_col = 0,
         .viewport_row = 0,
-        .visible = true,
         .offset_x = @as(u32, std.math.maxInt(i32)) + 1,
         .offset_y = @as(u32, std.math.maxInt(i32)) + 1,
         .pixel_width = 1,
@@ -2028,7 +2025,6 @@ test "scaled kitty placement reuses cached rgba variant" {
     const viewport: KittyPlacementViewport = .{
         .viewport_col = 0,
         .viewport_row = 0,
-        .visible = true,
         .offset_x = 0,
         .offset_y = 0,
         .pixel_width = 3,
@@ -2060,7 +2056,6 @@ test "scaled kitty cache protects a stable working set of 33 across frames" {
     const viewport: KittyPlacementViewport = .{
         .viewport_col = 0,
         .viewport_row = 0,
-        .visible = true,
         .offset_x = 0,
         .offset_y = 0,
         .pixel_width = 2,
@@ -2923,7 +2918,7 @@ test "render kitty image placement" {
     const pixels = try alloc.alloc(u32, @as(usize, width) * height);
     defer alloc.free(pixels);
 
-    const items = try collectKittyPlacements(&font, alloc, &term);
+    const items = try collectKittyPlacements(&font, alloc, &term, &state);
     defer alloc.free(items);
     try renderer.renderWithKittyItems(&state, items, pixels, width, height);
 
@@ -2938,7 +2933,7 @@ test "render kitty image placement" {
     const pending = term.screens.active.kitty_images.images.getPtr(1).?;
     pending.data.deinit(alloc);
     pending.data = .{ .pending = 3 };
-    const pending_items = try collectKittyPlacements(&font, alloc, &term);
+    const pending_items = try collectKittyPlacements(&font, alloc, &term, &state);
     defer alloc.free(pending_items);
     try std.testing.expectEqual(@as(usize, 0), pending_items.len);
 }
@@ -2964,7 +2959,10 @@ test "kitty placement collection uses the current animation frame" {
     try std.testing.expectEqual(@as(?u64, 40), storage.animationTick(std.testing.io, 0));
     try std.testing.expectEqual(@as(?u64, 40), storage.animationTick(std.testing.io, 40));
 
-    const items = try collectKittyPlacements(&font, alloc, &term);
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+    const items = try collectKittyPlacements(&font, alloc, &term, &state);
     defer alloc.free(items);
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, items[0].image.data.bytes().?);
@@ -2999,7 +2997,7 @@ test "render kitty unicode placeholder placement" {
     const pixels = try alloc.alloc(u32, @as(usize, width) * height);
     defer alloc.free(pixels);
 
-    const items = try collectKittyPlacements(&font, alloc, &term);
+    const items = try collectKittyPlacements(&font, alloc, &term, &state);
     defer alloc.free(items);
     try renderer.renderWithKittyItems(&state, items, pixels, width, height);
 

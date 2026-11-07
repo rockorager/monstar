@@ -129,6 +129,8 @@ async_job: AsyncJobSnapshot,
 /// Pinned copies of kitty image data shared between consecutive async
 /// jobs, so the worker never reads terminal-owned image bytes.
 kitty_cache: KittyImageCache,
+/// The kitty storage change counter at the last submitted frame.
+kitty_dirty_seen: u64,
 /// The window geometry changed, so a repaint at the new size must
 /// happen even while synchronized output has content frames frozen.
 geometry_redraw: bool,
@@ -704,6 +706,7 @@ pub fn init(
         .async_raster_loader = null,
         .async_generation = 1,
         .async_force_full = true,
+        .kitty_dirty_seen = 0,
         .held_frame = null,
         .async_job = .{},
         .kitty_cache = .empty,
@@ -7137,8 +7140,8 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         if (has_kitty_graphics) {
             // Text-only scrolling also dirties the kitty storage. It can
             // change pixels only when placements exist (or were removed).
-            kitty_changed = self.term.screens.active.kitty_images.dirty;
-            const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term);
+            kitty_changed = self.term.screens.active.kitty_images.dirty != self.kitty_dirty_seen;
+            const items = try Renderer.collectKittyPlacements(&self.font, self.alloc, &self.term, &self.render_state);
             if (!Renderer.kittyItemsEqual(self.async_job.kitty, items)) kitty_changed = true;
             try self.async_job.replaceKitty(self.alloc, &self.kitty_cache, items);
         } else {
@@ -7235,7 +7238,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         self.rasterFatal(err);
         return .deferred;
     };
-    if (!frozen) self.term.screens.active.kitty_images.dirty = false;
+    if (!frozen) self.kitty_dirty_seen = self.term.screens.active.kitty_images.dirty;
     if (!frozen) self.async_force_full = false;
     return .submitted;
 }

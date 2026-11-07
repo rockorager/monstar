@@ -37,7 +37,7 @@
             zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
               fetchAll = true;
-              hash = "sha256-zi+IPS654SbUHwAjvG8hVvYbXGV6Yl25BM27VGDfRhY=";
+              hash = "sha256-EI3qjCMBJixqrXmZV7t9Aomy+2WWb3sF0J/2K0aPLJw=";
             };
 
             postConfigure = ''
