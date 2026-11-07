@@ -6469,6 +6469,9 @@ const KeyBindingAction = union(enum) {
     top,
     bottom,
     new_window,
+    copy_to_clipboard,
+    paste_from_clipboard,
+    text: []const u8,
     passthrough,
 };
 
@@ -6483,6 +6486,9 @@ fn keyBindingAction(
         return switch (action) {
             .unbind => .passthrough,
             .new_window => .new_window,
+            .copy_to_clipboard => .copy_to_clipboard,
+            .paste_from_clipboard => .paste_from_clipboard,
+            .text => |bytes| .{ .text = bytes },
             .scroll_page_lines => |lines| if (active_screen == .primary) .{ .lines = lines } else .passthrough,
         };
     }
@@ -6500,7 +6506,6 @@ fn keyBindingAction(
 }
 
 fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: KeyBindingAction) void {
-    std.debug.assert(scroll != .passthrough and scroll != .new_window);
     // Consume the matching release too, but move only on press/repeat.
     if (event.action == .release) return;
 
@@ -6513,7 +6518,7 @@ fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: KeyBindingA
         .page_down => self.term.screens.active.pages.scroll(.{ .delta_row = rows }),
         .top => self.term.screens.active.pages.scroll(.top),
         .bottom => self.term.screens.active.pages.scroll(.active),
-        .new_window, .passthrough => unreachable,
+        else => unreachable,
     }
     self.revealScrollbar();
     self.needs_redraw = true;
@@ -6526,10 +6531,19 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
 
     if (self.search != null) return self.handleSearchKey(event);
 
+    var bound_text: ?[]const u8 = null;
     if (keyBindingAction(&self.config, self.term.screens.active_key, event)) |bound| switch (bound) {
         .passthrough => {},
         // Consume the matching repeats and releases too, like fixed shortcuts.
         .new_window => return if (action == .press) self.spawnNewWindow(),
+        .copy_to_clipboard => return if (action == .press) self.copyToClipboard(),
+        .paste_from_clipboard => return if (action == .press) self.beginPaste(.clipboard),
+        // Bound text replaces the key's encoding on press and repeat, like
+        // typing, and the release is consumed.
+        .text => |bytes| {
+            if (action == .release) return;
+            bound_text = bytes;
+        },
         else => return self.handleScrollbackKey(event, bound),
     } else if (!event.mods.alt and !event.mods.super) {
         // Fixed shortcuts fire once, but their matching repeats and releases
@@ -6559,7 +6573,10 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
         }
     }
 
-    const wrote = self.encodeAndWriteKey(event);
+    const wrote = if (bound_text) |bytes| wrote: {
+        self.writePty(bytes);
+        break :wrote true;
+    } else self.encodeAndWriteKey(event);
 
     // A non-modifier key that produced input dismisses the selection
     // and snaps a scrolled-back viewport to the bottom (ghostty's
@@ -6698,6 +6715,29 @@ test "fixed shortcuts consume repeats and releases only with matching modifiers"
     app.onKey(46, .repeat);
     const control_n = try posix.read(fds[0], &buf);
     try std.testing.expectEqualStrings("\x03", buf[0..control_n]);
+
+    // Bound text replaces Shift+Enter's legacy CR on press and repeat, and
+    // the release is consumed even when the application asks for releases.
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 29 + 8, c.XKB_KEY_UP);
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_DOWN);
+    try app.config.keybinds.append(alloc, .{
+        .trigger = .{ .key = .{ .physical = .enter }, .mods = .{ .shift = true } },
+        .action = .{ .text = "\x1b[13;2u" },
+    });
+    for ([_]bool{ false, true }) |kitty| {
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        if (kitty) stream.nextSlice("\x1b[>3u");
+        defer if (kitty) stream.nextSlice("\x1b[<u");
+        for ([_]vt.input.KeyAction{ .press, .repeat, .release }) |action| {
+            app.onKey(28, action);
+            const n = posix.read(fds[0], &buf) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => return err,
+            };
+            try std.testing.expectEqualStrings(if (action == .release) "" else "\x1b[13;2u", buf[0..n]);
+        }
+    }
 }
 
 fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {

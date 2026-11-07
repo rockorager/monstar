@@ -330,19 +330,46 @@ an invalid entry leaves previous bindings unchanged.
 scrolls by N terminal lines: negative values scroll up, positive values scroll
 down, and zero consumes the key without moving. N must be between -32768 and
 32767.
+.B new_window
+opens an independent window in the current directory.
+.B copy_to_clipboard
+and
+.B paste_from_clipboard
+copy the selection and paste the clipboard, like
+.B Ctrl+Shift+C
+and
+.BR Ctrl+Shift+V .
+.BI text: string
+sends
+.I string
+to the application, decoding Zig string literal escapes such as
+.BR \(rsx1b ,
+.BR \(rsn ,
+and
+.BR \(rsu{2028} .
+.BI csi: string
+sends ESC [ followed by
+.IR string .
+Text actions replace the key's own encoding on press and repeat.
 .B unbind
 removes a shortcut and passes its input to the application.
 .PP
-The default line-scrolling bindings are:
+The default bindings are:
 .nf
 keybind = shift+up=scroll_page_lines:-1
 keybind = shift+down=scroll_page_lines:1
+keybind = ctrl+shift+n=new_window
 .fi
 .PP
-For example, add a five-line shortcut and remove the default up shortcut:
+For example, add a five-line shortcut, remove the default up shortcut, send
+Shift+Enter as a CSI u sequence, and add the conventional Insert clipboard
+keys:
 .nf
 keybind = ctrl+shift+k=scroll_page_lines:-5
 keybind = shift+up=unbind
+keybind = shift+enter=csi:13;2u
+keybind = ctrl+insert=copy_to_clipboard
+keybind = shift+insert=paste_from_clipboard
 .fi
 .PP
 Triggers accept lowercase
@@ -371,12 +398,8 @@ to bind Ctrl+Equals.
 .PP
 Configured bindings take priority over fixed shortcuts and apply immediately
 on configuration reload. Scroll actions pass through on the alternate screen.
-Search mode retains its own controls. Only
-.B scroll_page_lines
-and
-.B unbind
-actions are supported; sequences, binding flags and other Ghostty actions are
-not supported.
+Search mode retains its own controls. Only the actions above are supported;
+sequences, binding flags and other Ghostty actions are not supported.
 .TP
 .BI scrollback-limit " = bytes"
 Set the terminal page-storage limit, including the active screen.

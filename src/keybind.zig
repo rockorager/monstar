@@ -33,6 +33,11 @@ const uucode = @import("uucode");
 pub const Action = union(enum) {
     new_window,
     scroll_page_lines: i16,
+    copy_to_clipboard,
+    paste_from_clipboard,
+    /// Bytes written to the pty. Ghostty's `text:` (Zig string literal
+    /// escapes) and `csi:` (prefixed with ESC [) both decode to this.
+    text: []const u8,
     unbind,
 };
 
@@ -61,9 +66,10 @@ const defaults = [_]Binding{
     .{ .trigger = .{ .key = .{ .unicode = 'n' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .new_window },
 };
 
-/// Parse without allocating. Only single-key triggers and the actions in Action
-/// are supported; unsupported Ghostty sequences, flags and actions are errors.
-pub fn parse(input: []const u8) error{InvalidValue}!Binding {
+/// Only single-key triggers and the actions in Action are supported;
+/// unsupported Ghostty sequences, flags and actions are errors. Text action
+/// bytes are allocated with `alloc` and owned by the caller.
+pub fn parse(alloc: std.mem.Allocator, input: []const u8) error{ InvalidValue, OutOfMemory }!Binding {
     // Skip '=' when it is the trigger key, e.g. ctrl+==scroll_page_lines:-1
     // or =+ctrl=scroll_page_lines:-1 (the key need not follow the modifiers).
     var offset: usize = 0;
@@ -76,16 +82,58 @@ pub fn parse(input: []const u8) error{InvalidValue}!Binding {
         break idx;
     } else return error.InvalidValue;
 
+    const trigger = try parseTrigger(std.mem.trim(u8, input[0..eq], " \t"));
     const action_text = std.mem.trim(u8, input[eq + 1 ..], " \t");
     const action: Action = if (std.mem.eql(u8, action_text, "unbind"))
         .unbind
     else if (std.mem.eql(u8, action_text, "new_window"))
         .new_window
+    else if (std.mem.eql(u8, action_text, "copy_to_clipboard"))
+        .copy_to_clipboard
+    else if (std.mem.eql(u8, action_text, "paste_from_clipboard"))
+        .paste_from_clipboard
     else if (std.mem.startsWith(u8, action_text, "scroll_page_lines:"))
         .{ .scroll_page_lines = std.fmt.parseInt(i16, action_text["scroll_page_lines:".len..], 10) catch return error.InvalidValue }
+    else if (std.mem.startsWith(u8, action_text, "csi:"))
+        .{ .text = try std.mem.concat(alloc, u8, &.{ "\x1b[", try nonEmpty(action_text["csi:".len..]) }) }
+    else if (std.mem.startsWith(u8, action_text, "text:"))
+        .{ .text = try parseText(alloc, try nonEmpty(action_text["text:".len..])) }
     else
         return error.InvalidValue;
-    return .{ .trigger = try parseTrigger(std.mem.trim(u8, input[0..eq], " \t")), .action = action };
+    return .{ .trigger = trigger, .action = action };
+}
+
+fn nonEmpty(text: []const u8) error{InvalidValue}![]const u8 {
+    return if (text.len == 0) error.InvalidValue else text;
+}
+
+/// Decode Zig string literal escapes (`\x1b`, `\n`, `\u{2028}`, ...) without
+/// surrounding quotes, matching Ghostty's `text:` action.
+fn parseText(alloc: std.mem.Allocator, text: []const u8) error{ InvalidValue, OutOfMemory }![]const u8 {
+    const string_literal = std.zig.string_literal;
+    var out: std.ArrayList(u8) = try .initCapacity(alloc, text.len);
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] != '\\') {
+            try out.append(alloc, text[index]);
+            index += 1;
+            continue;
+        }
+        const is_unicode = index + 1 < text.len and text[index + 1] == 'u';
+        const codepoint = switch (string_literal.parseEscapeSequence(text, &index)) {
+            .success => |cp| cp,
+            .failure => return error.InvalidValue,
+        };
+        if (is_unicode) {
+            var buf: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(codepoint, &buf) catch return error.InvalidValue;
+            try out.appendSlice(alloc, buf[0..len]);
+        } else {
+            try out.append(alloc, @intCast(codepoint));
+        }
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 fn parseTrigger(input: []const u8) error{InvalidValue}!Trigger {
@@ -158,9 +206,10 @@ fn foldedCodepoint(cp: u21) [3]u21 {
 }
 
 /// Replace an existing trigger or append a new one. Invalid input and allocation
-/// failure leave the list unchanged. Storage belongs to the supplied allocator.
+/// failure leave the list unchanged. Storage, including text action bytes that
+/// a replacement drops, belongs to the supplied allocator; pass an arena.
 pub fn put(bindings: *std.ArrayList(Binding), alloc: std.mem.Allocator, input: []const u8) error{ InvalidValue, OutOfMemory }!void {
-    const binding = try parse(input);
+    const binding = try parse(alloc, input);
     for (bindings.items) |*existing| {
         if (existing.trigger.equal(binding.trigger)) {
             existing.* = binding;
@@ -216,20 +265,40 @@ test "Ghostty single-key syntax and action parameters" {
     };
     for (cases) |case| {
         var buf: [128]u8 = undefined;
-        const binding = try parse(try std.fmt.bufPrint(&buf, "{s}=scroll_page_lines:-5", .{case.text}));
+        const binding = try parse(std.testing.allocator, try std.fmt.bufPrint(&buf, "{s}=scroll_page_lines:-5", .{case.text}));
         try std.testing.expectEqualDeep(case.key, binding.trigger.key);
         try std.testing.expectEqual(case.mods, binding.trigger.mods);
         try std.testing.expectEqual(@as(i16, -5), binding.action.scroll_page_lines);
     }
-    try std.testing.expectEqual(@as(i16, -32768), (try parse("a=scroll_page_lines:-32768")).action.scroll_page_lines);
-    try std.testing.expectEqual(@as(i16, 32767), (try parse("a=scroll_page_lines:32767")).action.scroll_page_lines);
-    try std.testing.expectEqual(@as(i16, 0), (try parse("a=scroll_page_lines:0")).action.scroll_page_lines);
+    try std.testing.expectEqual(@as(i16, -32768), (try parse(std.testing.allocator, "a=scroll_page_lines:-32768")).action.scroll_page_lines);
+    try std.testing.expectEqual(@as(i16, 32767), (try parse(std.testing.allocator, "a=scroll_page_lines:32767")).action.scroll_page_lines);
+    try std.testing.expectEqual(@as(i16, 0), (try parse(std.testing.allocator, "a=scroll_page_lines:0")).action.scroll_page_lines);
     for ([_][]const u8{
-        "",                    "ctrl=unbind",               "ctrl+control+a=unbind",      "a+b=unbind",              "=unbind",
-        "a=scroll_page_lines", "a=scroll_page_lines:32768", "a=scroll_page_lines:-32769", "a=scroll_page_lines:1.5", "a=scroll_page_lines:",
-        "a=unknown",           "a=unbind:1",                "a=new_window:1",             "ctrl+not-a-key=unbind",   "a>b=unbind",
-        "global:a=unbind",     "chain=unbind",              "catch_all=unbind",           "\xff=unbind",
-    }) |text| try std.testing.expectError(error.InvalidValue, parse(text));
+        "",                      "ctrl=unbind",               "ctrl+control+a=unbind",      "a+b=unbind",              "=unbind",
+        "a=scroll_page_lines",   "a=scroll_page_lines:32768", "a=scroll_page_lines:-32769", "a=scroll_page_lines:1.5", "a=scroll_page_lines:",
+        "a=unknown",             "a=unbind:1",                "a=new_window:1",             "ctrl+not-a-key=unbind",   "a>b=unbind",
+        "global:a=unbind",       "chain=unbind",              "catch_all=unbind",           "\xff=unbind",             "a=csi:",
+        "a=text:",               "a=text:\\q",                "a=text:\\x1",                "a=text:ok\\",             "a=text:\\u{110000}",
+        "a=copy_to_clipboard:1", "a=paste_from_clipboard:1",  "ctrl+nope=text:x",
+    }) |text| try std.testing.expectError(error.InvalidValue, parse(std.testing.allocator, text));
+}
+
+test "text, csi, and clipboard actions" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const shift_enter = try parse(arena, "shift+enter=csi:13;2u");
+    try std.testing.expectEqual(vt.input.Key.enter, shift_enter.trigger.key.physical);
+    try std.testing.expectEqual(vt.input.KeyMods{ .shift = true }, shift_enter.trigger.mods);
+    try std.testing.expectEqualStrings("\x1b[13;2u", shift_enter.action.text);
+    // Escapes decode; `=` and quotes after the trigger are literal text.
+    try std.testing.expectEqualStrings(
+        "\x1b[13;4u a=\"b\"\\\n\u{2028}",
+        (try parse(arena, "alt+shift+enter=text:\\x1b[13;4u a=\"b\"\\\\\\n\\u{2028}")).action.text,
+    );
+    try std.testing.expectEqual(Action.copy_to_clipboard, (try parse(arena, "ctrl+insert=copy_to_clipboard")).action);
+    try std.testing.expectEqual(Action.paste_from_clipboard, (try parse(arena, "shift+Insert=paste_from_clipboard")).action);
 }
 
 test "repeatable bindings replace, unbind and restore without losing other triggers" {

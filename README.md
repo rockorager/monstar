@@ -164,8 +164,9 @@ Other settings:
   discrete.
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
   `0` disables the flash (default `200`).
-- **keybind** — Repeatable Ghostty-style `trigger=action` bindings for line
-  scrolling and opening new windows. See [Keybindings](#keybindings) below.
+- **keybind** — Repeatable Ghostty-style `trigger=action` bindings for
+  scrolling, new windows, clipboard, and sending text. See
+  [Keybindings](#keybindings) below.
 - **background / foreground / cursor-color / cursor-text** — Terminal colors
   as `#RRGGBB` or `RRGGBB`; explicit colors override the theme.
   `cursor-color` and `cursor-text` also accept `cell-foreground` and
@@ -198,7 +199,7 @@ settings apply to new windows.
 
 ## Keybindings
 
-Configure line scrolling and new windows with repeatable `keybind` entries:
+Configure shortcuts with repeatable `keybind` entries:
 
 ```conf
 # Default line-scrolling bindings:
@@ -212,9 +213,19 @@ keybind = shift+up=unbind
 # Move new windows from the default Ctrl+Shift+N:
 keybind = ctrl+shift+enter=new_window
 keybind = ctrl+shift+n=unbind
+# Conventional Insert clipboard keys:
+keybind = ctrl+insert=copy_to_clipboard
+keybind = shift+insert=paste_from_clipboard
+# Send Shift+Enter and Alt+Shift+Enter as CSI u so TUIs can tell them apart:
+keybind = shift+enter=csi:13;2u
+keybind = alt+shift+enter=text:\x1b[13;4u
 ```
 
 `new_window` opens an independent window in the current directory.
+`copy_to_clipboard` and `paste_from_clipboard` act like `Ctrl+Shift+C` and
+`Ctrl+Shift+V`. `text:` sends its value with Zig string literal escapes such as
+`\x1b`, `\n`, and `\u{2028}` decoded; `csi:` sends `ESC [` followed by its
+value. Text actions replace the key's own encoding on press and repeat.
 For `scroll_page_lines`, negative counts scroll up; positive counts scroll down. Counts range from
 `-32768` to `32767`. Multiple triggers can invoke the same action; repeating a
 trigger replaces its previous binding. Invalid entries leave previous bindings
@@ -229,9 +240,9 @@ Include Shift when it is held to produce punctuation, for example
 `keybind = ctrl+shift++=scroll_page_lines:-5` on a US keyboard.
 
 Configured bindings take precedence over fixed shortcuts below; `unbind`
-passes the key to the application instead. Only `scroll_page_lines`,
-`new_window`, and `unbind` are currently supported actions. Ghostty sequences, binding flags,
-and other actions are not yet supported. Search mode retains its own controls.
+passes the key to the application instead. Only the actions above are
+currently supported. Ghostty sequences, binding flags, and other actions are
+not yet supported. Search mode retains its own controls.
 
 | Shortcut | Action |
 | --- | --- |
