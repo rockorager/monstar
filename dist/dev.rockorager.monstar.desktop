@@ -1,12 +1,16 @@
 [Desktop Entry]
 Type=Application
-Name=monstar
+Name=Monstar
+GenericName=Terminal
 Comment=Wayland terminal emulator
 Icon=dev.rockorager.monstar
+TryExec=monstar
 Exec=monstar
 Terminal=false
 StartupNotify=true
+StartupWMClass=dev.rockorager.monstar
 Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;
 X-TerminalArgExec=-e
 X-TerminalArgAppId=--app-id=
 X-TerminalArgTitle=--title=
