@@ -9,3 +9,5 @@ packaging/arch/*.pkg.tar.zst
 packaging/arch/PKGBUILD
 packaging/arch/PKGBUILD.source
 packaging/arch/PKGBUILD.git
+bench-results/
+__pycache__/
