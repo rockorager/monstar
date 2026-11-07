@@ -47,8 +47,9 @@ headless when there is none. `--session nested|headless` forces one;
 The tool runs as you and starts one small root helper with `sudo`, after
 printing why. The kernel restricts the RAPL energy counter to root since the
 PLATYPUS fix (CVE-2020-8694). The helper only reads RAPL counters, creates a
-uinput keyboard, traces KMS page flips (tracefs `drm_vblank_event`), reads
-debugfs plane state, and drops the page cache before cold starts. Monstar, the
+uinput keyboard, traces KMS page flips (tracefs `drm_vblank_event` paired
+with `drm_vblank_event_delivered`, since the first fires on every vblank),
+reads debugfs plane state, and drops the page cache before cold starts. Monstar, the
 compositor and the workloads always run as you. Every helper-backed
 measurement is marked `"privileged": true` in the JSON.
 

@@ -23,6 +23,7 @@ from pathlib import Path
 
 POWERCAP = "sys/class/powercap"
 TRACEFS = "sys/kernel/tracing"
+VBLANK_EVENTS = ("drm_vblank_event", "drm_vblank_event_delivered")
 DEBUGFS_DRI = "sys/kernel/debug/dri"
 DROP_CACHES = "proc/sys/vm/drop_caches"
 
@@ -117,8 +118,17 @@ class Uinput:
 
 # KMS ---------------------------------------------------------------------
 
-def parse_vblank_times(text):
-    return sorted(int(m.group(1)) for m in re.finditer(r"drm_vblank_event:.*?time=(\d+)", text))
+def parse_flip_times(text):
+    """Page-flip times (CLOCK_MONOTONIC ns) from a tracefs dump.
+    drm_vblank_event fires on every vblank while the interrupt is on, so a
+    flip is a vblank for which an event was also delivered to user space
+    (drm_vblank_event_delivered, same crtc and seq); that event carries no
+    timestamp of its own."""
+    times = {(m.group(1), m.group(2)): int(m.group(3))
+             for m in re.finditer(r"drm_vblank_event: crtc=(-?\d+), seq=(\d+), time=(-?\d+)", text)}
+    delivered = {(m.group(1), m.group(2))
+                 for m in re.finditer(r"drm_vblank_event_delivered: file=\S+ crtc=(-?\d+), seq=(\d+)", text)}
+    return sorted(times[key] for key in delivered if key in times)
 
 
 def parse_planes(state_text):
@@ -162,7 +172,7 @@ class Helper:
             "uid": os.geteuid(),
             "rapl": [name for name, _ in rapl_zones(self.root)],
             "uinput": os.path.exists("/dev/uinput") if self.root == "/" else os.path.exists(self.path("dev/uinput")),
-            "tracefs": os.path.exists(os.path.join(tracefs, "events/drm/drm_vblank_event/enable")),
+            "tracefs": all(os.path.exists(os.path.join(tracefs, f"events/drm/{event}/enable")) for event in VBLANK_EVENTS),
             "debugfs_dri": sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(self.path(DEBUGFS_DRI) + "/*/state")),
         }
 
@@ -198,18 +208,22 @@ class Helper:
     def _trace(self, rel, value):
         Path(self.path(TRACEFS), rel).write_text(value)
 
+    def _enable_vblank_events(self, value):
+        for event in VBLANK_EVENTS:
+            self._trace(f"events/drm/{event}/enable", value)
+
     def op_vblank_start(self, _req):
-        self._trace("events/drm/drm_vblank_event/enable", "0")
+        self._enable_vblank_events("0")
         self._trace("buffer_size_kb", "8192")
         self._trace("trace", "")
-        self._trace("events/drm/drm_vblank_event/enable", "1")
+        self._enable_vblank_events("1")
         self.tracing = True
         return {}
 
     def op_vblank_stop(self, _req):
-        self._trace("events/drm/drm_vblank_event/enable", "0")
+        self._enable_vblank_events("0")
         self.tracing = False
-        return {"flips": parse_vblank_times(Path(self.path(TRACEFS), "trace").read_text())}
+        return {"flips": parse_flip_times(Path(self.path(TRACEFS), "trace").read_text())}
 
     def op_planes(self, _req):
         out = {}
@@ -222,7 +236,7 @@ class Helper:
             self.uinput.close()
         if self.tracing:
             try:
-                self._trace("events/drm/drm_vblank_event/enable", "0")
+                self._enable_vblank_events("0")
             except OSError:
                 pass
 

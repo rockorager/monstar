@@ -112,7 +112,8 @@ class LatencyTest(unittest.TestCase):
             frame(4, 0, 506 * MS, 525 * MS),
             # Key c never produced a frame before the run ended.
         ]
-        flips = [117 * MS, 300 * MS, 525 * MS]
+        # The flip at 508 ms shows frame 1, committed before frame 4.
+        flips = [117 * MS, 300 * MS, 508 * MS, 525 * MS]
         lat = metrics.match_latency(sent, events, flips)
         self.assertEqual(lat["key_to_present_ms"], [17.0, 25.0])
         self.assertEqual(lat["key_to_commit_ms"], [4.0, 6.0])

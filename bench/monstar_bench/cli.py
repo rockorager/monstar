@@ -132,7 +132,7 @@ def measurements(args, helper, session, bench, sampler, keyboard):
         "cpu_memory": {"status": "ok", "privileged": False, "source": "/proc"},
         "input": {"status": "ok" if keyboard else "unused", "privileged": bool(keyboard and keyboard.privileged),
                   "source": keyboard.name if keyboard else None},
-        "kms_flips": {"status": ok(bench.kms_flips), "privileged": True, "source": "tracefs drm_vblank_event"},
+        "kms_flips": {"status": ok(bench.kms_flips), "privileged": True, "source": "tracefs drm_vblank_event + drm_vblank_event_delivered"},
         "kms_scanout": {"status": ok(bench.kms_planes), "privileged": True, "source": "debugfs dri/*/state (heuristic)"},
         "compositor_scanout": {"status": ok(session.compositor == "hyprland"), "privileged": False,
                                "source": "hyprctl monitors directScanoutTo"},

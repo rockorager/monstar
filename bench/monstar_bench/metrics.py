@@ -263,7 +263,11 @@ def match_latency(sent, events, flips=None):
         if received is not None:
             out["key_to_receive_ms"].append(round((received - t) / 1e6, 3))
         if flips:
-            while li < len(flips) and flips[li] <= frame["commit"]:
+            # The flip that showed the frame: a flip between commit and
+            # presentation still shows the previous frame. Half a refresh
+            # absorbs presentation timestamps that differ from the vblank.
+            tolerance = (frame.get("refresh") or 16_666_667) // 2
+            while li < len(flips) and flips[li] < max(frame["commit"], frame["present"] - tolerance):
                 li += 1
             if li < len(flips):
                 out["key_to_flip_ms"].append(round((flips[li] - t) / 1e6, 3))

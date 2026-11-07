@@ -58,8 +58,9 @@ def fake_sysfs(root, energy=1000, max_range=2**32):
     Path(root, "proc/sys/vm").mkdir(parents=True)
     Path(root, privileged.DROP_CACHES).write_text("0\n")
     trace = Path(root, privileged.TRACEFS)
-    (trace / "events/drm/drm_vblank_event").mkdir(parents=True)
-    (trace / "events/drm/drm_vblank_event/enable").write_text("0")
+    for event in privileged.VBLANK_EVENTS:
+        (trace / "events/drm" / event).mkdir(parents=True)
+        (trace / "events/drm" / event / "enable").write_text("0")
     (trace / "trace").write_text(
         "  <idle>-0 [003] d.h1. 100.0: drm_vblank_event: crtc=0, seq=10, time=5000000, high-prec=true\n"
         "  <idle>-0 [003] d.h1. 100.1: drm_vblank_event: crtc=0, seq=11, time=4000000, high-prec=true\n")
@@ -104,7 +105,8 @@ class HelperTest(unittest.TestCase):
                 enable = Path(root, privileged.TRACEFS, "events/drm/drm_vblank_event/enable")
                 self.assertEqual(enable.read_text(), "1")
                 Path(root, privileged.TRACEFS, "trace").write_text(
-                    "x-1 [000] d.h1. 1.0: drm_vblank_event: crtc=0, seq=1, time=7000, high-prec=true\n")
+                    "x-1 [000] d.h1. 1.0: drm_vblank_event: crtc=0, seq=1, time=7000, high-prec=true\n"
+                    "x-1 [000] d.h1. 1.0: drm_vblank_event_delivered: file=00000000bb715db9, crtc=0, seq=1\n")
                 self.assertEqual(client.call("vblank_stop")["flips"], [7000])
                 self.assertEqual(enable.read_text(), "0")
                 planes = client.call("planes")["cards"]["1"]
@@ -122,10 +124,20 @@ class HelperTest(unittest.TestCase):
                                      "size": "1920x1200"})
         self.assertEqual(planes[1]["size"], "64x64")
 
-    def test_vblank_times_sorted(self):
-        self.assertEqual(privileged.parse_vblank_times(Path(__file__).read_text()[:0]), [])
-        text = "a: drm_vblank_event: crtc=0, seq=2, time=20\nb: drm_vblank_event: crtc=0, seq=1, time=10\n"
-        self.assertEqual(privileged.parse_vblank_times(text), [10, 20])
+    def test_flips_are_vblanks_with_a_delivered_event(self):
+        self.assertEqual(privileged.parse_flip_times(""), [])
+        # Captured on amdgpu: vblanks 62-64 and 68, flips on 62 and 68. The
+        # delivered event may name another crtc's matching seq; it must not count.
+        text = (
+            "<idle>-0 [009] d.h3. 1.0: drm_vblank_event: crtc=0, seq=68, time=4000, high-prec=true\n"
+            "<idle>-0 [009] d.h3. 1.0: drm_vblank_event_delivered: file=00000000bb715db9, crtc=0, seq=68\n"
+            "<idle>-0 [009] d.h3. 0.5: drm_vblank_event: crtc=0, seq=62, time=1000, high-prec=true\n"
+            "<idle>-0 [009] d.h3. 0.5: drm_vblank_event_delivered: file=00000000bb715db9, crtc=0, seq=62\n"
+            "<idle>-0 [009] d.h3. 0.6: drm_vblank_event: crtc=0, seq=63, time=2000, high-prec=true\n"
+            "<idle>-0 [009] d.h3. 0.6: drm_vblank_event: crtc=1, seq=63, time=2100, high-prec=true\n"
+            "<idle>-0 [009] d.h3. 0.6: drm_vblank_event_delivered: file=00000000bb715db9, crtc=1, seq=64\n"
+            "<idle>-0 [009] d.h3. 0.7: drm_vblank_event: crtc=0, seq=64, time=3000, high-prec=true\n")
+        self.assertEqual(privileged.parse_flip_times(text), [1000, 4000])
 
 
 class SensorsTest(unittest.TestCase):
