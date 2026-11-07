@@ -562,6 +562,7 @@ test {
     _ = Pty;
     _ = @import("ReadPipeline.zig");
     _ = Renderer;
+    _ = @import("resize.zig");
     _ = @import("ScrollbackSearch.zig");
     _ = @import("ScrollDetector.zig");
     _ = @import("pixel_copy.zig");

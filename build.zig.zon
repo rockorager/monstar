@@ -30,6 +30,5 @@
         "README.md",
         "scripts",
         "src",
-        "vendor",
     },
 }

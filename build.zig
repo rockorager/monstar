@@ -89,8 +89,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Font stack: fontconfig (discovery) + FreeType (rasterization) +
-    // HarfBuzz (shaping) + stb image resizing, imported through one
-    // translated C header.
+    // HarfBuzz (shaping), imported through one translated C header.
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),
         .target = target,
@@ -183,7 +182,6 @@ pub fn build(b: *std.Build) void {
     // otherwise, so the linker kept their unused decoders.
     exe.link_function_sections = true;
     exe.link_data_sections = true;
-    root_module.addCSourceFile(.{ .file = b.path("vendor/stb_image_resize.c") });
 
     b.installArtifact(exe);
     b.installFile("dist/dev.rockorager.monstar.desktop", "share/applications/dev.rockorager.monstar.desktop");

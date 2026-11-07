@@ -19,6 +19,7 @@ const glyph_constraints = @import("glyph_constraints.zig");
 const kitty_graphics = @import("kitty_graphics.zig");
 const pixel_copy = @import("pixel_copy.zig");
 const pixel_raster = @import("pixel_raster.zig");
+const resize = @import("resize.zig");
 
 const log = std.log.scoped(.renderer);
 const KittyImage = vt.kitty.graphics.Image;
@@ -1360,27 +1361,17 @@ fn resizeRgba(
     // Upscaling is the common Kitty case (small images and video frames
     // stretched over a cell area), and animated content rescales every
     // frame. Bilinear filtering matches GPU terminals' texture sampling and
-    // is several times cheaper than stb's floating-point filter pipeline,
+    // is several times cheaper than the floating-point filter pipeline,
     // which remains for downscaling where it avoids aliasing.
     if (dest_width >= source_width and dest_height >= source_height) {
         return upscaleRgbaBilinear(alloc, source, source_width, source_height, dest, dest_width, dest_height);
     }
-    if (c.stbir_resize_uint8(
-        source.ptr,
-        @intCast(source_width),
-        @intCast(source_height),
-        @intCast(source_width * 4),
-        dest.ptr,
-        @intCast(dest_width),
-        @intCast(dest_height),
-        @intCast(dest_width * 4),
-        4,
-    ) == 0) return error.ImageResizeFailed;
+    try resize.resize(alloc, .rgba, dest, dest_width, dest_height, source, @as(usize, source_width) * 4, source_width, source_height);
 }
 
 /// Fixed-point bilinear resampling of RGBA bytes with pixel-center
 /// alignment and edge clamping. Channels interpolate independently in
-/// encoded space, like the stb path.
+/// encoded space.
 fn upscaleRgbaBilinear(
     alloc: std.mem.Allocator,
     source: []const u8,
@@ -2085,7 +2076,7 @@ fn drawRun(
             glyph_constraints.isSymbol(cp),
             .{ .x = origin_x.phase, .y = origin_y.phase },
         ) catch |err| switch (err) {
-            error.FontLoadFailed, error.GlyphResizeFailed => {
+            error.FontLoadFailed => {
                 log.warn("skipping glyph render face={d} glyph={d} codepoint=U+{X}: {}", .{
                     sg.face,
                     sg.glyph,

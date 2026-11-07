@@ -16,6 +16,7 @@ const build_options = @import("build_options");
 const c = @import("c");
 const uucode = @import("uucode");
 const Config = @import("Config.zig");
+const resize = @import("resize.zig");
 const sprite = @import("sprite.zig");
 
 const log = std.log.scoped(.font);
@@ -77,7 +78,7 @@ neighbor_row_overhang: bool,
 /// insufficient.
 multi_row_overhang: bool,
 
-pub const Error = error{ FontNotFound, FontLoadFailed, GlyphResizeFailed, OutOfMemory };
+pub const Error = error{ FontNotFound, FontLoadFailed, OutOfMemory };
 
 pub const FaceStyle = enum(u2) {
     regular,
@@ -432,7 +433,7 @@ pub const Face = struct {
 
         const copy = try alloc.alloc(u8, @as(usize, width) * height);
         errdefer alloc.free(copy);
-        try resizeGrayWithStbir(alloc, copy, width, height, bitmap, src_width, src_height);
+        try resizeGray(alloc, copy, width, height, bitmap, src_width, src_height);
 
         return .{
             .bitmap = copy,
@@ -511,7 +512,7 @@ pub const Face = struct {
 
         const copy = try alloc.alloc(u8, @as(usize, width) * height * 4);
         errdefer alloc.free(copy);
-        try resizeBgraWithStbir(alloc, copy, width, height, bitmap, src_width, src_height);
+        try resizeBgra(alloc, copy, width, height, bitmap, src_width, src_height);
 
         return .{
             .bitmap = copy,
@@ -708,7 +709,7 @@ test "unpack monochrome bitmap rows to alpha" {
     try std.testing.expectEqualSlices(u8, &expected, rendered.bitmap);
 }
 
-fn resizeGrayWithStbir(
+fn resizeGray(
     alloc: std.mem.Allocator,
     dst: []u8,
     dst_width: u31,
@@ -731,20 +732,10 @@ fn resizeGrayWithStbir(
     };
     defer if (bitmap.pitch < 0) alloc.free(src[0 .. src_pitch * src_height]);
 
-    if (c.stbir_resize_uint8(
-        src,
-        @intCast(src_width),
-        @intCast(src_height),
-        @intCast(src_pitch),
-        dst.ptr,
-        @intCast(dst_width),
-        @intCast(dst_height),
-        @intCast(dst_width),
-        1,
-    ) == 0) return error.GlyphResizeFailed;
+    try resize.resize(alloc, .gray, dst, dst_width, dst_height, src[0 .. src_pitch * src_height], src_pitch, src_width, src_height);
 }
 
-fn resizeBgraWithStbir(
+fn resizeBgra(
     alloc: std.mem.Allocator,
     dst: []u8,
     dst_width: u31,
@@ -771,17 +762,8 @@ fn resizeBgraWithStbir(
     };
     defer if (bitmap.pitch < 0) alloc.free(src[0 .. src_pitch * src_height]);
 
-    if (c.stbir_resize_uint8(
-        src,
-        @intCast(src_width),
-        @intCast(src_height),
-        @intCast(src_pitch),
-        dst.ptr,
-        @intCast(dst_width),
-        @intCast(dst_height),
-        @intCast(@as(usize, dst_width) * 4),
-        4,
-    ) == 0) return error.GlyphResizeFailed;
+    // FreeType's BGRA glyphs are premultiplied, so they filter as stored.
+    try resize.resize(alloc, .bgra_premultiplied, dst, dst_width, dst_height, src[0 .. src_pitch * src_height], src_pitch, src_width, src_height);
 }
 
 fn bitmapRow(bitmap: c.FT_Bitmap, height: u31, y: usize) usize {
