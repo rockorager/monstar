@@ -277,7 +277,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
     const working_directory = try resolveWorkingDirectory(arena, init.minimal.environ, config.working_directory);
 
     const command = try buildCommand(arena, config, init.minimal.environ, cli.command_mode, cli.command, working_directory);
-    const envp = try buildEnvp(init.io, arena, init.minimal.environ, working_directory);
+    const envp = try buildEnvp(init.io, arena, init.minimal.environ, working_directory, config.term);
 
     const app = try App.init(
         init.io,
@@ -388,13 +388,14 @@ fn validateWorkingDirectory(path: [:0]const u8) !void {
         return error.InvalidCli;
 }
 
-/// Build the child's environment with Monstar's terminal definition and PWD
-/// matching the resolved working-directory override, if any.
+/// Build the child's environment with the configured TERM and PWD matching
+/// the resolved working-directory override, if any.
 fn buildEnvp(
     io: std.Io,
     arena: std.mem.Allocator,
     environ: std.process.Environ,
     cwd: ?[:0]const u8,
+    term: [:0]const u8,
 ) ![*:null]const ?[*:0]const u8 {
     var list: std.ArrayList(?[*:0]const u8) = .empty;
     var has_terminfo = false;
@@ -410,9 +411,10 @@ fn buildEnvp(
         try list.append(arena, e);
     }
     if (cwd) |path| try list.append(arena, try std.mem.joinZ(arena, "", &.{ "PWD=", path }));
-    try list.append(arena, "TERM=monstar");
+    try list.append(arena, try std.mem.joinZ(arena, "", &.{ "TERM=", term }));
     try list.append(arena, "COLORTERM=truecolor");
-    if (!has_terminfo) {
+    // Another TERM must resolve from the system database, not only ours.
+    if (!has_terminfo and std.mem.eql(u8, term, "monstar")) {
         var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (std.process.executableDirPath(io, &exe_dir_buf)) |len| {
             const terminfo_dir = try std.fs.path.joinZ(arena, &.{ exe_dir_buf[0..len], "..", "share", "terminfo" });
@@ -437,17 +439,19 @@ test "shell environment excludes the launch activation token" {
         "KEEP=value",
     };
     const environ: std.process.Environ = .{ .block = .{ .slice = &envp } };
-    const child = try buildEnvp(std.testing.io, arena_state.allocator(), environ, null);
-    const expected = [_][]const u8{
-        "TERMINFO=/custom/terminfo",
-        "KEEP=value",
-        "TERM=monstar",
-        "COLORTERM=truecolor",
-    };
-    const actual = std.mem.span(child);
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |want, entry| {
-        try std.testing.expectEqualStrings(want, std.mem.span(entry.?));
+    for ([_][:0]const u8{ "monstar", "xterm-256color" }) |term| {
+        const child = try buildEnvp(std.testing.io, arena_state.allocator(), environ, null, term);
+        const expected = [_][]const u8{
+            "TERMINFO=/custom/terminfo",
+            "KEEP=value",
+            try std.mem.concat(arena_state.allocator(), u8, &.{ "TERM=", term }),
+            "COLORTERM=truecolor",
+        };
+        const actual = std.mem.span(child);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, entry| {
+            try std.testing.expectEqualStrings(want, std.mem.span(entry.?));
+        }
     }
     try std.testing.expectEqualStrings("launcher-token", environ.getPosix("XDG_ACTIVATION_TOKEN").?);
 }
@@ -458,7 +462,7 @@ test "child environment updates PWD only when changing working directory" {
     const inherited = [_:null]?[*:0]const u8{ "PWD=/launcher", "PWD_EXTRA=keep" };
     for ([_]std.process.Environ{ .{ .block = .{ .slice = &inherited } }, .empty }) |environ| {
         for ([_]?[:0]const u8{ null, "/tmp/monstar project" }) |cwd| {
-            const envp = try buildEnvp(std.testing.io, arena_state.allocator(), environ, cwd);
+            const envp = try buildEnvp(std.testing.io, arena_state.allocator(), environ, cwd, "monstar");
             const child: std.process.Environ = .{ .block = .{ .slice = std.mem.span(envp) } };
             const expected = cwd orelse environ.getPosix("PWD");
             if (expected) |path| {

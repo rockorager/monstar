@@ -126,6 +126,9 @@ working_directory: ?[:0]const u8 = null,
 /// Command to run; unset falls back to $SHELL, then /bin/sh. This only
 /// affects startup because reloading does not replace a running child.
 command: ?Command = null,
+/// TERM value for the child. Only `monstar` also points TERMINFO at a bundled
+/// terminfo directory. This only affects startup.
+term: [:0]const u8 = "monstar",
 /// Shell command that receives the last semantic command output on stdin.
 pipe_command_output: ?[:0]const u8 = null,
 notify_on_command_finish: NotifyOnCommandFinish = .never,
@@ -382,6 +385,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.working_directory = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "command")) {
         self.command = try parseCommand(arena, value);
+    } else if (std.mem.eql(u8, key, "term")) {
+        self.term = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "pipe-command-output")) {
         self.pipe_command_output = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "notify-on-command-finish")) {

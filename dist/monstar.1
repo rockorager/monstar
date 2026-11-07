@@ -128,8 +128,11 @@ as fallbacks.
 .PP
 The child environment is inherited except that
 .B TERM
-is set to
-.BR monstar .
+is set to the
+.B term
+setting,
+.B monstar
+by default.
 .SH TERMINAL COMPATIBILITY
 Monstar uses Ghostty's
 .B libghostty-vt
@@ -265,9 +268,11 @@ Override the resource directory used to find installed themes.
 Default child command when no command is otherwise configured.
 .TP
 .B TERM
-The inherited value is replaced with
+The inherited value is replaced with the
+.B term
+setting,
 .B monstar
-for the child.
+by default, for the child.
 .TP
 .B XDG_CONFIG_HOME
 Base directory for the configuration file and user themes.

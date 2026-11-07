@@ -86,8 +86,9 @@ Visual and interaction settings apply to the running window.
 The
 .BR command ,
 .BR linux-cgroup ,
+.BR scrollback-limit ,
 and
-.B scrollback-limit
+.B term
 settings describe resources created at startup and do not replace or move an
 existing child or resize existing scrollback storage.
 .SH GENERAL SETTINGS
@@ -129,6 +130,22 @@ standard input when
 .B Ctrl+Shift+G
 is pressed.
 The default is unset.
+.TP
+.BI term " = name"
+Set the
+.B TERM
+environment variable for the child.
+The default is
+.BR monstar ,
+which also points
+.B TERMINFO
+at the bundled terminfo directory when Monstar runs from a prefix that has one.
+Other values, such as
+.BR xterm-256color ,
+must exist in the system terminfo database.
+Monstar still identifies itself as
+.B monstar
+in terminal capability replies.
 .TP
 .BI working-directory " = path"
 Start the child in

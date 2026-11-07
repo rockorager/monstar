@@ -149,6 +149,9 @@ Other settings:
   `~`, or `~/path`. Unusable directories are ignored with a warning.
   `--working-directory` overrides it, and `Ctrl+Shift+N` windows start in the
   current terminal directory.
+- **term** — `TERM` for the child (default `monstar`). Set
+  `term = xterm-256color` when remote hosts lack Monstar's terminfo; see
+  [Terminfo](#terminfo).
 - **pipe-command-output** — Shell command that receives the last command's
   output on stdin when `Ctrl+Shift+G` is pressed.
 - **scrollback-limit** — Terminal page storage in bytes, including the active
@@ -307,7 +310,9 @@ session is detected.
 
 ## Terminfo
 
-Monstar uses `TERM=monstar` by default.
+Monstar uses `TERM=monstar` by default. Set `term = xterm-256color` to use a
+definition that remote hosts already have, at the cost of Monstar-specific
+capabilities.
 
 If a remote server does not recognize `monstar` over SSH, send it the installed
 definition from your local machine:
