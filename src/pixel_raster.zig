@@ -284,7 +284,7 @@ fn toLinear(value: f64) f64 {
     return if (value <= 0.04045) value / 12.92 else std.math.pow(f64, (value + 0.055) / 1.055, 2.4);
 }
 
-const decode: [256]u16 = blk: {
+pub const decode: [256]u16 = blk: {
     @setEvalBranchQuota(100_000);
     var table: [256]u16 = undefined;
     for (&table, 0..) |*entry, i| {
@@ -295,7 +295,7 @@ const decode: [256]u16 = blk: {
 };
 // Construct the 64 KiB encode table using the 255 boundaries between
 // rounded output bytes, instead of evaluating pow for all 65536 entries.
-const encode: [65536]u8 = blk: {
+pub const encode: [65536]u8 = blk: {
     @setEvalBranchQuota(200_000);
     var table: [65536]u8 = undefined;
     var start: usize = 0;

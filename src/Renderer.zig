@@ -11,9 +11,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c");
 const vt = @import("ghostty-vt");
+const Canvas = @import("Canvas.zig");
 const CellDamageTracker = @import("CellDamageTracker.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
+const GpuDrawList = @import("GpuDrawList.zig");
 const TextShaper = @import("TextShaper.zig");
 const glyph_constraints = @import("glyph_constraints.zig");
 const kitty_graphics = @import("kitty_graphics.zig");
@@ -258,24 +260,26 @@ fn pixelStride(self: *const Renderer, width: u31) u31 {
     return stride;
 }
 
-fn pixelBufferFits(pixels: []const u32, stride: u31, width: u31, height: u31) bool {
-    if (width == 0 or height == 0) return true;
-    return pixels.len >= @as(usize, height - 1) * stride + width;
+/// A CPU canvas over `pixels` using `buffer_stride` (zero means `width`).
+pub fn pixelCanvas(self: *const Renderer, pixels: []u32, width: u31, height: u31) Canvas {
+    return .cpu(pixels, self.pixelStride(width), width, height);
 }
 
-/// Draw the full render state into `pixels` (width*height, stride == width).
-pub fn render(
+/// Draw the full render state into `pixels`; see `draw`.
+pub fn render(self: *Renderer, state: *const vt.RenderState, pixels: []u32, width: u31, height: u31) !void {
+    return self.draw(state, self.pixelCanvas(pixels, width, height));
+}
+
+/// Draw the full render state onto `canvas`.
+pub fn draw(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
-    std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
     self.cell_damage_measured = false;
 
     if (state.rows == 0 or state.cols == 0) {
-        fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
+        try canvas.fillRect(0, 0, canvas.width, canvas.height, self.backgroundPixel(state.colors.background));
         if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
         return;
     }
@@ -290,25 +294,19 @@ pub fn render(
             all_cells[y].slice(),
             all_selections[y],
             @intCast(y),
-            pixels,
-            width,
-            height,
+            canvas,
         );
     }
 
     // Rows cover their own background; only the strip below the last
     // grid row remains.
     const grid_bottom = @as(usize, state.rows) * self.font.cell_height;
-    if (grid_bottom < height) {
-        fillRect(
-            pixels,
-            self.pixelStride(width),
-            width,
-            height,
+    if (grid_bottom < canvas.height) {
+        try canvas.fillRect(
             0,
             @intCast(grid_bottom),
-            width,
-            height - @as(u31, @intCast(grid_bottom)),
+            canvas.width,
+            canvas.height - @as(u31, @intCast(grid_bottom)),
             self.backgroundPixel(state.colors.background),
         );
     }
@@ -320,21 +318,17 @@ pub fn render(
 /// Grid-anchored preedit text is cropped with the terminal. Overlays anchored
 /// to the window must be drawn after this call. This is a full repaint; callers
 /// must also repaint fully when returning to offset zero.
-pub fn renderScrolled(
+pub fn drawScrolled(
     self: *Renderer,
     state: *const vt.RenderState,
     items: []const KittyRenderItem,
     preedit: ?[]const u8,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     offset: u31,
 ) !void {
     std.debug.assert(offset > 0 and offset < self.font.cell_height);
     std.debug.assert(state.viewportStart() == 0 and state.overscan.below == 1);
-    const stride = self.pixelStride(width);
-    const expanded_height = height + self.font.cell_height;
-    try self.scroll_pixels.resize(self.alloc, @as(usize, width) * expanded_height);
+    const expanded_height = canvas.height + self.font.cell_height;
 
     // Borrow the snapshot without changing its ownership or viewport contract.
     // Rendering and clipping the extended grid together keeps glyph overhang,
@@ -343,22 +337,32 @@ pub fn renderScrolled(
     expanded.rows += 1;
     const track = self.track_cell_damage;
     self.track_cell_damage = false;
-    const old_stride = self.buffer_stride;
-    self.buffer_stride = width;
-    defer {
-        self.track_cell_damage = track;
-        self.buffer_stride = old_stride;
-    }
+    defer self.track_cell_damage = track;
+
+    // GPU views translate and clip instead of cropping a scratch buffer.
+    const expanded_canvas: Canvas = switch (canvas.target) {
+        .pixels => blk: {
+            try self.scroll_pixels.resize(self.alloc, @as(usize, canvas.width) * expanded_height);
+            break :blk .cpu(self.scroll_pixels.items, canvas.width, canvas.width, expanded_height);
+        },
+        .gpu => canvas.translated(-@as(i32, offset), canvas.width, expanded_height),
+    };
     if (items.len > 0) {
-        try self.renderWithKittyItems(&expanded, items, self.scroll_pixels.items, width, expanded_height);
+        try self.drawWithKittyItems(&expanded, items, expanded_canvas);
     } else {
-        try self.render(&expanded, self.scroll_pixels.items, width, expanded_height);
+        try self.draw(&expanded, expanded_canvas);
     }
     if (preedit) |text| {
-        try self.renderPreedit(&expanded, self.scroll_pixels.items, width, expanded_height, text);
+        try self.drawPreedit(&expanded, expanded_canvas, text);
     }
-    for (0..height) |y| {
-        copyPixels(pixels[y * stride ..][0..width], self.scroll_pixels.items[(y + offset) * width ..][0..width]);
+    switch (canvas.target) {
+        .pixels => |pixels| for (0..canvas.height) |y| {
+            copyPixels(
+                pixels[y * canvas.stride ..][0..canvas.width],
+                self.scroll_pixels.items[(y + offset) * canvas.width ..][0..canvas.width],
+            );
+        },
+        .gpu => {},
     }
 }
 
@@ -373,7 +377,15 @@ pub fn renderWithKittyItems(
     width: u31,
     height: u31,
 ) !void {
-    std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
+    return self.drawWithKittyItems(state, items, self.pixelCanvas(pixels, width, height));
+}
+
+pub fn drawWithKittyItems(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    items: []const KittyRenderItem,
+    canvas: Canvas,
+) !void {
     self.kitty_frame +%= 1;
 
     // An opaque above-text image covering the framebuffer determines
@@ -383,21 +395,21 @@ pub fn renderWithKittyItems(
         const final = items[items.len - 1];
         const rect = kittyDestRect(final, self.font.cell_width, self.font.cell_height);
         if (final.z >= 0 and kittyItemOpaque(final) and
-            rect.x0 <= 0 and rect.y0 <= 0 and rect.x1 >= width and rect.y1 >= height)
+            rect.x0 <= 0 and rect.y0 <= 0 and rect.x1 >= canvas.width and rect.y1 >= canvas.height)
         {
-            try self.renderKittyPlacement(pixels, width, height, final.image, final.viewport);
+            try self.renderKittyPlacement(canvas, final.image, final.viewport, false);
             if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
             return;
         }
     }
 
-    fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
+    try canvas.fillRect(0, 0, canvas.width, canvas.height, self.backgroundPixel(state.colors.background));
     if (state.rows == 0 or state.cols == 0) {
         if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
         return;
     }
 
-    try self.renderKittyItems(items, pixels, width, height, .below_bg);
+    try self.renderKittyItems(items, canvas, .below_bg);
 
     const rows = state.row_data.slice();
     const all_cells = rows.items(.cells);
@@ -408,14 +420,12 @@ pub fn renderWithKittyItems(
             all_cells[y].slice(),
             all_selections[y],
             @intCast(y),
-            pixels,
-            width,
-            height,
+            canvas,
             .styled,
         );
     }
 
-    try self.renderKittyItems(items, pixels, width, height, .below_text);
+    try self.renderKittyItems(items, canvas, .below_text);
 
     for (0..state.rows) |y| {
         try self.prepareRow(
@@ -423,22 +433,18 @@ pub fn renderWithKittyItems(
             all_cells[y].slice(),
             all_selections[y],
             @intCast(y),
-            pixels,
-            width,
-            height,
+            canvas,
             .none,
         );
         try self.renderRowForeground(
             state,
             all_cells[y].slice(),
             @intCast(y),
-            pixels,
-            width,
-            height,
+            canvas,
         );
     }
 
-    try self.renderKittyItems(items, pixels, width, height, .above_text);
+    try self.renderKittyItems(items, canvas, .above_text);
     if (self.track_cell_damage) try self.snapshotCellFingerprints(state);
 }
 
@@ -449,24 +455,26 @@ pub fn renderWithKittyItems(
 /// dirty row, when it reaches into the dirty row's freshly cleared
 /// strip. Modified grid-pixel rectangles are recorded in
 /// `rendered_rects` for repair and surface damage.
-pub fn renderDirty(
+pub fn renderDirty(self: *Renderer, state: *vt.RenderState, pixels: []u32, width: u31, height: u31) !void {
+    return self.drawDirty(state, self.pixelCanvas(pixels, width, height));
+}
+
+/// `renderDirty` onto a canvas holding the previously drawn frame.
+pub fn drawDirty(
     self: *Renderer,
     state: *vt.RenderState,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
-    std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
     self.rendered_rects.clearRetainingCapacity();
     if (state.rows == 0 or state.cols == 0) return;
     if (self.font.multi_row_overhang) {
-        try self.render(state, pixels, width, height);
-        if (width > 0 and height > 0) {
+        try self.draw(state, canvas);
+        if (canvas.width > 0 and canvas.height > 0) {
             try self.rendered_rects.append(self.alloc, .{
                 .x = 0,
                 .y = 0,
-                .width = width,
-                .height = height,
+                .width = canvas.width,
+                .height = canvas.height,
             });
         }
         return;
@@ -485,7 +493,7 @@ pub fn renderDirty(
         if (self.font.neighbor_row_overhang) {
             // Shrunk cells ink in both directions; repaint both neighbors.
             for (@max(y -| 1, rendered_until)..@min(state.rows, y + 2)) |row| {
-                try self.repaintRow(state, row, null, pixels, width, height);
+                try self.repaintRow(state, row, null, canvas);
             }
             rendered_until = @min(state.rows, y + 2);
             continue;
@@ -496,22 +504,23 @@ pub fn renderDirty(
             // Clear the ink this row's previous content left above it. The
             // row above is unchanged, so its own ink above stays as it is.
             const keep = y >= 2 and self.row_overhang.isSet(y - 1);
-            if (keep) try self.saveStrip(y - 2, pixels, width, height);
-            try self.repaintRow(state, y - 1, null, pixels, width, height);
-            if (keep) self.restoreStrip(y - 2, pixels, width, height);
+            if (keep) try self.saveStrip(y - 2, canvas);
+            try self.repaintRow(state, y - 1, null, canvas);
+            if (keep) self.restoreStrip(y - 2, canvas);
         }
         const cell_damage = if (self.partial_cell_raster and !inks_up and !inked_from_below)
             self.cell_damage_tracker.damageForRow(y)
         else
             null;
-        try self.repaintRow(state, y, cell_damage, pixels, width, height);
+        try self.repaintRow(state, y, cell_damage, canvas);
         if (inked_from_below and !(all_dirty[y + 1] and self.rowRepaints(y + 1))) {
             // Redraw the unchanged row below only where it inks into this
             // row's freshly cleared strip.
-            const strip_end: u31 = @intCast(@min(@as(u64, y + 1) * self.font.cell_height, height));
+            const strip_end: u31 = @intCast(@min(@as(u64, y + 1) * self.font.cell_height, canvas.height));
             const below = all_cells[y + 1].slice();
-            try self.prepareRow(state, below, all_selections[y + 1], @intCast(y + 1), pixels, width, strip_end, .none);
-            try self.renderRowForeground(state, below, @intCast(y + 1), pixels, width, strip_end);
+            const above_strip_end = canvas.view(0, 0, canvas.width, strip_end);
+            try self.prepareRow(state, below, all_selections[y + 1], @intCast(y + 1), above_strip_end, .none);
+            try self.renderRowForeground(state, below, @intCast(y + 1), above_strip_end);
         }
         rendered_until = y + 1;
     }
@@ -529,19 +538,17 @@ fn repaintRow(
     state: *const vt.RenderState,
     y: usize,
     cell_range: ?CellRange,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
     const rows = state.row_data.slice();
     const cells = rows.items(.cells)[y].slice();
     const selection = rows.items(.selection)[y];
     if (cell_range) |range| {
-        try self.renderRowCells(state, cells, selection, range, @intCast(y), pixels, width, height);
-        try self.recordRenderedRect(range, y, state.cols, width, height);
+        try self.renderRowCells(state, cells, selection, range, @intCast(y), canvas);
+        try self.recordRenderedRect(range, y, state.cols, canvas.width, canvas.height);
     } else {
-        try self.renderRow(state, cells, selection, @intCast(y), pixels, width, height);
-        try self.recordRenderedRect(.{ .start = 0, .end = state.cols }, y, state.cols, width, height);
+        try self.renderRow(state, cells, selection, @intCast(y), canvas);
+        try self.recordRenderedRect(.{ .start = 0, .end = state.cols }, y, state.cols, canvas.width, canvas.height);
     }
 }
 
@@ -563,22 +570,39 @@ pub fn measureDirtyDamage(self: *Renderer, state: *const vt.RenderState) !?usize
     return cells;
 }
 
-fn stripPixels(self: *const Renderer, y: usize, width: u31, height: u31) struct { start: usize, end: usize } {
-    const stride: usize = self.pixelStride(width);
-    const top = @min(y * self.font.cell_height, height);
-    const bottom = @min((y + 1) * self.font.cell_height, height);
-    return .{ .start = top * stride, .end = if (bottom > top) (bottom - 1) * stride + width else top * stride };
+fn stripPixels(self: *const Renderer, y: usize, canvas: Canvas) struct { start: usize, end: usize } {
+    const stride: usize = canvas.stride;
+    const top = @min(y * self.font.cell_height, canvas.height);
+    const bottom = @min((y + 1) * self.font.cell_height, canvas.height);
+    return .{ .start = top * stride, .end = if (bottom > top) (bottom - 1) * stride + canvas.width else top * stride };
 }
 
-fn saveStrip(self: *Renderer, y: usize, pixels: []const u32, width: u31, height: u31) !void {
-    const strip = self.stripPixels(y, width, height);
-    try self.strip_scratch.resize(self.alloc, strip.end - strip.start);
-    @memcpy(self.strip_scratch.items, pixels[strip.start..strip.end]);
+/// Preserve row `y`'s strip across the next repaint until restoreStrip.
+/// GPU canvases discard drawing above the strip's bottom edge instead of
+/// copying it, which leaves the same pixels.
+fn saveStrip(self: *Renderer, y: usize, canvas: Canvas) !void {
+    switch (canvas.target) {
+        .pixels => |pixels| {
+            const strip = self.stripPixels(y, canvas);
+            try self.strip_scratch.resize(self.alloc, strip.end - strip.start);
+            @memcpy(self.strip_scratch.items, pixels[strip.start..strip.end]);
+        },
+        .gpu => |list| {
+            std.debug.assert(list.clip_min_y == std.math.minInt(i32));
+            const bottom = @min((y + 1) * self.font.cell_height, canvas.height);
+            list.clip_min_y = canvas.origin_y + @as(i32, @intCast(bottom));
+        },
+    }
 }
 
-fn restoreStrip(self: *Renderer, y: usize, pixels: []u32, width: u31, height: u31) void {
-    const strip = self.stripPixels(y, width, height);
-    @memcpy(pixels[strip.start..strip.end], self.strip_scratch.items);
+fn restoreStrip(self: *Renderer, y: usize, canvas: Canvas) void {
+    switch (canvas.target) {
+        .pixels => |pixels| {
+            const strip = self.stripPixels(y, canvas);
+            @memcpy(pixels[strip.start..strip.end], self.strip_scratch.items);
+        },
+        .gpu => |list| list.clip_min_y = std.math.minInt(i32),
+    }
 }
 
 fn recordRenderedRect(
@@ -784,12 +808,10 @@ pub fn scrollDiscardsInk(self: *const Renderer, rows: usize, shift_rows: isize) 
     return self.row_overhang.isSet(rows - @abs(shift_rows));
 }
 
-pub fn renderPreedit(
+pub fn drawPreedit(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     text: []const u8,
 ) !void {
     if (text.len == 0) return;
@@ -813,11 +835,7 @@ pub fn renderPreedit(
         const clipped_span: u31 = @min(span, state.cols - x);
         const cp = cps[i - cluster.len];
 
-        fillRect(
-            pixels,
-            self.pixelStride(width),
-            width,
-            height,
+        try canvas.fillRect(
             x * self.font.cell_width,
             y * self.font.cell_height,
             clipped_span * self.font.cell_width,
@@ -829,11 +847,7 @@ pub fn renderPreedit(
         if (face_idx == Font.sprite_face_index) {
             const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
             self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
-            blitGlyph(
-                pixels,
-                self.pixelStride(width),
-                width,
-                height,
+            try canvas.blitGlyph(
                 g,
                 @as(i32, x) * self.font.cell_width + g.bearing_x,
                 baseline_y - g.bearing_y,
@@ -846,11 +860,7 @@ pub fn renderPreedit(
             const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
             if (glyph_idx != 0) {
                 const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
-                blitGlyph(
-                    pixels,
-                    self.pixelStride(width),
-                    width,
-                    height,
+                try canvas.blitGlyph(
                     g,
                     @as(i32, x) * self.font.cell_width + g.bearing_x,
                     baseline_y - g.bearing_y,
@@ -860,23 +870,19 @@ pub fn renderPreedit(
                 );
             }
         }
-        try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), pixels, width, height);
+        try self.blitDecoration(.underline, x, y, argb(state.colors.foreground), canvas);
         x += span;
     }
 }
 
-pub fn renderLinkHint(
+pub fn drawLinkHint(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     uri: []const u8,
 ) !void {
     try self.renderTextOverlay(
-        pixels,
-        width,
-        height,
+        canvas,
         uri,
         .bottom_left,
         self.selection_bg,
@@ -884,19 +890,15 @@ pub fn renderLinkHint(
     );
 }
 
-pub fn renderSearch(
+pub fn drawSearch(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     text: []const u8,
     no_match: bool,
 ) !void {
     try self.renderTextOverlay(
-        pixels,
-        width,
-        height,
+        canvas,
         text,
         .top_right,
         if (no_match) state.colors.palette[1] else self.selection_bg,
@@ -907,19 +909,14 @@ pub fn renderSearch(
 /// Draw a macOS-style overlay scrollbar: a narrow adaptive pill with no
 /// track. Geometry is in full-surface physical pixels rather than grid-local
 /// pixels, so the thumb stays against the window edge when padding is used.
-pub fn renderScrollbarThumb(
+pub fn drawScrollbarThumb(
     self: *Renderer,
     state: *const vt.RenderState,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     thumb: ScrollbarThumb,
-) void {
-    blendCapsule(
-        pixels,
-        self.pixelStride(width),
-        width,
-        height,
+) !void {
+    _ = self;
+    try canvas.blendCapsule(
         thumb,
         argb(state.colors.foreground),
     );
@@ -966,31 +963,25 @@ fn overlayText(cps: []const u21, max_width: u31, suffix: bool) OverlayText {
 
 fn renderTextOverlay(
     self: *Renderer,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     text: []const u8,
     position: OverlayPosition,
     bg: vt.color.RGB,
     fg: vt.color.RGB,
 ) !void {
-    if (text.len == 0 or width == 0 or height < self.font.cell_height) return;
+    if (text.len == 0 or canvas.width == 0 or canvas.height < self.font.cell_height) return;
 
-    const cols: u31 = @max(1, width / self.font.cell_width);
+    const cols: u31 = @max(1, canvas.width / self.font.cell_width);
     const padding: u31 = @intFromBool(cols > 2);
     const max_text_width = cols - padding * 2;
     const cps = try self.overlayCodepoints(text);
     const visible = overlayText(cps, max_text_width, position == .top_right);
     const box_width = visible.width + padding * 2;
     const box_x: u31 = if (position == .top_right) cols - box_width else 0;
-    const y: u31 = if (position == .top_right) 0 else height - self.font.cell_height;
+    const y: u31 = if (position == .top_right) 0 else canvas.height - self.font.cell_height;
     const baseline_y: i32 = @as(i32, @intCast(y)) + self.font.baseline;
 
-    fillRect(
-        pixels,
-        self.pixelStride(width),
-        width,
-        height,
+    try canvas.fillRect(
         box_x * self.font.cell_width,
         y,
         box_width * self.font.cell_width,
@@ -1013,11 +1004,7 @@ fn renderTextOverlay(
         if (face_idx == Font.sprite_face_index) {
             const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
             self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
-            blitGlyph(
-                pixels,
-                self.pixelStride(width),
-                width,
-                height,
+            try canvas.blitGlyph(
                 g,
                 @as(i32, x) * self.font.cell_width + g.bearing_x,
                 baseline_y - g.bearing_y,
@@ -1030,11 +1017,7 @@ fn renderTextOverlay(
             const glyph_idx = c.FT_Get_Char_Index(face.ft_face, cp);
             if (glyph_idx != 0) {
                 const g = try face.glyph(self.alloc, glyph_idx, @intCast(@min(span, 2)), glyph_constraints.isSymbol(cp));
-                blitGlyph(
-                    pixels,
-                    self.pixelStride(width),
-                    width,
-                    height,
+                try canvas.blitGlyph(
                     g,
                     @as(i32, x) * self.font.cell_width + g.bearing_x,
                     baseline_y - g.bearing_y,
@@ -1051,14 +1034,12 @@ fn renderTextOverlay(
 fn renderKittyItems(
     self: *Renderer,
     items: []const KittyRenderItem,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     layer: KittyGraphicsLayer,
 ) !void {
     for (items) |item| {
         if (!layer.matches(item.z)) continue;
-        try self.renderKittyPlacement(pixels, width, height, item.image, item.viewport);
+        try self.renderKittyPlacement(canvas, item.image, item.viewport, layer != .above_text);
     }
 }
 
@@ -1079,11 +1060,11 @@ const KittyGraphicsLayer = enum {
 
 fn renderKittyPlacement(
     self: *Renderer,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     image: KittyImage,
     viewport: KittyPlacementViewport,
+    /// Below the text layer: text coverage correction sees it as background.
+    background: bool,
 ) !void {
     if (image.width == 0 or image.height == 0 or image.data.len() == 0) return;
 
@@ -1101,15 +1082,61 @@ fn renderKittyPlacement(
     // Senders like mpv pre-scale frames to the cell area and place them
     // without c=/r=, making dest dims equal source dims. Blit straight
     // from the image bytes: no staging buffers, no resampler.
-    if (dest_width == source_width and dest_height == source_height) {
-        blitKittyUnscaled(pixels, self.pixelStride(width), width, height, image, viewport, dest_x, dest_y);
+    const unscaled = dest_width == source_width and dest_height == source_height;
+    const pixels = switch (canvas.target) {
+        .pixels => |pixels| pixels,
+        .gpu => |list| return self.drawGpuKittyPlacement(canvas, list, image, viewport, unscaled, dest_x, dest_y, background),
+    };
+    if (unscaled) {
+        blitKittyUnscaled(pixels, canvas.stride, canvas.width, canvas.height, image, viewport, dest_x, dest_y);
         return;
     }
 
     const scaled = try self.scaledKittyRgba(image, viewport) orelse return;
     defer if (!scaled.cached) self.alloc.free(scaled.bytes);
 
-    blendRgba(pixels, self.pixelStride(width), width, height, scaled.bytes, dest_width, dest_height, dest_x, dest_y);
+    blendRgba(pixels, canvas.stride, canvas.width, canvas.height, scaled.bytes, dest_width, dest_height, dest_x, dest_y);
+}
+
+/// Upload the placement's final RGBA texels once per image generation and
+/// crop, then draw them 1:1. Scaling and format conversion are the CPU
+/// renderer's, so both backends produce the same texels.
+fn drawGpuKittyPlacement(
+    self: *Renderer,
+    canvas: Canvas,
+    list: *GpuDrawList,
+    image: KittyImage,
+    viewport: KittyPlacementViewport,
+    unscaled: bool,
+    dest_x: i64,
+    dest_y: i64,
+    background: bool,
+) !void {
+    const key: GpuDrawList.ImageKey = .{
+        .image_id = image.id,
+        .generation = image.generation,
+        .format = @backingInt(image.format),
+        .image_width = image.width,
+        .image_height = image.height,
+        .source_x = viewport.source_x,
+        .source_y = viewport.source_y,
+        .source_width = viewport.source_width,
+        .source_height = viewport.source_height,
+        .dest_width = viewport.pixel_width,
+        .dest_height = viewport.pixel_height,
+    };
+    const slot = list.findImage(key) orelse slot: {
+        if (unscaled) {
+            var rgba = try self.alloc.alloc(u8, @as(usize, viewport.source_width) * viewport.source_height * 4);
+            defer self.alloc.free(rgba);
+            if (!copyKittySourceRgba(&rgba, image, viewport)) return;
+            break :slot try list.uploadImage(key, rgba, viewport.source_width, viewport.source_height);
+        }
+        const scaled = try self.scaledKittyRgba(image, viewport) orelse return;
+        defer if (!scaled.cached) self.alloc.free(scaled.bytes);
+        break :slot try list.uploadImage(key, scaled.bytes, viewport.pixel_width, viewport.pixel_height);
+    };
+    try canvas.drawImage(slot, viewport.pixel_width, viewport.pixel_height, dest_x, dest_y, background);
 }
 
 fn scaledKittyRgba(
@@ -1510,12 +1537,10 @@ fn renderRow(
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     selection: ?[2]vt.size.CellCountInt,
     y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
-    try self.prepareRow(state, cells, selection, y, pixels, width, height, .all);
-    try self.renderRowForeground(state, cells, y, pixels, width, height);
+    try self.prepareRow(state, cells, selection, y, canvas, .all);
+    try self.renderRowForeground(state, cells, y, canvas);
 }
 
 fn renderRowCells(
@@ -1525,9 +1550,7 @@ fn renderRowCells(
     selection: ?[2]vt.size.CellCountInt,
     cell_range: CellRange,
     y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
     std.debug.assert(self.glyph_clip_x == null);
     self.glyph_clip_x = .{
@@ -1535,8 +1558,8 @@ fn renderRowCells(
         .end = @intCast(cell_range.end * self.font.cell_width),
     };
     defer self.glyph_clip_x = null;
-    try self.prepareRowCells(state, cells, selection, cell_range, y, pixels, width, height, .all);
-    try self.renderRowForegroundCells(state, cells, cell_range, y, pixels, width, height);
+    try self.prepareRowCells(state, cells, selection, cell_range, y, canvas, .all);
+    try self.renderRowForegroundCells(state, cells, cell_range, y, canvas);
 }
 
 /// Cell SGR colors after reverse video, used to resolve `cell-foreground`
@@ -1587,9 +1610,7 @@ fn prepareRow(
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     selection: ?[2]vt.size.CellCountInt,
     y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     backgrounds: Backgrounds,
 ) !void {
     return self.prepareRowCells(
@@ -1598,9 +1619,7 @@ fn prepareRow(
         selection,
         .{ .start = 0, .end = @min(@as(usize, state.cols), cells.len) },
         y,
-        pixels,
-        width,
-        height,
+        canvas,
         backgrounds,
     );
 }
@@ -1612,9 +1631,7 @@ fn prepareRowCells(
     selection: ?[2]vt.size.CellCountInt,
     cell_range: CellRange,
     y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
     backgrounds: Backgrounds,
 ) !void {
     const font = self.font;
@@ -1694,7 +1711,7 @@ fn prepareRowCells(
         }
         // Focused block cursor: recolor its glyph. Its background is painted
         // after the cell backgrounds so it can retain the font's natural
-        // height when the cell height is adjusted. All other cursor shapes
+        // canvas.height when the cell canvas.height is adjusted. All other cursor shapes
         // (and any unfocused cursor) overlay a sprite after drawing instead.
         if (cursor_x != null and cursor_x.? == x and
             state.cursor.visual_style == .block and self.focused)
@@ -1727,11 +1744,11 @@ fn prepareRowCells(
                 if (bg_run.active and pixel == bg_run.color and px_start <= bg_run.end_px) {
                     bg_run.end_px = @max(bg_run.end_px, px_end);
                 } else {
-                    bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
+                    try bg_run.flush(canvas, y_px, font.cell_height);
                     bg_run = .{ .active = true, .color = pixel, .start_px = px_start, .end_px = px_end };
                 }
             } else {
-                bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
+                try bg_run.flush(canvas, y_px, font.cell_height);
             }
         }
     }
@@ -1739,17 +1756,17 @@ fn prepareRowCells(
     // buffer's right edge past the last column.
     if (backgrounds == .all and cell_range.end == cols) {
         const margin_start: u31 = cols * font.cell_width;
-        if (margin_start < width) {
+        if (margin_start < canvas.width) {
             const color = self.backgroundPixel(colors.background);
             if (bg_run.active and color == bg_run.color) {
-                bg_run.end_px = width;
+                bg_run.end_px = canvas.width;
             } else {
-                bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
-                bg_run = .{ .active = true, .color = color, .start_px = margin_start, .end_px = width };
+                try bg_run.flush(canvas, y_px, font.cell_height);
+                bg_run = .{ .active = true, .color = color, .start_px = margin_start, .end_px = canvas.width };
             }
         }
     }
-    bg_run.flush(pixels, self.pixelStride(width), width, height, y_px, font.cell_height);
+    try bg_run.flush(canvas, y_px, font.cell_height);
 
     if (cursor_x) |cx| {
         if (self.focused and state.cursor.visual_style == .block and
@@ -1763,15 +1780,11 @@ fn prepareRowCells(
                 2,
             );
             const bottom = top + cursor_height;
-            const clipped_top: u31 = @intCast(std.math.clamp(top, 0, height));
-            const clipped_bottom: u31 = @intCast(std.math.clamp(bottom, 0, height));
+            const clipped_top: u31 = @intCast(std.math.clamp(top, 0, canvas.height));
+            const clipped_bottom: u31 = @intCast(std.math.clamp(bottom, 0, canvas.height));
             if (clipped_bottom > clipped_top) {
                 const cursor_width = font.cell_width * glyph_constraints.cellSpan(raws[cx]);
-                fillRect(
-                    pixels,
-                    self.pixelStride(width),
-                    width,
-                    height,
+                try canvas.fillRect(
                     cx * font.cell_width,
                     clipped_top,
                     cursor_width,
@@ -1800,10 +1813,10 @@ const BgRun = struct {
     start_px: u31 = 0,
     end_px: u31 = 0,
 
-    fn flush(run: *BgRun, pixels: []u32, stride: u31, buf_width: u31, buf_height: u31, y_px: u31, h: u31) void {
+    fn flush(run: *BgRun, canvas: Canvas, y_px: u31, h: u31) !void {
         if (!run.active) return;
-        fillRect(pixels, stride, buf_width, buf_height, run.start_px, y_px, run.end_px - run.start_px, h, run.color);
         run.active = false;
+        try canvas.fillRect(run.start_px, y_px, run.end_px - run.start_px, h, run.color);
     }
 };
 
@@ -1812,18 +1825,14 @@ fn renderRowForeground(
     state: *const vt.RenderState,
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
     return self.renderRowForegroundCells(
         state,
         cells,
         .{ .start = 0, .end = @min(@as(usize, state.cols), cells.len) },
         y,
-        pixels,
-        width,
-        height,
+        canvas,
     );
 }
 
@@ -1833,9 +1842,7 @@ fn renderRowForegroundCells(
     cells: std.MultiArrayList(vt.RenderState.Cell).Slice,
     cell_range: CellRange,
     y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
     const colors = &state.colors;
     const raws = cells.items(.raw);
@@ -1880,13 +1887,13 @@ fn renderRowForegroundCells(
             (cursor_x != null and (x == cursor_x.? or run_start == cursor_x.?));
         if (breaks_run) {
             if (run_start <= range_end and x >= range_start) {
-                try self.drawRun(raws, styles, graphemes, run_start, x, cols, y, pixels, width, height);
+                try self.drawRun(raws, styles, graphemes, run_start, x, cols, y, canvas);
             }
             run_start = if (has_text) x else x + 1;
         }
     }
     if (run_start <= range_end and scan_end >= range_start) {
-        try self.drawRun(raws, styles, graphemes, run_start, scan_end, cols, y, pixels, width, height);
+        try self.drawRun(raws, styles, graphemes, run_start, scan_end, cols, y, canvas);
     }
 
     // Decoration pass: underlines, strikethrough, overline, and hyperlink
@@ -1906,7 +1913,7 @@ fn renderRowForegroundCells(
 
         const cell_x: u31 = @intCast(dx);
         if (show_hyperlink) {
-            try self.blitDecoration(.underline, cell_x, y, argb(self.fg_scratch.items[dx]), pixels, width, height);
+            try self.blitDecoration(.underline, cell_x, y, argb(self.fg_scratch.items[dx]), canvas);
         }
         if (underline) |u| {
             const kind: @import("sprite.zig").Decoration = switch (u) {
@@ -1918,15 +1925,15 @@ fn renderRowForegroundCells(
                 .none => unreachable,
             };
             const color = style.underlineColor(&colors.palette) orelse self.fg_scratch.items[dx];
-            try self.blitDecoration(kind, cell_x, y, argb(color), pixels, width, height);
+            try self.blitDecoration(kind, cell_x, y, argb(color), canvas);
         }
         if (style.flags.strikethrough) {
             const color = self.fg_scratch.items[dx];
-            try self.blitDecoration(.strikethrough, cell_x, y, argb(color), pixels, width, height);
+            try self.blitDecoration(.strikethrough, cell_x, y, argb(color), canvas);
         }
         if (style.flags.overline) {
             const color = self.fg_scratch.items[dx];
-            try self.blitDecoration(.overline, cell_x, y, argb(color), pixels, width, height);
+            try self.blitDecoration(.overline, cell_x, y, argb(color), canvas);
         }
     }
 
@@ -1946,7 +1953,7 @@ fn renderRowForegroundCells(
         if (kind) |k| {
             const cell = cursorCellRgb(state.cursor.style, &state.cursor.cell, colors);
             const color = self.cursorFill(colors, cell.fg, cell.bg);
-            try self.blitDecoration(k, cx, y, argb(color), pixels, width, height);
+            try self.blitDecoration(k, cx, y, argb(color), canvas);
         }
     }
 }
@@ -1964,19 +1971,13 @@ fn blitDecoration(
     cell_x: u31,
     y: u31,
     color: u32,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
     const font = self.font;
     const g = try font.decorationGlyph(self.alloc, kind);
     self.noteOverhang(@as(i32, font.baseline) - g.bearing_y, g.height);
     const baseline_y: i32 = @as(i32, y) * font.cell_height + font.baseline;
-    blitGlyph(
-        pixels,
-        self.pixelStride(width),
-        width,
-        height,
+    try canvas.blitGlyph(
         g,
         @as(i32, cell_x) * font.cell_width + g.bearing_x,
         baseline_y - g.bearing_y,
@@ -1997,9 +1998,7 @@ fn drawRun(
     end: u31,
     cols: u31,
     y: u31,
-    pixels: []u32,
-    width: u31,
-    height: u31,
+    canvas: Canvas,
 ) !void {
     if (start >= end) return;
     const font = self.font;
@@ -2016,11 +2015,7 @@ fn drawRun(
             const cell_span: u2 = @intCast(@min(glyph_constraints.cellSpan(raw), 2));
             const g = try font.spriteGlyph(self.alloc, cp, cell_span);
             self.noteOverhang(@as(i32, font.baseline) - g.bearing_y, g.height);
-            blitGlyph(
-                pixels,
-                self.pixelStride(width),
-                width,
-                height,
+            try canvas.blitGlyph(
                 g,
                 @as(i32, @intCast(x)) * font.cell_width + g.bearing_x,
                 baseline_y - g.bearing_y,
@@ -2089,11 +2084,7 @@ fn drawRun(
             else => |e| return e,
         };
         self.noteOverhang(@as(i32, font.baseline) + origin_y.pixel - g.bearing_y, g.height);
-        blitGlyph(
-            pixels,
-            self.pixelStride(width),
-            width,
-            height,
+        try canvas.blitGlyph(
             g,
             origin_x.pixel + g.bearing_x,
             baseline_y + origin_y.pixel - g.bearing_y,
@@ -2227,7 +2218,7 @@ test "kitty placement clips offsets above signed 32-bit range" {
     };
     var pixels = [_]u32{0xff000000};
 
-    try renderer.renderKittyPlacement(&pixels, 1, 1, image, viewport);
+    try renderer.renderKittyPlacement(.cpu(&pixels, 1, 1, 1), image, viewport, false);
     try std.testing.expectEqual(@as(u32, 0xff000000), pixels[0]);
 }
 
@@ -2263,10 +2254,10 @@ test "scaled kitty placement reuses cached rgba variant" {
     };
     var pixels: [9]u32 = @splat(0xff000000);
 
-    try renderer.renderKittyPlacement(&pixels, 3, 3, image, viewport);
+    try renderer.renderKittyPlacement(.cpu(&pixels, 3, 3, 3), image, viewport, false);
     const first = pixels;
     @memset(&pixels, 0xff000000);
-    try renderer.renderKittyPlacement(&pixels, 3, 3, image, viewport);
+    try renderer.renderKittyPlacement(.cpu(&pixels, 3, 3, 3), image, viewport, false);
 
     try std.testing.expectEqualSlices(u32, &first, &pixels);
     try std.testing.expectEqual(@as(usize, 1), renderer.kitty_scale_count);
@@ -2306,7 +2297,7 @@ test "upscaled kitty placement interpolates bilinearly between pixel centers" {
         .source_height = 2,
     };
     var pixels: [16]u32 = @splat(0xff000000);
-    try renderer.renderKittyPlacement(&pixels, 4, 4, image, viewport);
+    try renderer.renderKittyPlacement(.cpu(&pixels, 4, 4, 4), image, viewport, false);
 
     // At 2x, destination centers fall at source positions -0.25 (clamped),
     // 0.25, 0.75, and 1.25 (clamped): weights 0, 1/4, 3/4, 1, rounded.
@@ -2475,7 +2466,7 @@ test "emoji keycap grapheme selects emoji fallback face" {
     const height: u31 = font.cell_height;
     const pixels = try alloc.alloc(u32, @as(usize, width) * height);
     defer alloc.free(pixels);
-    try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+    try renderer.prepareRow(&state, cells, null, 0, .cpu(pixels, width, width, height), .none);
     try testing.expectEqual(keycap_face, renderer.face_scratch.items[0]);
 
     try renderer.text_shaper.beginKey(keycap_face, .regular);
@@ -2540,7 +2531,7 @@ test "emoji presentation graphemes select emoji fallback face" {
         const case_face = font.faceForCluster(alloc, renderer.cluster_scratch.items, .regular);
         try testing.expect(case_face != 0);
 
-        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+        try renderer.prepareRow(&state, cells, null, 0, .cpu(pixels, width, width, height), .none);
         try testing.expectEqual(case_face, renderer.face_scratch.items[0]);
 
         try renderer.text_shaper.beginKey(case_face, .regular);
@@ -2607,7 +2598,7 @@ test "default emoji presentation squares select emoji fallback face" {
         const case_face = font.faceForCodepoint(alloc, raws[0].content.codepoint.data);
         try testing.expect(case_face != 0);
 
-        try renderer.prepareRow(&state, cells, null, 0, pixels, width, height, .none);
+        try renderer.prepareRow(&state, cells, null, 0, .cpu(pixels, width, width, height), .none);
         try testing.expectEqual(case_face, renderer.face_scratch.items[0]);
 
         try renderer.text_shaper.beginKey(case_face, .regular);
@@ -2826,9 +2817,9 @@ fn testSpriteOverlay(kind: enum { preedit, search, link }) !void {
     // The full block must use the sprite face; the adjacent A uses a font.
     try std.testing.expectEqual(Font.sprite_face_index, font.faceForCodepoint(alloc, 0x2588));
     switch (kind) {
-        .preedit => try renderer.renderPreedit(&state, pixels, width, height, "█A"),
-        .search => try renderer.renderSearch(&state, pixels, width, height, "█A", false),
-        .link => try renderer.renderLinkHint(&state, pixels, width, height, "█A"),
+        .preedit => try renderer.drawPreedit(&state, renderer.pixelCanvas(pixels, width, height), "█A"),
+        .search => try renderer.drawSearch(&state, renderer.pixelCanvas(pixels, width, height), "█A", false),
+        .link => try renderer.drawLinkHint(&state, renderer.pixelCanvas(pixels, width, height), "█A"),
     }
     const fg = argb(if (kind == .preedit) state.colors.foreground else renderer.selection_fg orelse state.colors.foreground);
     const bg = if (kind == .preedit) renderer.backgroundPixel(state.colors.background) else argb(renderer.selection_bg);
@@ -2876,7 +2867,7 @@ test "smooth scroll crops text and overscan without touching stride padding" {
     defer alloc.free(expected);
     reference_state.cursor.viewport = .{ .x = 0, .y = 2, .wide_tail = false };
     try renderer.render(&reference_state, expected, width, font.cell_height * 3);
-    try renderer.renderPreedit(&reference_state, expected, width, font.cell_height * 3, "IME");
+    try renderer.drawPreedit(&reference_state, renderer.pixelCanvas(expected, width, font.cell_height * 3), "IME");
     const stride = width + 3;
     const pixels = try alloc.alloc(u32, @as(usize, stride) * height);
     defer alloc.free(pixels);
@@ -2893,7 +2884,7 @@ test "smooth scroll crops text and overscan without touching stride padding" {
     state.cursor.viewport = .{ .x = 0, .y = 2, .wide_tail = false };
     for ([_]u31{ 1, font.cell_height / 3, font.cell_height - 1 }) |offset| {
         @memset(pixels, 0xdeadbeef);
-        try renderer.renderScrolled(&state, &.{}, "IME", pixels, width, height, offset);
+        try renderer.drawScrolled(&state, &.{}, "IME", renderer.pixelCanvas(pixels, width, height), offset);
         for (0..height) |y| {
             try std.testing.expectEqualSlices(u32, expected[(y + offset) * width ..][0..width], pixels[y * stride ..][0..width]);
             for (pixels[y * stride + width ..][0..3]) |pixel| try std.testing.expectEqual(@as(u32, 0xdeadbeef), pixel);

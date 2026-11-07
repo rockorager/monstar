@@ -13,6 +13,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
 const vt = @import("ghostty-vt");
+const Canvas = @import("Canvas.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Renderer = @import("Renderer.zig");
@@ -494,7 +495,11 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     std.debug.assert(job.stride >= job.width);
     std.debug.assert(job.pixels.len >= @as(usize, job.stride) * job.height);
     self.renderer.buffer_stride = job.stride;
-    const grid_pixels = gridPixels(job);
+    return self.renderJobOn(job, .cpu(job.pixels, job.stride, job.width, job.height), damage);
+}
+
+fn renderJobOn(self: *AsyncRaster, job: Job, canvas: Canvas, damage: *Damage) !void {
+    const grid = canvas.view(job.grid_x, job.grid_y, job.grid_width, job.grid_height);
     // Overlays draw outside the grid rows that dirty tracking accounts
     // for, so an overlay frame is always a full render with full damage.
     if (job.hasOverlay() or job.scroll_offset != 0) {
@@ -503,73 +508,60 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
         // so repair to it instead of re-rendering. Without this a
         // visible kitty image turns every submitted job into a full
         // render.
-        if (!job.overlay_dirty and self.state.dirty == .false and repairToPreviousFrame(job)) {
+        if (!job.overlay_dirty and self.state.dirty == .false and repairToPreviousFrame(job, canvas)) {
             damage.* = .none;
             return;
         }
-        clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
+        try clearPadding(job, canvas, self.renderer.backgroundPixel(self.state.colors.background));
         if (job.scroll_offset != 0) {
-            try self.renderer.renderScrolled(self.state, job.kitty_items, job.preedit, grid_pixels, job.grid_width, job.grid_height, job.scroll_offset);
+            try self.renderer.drawScrolled(self.state, job.kitty_items, job.preedit, grid, job.scroll_offset);
         } else if (job.kitty_items.len > 0) {
-            try self.renderer.renderWithKittyItems(self.state, job.kitty_items, grid_pixels, job.grid_width, job.grid_height);
+            try self.renderer.drawWithKittyItems(self.state, job.kitty_items, grid);
         } else {
-            try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
+            try self.renderer.draw(self.state, grid);
         }
         if (job.scroll_offset == 0) {
             if (job.preedit) |text| {
-                try self.renderer.renderPreedit(self.state, grid_pixels, job.grid_width, job.grid_height, text);
+                try self.renderer.drawPreedit(self.state, grid, text);
             }
         }
         if (job.link_hint) |uri| {
-            try self.renderer.renderLinkHint(self.state, grid_pixels, job.grid_width, job.grid_height, uri);
+            try self.renderer.drawLinkHint(self.state, grid, uri);
         }
         if (job.search) |text| {
-            try self.renderer.renderSearch(
-                self.state,
-                grid_pixels,
-                job.grid_width,
-                job.grid_height,
-                text,
-                job.search_no_match,
-            );
+            try self.renderer.drawSearch(self.state, grid, text, job.search_no_match);
         }
         if (job.scrollbar) |thumb| {
-            self.renderer.renderScrollbarThumb(
-                self.state,
-                job.pixels,
-                job.width,
-                job.height,
-                thumb,
-            );
+            try self.renderer.drawScrollbarThumb(self.state, canvas, thumb);
         }
         damage.* = .full;
         return;
     }
     if (job.scroll_shift) |shift| {
-        clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
+        try clearPadding(job, canvas, self.renderer.backgroundPixel(self.state.colors.background));
         // Retained pixels must not hold ink from a discarded row. Upward
         // glyph overhang is tracked per row; downward overhang only exists
         // when the cell is shrunk below the font's natural height.
         if (!self.font.neighbor_row_overhang and
             !self.renderer.scrollDiscardsInk(self.state.rows, shift) and
-            scrollFromPreviousFrame(job, shift, self.font.cell_height))
+            scrollFromPreviousFrame(job, canvas, shift, self.font.cell_height))
         {
             try self.renderer.shiftCellState(self.state.rows, self.state.cols, shift);
-            try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
+            try self.renderer.drawDirty(self.state, grid);
             // Rasterization touched only dirty rows, but every retained row
             // moved to a different surface location.
             damage.* = .full;
             return;
         }
         // Dirty rows may already have been narrowed by the detector.
-        try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
+        try self.renderer.draw(self.state, grid);
         damage.* = .full;
         return;
     }
     switch (self.state.dirty) {
         .full => {
-            clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
-            try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
+            try clearPadding(job, canvas, self.renderer.backgroundPixel(self.state.colors.background));
+            try self.renderer.draw(self.state, grid);
             damage.* = .full;
         },
         .partial => {
@@ -578,20 +570,20 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             const damaged_cells = try self.renderer.measureDirtyDamage(self.state);
             const grid_cells = @as(usize, self.state.rows) * self.state.cols;
             if ((damaged_cells != null and damaged_cells.? * 2 > grid_cells) or
-                !repairToPreviousFrame(job))
+                !repairToPreviousFrame(job, canvas))
             {
-                clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
-                try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
+                try clearPadding(job, canvas, self.renderer.backgroundPixel(self.state.colors.background));
+                try self.renderer.draw(self.state, grid);
                 damage.* = .full;
                 return;
             }
-            try self.renderer.renderDirty(self.state, grid_pixels, job.grid_width, job.grid_height);
+            try self.renderer.drawDirty(self.state, grid);
             damage.* = if (self.renderer.rendered_rects.items.len == 0) .none else .partial;
         },
         .false => {
-            if (!repairToPreviousFrame(job)) {
-                clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
-                try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
+            if (!repairToPreviousFrame(job, canvas)) {
+                try clearPadding(job, canvas, self.renderer.backgroundPixel(self.state.colors.background));
+                try self.renderer.draw(self.state, grid);
                 damage.* = .full;
                 return;
             }
@@ -600,26 +592,37 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     }
 }
 
-fn gridPixels(job: Job) []u32 {
-    std.debug.assert(job.grid_x + job.grid_width <= job.width);
-    std.debug.assert(job.grid_y + job.grid_height <= job.height);
-    const offset = @as(usize, job.grid_y) * job.stride + job.grid_x;
-    return job.pixels[offset..];
-}
-
-fn clearPadding(job: Job, color: u32) void {
-    @memset(job.pixels[0 .. @as(usize, job.grid_y) * job.stride], color);
+fn clearPadding(job: Job, canvas: Canvas, color: u32) !void {
+    const pixels = switch (canvas.target) {
+        .pixels => |pixels| pixels,
+        .gpu => {
+            const grid_bottom = job.grid_y + job.grid_height;
+            const grid_right = job.grid_x + job.grid_width;
+            try canvas.fillRect(0, 0, job.width, job.grid_y, color);
+            try canvas.fillRect(0, grid_bottom, job.width, job.height - grid_bottom, color);
+            try canvas.fillRect(0, job.grid_y, job.grid_x, job.grid_height, color);
+            try canvas.fillRect(grid_right, job.grid_y, job.width - grid_right, job.grid_height, color);
+            return;
+        },
+    };
+    @memset(pixels[0 .. @as(usize, job.grid_y) * job.stride], color);
     const grid_bottom = @as(usize, job.grid_y + job.grid_height) * job.stride;
-    @memset(job.pixels[grid_bottom..], color);
+    @memset(pixels[grid_bottom..], color);
     for (job.grid_y..job.grid_y + job.grid_height) |y| {
         const row = @as(usize, y) * job.stride;
-        @memset(job.pixels[row .. row + job.grid_x], color);
+        @memset(pixels[row .. row + job.grid_x], color);
         const right = row + job.grid_x + job.grid_width;
-        @memset(job.pixels[right .. row + job.width], color);
+        @memset(pixels[right .. row + job.width], color);
     }
 }
 
-fn repairToPreviousFrame(job: Job) bool {
+/// Bring the target up to the previous committed frame. A GPU canvas always
+/// holds the previous frame unless it was just (re)created.
+fn repairToPreviousFrame(job: Job, canvas: Canvas) bool {
+    switch (canvas.target) {
+        .pixels => {},
+        .gpu => |list| return list.previous_frame,
+    }
     return switch (job.repair) {
         .none => true,
         .full => repair: {
@@ -654,11 +657,27 @@ fn repairToPreviousFrame(job: Job) bool {
 /// Move retained framebuffer rows directly from the previous frame into
 /// their new positions. This avoids a full stale-buffer repair followed by
 /// a second in-place shift when source and destination differ.
-fn scrollFromPreviousFrame(job: Job, shift_rows: isize, cell_height: u31) bool {
+fn scrollFromPreviousFrame(job: Job, canvas: Canvas, shift_rows: isize, cell_height: u31) bool {
     const rows: usize = @abs(shift_rows);
     if (rows == 0) return false;
     const shift_pixels = rows * cell_height;
     if (shift_pixels >= job.grid_height) return false;
+    switch (canvas.target) {
+        .pixels => {},
+        .gpu => |list| {
+            if (!list.previous_frame) return false;
+            const retained: u31 = @intCast(job.grid_height - shift_pixels);
+            const offset: u31 = @intCast(shift_pixels);
+            list.setScroll(.{
+                .x = 0,
+                .width = job.width,
+                .src_y = if (shift_rows > 0) job.grid_y + offset else job.grid_y,
+                .dst_y = if (shift_rows > 0) job.grid_y else job.grid_y + offset,
+                .height = retained,
+            });
+            return true;
+        },
+    }
 
     const source = if (job.age == 1)
         @as([]const u32, job.pixels)
@@ -940,6 +959,10 @@ test "primary and alternate screen scroll pixels match full repaint" {
     }
 }
 
+fn testCanvas(job: Job) Canvas {
+    return .cpu(job.pixels, job.stride, job.width, job.height);
+}
+
 test "repair previous frame" {
     var target = [_]u32{ 1, 2, 3, 4 };
     const source = [_]u32{ 5, 6, 7, 8 };
@@ -973,7 +996,7 @@ test "repair previous frame" {
         .repair = .full,
     };
 
-    try std.testing.expect(repairToPreviousFrame(base));
+    try std.testing.expect(repairToPreviousFrame(base, testCanvas(base)));
     try std.testing.expectEqualSlices(u32, &source, &target);
 
     target = .{ 1, 2, 3, 4 };
@@ -981,18 +1004,18 @@ test "repair previous frame" {
     current.source_pixels = null;
     current.age = 1;
     current.repair = .none;
-    try std.testing.expect(repairToPreviousFrame(current));
+    try std.testing.expect(repairToPreviousFrame(current, testCanvas(current)));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, &target);
 
     const rects = [_]RepairRect{.{ .x = 1, .y = 1, .width = 1, .height = 1 }};
     current = base;
     current.repair = .{ .rects = &rects };
-    try std.testing.expect(repairToPreviousFrame(current));
+    try std.testing.expect(repairToPreviousFrame(current, testCanvas(current)));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 8 }, &target);
 
     target = .{ 1, 2, 3, 4 };
     current.repair = .{ .rects = &.{} };
-    try std.testing.expect(repairToPreviousFrame(current));
+    try std.testing.expect(repairToPreviousFrame(current, testCanvas(current)));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, &target);
 
     const invalid_rects = [_]RepairRect{
@@ -1000,12 +1023,12 @@ test "repair previous frame" {
         .{ .x = 0, .y = 2, .width = 2, .height = 1 },
     };
     current.repair = .{ .rects = &invalid_rects };
-    try std.testing.expect(!repairToPreviousFrame(current));
+    try std.testing.expect(!repairToPreviousFrame(current, testCanvas(current)));
 
     current.source_pixels = null;
     current.age = 0;
     current.repair = .full;
-    try std.testing.expect(!repairToPreviousFrame(current));
+    try std.testing.expect(!repairToPreviousFrame(current, testCanvas(current)));
 }
 
 test "scroll previous frame in place and from distinct source" {
@@ -1046,7 +1069,7 @@ test "scroll previous frame in place and from distinct source" {
         .repair = .none,
     };
 
-    try std.testing.expect(scrollFromPreviousFrame(job, 1, 1));
+    try std.testing.expect(scrollFromPreviousFrame(job, testCanvas(job), 1, 1));
     try std.testing.expectEqualSlices(u32, &.{ 6, 7, 8, 9, 10, 11 }, pixels[3..9]);
     // The newly exposed row is deliberately untouched for renderDirty.
     try std.testing.expectEqualSlices(u32, &.{ 9, 10, 11 }, pixels[9..12]);
@@ -1061,13 +1084,13 @@ test "scroll previous frame in place and from distinct source" {
     @memset(&pixels, 99);
     job.age = 0;
     job.source_pixels = &source;
-    try std.testing.expect(scrollFromPreviousFrame(job, -1, 1));
+    try std.testing.expect(scrollFromPreviousFrame(job, testCanvas(job), -1, 1));
     try std.testing.expectEqualSlices(u32, &.{ 23, 24, 25, 26, 27, 28 }, pixels[6..12]);
     try std.testing.expectEqualSlices(u32, &.{ 99, 99, 99 }, pixels[3..6]);
 
     job.source_pixels = null;
-    try std.testing.expect(!scrollFromPreviousFrame(job, 1, 1));
-    try std.testing.expect(!scrollFromPreviousFrame(job, 3, 1));
+    try std.testing.expect(!scrollFromPreviousFrame(job, testCanvas(job), 1, 1));
+    try std.testing.expect(!scrollFromPreviousFrame(job, testCanvas(job), 3, 1));
 }
 
 test "padded rows render the same visible pixels as packed rows" {

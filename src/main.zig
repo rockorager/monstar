@@ -542,6 +542,7 @@ test {
     _ = App;
     _ = @import("AsyncJobSnapshot.zig");
     _ = @import("AsyncRaster.zig");
+    _ = @import("Canvas.zig");
     _ = @import("CellDamageTracker.zig");
     _ = @import("Clipboard.zig");
     _ = @import("CommandNotification.zig");
@@ -558,6 +559,7 @@ test {
     _ = @import("terminfo_gen.zig");
     _ = @import("config_theme.zig");
     _ = @import("glyph_constraints.zig");
+    _ = @import("GpuDrawList.zig");
     _ = @import("Keyboard.zig");
     _ = @import("keybind.zig");
     _ = @import("KittyImageCache.zig");
