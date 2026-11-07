@@ -14,9 +14,16 @@ permissions:
   contents: write
 
 jobs:
-  publish:
-    name: Build & Publish Release
-    runs-on: ubuntu-24.04
+  build:
+    name: Build ${{ matrix.arch }} binary
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -92,7 +99,37 @@ jobs:
           PICI_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
         run: ./packaging/build-binary-dist.sh
 
-      - name: Upload binary asset to GitHub Release
+      - name: Store binary tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: monstar-${{ matrix.arch }}-linux
+          path: dist/monstar-*-${{ matrix.arch }}-linux.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release & AUR Packages
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
+          fetch-depth: 0
+
+      - name: Fetch binary tarballs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: monstar-*-linux
+          path: dist
+          merge-multiple: true
+
+      - name: Build source archive and AUR PKGBUILDs
+        env:
+          PICI_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+        run: ./packaging/build-source-dist.sh
+
+      - name: Upload assets to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

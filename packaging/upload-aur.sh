@@ -25,7 +25,7 @@ esac
 
 if [ -z "$PKGBUILD" ] || [ ! -f "$PKGBUILD" ]; then
   echo "error: PKGBUILD not found at $PKGBUILD" >&2
-  echo "       Run ./packaging/build-binary-dist.sh first." >&2
+  echo "       Run ./packaging/build-source-dist.sh first." >&2
   exit 1
 fi
 

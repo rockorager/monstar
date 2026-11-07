@@ -3,7 +3,7 @@ pkgname=monstar-bin
 pkgver=@VERSION@
 pkgrel=1
 pkgdesc="wayland terminal based on libghostty"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://github.com/rockorager/monstar"
 license=('MIT')
 provides=('monstar')
@@ -24,19 +24,22 @@ optdepends=(
   'xdg-desktop-portal: open links and files through a desktop portal'
   'xdg-utils: open links when a desktop portal is unavailable'
 )
-source=("monstar-@VERSION@-x86_64-linux.tar.gz::https://github.com/rockorager/monstar/releases/download/v@VERSION@/monstar-@VERSION@-x86_64-linux.tar.gz")
-sha256sums=('@SHA256@')
+_release="https://github.com/rockorager/monstar/releases/download/v@VERSION@"
+source_x86_64=("monstar-@VERSION@-x86_64-linux.tar.gz::${_release}/monstar-@VERSION@-x86_64-linux.tar.gz")
+source_aarch64=("monstar-@VERSION@-aarch64-linux.tar.gz::${_release}/monstar-@VERSION@-aarch64-linux.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
 
 build() {
   :
 }
 
 check() {
-  test -f "$srcdir/monstar-${pkgver}-x86_64-linux/share/terminfo/m/monstar"
+  test -f "$srcdir/monstar-${pkgver}-${CARCH}-linux/share/terminfo/m/monstar"
 }
 
 package() {
-  cd "$srcdir/monstar-${pkgver}-x86_64-linux"
+  cd "$srcdir/monstar-${pkgver}-${CARCH}-linux"
   mkdir -p "$pkgdir/usr"
   cp -r bin share "$pkgdir/usr/"
 }
