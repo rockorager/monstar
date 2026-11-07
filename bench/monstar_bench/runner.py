@@ -260,7 +260,7 @@ class Bench:
         family0 = metrics.children(client)
         result_file = run_dir / "flood.json"
         flips = None
-        planes = []
+        planes, scans = [], []
         if self.kms_flips:
             self.helper.call("vblank_start")
         fd0 = metrics.drm_fdinfo(client)
@@ -285,7 +285,7 @@ class Bench:
             player = threading.Thread(target=type_keys)
             player.start()
         end = t0 + int(workload.duration * 1e9)
-        next_plane = t0
+        next_sample, samples = t0, 0
         while True:
             now = now_ns()
             if workload.until_done:
@@ -293,9 +293,16 @@ class Bench:
                     break
             elif now >= end:
                 break
-            if self.kms_planes and now >= next_plane and len(planes) < KMS_PLANE_SAMPLES:
-                planes.append(self.helper.call("planes")["cards"])
-                next_plane = now + int(workload.duration * 1e9 / KMS_PLANE_SAMPLES)
+            # Scanout is sampled while the workload runs: a compositor can
+            # stop scanning out once frames stop or a screenshot is taken.
+            if now >= next_sample and samples < KMS_PLANE_SAMPLES:
+                if self.kms_planes:
+                    planes.append(self.helper.call("planes")["cards"])
+                scan = self.session.scanout()
+                if scan is not None:
+                    scans.append(scan)
+                samples += 1
+                next_sample = now + int(workload.duration * 1e9 / KMS_PLANE_SAMPLES)
             time.sleep(0.005 if workload.until_done else min(0.05, max(0.0, (end - now) / 1e9)))
         if player:
             player.join()
@@ -349,6 +356,8 @@ class Bench:
             sample["latency"]["input"] = self.keyboard.name
         if flips is not None:
             sample["kms_flips"] = len(flips)
+        if scans:
+            sample["scanout_compositor"] = 2 * sum(scans) > len(scans)
         if planes:
             sample["kms_fbs"] = sorted({(p["fb"], p.get("size"), p.get("modifier"))
                                         for snap in planes for card in snap.values() for p in card}, key=str)
@@ -392,9 +401,6 @@ class Bench:
                 subprocess.run(["grim", str(shot)], env=self.session.env, timeout=10, check=False)
             win = self.session.window(APP_ID) or win
             sample["window"] = {"rect": win.get("rect"), "fullscreen": win.get("fullscreen")}
-            scanout = self.session.scanout()
-            if scanout is not None:
-                sample["scanout_compositor"] = scanout
             events = metrics.read_telemetry(telemetry)
             path, clock = metrics.telemetry_path_info(events)
             sample["effective"] = path
