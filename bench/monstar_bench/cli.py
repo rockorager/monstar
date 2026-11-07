@@ -106,6 +106,7 @@ def cmd_probe(args):
     problem = cache.check()
     zones = privileged.rapl_zones(args.sysfs_root)
     session = open_session(args)
+    bench = None
     try:
         session.prepare()
         bench = runner.Bench(args, session, NoHelper(), cache, str(args.monstar), None, {})
@@ -119,6 +120,8 @@ def cmd_probe(args):
             "gpus": sensors.gpus(),
         }, indent=2))
     finally:
+        if bench:
+            bench.close()
         session.close()
 
 
