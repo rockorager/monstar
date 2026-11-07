@@ -2496,24 +2496,15 @@ fn runPipeCommandChild(
     // The pipe may occupy standard descriptors when inherited stdio is
     // closed. Close its writer before installing stdin, never afterwards.
     _ = linux.close(write_fd);
-    if (linux.errno(linux.dup2(read_fd, 0)) != .SUCCESS) linux.exit(126);
-    if (read_fd != 0) {
-        _ = linux.close(read_fd);
-    } else {
-        // dup2(fd, fd) retains CLOEXEC, including for /dev/null below.
-        if (linux.errno(linux.fcntl(0, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
-    }
+    if (linux.errno(Pty.installFd(read_fd, 0)) != .SUCCESS) linux.exit(126);
+    if (read_fd != 0) _ = linux.close(read_fd);
 
     const devnull = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
     if (linux.errno(devnull) != .SUCCESS) linux.exit(126);
     const fd: posix.fd_t = @intCast(devnull);
-    if (linux.errno(linux.dup2(fd, 1)) != .SUCCESS) linux.exit(126);
-    if (linux.errno(linux.dup2(fd, 2)) != .SUCCESS) linux.exit(126);
-    if (fd > 2) {
-        _ = linux.close(fd);
-    } else {
-        if (linux.errno(linux.fcntl(fd, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
-    }
+    if (linux.errno(Pty.installFd(fd, 1)) != .SUCCESS) linux.exit(126);
+    if (linux.errno(Pty.installFd(fd, 2)) != .SUCCESS) linux.exit(126);
+    if (fd > 2) _ = linux.close(fd);
 
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", command.ptr };
     _ = linux.execve("/bin/sh", &argv, envp);

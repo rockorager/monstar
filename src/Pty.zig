@@ -134,15 +134,10 @@ pub fn spawn(
             }
             _ = linux.close(gate_fds[0]);
         }
-        if (linux.errno(linux.dup2(self.slave, 0)) != .SUCCESS) linux.exit(126);
-        if (linux.errno(linux.dup2(self.slave, 1)) != .SUCCESS) linux.exit(126);
-        if (linux.errno(linux.dup2(self.slave, 2)) != .SUCCESS) linux.exit(126);
-        if (self.slave > 2) {
-            _ = linux.close(self.slave);
-        } else {
-            // dup2(fd, fd) leaves CLOEXEC set on the original slave.
-            if (linux.errno(linux.fcntl(self.slave, linux.F.SETFD, 0)) != .SUCCESS) linux.exit(126);
+        for (0..3) |target| {
+            if (linux.errno(installFd(self.slave, @intCast(target))) != .SUCCESS) linux.exit(126);
         }
+        if (self.slave > 2) _ = linux.close(self.slave);
         _ = linux.execve(path, argv, envp);
         linux.exit(127); // exec failed
     }
@@ -180,6 +175,14 @@ pub fn tryWait(pid: posix.pid_t) Error!?u32 {
             return error.PtyFailed;
         },
     };
+}
+
+/// Make `target` a copy of `fd` that survives exec; returns a raw syscall
+/// result. When they are equal, dup2 would keep CLOEXEC, and Zig's dup2
+/// emulation on targets without the syscall (aarch64) checks the wrong
+/// descriptor in safe builds, so clear CLOEXEC directly. Async-signal-safe.
+pub fn installFd(fd: posix.fd_t, target: posix.fd_t) usize {
+    return if (fd == target) linux.fcntl(fd, linux.F.SETFD, 0) else linux.dup2(fd, target);
 }
 
 fn openRw(path: [*:0]const u8) ?posix.fd_t {
