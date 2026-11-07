@@ -16,6 +16,59 @@ const Window = @import("Window.zig");
 
 const log = std.log.scoped(.main);
 
+pub const std_options: std.Options = .{ .logFn = logFn };
+
+/// Same output as `std.log.defaultLog`, but only the message formatting is
+/// instantiated per call site. The default inlines stderr locking and the
+/// colored level/scope prefix into each of the several hundred log calls
+/// (most of them in ghostty-vt), which cost about 500 KB of code.
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    var buffer: [64]u8 = undefined;
+    const locked = logLock(&buffer, level, if (scope == .default) "" else @tagName(scope));
+    defer logUnlock(locked.cancel_protection);
+    locked.writer.print(format ++ "\n", args) catch {};
+}
+
+const LockedLog = struct {
+    writer: *std.Io.Writer,
+    cancel_protection: std.Io.CancelProtection,
+};
+
+/// Locks stderr and writes the message prefix. `buffer` backs the stderr
+/// writer until `logUnlock`.
+noinline fn logLock(buffer: []u8, level: std.log.Level, scope: []const u8) LockedLog {
+    const io = std.Options.debug_io;
+    const cancel_protection = io.swapCancelProtection(.blocked);
+    const t = std.debug.lockStderr(buffer).terminal();
+    t.setColor(switch (level) {
+        .err => .red,
+        .warn => .yellow,
+        .info => .green,
+        .debug => .magenta,
+    }) catch {};
+    t.setColor(.bold) catch {};
+    t.writer.writeAll(switch (level) {
+        inline else => |l| l.asText(),
+    }) catch {};
+    t.setColor(.reset) catch {};
+    t.setColor(.dim) catch {};
+    t.setColor(.bold) catch {};
+    if (scope.len != 0) t.writer.print("({s})", .{scope}) catch {};
+    t.writer.writeAll(": ") catch {};
+    t.setColor(.reset) catch {};
+    return .{ .writer = t.writer, .cancel_protection = cancel_protection };
+}
+
+noinline fn logUnlock(cancel_protection: std.Io.CancelProtection) void {
+    std.debug.unlockStderr();
+    _ = std.Options.debug_io.swapCancelProtection(cancel_protection);
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
