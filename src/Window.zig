@@ -944,6 +944,61 @@ pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
     }
 }
 
+/// Check out the surface for a frame that an external presenter (the Vulkan
+/// swapchain) commits. Refused like `acquireRenderTarget`. End the checkout
+/// with `cancelExternalRender` or `beginExternalCommit`.
+pub fn beginExternalRender(self: *Window) !struct { width: u31, height: u31 } {
+    if (self.width == 0 or self.suspended or self.rendering_pending) return error.NotReady;
+    self.rendering_pending = true;
+    return .{ .width = self.physical(self.width), .height = self.physical(self.height) };
+}
+
+pub fn cancelExternalRender(self: *Window) void {
+    self.rendering_pending = false;
+}
+
+/// End an external checkout and queue the surface state its commit of a
+/// `width`×`height` buffer must carry: the viewport destination, a frame
+/// callback and telemetry feedback. Call immediately before the presenter
+/// commits the surface, then `endExternalCommit`.
+pub fn beginExternalCommit(self: *Window, width: u31, height: u31) !void {
+    self.rendering_pending = false;
+    if (self.viewport) |viewport| viewport.setDestination(self.width, self.height);
+    if (!self.frame_pending) {
+        const frame_cb = try self.surface.frame();
+        frame_cb.setListener(*Window, frameListener, self);
+        self.frame_pending = true;
+    }
+    if (self.telemetry) |telemetry| {
+        telemetry.notePath("vulkan", "swapchain");
+        telemetry.beforeCommit(self.surface, width, height);
+    }
+}
+
+pub fn endExternalCommit(self: *Window) void {
+    if (self.initial_activation_token) |token| {
+        self.initial_activation_token = null;
+        if (token.len > 0) self.activate(token);
+    }
+}
+
+/// Destroy shm buffers the compositor has released, once an external
+/// presenter has replaced them. Returns whether any remain.
+pub fn releaseIdleBuffers(self: *Window) bool {
+    var kept: usize = 0;
+    for (self.buffers.items) |buffer| {
+        if (buffer.busy or buffer.rendering) {
+            self.buffers.items[kept] = buffer;
+            kept += 1;
+            continue;
+        }
+        if (self.newest_buffer == buffer) self.newest_buffer = null;
+        buffer.destroy(self.alloc);
+    }
+    self.buffers.items.len = kept;
+    return kept > 0;
+}
+
 test "launcher activation follows the first buffer commit exactly once" {
     const linux = std.os.linux;
     for ([_]bool{ false, true }) |supported| {

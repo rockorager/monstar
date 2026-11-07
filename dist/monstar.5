@@ -87,9 +87,11 @@ The
 .BR command ,
 .BR linux-cgroup ,
 .BR presentation ,
+.BR renderer ,
 .BR scrollback-limit ,
+.BR term ,
 and
-.B term
+.B vulkan-startup
 settings describe resources created at startup and do not replace or move an
 existing child, change how the open window presents frames, or resize existing
 scrollback storage.
@@ -138,6 +140,30 @@ when the device is unavailable or the compositor cannot import the buffer.
 behaves the same but logs a warning when it falls back.
 .B shm
 always uses wl_shm.
+.TP
+.BI renderer " = cpu|vulkan"
+Choose the rasterizer.
+The default is
+.BR cpu ,
+which draws on the CPU and presents as set by
+.BR presentation .
+.B vulkan
+draws on the GPU and presents through a Vulkan swapchain, which the compositor
+can scan out directly.
+Both share text shaping, damage tracking and overlays and produce nearly the
+same pixels; translucent backgrounds blend slightly differently.
+Monstar uses the CPU renderer when Vulkan is unavailable.
+.TP
+.BI vulkan-startup " = wait|cpu-first"
+Choose how the
+.B vulkan
+renderer starts.
+The default,
+.BR cpu-first ,
+shows CPU frames until Vulkan is ready, hiding its initialization time, and
+then switches to Vulkan.
+.B wait
+shows the first frame only once Vulkan is ready.
 .TP
 .BI pipe-command-output " = command"
 Set a shell command that receives the last OSC 133-delimited command output on

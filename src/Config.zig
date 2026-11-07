@@ -140,6 +140,13 @@ notify_on_command_finish_after: u64 = 5 * std.time.ns_per_s,
 linux_cgroup: LinuxCgroup = .never,
 /// How CPU-rendered frames reach the compositor. This only affects startup.
 presentation: Presentation = .auto,
+/// Rasterizer. `vulkan` draws with the GPU and presents through a Vulkan
+/// swapchain; it falls back to `cpu` when Vulkan is unavailable. This only
+/// affects startup.
+renderer: RendererKind = .cpu,
+/// How a `vulkan` renderer starts: `cpu-first` shows CPU frames until Vulkan
+/// is ready; `wait` shows nothing until then. This only affects startup.
+vulkan_startup: VulkanStartup = .@"cpu-first",
 /// Logical terminal page storage in bytes, including the active screen. This
 /// only affects startup because libghostty-vt does not resize live scrollback.
 scrollback_limit: usize = 50_000_000,
@@ -183,6 +190,8 @@ pub const LinuxCgroup = enum { never, always };
 /// wl_shm; `dmabuf` does the same but warns when it falls back; `shm` always
 /// uses wl_shm.
 pub const Presentation = enum { auto, shm, dmabuf };
+pub const RendererKind = enum { cpu, vulkan };
+pub const VulkanStartup = enum { @"cpu-first", wait };
 pub const NotifyOnCommandFinish = enum { never, unfocused, always };
 pub const CommandFinishAction = struct {
     bell: bool = true,
@@ -405,6 +414,10 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.linux_cgroup = std.meta.stringToEnum(LinuxCgroup, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "presentation")) {
         self.presentation = std.meta.stringToEnum(Presentation, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "renderer")) {
+        self.renderer = std.meta.stringToEnum(RendererKind, value) orelse return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "vulkan-startup")) {
+        self.vulkan_startup = std.meta.stringToEnum(VulkanStartup, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "scrollback-limit")) {
         self.scrollback_limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "image-storage-limit")) {
@@ -782,6 +795,8 @@ test "defaults" {
     try std.testing.expectEqual(@as(u64, 5_000_000_000), config.notify_on_command_finish_after);
     try std.testing.expectEqual(LinuxCgroup.never, config.linux_cgroup);
     try std.testing.expectEqual(Presentation.auto, config.presentation);
+    try std.testing.expectEqual(RendererKind.cpu, config.renderer);
+    try std.testing.expectEqual(VulkanStartup.@"cpu-first", config.vulkan_startup);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(usize, 320_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1), config.mouse_scroll_multiplier.precision);
@@ -832,6 +847,8 @@ test "parse config" {
         \\command = /usr/bin/fish --login
         \\pipe-command-output = cat > /tmp/monstar-output
         \\linux-cgroup = always
+        \\renderer = vulkan
+        \\vulkan-startup = wait
         \\scrollback-limit = 50000000
         \\image-storage-limit = 50000000
         \\mouse-scroll-multiplier = precision:1.5,discrete:5
@@ -868,6 +885,8 @@ test "parse config" {
     try std.testing.expectEqualStrings("/usr/bin/fish --login", config.command.?.shell);
     try std.testing.expectEqualStrings("cat > /tmp/monstar-output", config.pipe_command_output.?);
     try std.testing.expectEqual(LinuxCgroup.always, config.linux_cgroup);
+    try std.testing.expectEqual(RendererKind.vulkan, config.renderer);
+    try std.testing.expectEqual(VulkanStartup.wait, config.vulkan_startup);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.scrollback_limit);
     try std.testing.expectEqual(@as(usize, 50_000_000), config.image_storage_limit);
     try std.testing.expectEqual(@as(f64, 1.5), config.mouse_scroll_multiplier.precision);

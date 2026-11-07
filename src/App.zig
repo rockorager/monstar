@@ -35,6 +35,8 @@ const AsyncRaster = @import("AsyncRaster.zig");
 const FrameTelemetry = @import("FrameTelemetry.zig");
 const AsyncJobSnapshot = @import("AsyncJobSnapshot.zig");
 const FrameDamageTracker = @import("FrameDamageTracker.zig");
+const VulkanPresenter = @import("VulkanPresenter.zig");
+const VulkanRenderer = @import("VulkanRenderer.zig");
 const KittyImageCache = @import("KittyImageCache.zig");
 const ScrollbackSearch = @import("ScrollbackSearch.zig");
 const ScrollDetector = @import("ScrollDetector.zig");
@@ -122,10 +124,14 @@ async_generation: u64,
 /// The next async snapshot must be rebuilt completely because renderer-only
 /// state changed or a prior snapshot was rendered but not committed.
 async_force_full: bool,
-/// A finished async frame whose buffer is checked out, waiting for the
+/// A finished async frame whose target is checked out, waiting for the
 /// outstanding frame callback before it can be committed. While held,
 /// `window.rendering_pending` stays true so no new render can start.
-held_frame: ?*Window.Buffer,
+held_frame: ?FrameTarget,
+/// Vulkan backend state for `renderer = vulkan`.
+vulkan: VulkanState = .{},
+/// Per-frame raster timing, logged each second with MONSTAR_RENDER_STATS.
+render_stats: ?RenderStats = null,
 /// Owned overlay and Kitty inputs for the in-flight async job.
 async_job: AsyncJobSnapshot,
 /// Pinned copies of kitty image data shared between consecutive async
@@ -1826,6 +1832,8 @@ pub fn deinit(self: *App) void {
     self.selection_gesture.deinit(&self.term);
     if (self.async_raster_loader) |*loader| loader.deinit();
     if (self.async_raster) |*async_raster| async_raster.deinit();
+    // The swapchain and VkSurface must go before the wl_surface.
+    self.vulkan.deinit(self.alloc);
     self.frame_damage.deinit();
     self.async_job.deinit(self.alloc, &self.kitty_cache);
     if (self.hovered_link) |link| self.alloc.free(link.uri);
@@ -1869,6 +1877,8 @@ pub fn run(self: *App) !void {
     // The raster worker is the only renderer; start building it before
     // the first configure so it is usually ready by the first frame.
     self.startAsyncRasterLoad();
+    self.startVulkanLoad();
+    if (self.environ.getPosix("MONSTAR_RENDER_STATS") != null) self.render_stats = .{};
 
     try self.pipeline.start();
 
@@ -1895,6 +1905,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.resize_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
     } ++ @as([Clipboard.max_outgoing_transfers]posix.pollfd, @splat(.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }));
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1914,7 +1925,8 @@ pub fn run(self: *App) !void {
     const kitty_animation_fd = &fds[15];
     const compression_fd = &fds[16];
     const resize_fd = &fds[17];
-    const outgoing_clipboard_fds = fds[18..][0..Clipboard.max_outgoing_transfers];
+    const vulkan_fd = &fds[18];
+    const outgoing_clipboard_fds = fds[19..][0..Clipboard.max_outgoing_transfers];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         self.expireDbusRequests();
@@ -1928,6 +1940,7 @@ pub fn run(self: *App) !void {
             async_raster.complete_fd
         else
             -1;
+        vulkan_fd.fd = if (self.vulkan.loader) |*loader| loader.complete_fd else -1;
 
         // Standard libwayland read dance: drain the local queue, flush
         // requests, then sleep until one of the fds is ready.
@@ -2056,6 +2069,7 @@ pub fn run(self: *App) !void {
             else
                 self.finishAsyncRender();
         }
+        if (vulkan_fd.revents & posix.POLL.IN != 0) self.finishVulkanLoad();
 
         self.clipboard.dispatchOutgoing(outgoing_clipboard_fds);
         if (self.clipboard.transferFd() >= 0 and paste_fd.fd == self.clipboard.transferFd() and
@@ -7074,6 +7088,11 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
     if (async_raster.busy()) return .deferred;
     // Includes the snapshot work below, which is per-frame client cost.
     const telemetry_start: u64 = if (self.window.telemetry != null) FrameTelemetry.now() else 0;
+    // No target is checked out, so the CPU frames stop here.
+    if (self.vulkan.pending) |renderer| {
+        self.vulkan.pending = null;
+        self.adoptVulkan(renderer);
+    }
     const selection_bg = self.selectionBackgroundForRender();
     const selection_fg = self.selectionForegroundForRender();
     if (!async_raster.configuredFor(
@@ -7226,7 +7245,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         if (self.async_job.scrollbar != null) self.render_state.dirty = .full;
     }
     std.debug.assert(self.held_frame == null);
-    const target = self.window.acquireRenderTarget() catch |err| {
+    const target = self.acquireFrameTarget() catch |err| {
         // Overlay snapshots above now describe the pending frame rather than
         // the last submitted one. Ensure the retry cannot mistake them for
         // unchanged inputs and skip the frame.
@@ -7237,7 +7256,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         if (err != error.NotReady) self.rasterFatal(err);
         return .deferred;
     };
-    errdefer self.window.cancelRender(target.buffer);
+    errdefer self.cancelFrameTarget(target.frame);
     if (scroll != null and target.age != 1 and target.source_pixels == null) scroll = null;
     if (scroll) |value| self.scroll_detector.prepare(&self.render_state, value, old_cursor);
     const repair: AsyncRaster.Repair = if (scroll == null)
@@ -7287,8 +7306,9 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .scroll_shift = if (scroll) |value| value.shift else null,
         .scroll_offset = @min(self.render_scroll_offset, self.font.cell_height - 1),
         .repair = repair,
+        .gpu = if (target.frame == .gpu) self.vulkan.renderer else null,
     }) catch |err| {
-        self.window.cancelRender(target.buffer);
+        self.cancelFrameTarget(target.frame);
         self.kitty_cache.sweep(self.alloc);
         self.rasterFatal(err);
         return .deferred;
@@ -7333,6 +7353,7 @@ fn hasContentRedraw(self: *App) bool {
     if (self.window.width == 0 or self.window.suspended) return false;
     if (self.window.rendering_pending) return false;
     if (self.async_raster == null) return false;
+    if (self.vulkan.blocksFrames()) return false;
     return true;
 }
 
@@ -7358,36 +7379,244 @@ fn redrawIfNeeded(self: *App) !void {
 /// Commit a finished frame that was held for the frame callback, unless
 /// the window geometry changed while it waited.
 fn commitHeldFrame(self: *App) void {
-    const buffer = self.held_frame orelse return;
+    const frame = self.held_frame orelse return;
     self.held_frame = null;
-    if (buffer.width != Window.physicalDimension(self.window.width, self.window.scale120) or
-        buffer.height != Window.physicalDimension(self.window.height, self.window.scale120))
+    const size = frame.size();
+    if (size.width != Window.physicalDimension(self.window.width, self.window.scale120) or
+        size.height != Window.physicalDimension(self.window.height, self.window.scale120))
     {
-        self.window.cancelRender(buffer);
+        self.cancelFrameTarget(frame);
         self.frame_damage.invalidate();
         self.async_force_full = true;
         self.needs_redraw = true;
         return;
     }
-    self.commitFinishedFrame(buffer);
+    self.commitFinishedFrame(frame);
 }
 
-/// Commit an async-rendered buffer using the current frame's damage
+/// Commit an async-rendered frame using the current frame's damage
 /// entry. Commit failures are fatal: the surface is unusable.
-fn commitFinishedFrame(self: *App, buffer: *Window.Buffer) void {
-    const surface_damage = self.frame_damage.currentSurfaceDamage(buffer.height) catch |err| {
+fn commitFinishedFrame(self: *App, frame: FrameTarget) void {
+    const surface_damage = self.frame_damage.currentSurfaceDamage(frame.size().height) catch |err| {
         log.err("async surface damage failed: {}", .{err});
-        self.window.cancelRender(buffer);
+        self.cancelFrameTarget(frame);
         self.window.fatal_error = err;
         self.window.running = false;
         return;
     };
-    self.window.commitRender(buffer, surface_damage) catch |err| {
+    const result = switch (frame) {
+        .shm => |buffer| self.window.commitRender(buffer, surface_damage),
+        .gpu => |size| self.presentVulkanFrame(size.width, size.height, surface_damage),
+    };
+    result catch |err| {
+        if (err == error.OutOfDate) {
+            // The compositor rejected this swapchain; draw the next frame
+            // in full into a new one. Nothing was committed, so the frame
+            // callback requested for this frame fires only with the next.
+            self.window.frame_pending = false;
+            self.async_force_full = true;
+            self.needs_redraw = true;
+            return;
+        }
         log.err("async commit failed: {}", .{err});
-        self.window.cancelRender(buffer);
+        if (frame == .shm) self.cancelFrameTarget(frame);
         self.window.fatal_error = err;
         self.window.running = false;
     };
+}
+
+/// A checked-out render target: a CPU shm buffer, or the Vulkan canvas.
+const FrameTarget = union(enum) {
+    shm: *Window.Buffer,
+    gpu: struct { width: u31, height: u31 },
+
+    fn size(self: FrameTarget) struct { width: u31, height: u31 } {
+        return switch (self) {
+            .shm => |buffer| .{ .width = buffer.width, .height = buffer.height },
+            .gpu => |gpu| .{ .width = gpu.width, .height = gpu.height },
+        };
+    }
+};
+
+const AcquiredTarget = struct {
+    frame: FrameTarget,
+    pixels: []u32,
+    source_pixels: ?[]const u32,
+    width: u31,
+    height: u31,
+    stride: u31,
+    age: usize,
+};
+
+fn acquireFrameTarget(self: *App) !AcquiredTarget {
+    if (self.vulkan.renderer == null) {
+        const target = try self.window.acquireRenderTarget();
+        return .{
+            .frame = .{ .shm = target.buffer },
+            .pixels = target.pixels,
+            .source_pixels = target.source_pixels,
+            .width = target.width,
+            .height = target.height,
+            .stride = target.stride,
+            .age = target.age,
+        };
+    }
+    const size = try self.window.beginExternalRender();
+    // The Vulkan canvas always holds the previous frame (or reports that
+    // it does not), like a shm buffer of age 1.
+    return .{
+        .frame = .{ .gpu = .{ .width = size.width, .height = size.height } },
+        .pixels = &.{},
+        .source_pixels = null,
+        .width = size.width,
+        .height = size.height,
+        .stride = size.width,
+        .age = 1,
+    };
+}
+
+fn cancelFrameTarget(self: *App, frame: FrameTarget) void {
+    switch (frame) {
+        .shm => |buffer| self.window.cancelRender(buffer),
+        .gpu => self.window.cancelExternalRender(),
+    }
+}
+
+/// Copy the canvas into a swapchain image, covering everything that image
+/// missed, and present it with this frame's damage.
+fn presentVulkanFrame(self: *App, width: u31, height: u31, damage: Window.Damage) !void {
+    const presenter = self.vulkan.presenter.?;
+    errdefer self.window.cancelExternalRender();
+    const acquired = try presenter.acquire(width, height, self.window.buffer_format == .xrgb8888);
+    const copy: ?[]const Renderer.PixelRect = switch (try self.frame_damage.presentRepair(acquired.age)) {
+        .none => &.{},
+        .full => null,
+        .rects => |rects| rects,
+    };
+    try presenter.copy(acquired, copy);
+    // The swapchain commits the surface; queue the state that commit carries.
+    try self.window.beginExternalCommit(width, height);
+    try presenter.present(acquired, switch (damage) {
+        .full => null,
+        .rects => |rects| rects,
+    });
+    self.window.endExternalCommit();
+    if (self.vulkan.shm_leftover) self.vulkan.shm_leftover = self.window.releaseIdleBuffers();
+}
+
+fn startVulkanLoad(self: *App) void {
+    if (self.config.renderer != .vulkan) return;
+    self.vulkan.wait = self.config.vulkan_startup == .wait;
+    self.vulkan.loader = VulkanRenderer.Loader.init(self.alloc, .{
+        .wl_display = self.window.display,
+        .wl_surface = self.window.surface,
+    }) catch |err| {
+        log.warn("Vulkan unavailable, using the CPU renderer: {}", .{err});
+        return;
+    };
+    self.vulkan.loader.?.start() catch |err| {
+        log.warn("Vulkan unavailable, using the CPU renderer: {}", .{err});
+        self.vulkan.loader.?.deinit();
+        self.vulkan.loader = null;
+    };
+}
+
+fn finishVulkanLoad(self: *App) void {
+    const loader = &(self.vulkan.loader orelse return);
+    const result = loader.takeResult() orelse return;
+    loader.deinit();
+    self.vulkan.loader = null;
+    // Either way frames can start now; the renderer is adopted before the
+    // next one.
+    self.needs_redraw = true;
+    self.vulkan.pending = result catch |err| {
+        log.warn("Vulkan unavailable, using the CPU renderer: {}", .{err});
+        return;
+    };
+}
+
+/// Switch rendering to Vulkan. Requires that no frame target is checked out.
+fn adoptVulkan(self: *App, renderer: *VulkanRenderer) void {
+    std.debug.assert(!self.window.rendering_pending and self.held_frame == null);
+    const presenter = self.alloc.create(VulkanPresenter) catch |err| {
+        log.warn("Vulkan presenter failed, using the CPU renderer: {}", .{err});
+        renderer.destroy();
+        return;
+    };
+    presenter.* = VulkanPresenter.init(renderer) catch |err| {
+        log.warn("Vulkan presenter failed, using the CPU renderer: {}", .{err});
+        self.alloc.destroy(presenter);
+        renderer.destroy();
+        return;
+    };
+    self.vulkan.renderer = renderer;
+    self.vulkan.presenter = presenter;
+    self.vulkan.shm_leftover = self.window.buffers.items.len > 0;
+    self.async_force_full = true;
+    self.frame_damage.invalidate();
+}
+
+const VulkanState = struct {
+    loader: ?VulkanRenderer.Loader = null,
+    /// Loaded, and adopted before the next frame starts.
+    pending: ?*VulkanRenderer = null,
+    renderer: ?*VulkanRenderer = null,
+    presenter: ?*VulkanPresenter = null,
+    /// `vulkan-startup = wait`: draw nothing until the loader finishes.
+    wait: bool = false,
+    /// CPU shm buffers from before the switch are still alive.
+    shm_leftover: bool = false,
+
+    fn deinit(self: *VulkanState, alloc: std.mem.Allocator) void {
+        if (self.loader) |*loader| loader.deinit();
+        if (self.pending) |renderer| renderer.destroy();
+        if (self.presenter) |presenter| {
+            presenter.deinit();
+            alloc.destroy(presenter);
+        }
+        if (self.renderer) |renderer| renderer.destroy();
+        self.* = .{};
+    }
+
+    /// Frames must wait for the loader.
+    fn blocksFrames(self: *const VulkanState) bool {
+        return self.wait and self.loader != null;
+    }
+};
+
+const RenderStats = struct {
+    frames: u64 = 0,
+    cpu_ns: u64 = 0,
+    cpu_max_ns: u64 = 0,
+    since_ns: u64 = 0,
+
+    fn add(self: *RenderStats, cpu_ns: u64, gpu: ?*VulkanRenderer) void {
+        const now = monotonicNs();
+        if (self.since_ns == 0) self.since_ns = now;
+        self.frames += 1;
+        self.cpu_ns += cpu_ns;
+        self.cpu_max_ns = @max(self.cpu_max_ns, cpu_ns);
+        if (now - self.since_ns < std.time.ns_per_s) return;
+        const us = std.time.ns_per_us;
+        if (gpu) |renderer| {
+            const g = renderer.takeStats();
+            log.info("render stats: {d} frames, worker cpu {d} us mean {d} us max, gpu {d} us mean {d} us max over {d} frames", .{
+                self.frames,                       self.cpu_ns / self.frames / us, self.cpu_max_ns / us,
+                g.gpu_ns / @max(g.frames, 1) / us, g.gpu_max_ns / us,              g.frames,
+            });
+        } else {
+            log.info("render stats: {d} frames, worker cpu {d} us mean {d} us max", .{
+                self.frames, self.cpu_ns / self.frames / us, self.cpu_max_ns / us,
+            });
+        }
+        self.* = .{ .since_ns = now };
+    }
+};
+
+fn monotonicNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// The raster worker is the only renderer; a load failure is fatal.
@@ -7467,12 +7696,16 @@ fn finishAsyncRender(self: *App) void {
     var async_raster = &(self.async_raster orelse return);
     const result = async_raster.takeResult() orelse return;
     if (self.window.telemetry) |telemetry| telemetry.renderFinished();
-    const buffer = self.findRenderingBuffer(result.job.pixels) orelse {
-        self.needs_redraw = true;
-        return;
-    };
+    const frame: FrameTarget = if (result.job.gpu != null)
+        .{ .gpu = .{ .width = result.job.width, .height = result.job.height } }
+    else
+        .{ .shm = self.findRenderingBuffer(result.job.pixels) orelse {
+            self.needs_redraw = true;
+            return;
+        } };
+    if (self.render_stats) |*stats| stats.add(result.cpu_ns, self.vulkan.renderer);
     if (result.err) |err| {
-        self.window.cancelRender(buffer);
+        self.cancelFrameTarget(frame);
         self.async_job.releaseKitty(self.alloc, &self.kitty_cache);
         self.kitty_cache.sweep(self.alloc);
         // A deterministic raster error would retry forever; with no other
@@ -7485,7 +7718,7 @@ fn finishAsyncRender(self: *App) void {
         result.job.width != Window.physicalDimension(self.window.width, self.window.scale120) or
         result.job.height != Window.physicalDimension(self.window.height, self.window.scale120))
     {
-        self.window.cancelRender(buffer);
+        self.cancelFrameTarget(frame);
         self.async_force_full = true;
         self.needs_redraw = true;
         return;
@@ -7493,7 +7726,7 @@ fn finishAsyncRender(self: *App) void {
     if (result.damage == .none) {
         // The target may have been repaired, but it matches the current
         // surface. Do not advance frame history unless a commit does.
-        self.window.cancelRender(buffer);
+        self.cancelFrameTarget(frame);
         self.clearRenderDirty();
         self.syncTextInputCursorRect(&self.render_state);
         return;
@@ -7510,7 +7743,7 @@ fn finishAsyncRender(self: *App) void {
     });
     self.frame_damage.record(async_raster, result.damage) catch |err| {
         log.err("async damage bookkeeping failed: {}", .{err});
-        self.window.cancelRender(buffer);
+        self.cancelFrameTarget(frame);
         self.window.fatal_error = err;
         self.window.running = false;
         return;
@@ -7523,10 +7756,10 @@ fn finishAsyncRender(self: *App) void {
         // callback fires, then starts the next render immediately so
         // raster work overlaps the following frame wait.
         std.debug.assert(self.held_frame == null);
-        self.held_frame = buffer;
+        self.held_frame = frame;
         return;
     }
-    self.commitFinishedFrame(buffer);
+    self.commitFinishedFrame(frame);
 }
 
 fn redrawReady(ctx: *anyopaque) void {
@@ -7636,9 +7869,9 @@ fn invalidateAsyncFrame(self: *App) void {
     self.async_force_full = true;
     // A held frame was rastered from the now-stale state; drop it rather
     // than commit outdated pixels on the next frame callback.
-    if (self.held_frame) |buffer| {
+    if (self.held_frame) |frame| {
         self.held_frame = null;
-        self.window.cancelRender(buffer);
+        self.cancelFrameTarget(frame);
         self.frame_damage.invalidate();
         self.needs_redraw = true;
     }

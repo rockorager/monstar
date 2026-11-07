@@ -105,6 +105,16 @@ pub fn build(b: *std.Build) void {
     translate_c.linkSystemLibrary("xkbcommon", .{});
     root_module.addImport("c", translate_c.createModule());
 
+    // Vulkan types for the optional GPU renderer. Nothing links libvulkan:
+    // VulkanRenderer loads it with dlopen only when selected.
+    const translate_vk = b.addTranslateC(.{
+        .root_source_file = b.path("src/vulkan.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_vk.linkSystemLibrary("wayland-client", .{});
+    root_module.addImport("vk", translate_vk.createModule());
+
     if (b.lazyDependency("z2d", .{
         .target = target,
         .optimize = optimize,
@@ -217,6 +227,17 @@ pub fn build(b: *std.Build) void {
     run_cmd.addArtifactArg2(exe, .{});
     run_cmd.addPassthruArgs();
     run_cmd.step.dependOn(b.getInstallStep());
+
+    // Regenerate the committed SPIR-V for the Vulkan renderer. Builds embed
+    // the committed files, so glslc is only needed after editing shaders.
+    const shaders_step = b.step("shaders", "Compile src/shaders/*.{vert,frag} to SPIR-V with glslc");
+    inline for (.{ "canvas.vert", "canvas.frag" }) |name| {
+        const glslc = b.addSystemCommand(&.{ "glslc", "-O", "--target-env=vulkan1.2", "-o" });
+        glslc.setCwd(b.path("."));
+        glslc.addArg("src/shaders/" ++ name ++ ".spv");
+        glslc.addFileArg(b.path("src/shaders/" ++ name));
+        shaders_step.dependOn(&glslc.step);
+    }
 
     const run_step = b.step("run", "Run the application");
     run_step.dependOn(&run_cmd.step);

@@ -110,8 +110,19 @@ pub fn planRepair(
     self.repair_rects.clearRetainingCapacity();
     if (dirty_full or age == 1) return .none;
     if (age == 0 or age > frame_damage_len + 1) return .full;
+    return self.collectRepair(age - 1, geometry);
+}
 
-    const missed_frames = age - 1;
+/// Describe the rectangles a presentation image of `age` (0 = never shown)
+/// misses after the current frame, which must already be recorded: the
+/// current frame's damage plus every frame since the image was shown.
+pub fn presentRepair(self: *FrameDamageTracker, age: usize) !AsyncRaster.Repair {
+    self.repair_rects.clearRetainingCapacity();
+    if (age == 0 or age > frame_damage_len) return .full;
+    return self.collectRepair(age, self.frameDamageBack(0).geometry);
+}
+
+fn collectRepair(self: *FrameDamageTracker, missed_frames: usize, geometry: Geometry) !AsyncRaster.Repair {
     const frame_area = @as(u64, geometry.width) * geometry.height;
     var repair_area: u64 = 0;
     for (0..missed_frames) |back| {
@@ -237,4 +248,37 @@ test "repair planning requires matching valid geometry" {
     try std.testing.expectEqual(.full, try tracker.planRepair(2, false, changed));
     tracker.invalidate();
     try std.testing.expectEqual(.full, try tracker.planRepair(2, false, geometry));
+}
+
+test "present repair covers the current frame and the image's missed frames" {
+    var tracker: FrameDamageTracker = .init(std.testing.allocator);
+    defer tracker.deinit();
+    const geometry: Geometry = .{
+        .width = 100,
+        .height = 50,
+        .grid_x = 0,
+        .grid_y = 0,
+        .grid_width = 100,
+        .grid_height = 50,
+        .cell_width = 10,
+        .cell_height = 10,
+    };
+    const rects = [_]Renderer.PixelRect{
+        .{ .x = 0, .y = 0, .width = 10, .height = 10 },
+        .{ .x = 20, .y = 10, .width = 10, .height = 10 },
+        .{ .x = 40, .y = 20, .width = 10, .height = 10 },
+    };
+    for (rects) |rect| {
+        tracker.begin(geometry);
+        tracker.frame_damage[tracker.frame_damage_index].full = false;
+        try tracker.frame_damage[tracker.frame_damage_index].rects.append(std.testing.allocator, rect);
+    }
+    try std.testing.expectEqual(.full, try tracker.presentRepair(0));
+    // An image that shows the previous frame needs only the current damage.
+    try std.testing.expectEqualSlices(Renderer.PixelRect, rects[2..], (try tracker.presentRepair(1)).rects);
+    const two = (try tracker.presentRepair(2)).rects;
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqual(rects[1], two[1]);
+    // The oldest frame was never recorded with rectangles before the ring.
+    try std.testing.expectEqual(.full, try tracker.presentRepair(4));
 }

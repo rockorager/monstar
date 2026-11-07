@@ -83,6 +83,10 @@ pub fn main(init: std.process.Init) !void {
             if (build_options.enable_benchmarks) return @import("bench.zig").run(init);
             unreachable;
         },
+        .vk_parity => {
+            if (build_options.enable_benchmarks) return @import("vk_parity.zig").run(init);
+            unreachable;
+        },
         .help => return printUsage(init),
         .version => return printVersion(init),
     }
@@ -93,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-const CliAction = enum { run, bench, help, version };
+const CliAction = enum { run, bench, vk_parity, help, version };
 
 const CommandMode = enum { shell, exec };
 
@@ -128,6 +132,9 @@ const CliParser = struct {
             const arg = self.args[self.index];
             if (build_options.enable_benchmarks and std.mem.eql(u8, arg, "--bench")) {
                 self.cli.action = .bench;
+                return self.cli;
+            } else if (build_options.enable_benchmarks and std.mem.eql(u8, arg, "--vk-parity")) {
+                self.cli.action = .vk_parity;
                 return self.cli;
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 self.cli.action = .help;

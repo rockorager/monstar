@@ -17,6 +17,7 @@ const Canvas = @import("Canvas.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const Renderer = @import("Renderer.zig");
+const VulkanRenderer = @import("VulkanRenderer.zig");
 
 pub const RepairRect = Renderer.PixelRect;
 
@@ -33,6 +34,7 @@ pub const Repair = union(enum) {
 /// are read-only. A returned `Result.job` preserves these borrows and does not
 /// transfer ownership of their backing storage.
 pub const Job = struct {
+    /// CPU target storage; unused (empty) when `gpu` is set.
     pixels: []u32,
     source_pixels: ?[]const u32,
     width: u31,
@@ -83,6 +85,10 @@ pub const Job = struct {
     /// Work needed to bring a stale target up to the previous committed
     /// frame.
     repair: Repair,
+    /// Draw with the Vulkan backend instead of into `pixels`. The backend
+    /// keeps the previous frame itself, so `source_pixels`, `age` and
+    /// `repair` do not apply.
+    gpu: ?*VulkanRenderer = null,
 
     fn hasOverlay(self: *const Job) bool {
         return self.preedit != null or self.link_hint != null or
@@ -103,6 +109,8 @@ pub const Result = struct {
     job: Job,
     err: ?anyerror,
     damage: Damage,
+    /// Worker thread CPU time spent on the job.
+    cpu_ns: u64 = 0,
 };
 
 pub const LoadResult = union(enum) {
@@ -223,8 +231,13 @@ pub const Loader = struct {
     }
 };
 
+var next_font_id: std.atomic.Value(u64) = .init(1);
+
 alloc: std.mem.Allocator,
 font: *Font,
+/// Process-unique identity of `font`. GPU atlases key glyphs by bitmap
+/// address, which a later Font may reuse, so they reset when this changes.
+font_id: u64,
 renderer: Renderer,
 thread: ?std.Thread,
 mutex: std.atomic.Mutex = .unlocked,
@@ -273,6 +286,7 @@ pub fn init(
     const self: AsyncRaster = .{
         .alloc = alloc,
         .font = font,
+        .font_id = next_font_id.fetchAdd(1, .monotonic),
         .renderer = renderer,
         .thread = null,
         .job_fd = @intCast(job_rc),
@@ -341,6 +355,7 @@ pub fn reconfigure(
     self.font.deinit(self.alloc);
     self.alloc.destroy(self.font);
     self.font = font;
+    self.font_id = next_font_id.fetchAdd(1, .monotonic);
     self.renderer = renderer;
 }
 
@@ -481,21 +496,45 @@ fn workerMain(self: *AsyncRaster) void {
         self.renderer.search_bg = job.search_background;
         self.renderer.search_fg = job.search_foreground;
         var damage: Damage = .full;
+        const cpu_start = threadCpuNs();
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
+        const cpu_ns = threadCpuNs() - cpu_start;
 
         self.lock();
         self.working = false;
-        self.result = .{ .job = job, .err = maybe_err, .damage = damage };
+        self.result = .{ .job = job, .err = maybe_err, .damage = damage, .cpu_ns = cpu_ns };
         self.mutex.unlock();
         writeEventfd(self.complete_fd) catch |err| std.debug.panic("failed to notify async raster completion: {}", .{err});
     }
 }
 
+fn threadCpuNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
 fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
-    std.debug.assert(job.stride >= job.width);
-    std.debug.assert(job.pixels.len >= @as(usize, job.stride) * job.height);
-    self.renderer.buffer_stride = job.stride;
-    return self.renderJobOn(job, .cpu(job.pixels, job.stride, job.width, job.height), damage);
+    const gpu = job.gpu orelse {
+        std.debug.assert(job.stride >= job.width);
+        std.debug.assert(job.pixels.len >= @as(usize, job.stride) * job.height);
+        self.renderer.buffer_stride = job.stride;
+        return self.renderJobOn(job, .cpu(job.pixels, job.stride, job.width, job.height), damage);
+    };
+    const list = try gpu.beginFrame(job.width, job.height, self.font_id);
+    errdefer gpu.cancelFrame();
+    const canvas: Canvas = .gpu(list, job.width, job.height);
+    self.renderJobOn(job, canvas, damage) catch |err| switch (err) {
+        // Restart from an empty atlas. A full frame needs only the glyphs it
+        // shows, so the second attempt fits.
+        error.AtlasFull => {
+            list.abortFrame();
+            list.previous_frame = false;
+            try self.renderJobOn(job, canvas, damage);
+        },
+        else => |e| return e,
+    };
+    try gpu.submitFrame();
 }
 
 fn renderJobOn(self: *AsyncRaster, job: Job, canvas: Canvas, damage: *Damage) !void {
