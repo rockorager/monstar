@@ -32,7 +32,10 @@ pub fn create(
     errdefer for (previews[0..created]) |preview| preview.buffer.destroy(alloc);
     for (pixels, previews) |src, *preview| {
         const buffer = try ShmBuffer.create(alloc, shm, src.width, src.height, .argb8888);
-        @memcpy(buffer.pixels(), src.argb);
+        const dst = buffer.pixels();
+        for (0..src.height) |y| {
+            @memcpy(dst[y * buffer.stride ..][0..src.width], src.argb[y * src.width ..][0..src.width]);
+        }
         preview.* = .{ .buffer = buffer, .scale = src.scale };
         created += 1;
     }

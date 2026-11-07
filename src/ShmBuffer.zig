@@ -1,4 +1,5 @@
-//! A wl_shm-backed pixel buffer and its mapped pool storage.
+//! A wl_shm-backed pixel buffer and its mapped pool storage. Rows are padded
+//! to `stride_alignment` bytes.
 
 const ShmBuffer = @This();
 
@@ -8,12 +9,19 @@ const posix = std.posix;
 const wayland = @import("wayland");
 const wl = wayland.client.wl;
 
+/// Row pitch alignment in bytes. GPUs import LINEAR buffers only with aligned
+/// pitches; 256 bytes satisfies amdgpu, the strictest common driver. wl_shm
+/// accepts any pitch.
+pub const stride_alignment = 256;
+
 wl_buffer: *wl.Buffer,
 pool: *wl.ShmPool,
 fd: posix.fd_t,
 data: []align(std.heap.page_size_min) u8,
 width: u31,
 height: u31,
+/// Row pitch in pixels; at least `width`.
+stride: u31,
 format: Format,
 busy: bool,
 rendering: bool,
@@ -64,6 +72,7 @@ pub fn create(
         .data = data,
         .width = width,
         .height = height,
+        .stride = dimensions.stridePixels(),
         .format = format,
         .busy = false,
         .rendering = false,
@@ -99,6 +108,7 @@ pub fn reshape(self: *ShmBuffer, width: u31, height: u31, format: Format) !void 
     self.wl_buffer = wl_buffer;
     self.width = width;
     self.height = height;
+    self.stride = dimensions.stridePixels();
     self.format = format;
     self.frame = 0;
 }
@@ -111,8 +121,9 @@ pub fn destroy(self: *ShmBuffer, alloc: std.mem.Allocator) void {
     alloc.destroy(self);
 }
 
+/// Rows of `stride` pixels; columns at and beyond `width` are not displayed.
 pub fn pixels(self: *ShmBuffer) []u32 {
-    const pixel_count = @as(usize, self.width) * @as(usize, self.height);
+    const pixel_count = @as(usize, self.stride) * @as(usize, self.height);
     return @alignCast(std.mem.bytesAsSlice(u32, self.data)[0..pixel_count]);
 }
 
@@ -123,12 +134,17 @@ fn bufferListener(_: *wl.Buffer, event: wl.Buffer.Event, self: *ShmBuffer) void 
 }
 
 const BufferDimensions = struct {
+    /// Row pitch in bytes.
     stride: i32,
     size: usize,
+
+    fn stridePixels(self: BufferDimensions) u31 {
+        return @intCast(@divExact(self.stride, @sizeOf(u32)));
+    }
 };
 
 fn bufferDimensions(width: u31, height: u31) !BufferDimensions {
-    const stride = @as(usize, width) * @sizeOf(u32);
+    const stride = std.mem.alignForward(usize, @as(usize, width) * @sizeOf(u32), stride_alignment);
     const size = stride * @as(usize, height);
     if (stride > std.math.maxInt(i32) or size > std.math.maxInt(i32)) return error.ShmBufferTooLarge;
     return .{ .stride = @intCast(stride), .size = size };

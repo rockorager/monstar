@@ -7250,6 +7250,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .source_pixels = target.source_pixels,
         .width = target.width,
         .height = target.height,
+        .stride = target.stride,
         .grid_x = self.layout.grid_x,
         .grid_y = self.layout.grid_y,
         .grid_width = self.layout.grid_width,

@@ -36,6 +36,8 @@ pub const Job = struct {
     source_pixels: ?[]const u32,
     width: u31,
     height: u31,
+    /// Row pitch of both pixel slices in pixels; at least `width`.
+    stride: u31,
     grid_x: u31,
     grid_y: u31,
     grid_width: u31,
@@ -477,7 +479,6 @@ fn workerMain(self: *AsyncRaster) void {
         self.renderer.search_matches = job.search_matches;
         self.renderer.search_bg = job.search_background;
         self.renderer.search_fg = job.search_foreground;
-        self.renderer.buffer_stride = job.width;
         var damage: Damage = .full;
         const maybe_err: ?anyerror = if (self.renderJob(job, &damage)) |_| null else |e| e;
 
@@ -490,6 +491,9 @@ fn workerMain(self: *AsyncRaster) void {
 }
 
 fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
+    std.debug.assert(job.stride >= job.width);
+    std.debug.assert(job.pixels.len >= @as(usize, job.stride) * job.height);
+    self.renderer.buffer_stride = job.stride;
     const grid_pixels = gridPixels(job);
     // Overlays draw outside the grid rows that dirty tracking accounts
     // for, so an overlay frame is always a full render with full damage.
@@ -599,16 +603,16 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
 fn gridPixels(job: Job) []u32 {
     std.debug.assert(job.grid_x + job.grid_width <= job.width);
     std.debug.assert(job.grid_y + job.grid_height <= job.height);
-    const offset = @as(usize, job.grid_y) * job.width + job.grid_x;
+    const offset = @as(usize, job.grid_y) * job.stride + job.grid_x;
     return job.pixels[offset..];
 }
 
 fn clearPadding(job: Job, color: u32) void {
-    @memset(job.pixels[0 .. @as(usize, job.grid_y) * job.width], color);
-    const grid_bottom = @as(usize, job.grid_y + job.grid_height) * job.width;
+    @memset(job.pixels[0 .. @as(usize, job.grid_y) * job.stride], color);
+    const grid_bottom = @as(usize, job.grid_y + job.grid_height) * job.stride;
     @memset(job.pixels[grid_bottom..], color);
     for (job.grid_y..job.grid_y + job.grid_height) |y| {
-        const row = @as(usize, y) * job.width;
+        const row = @as(usize, y) * job.stride;
         @memset(job.pixels[row .. row + job.grid_x], color);
         const right = row + job.grid_x + job.grid_width;
         @memset(job.pixels[right .. row + job.width], color);
@@ -635,7 +639,7 @@ fn repairToPreviousFrame(job: Job) bool {
                     break :repair false;
                 }
                 for (rect.y..rect.y + rect.height) |y| {
-                    const offset = @as(usize, y) * job.width + rect.x;
+                    const offset = @as(usize, y) * job.stride + rect.x;
                     Renderer.copyPixels(
                         job.pixels[offset..][0..rect.width],
                         source[offset..][0..rect.width],
@@ -662,7 +666,7 @@ fn scrollFromPreviousFrame(job: Job, shift_rows: isize, cell_height: u31) bool {
         job.source_pixels orelse return false;
     if (source.len != job.pixels.len) return false;
 
-    const stride: usize = job.width;
+    const stride: usize = job.stride;
     const grid_start = @as(usize, job.grid_y) * stride;
     const grid_end = @as(usize, job.grid_y + job.grid_height) * stride;
     const offset = shift_pixels * stride;
@@ -720,6 +724,7 @@ test "unchanged dirty rows report no damage" {
         .source_pixels = null,
         .width = width,
         .height = height,
+        .stride = width,
         .grid_x = 0,
         .grid_y = 0,
         .grid_width = width,
@@ -786,6 +791,7 @@ test "full-screen repaints render changed cells unless most cells changed" {
         .source_pixels = null,
         .width = width,
         .height = height,
+        .stride = width,
         .grid_x = 0,
         .grid_y = 0,
         .grid_width = width,
@@ -877,6 +883,7 @@ test "primary and alternate screen scroll pixels match full repaint" {
                         .source_pixels = null,
                         .width = width,
                         .height = height,
+                        .stride = width,
                         .grid_x = 0,
                         .grid_y = 0,
                         .grid_width = width,
@@ -941,6 +948,7 @@ test "repair previous frame" {
         .source_pixels = &source,
         .width = 2,
         .height = 2,
+        .stride = 2,
         .grid_x = 0,
         .grid_y = 0,
         .grid_width = 2,
@@ -1013,6 +1021,7 @@ test "scroll previous frame in place and from distinct source" {
         .source_pixels = null,
         .width = 3,
         .height = 5,
+        .stride = 3,
         .grid_x = 0,
         .grid_y = 1,
         .grid_width = 3,
@@ -1059,4 +1068,127 @@ test "scroll previous frame in place and from distinct source" {
     job.source_pixels = null;
     try std.testing.expect(!scrollFromPreviousFrame(job, 1, 1));
     try std.testing.expect(!scrollFromPreviousFrame(job, 3, 1));
+}
+
+test "padded rows render the same visible pixels as packed rows" {
+    const ScrollDetector = @import("ScrollDetector.zig");
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "DejaVu Sans Mono", 16, .{});
+    defer font.deinit(alloc);
+    const grid_x = 3;
+    const grid_y = 2;
+    const grid_width = font.cell_width * 10;
+    const grid_height = font.cell_height * 4;
+    const width = grid_width + grid_x + 4;
+    const height = grid_height + grid_y + 3;
+    const steps = 4;
+
+    // Visible pixels after each step, packed, for each row pitch.
+    var frames: [2][]u32 = undefined;
+    for (&frames) |*frame| frame.* = try alloc.alloc(u32, @as(usize, width) * height * steps);
+    defer for (frames) |frame| alloc.free(frame);
+
+    for ([_]u31{ width, width + 7 }, &frames) |stride, frame| {
+        var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 4 });
+        defer term.deinit(alloc);
+        var stream = term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[?25lone\r\n\x1b[41mtwo\x1b[m\r\nthree\r\nfour");
+        var state: vt.RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &term);
+        var raster = try AsyncRaster.init(font.discovery(), .{ .r = 1, .g = 2, .b = 3 }, null, null, null, 255, false, &state);
+        defer raster.deinit();
+
+        const pixels = try alloc.alloc(u32, @as(usize, stride) * height);
+        defer alloc.free(pixels);
+        const previous = try alloc.alloc(u32, pixels.len);
+        defer alloc.free(previous);
+        @memset(pixels, 0xdead);
+        var job: Job = .{
+            .pixels = pixels,
+            .source_pixels = null,
+            .width = width,
+            .height = height,
+            .stride = stride,
+            .grid_x = grid_x,
+            .grid_y = grid_y,
+            .grid_width = grid_width,
+            .grid_height = grid_height,
+            .age = 0,
+            .generation = 1,
+            .focused = true,
+            .hyperlink_hints = false,
+            .link_range = null,
+            .search_range = null,
+            .search_matches = &.{},
+            .search_background = .{ .r = 1, .g = 2, .b = 3 },
+            .search_foreground = .{ .r = 4, .g = 5, .b = 6 },
+            .preedit = null,
+            .link_hint = null,
+            .search = null,
+            .search_no_match = false,
+            .scrollbar = null,
+            .kitty_items = &.{},
+            .overlay_dirty = false,
+            .scroll_shift = null,
+            .repair = .none,
+        };
+        var damage: Damage = .none;
+
+        // 1. Full render, including the padding around the grid.
+        try raster.renderJob(job, &damage);
+        try std.testing.expectEqual(Damage.full, damage);
+        packVisible(frame[0 .. @as(usize, width) * height], pixels, width, stride);
+
+        // 2. Scroll a stale target from a distinct previous frame.
+        @memcpy(previous, pixels);
+        @memset(pixels, 0xdead);
+        for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+        state.dirty = .false;
+        const old_cursor = state.cursor;
+        stream.nextSlice("\r\nfive");
+        var detector: ScrollDetector = .{};
+        defer detector.deinit(alloc);
+        const scroll = (try detector.detect(alloc, &state, &term)).?;
+        try state.update(alloc, &term);
+        detector.prepare(&state, scroll, old_cursor);
+        job.scroll_shift = scroll.shift;
+        job.age = 2;
+        job.source_pixels = previous;
+        raster.renderer.resetCellDamageStats();
+        try raster.renderJob(job, &damage);
+        // Retained rows moved instead of being repainted.
+        try std.testing.expect(raster.renderer.cellDamageStats().dirty_rows < state.rows);
+        packVisible(frame[@as(usize, width) * height ..][0 .. @as(usize, width) * height], pixels, width, stride);
+
+        // 3. Repair a target that differs from the previous frame only
+        // inside one rectangle, then render one changed cell.
+        @memcpy(previous, pixels);
+        const rects = [_]RepairRect{.{ .x = 20, .y = 10, .width = 40, .height = 30 }};
+        for (rects[0].y..rects[0].y + rects[0].height) |y| @memset(pixels[y * stride + rects[0].x ..][0..rects[0].width], 0xdead);
+        for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+        state.dirty = .false;
+        stream.nextSlice("\x1b[2;3HZ");
+        try state.update(alloc, &term);
+        job.scroll_shift = null;
+        job.repair = .{ .rects = &rects };
+        try raster.renderJob(job, &damage);
+        try std.testing.expectEqual(Damage.partial, damage);
+        packVisible(frame[@as(usize, width) * height * 2 ..][0 .. @as(usize, width) * height], pixels, width, stride);
+
+        // 4. A window-anchored overlay drawn by the renderer at the stride.
+        job.repair = .none;
+        job.age = 1;
+        job.source_pixels = null;
+        job.overlay_dirty = true;
+        job.scrollbar = .{ .x = width - 6, .y = 3.5, .width = 4, .height = 20, .alpha = 200 };
+        try raster.renderJob(job, &damage);
+        packVisible(frame[@as(usize, width) * height * 3 ..][0 .. @as(usize, width) * height], pixels, width, stride);
+    }
+    try std.testing.expectEqualSlices(u32, frames[0], frames[1]);
+}
+
+fn packVisible(dst: []u32, pixels: []const u32, width: u31, stride: u31) void {
+    for (0..dst.len / width) |y| @memcpy(dst[y * width ..][0..width], pixels[y * stride ..][0..width]);
 }

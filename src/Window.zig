@@ -805,6 +805,8 @@ pub const RenderTarget = struct {
     source_pixels: ?[]const u32,
     width: u31,
     height: u31,
+    /// Row pitch of both pixel slices in pixels; at least `width`.
+    stride: u31,
     /// Buffer-age hint derived from commit-attempt bookkeeping, or 0 when no
     /// prior attempt is recorded. It does not guarantee that the current
     /// pixels appeared in a displayed frame: a commit may have failed, or a
@@ -836,7 +838,7 @@ fn beginRender(self: *Window, phys_width: u31, phys_height: u31) !RenderTarget {
             null
     else
         null;
-    return .{ .buffer = buffer, .pixels = buffer.pixels(), .source_pixels = source_pixels, .width = phys_width, .height = phys_height, .age = age };
+    return .{ .buffer = buffer, .pixels = buffer.pixels(), .source_pixels = source_pixels, .width = phys_width, .height = phys_height, .stride = buffer.stride, .age = age };
 }
 
 /// End the checkout for `buffer`. This does not restore pixels changed by the
