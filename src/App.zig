@@ -32,6 +32,7 @@ const Pty = @import("Pty.zig");
 const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
 const AsyncRaster = @import("AsyncRaster.zig");
+const FrameTelemetry = @import("FrameTelemetry.zig");
 const AsyncJobSnapshot = @import("AsyncJobSnapshot.zig");
 const FrameDamageTracker = @import("FrameDamageTracker.zig");
 const KittyImageCache = @import("KittyImageCache.zig");
@@ -645,7 +646,14 @@ pub fn init(
     // space) while we respond to queries embedded in that output.
     setNonblocking(pty.master);
 
-    const window = try Window.create(alloc, config.app_id, options.title, startup_size.window, config.presentation);
+    const window = try Window.create(
+        alloc,
+        config.app_id,
+        options.title,
+        startup_size.window,
+        config.presentation,
+        environ.getPosix(FrameTelemetry.env_var),
+    );
     errdefer window.destroy();
     window.setBufferAlpha(config.background_opacity < 255);
     window.setBackgroundBlur(config.background_blur and config.background_opacity < 255);
@@ -5894,6 +5902,9 @@ fn keyboardEvent(ctx: *anyopaque, maybe_event: ?wl.Keyboard.Event) void {
                 .repeated => .repeat,
                 else => return,
             };
+            if (action == .press) {
+                if (self.window.telemetry) |telemetry| telemetry.keyPressed(key.key);
+            }
             self.onKey(key.key, action);
             switch (action) {
                 .press => if (self.keyboard.keyRepeats(key.key)) self.armRepeat(key.key),
@@ -7061,6 +7072,8 @@ const AsyncRenderStart = enum { submitted, no_work, deferred };
 fn startAsyncRender(self: *App) !AsyncRenderStart {
     var async_raster = &(self.async_raster orelse return .deferred);
     if (async_raster.busy()) return .deferred;
+    // Includes the snapshot work below, which is per-frame client cost.
+    const telemetry_start: u64 = if (self.window.telemetry != null) FrameTelemetry.now() else 0;
     const selection_bg = self.selectionBackgroundForRender();
     const selection_fg = self.selectionForegroundForRender();
     if (!async_raster.configuredFor(
@@ -7282,6 +7295,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
     };
     if (!frozen) self.kitty_dirty_seen = self.term.screens.active.kitty_images.dirty;
     if (!frozen) self.async_force_full = false;
+    if (self.window.telemetry) |telemetry| telemetry.renderSubmitted(telemetry_start);
     return .submitted;
 }
 
@@ -7452,6 +7466,7 @@ fn rasterFatal(self: *App, err: anyerror) void {
 fn finishAsyncRender(self: *App) void {
     var async_raster = &(self.async_raster orelse return);
     const result = async_raster.takeResult() orelse return;
+    if (self.window.telemetry) |telemetry| telemetry.renderFinished();
     const buffer = self.findRenderingBuffer(result.job.pixels) orelse {
         self.needs_redraw = true;
         return;

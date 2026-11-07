@@ -7,6 +7,7 @@ const std = @import("std");
 const Config = @import("Config.zig");
 const ShmBuffer = @import("ShmBuffer.zig");
 const Udmabuf = @import("Udmabuf.zig");
+const FrameTelemetry = @import("FrameTelemetry.zig");
 const wayland = @import("wayland");
 const ext = wayland.client.ext;
 const wl = wayland.client.wl;
@@ -63,6 +64,8 @@ decoration_manager: ?*zxdg.DecorationManagerV1,
 toplevel_decoration: ?*zxdg.ToplevelDecorationV1,
 viewport: ?*wp.Viewport,
 fractional_scale: ?*wp.FractionalScaleV1,
+/// Benchmark frame telemetry; null unless MONSTAR_FRAME_TELEMETRY is set.
+telemetry: ?*FrameTelemetry,
 surface: *wl.Surface,
 xdg_surface: *xdg.Surface,
 toplevel: *xdg.Toplevel,
@@ -231,6 +234,9 @@ const Globals = struct {
     primary_manager: ?*zwp.PrimarySelectionDeviceManagerV1 = null,
     text_input_manager: ?*zwp.TextInputManagerV3 = null,
     decoration_manager: ?*zxdg.DecorationManagerV1 = null,
+    /// Bound only for frame telemetry.
+    bind_presentation: bool = false,
+    presentation: ?*wp.Presentation = null,
     outputs: std.ArrayList(*OutputState) = .empty,
 
     fn deinit(self: *Globals) void {
@@ -260,17 +266,24 @@ pub fn create(
     title: [:0]const u8,
     initial_size: InitialSize,
     presentation: Config.Presentation,
+    telemetry_path: ?[:0]const u8,
 ) !*Window {
     const display = try wl.Display.connect(null);
     errdefer display.disconnect();
 
+    const telemetry: ?*FrameTelemetry = if (telemetry_path) |path| FrameTelemetry.create(alloc, path) else null;
+    errdefer if (telemetry) |value| value.destroy();
+
     const registry = try display.getRegistry();
     errdefer registry.destroy();
     const globals = try alloc.create(Globals);
-    globals.* = .{ .alloc = alloc };
+    globals.* = .{ .alloc = alloc, .bind_presentation = telemetry != null };
     errdefer globals.deinit();
     registry.setListener(*Globals, registryListener, globals);
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
+    if (telemetry) |value| {
+        if (globals.presentation) |wp_presentation| value.setPresentation(wp_presentation);
+    }
 
     const compositor = globals.compositor orelse return error.NoWlCompositor;
     const shm = globals.shm orelse return error.NoWlShm;
@@ -420,6 +433,7 @@ pub fn create(
         .toplevel_decoration = toplevel_decoration,
         .viewport = viewport,
         .fractional_scale = fractional_scale,
+        .telemetry = telemetry,
         .surface = surface,
         .xdg_surface = xdg_surface,
         .toplevel = toplevel,
@@ -513,6 +527,7 @@ pub fn destroy(self: *Window) void {
     self.xdg_surface.destroy();
     self.surface.destroy();
     if (self.background_effect_manager) |manager| manager.destroy();
+    if (self.telemetry) |telemetry| telemetry.destroy();
     self.wm_base.destroy();
     if (self.shm.getVersion() >= wl.Shm.release_since_version)
         self.shm.release()
@@ -916,6 +931,11 @@ pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
         .rects => |rects| if (rects.len > 0)
             self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32)),
     }
+    if (self.telemetry) |telemetry| {
+        // Udmabuf falls back to wl_shm per buffer, so report this one's path.
+        telemetry.notePath("cpu", if (buffer.dmabuf) "dmabuf" else "shm");
+        telemetry.beforeCommit(self.surface, phys_width, phys_height);
+    }
     self.surface.commit();
     buffer.busy = true;
     if (self.initial_activation_token) |token| {
@@ -959,6 +979,7 @@ test "launcher activation follows the first buffer commit exactly once" {
             window.frame_counter = 0;
             window.frame_pending = false;
             window.viewport = null;
+            window.telemetry = null;
             for (0..2) |_| {
                 buffer.rendering = true;
                 try window.commitRender(buffer, .full);
@@ -1103,6 +1124,9 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
             } else if (std.mem.orderZ(u8, global.interface, wp.Viewporter.interface.name) == .eq) {
                 if (globals.viewporter == null)
                     globals.viewporter = registry.bind(global.name, wp.Viewporter, 1) catch return;
+            } else if (std.mem.orderZ(u8, global.interface, wp.Presentation.interface.name) == .eq) {
+                if (globals.bind_presentation and globals.presentation == null)
+                    globals.presentation = registry.bind(global.name, wp.Presentation, 1) catch return;
             } else if (std.mem.orderZ(u8, global.interface, wp.FractionalScaleManagerV1.interface.name) == .eq) {
                 if (globals.fractional_manager == null)
                     globals.fractional_manager = registry.bind(global.name, wp.FractionalScaleManagerV1, 1) catch return;

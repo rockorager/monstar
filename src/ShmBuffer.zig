@@ -17,6 +17,8 @@ const Udmabuf = @import("Udmabuf.zig");
 pub const stride_alignment = 256;
 
 wl_buffer: *wl.Buffer,
+/// Whether `wl_buffer` is a linux-dmabuf buffer rather than wl_shm.
+dmabuf: bool,
 pool: *wl.ShmPool,
 fd: posix.fd_t,
 data: []align(std.heap.page_size_min) u8,
@@ -75,12 +77,13 @@ pub fn create(
     errdefer if (udmabuf_fd) |value| {
         _ = linux.close(value);
     };
-    const wl_buffer = try createWlBuffer(pool, udmabuf, udmabuf_fd, width, height, dimensions.stride, format);
-    errdefer wl_buffer.destroy();
+    const created = try createWlBuffer(pool, udmabuf, udmabuf_fd, width, height, dimensions.stride, format);
+    errdefer created.buffer.destroy();
 
     const self = try alloc.create(ShmBuffer);
     self.* = .{
-        .wl_buffer = wl_buffer,
+        .wl_buffer = created.buffer,
+        .dmabuf = created.dmabuf,
         .pool = pool,
         .fd = fd,
         .data = data,
@@ -94,7 +97,7 @@ pub fn create(
         .rendering = false,
         .frame = 0,
     };
-    wl_buffer.setListener(*ShmBuffer, bufferListener, self);
+    created.buffer.setListener(*ShmBuffer, bufferListener, self);
     return self;
 }
 
@@ -121,10 +124,11 @@ pub fn reshape(self: *ShmBuffer, width: u31, height: u31, format: Format) !void 
         self.udmabuf_fd = if (self.udmabuf) |udmabuf| udmabuf.wrap(self.fd, capacity) else null;
     }
 
-    const wl_buffer = try createWlBuffer(self.pool, self.udmabuf, self.udmabuf_fd, width, height, dimensions.stride, format);
-    wl_buffer.setListener(*ShmBuffer, bufferListener, self);
+    const created = try createWlBuffer(self.pool, self.udmabuf, self.udmabuf_fd, width, height, dimensions.stride, format);
+    created.buffer.setListener(*ShmBuffer, bufferListener, self);
     self.wl_buffer.destroy();
-    self.wl_buffer = wl_buffer;
+    self.wl_buffer = created.buffer;
+    self.dmabuf = created.dmabuf;
     self.width = width;
     self.height = height;
     self.stride = dimensions.stridePixels();
@@ -151,11 +155,12 @@ fn createWlBuffer(
     height: u31,
     stride: i32,
     format: Format,
-) !*wl.Buffer {
+) !struct { buffer: *wl.Buffer, dmabuf: bool } {
     if (udmabuf_fd) |fd| {
-        if (udmabuf.?.createBuffer(fd, width, height, @intCast(stride), format)) |buffer| return buffer;
+        if (udmabuf.?.createBuffer(fd, width, height, @intCast(stride), format)) |buffer|
+            return .{ .buffer = buffer, .dmabuf = true };
     }
-    return pool.createBuffer(0, width, height, stride, shmFormat(format));
+    return .{ .buffer = try pool.createBuffer(0, width, height, stride, shmFormat(format)), .dmabuf = false };
 }
 
 /// Rows of `stride` pixels; columns at and beyond `width` are not displayed.

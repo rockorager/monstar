@@ -460,6 +460,8 @@ fn buildEnvp(
         if (cwd != null and std.mem.startsWith(u8, value, "PWD=")) continue;
         // The launcher token belongs to our window, not the shell or its children.
         if (std.mem.startsWith(u8, value, "XDG_ACTIVATION_TOKEN=")) continue;
+        // Benchmark telemetry describes this window only, not nested terminals.
+        if (std.mem.startsWith(u8, value, "MONSTAR_FRAME_TELEMETRY=")) continue;
         if (std.mem.startsWith(u8, value, "TERMINFO=")) has_terminfo = true;
         try list.append(arena, e);
     }
@@ -481,11 +483,12 @@ fn buildEnvp(
     return slice.ptr;
 }
 
-test "shell environment excludes the launch activation token" {
+test "shell environment excludes the launch activation token and telemetry path" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const envp = [_:null]?[*:0]const u8{
         "XDG_ACTIVATION_TOKEN=launcher-token",
+        "MONSTAR_FRAME_TELEMETRY=/run/user/1000/frames.jsonl",
         "TERM=old-terminal",
         "COLORTERM=old-color",
         "TERMINFO=/custom/terminfo",
@@ -546,6 +549,7 @@ test {
     _ = @import("KittyDrag.zig");
     _ = @import("drag_preview.zig");
     _ = @import("FrameDamageTracker.zig");
+    _ = @import("FrameTelemetry.zig");
     _ = Config;
     _ = Font;
     _ = @import("cgroup.zig");

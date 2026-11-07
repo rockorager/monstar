@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     const scanner = Scanner.create(b, .{});
     scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addSystemProtocol("stable/viewporter/viewporter.xml");
+    scanner.addSystemProtocol("stable/presentation-time/presentation-time.xml");
     scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
     scanner.addSystemProtocol("staging/xdg-activation/xdg-activation-v1.xml");
     scanner.addSystemProtocol("staging/fractional-scale/fractional-scale-v1.xml");
@@ -53,6 +54,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("xdg_wm_base", 7);
     scanner.generate("xdg_activation_v1", 1);
     scanner.generate("wp_viewporter", 1);
+    scanner.generate("wp_presentation", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 2);
     scanner.generate("xdg_system_bell_v1", 1);
