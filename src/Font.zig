@@ -911,12 +911,17 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     }
     const primary = &faces.items[0];
     // Cell metrics: advance of a reference glyph for width, font-global
-    // ascender/descender for height. A configured adjustment changes the
-    // height and keeps the text vertically centered. ft metrics are 26.6
-    // fixed point.
+    // ascender, descender, and line gap for height. Like ghostty, half the
+    // line gap goes above the text and half below; fonts such as Nimbus
+    // Mono PS set the ascender at stem height and rely on the gap to hold
+    // taller glyphs. A configured adjustment changes the height and keeps
+    // the text vertically centered. ft metrics are 26.6 fixed point.
     const metrics = primary.ft_face.*.size.*.metrics;
-    const natural_height: u31 = @intCast((metrics.ascender - metrics.descender) >> 6);
+    const ink_height: u31 = @intCast((metrics.ascender - metrics.descender) >> 6);
+    const line_gap: u31 = @intCast(@max(0, (metrics.height >> 6) - ink_height));
+    const natural_height: u31 = ink_height + line_gap;
     const ascender: u31 = @intCast(metrics.ascender >> 6);
+    const natural_baseline: u31 = ascender + line_gap / 2;
     const adjustments = discovery_data.adjustments;
     const cell_height = if (adjustments.cell_height) |modifier|
         modifier.apply(natural_height)
@@ -924,12 +929,12 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         natural_height;
     const baseline: u31 = if (adjustments.cell_height != null)
         @intCast(std.math.clamp(
-            @as(i64, ascender) + @divFloor(@as(i64, cell_height) - natural_height, 2),
+            @as(i64, natural_baseline) + @divFloor(@as(i64, cell_height) - natural_height, 2),
             0,
             cell_height,
         ))
     else
-        ascender;
+        natural_baseline;
     const cell_width: u31 = width: {
         const idx = c.FT_Get_Char_Index(primary.ft_face, 'M');
         if (idx != 0 and c.FT_Load_Glyph(primary.ft_face, idx, c.FT_LOAD_DEFAULT) == 0) {
@@ -993,7 +998,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     const thickness: u32 = thickness: {
         const units: i64 = ft_face.*.underline_thickness;
         if (units > 0) break :thickness lineThickness(units, y_scale);
-        break :thickness @max(1, natural_height / 16);
+        break :thickness @max(1, ink_height / 16);
     };
 
     // FreeType underline position: relative to baseline, +up.
@@ -1011,7 +1016,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
             if (idx != 0 and c.FT_Load_Glyph(ft_face, idx, c.FT_LOAD_DEFAULT) == 0) {
                 break :ex @intCast(ft_face.*.glyph.*.metrics.horiBearingY >> 6);
             }
-            break :ex @divTrunc(@as(i64, natural_height) * 3, 10);
+            break :ex @divTrunc(@as(i64, ink_height) * 3, 10);
         };
         const top: i64 = baseline - @divTrunc(ex_height + thickness, 2);
         break :position @intCast(std.math.clamp(top, 0, cell_height -| thickness));
@@ -1046,8 +1051,10 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         .cell_width = cell_width,
         .cell_height = cell_height,
         .baseline = baseline,
-        .neighbor_row_overhang = natural_height > cell_height,
-        .multi_row_overhang = @as(u64, natural_height) > @as(u64, cell_height) * 2,
+        // Shrinking the cell into the line gap keeps the ink box inside it.
+        .neighbor_row_overhang = baseline < ascender or
+            @as(i64, baseline) + ink_height - ascender > cell_height,
+        .multi_row_overhang = @as(u64, ink_height) > @as(u64, cell_height) * 2,
     };
 }
 
