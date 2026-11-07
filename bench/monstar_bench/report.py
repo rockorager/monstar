@@ -82,14 +82,16 @@ def summarize_cell(cell, baseline_w):
             gpu_mem.setdefault(name, []).append(kb / 1024)
     if gpu_mem:
         summary["client_gpu_memory_mb"] = {name: spread(v) for name, v in gpu_mem.items()}
-    engine = {}
-    for r in runs:
-        frames = _get(r, "frames", "presented") or 0
-        for name, ms in (_get(r, "gpu", "client_engine_ms") or {}).items():
-            if frames:
-                engine.setdefault(name, []).append(ms / frames)
-    if engine:
-        summary["gpu_engine_ms_per_frame"] = {name: spread(v) for name, v in engine.items()}
+    for field, out in (("client_engine_ms", "gpu_engine_ms_per_frame"),
+                       ("compositor_engine_ms", "compositor_gpu_engine_ms_per_frame")):
+        engine = {}
+        for r in runs:
+            frames = _get(r, "frames", "presented") or 0
+            for name, ms in (_get(r, "gpu", field) or {}).items():
+                if frames:
+                    engine.setdefault(name, []).append(ms / frames)
+        if engine:
+            summary[out] = {name: spread(v) for name, v in engine.items()}
     scan = [r.get("scanout_compositor") for r in runs if "scanout_compositor" in r]
     if scan:
         summary["scanout_compositor"] = all(scan)
@@ -204,6 +206,9 @@ def notes_for(cell, s):
     if engine:
         busiest = max(engine.items(), key=lambda kv: (kv[1] or {}).get("median", 0))
         notes.append(f"GPU {busiest[0]} {fmt(busiest[1], 2)} ms/frame")
+    comp_gfx = (s.get("compositor_gpu_engine_ms_per_frame") or {}).get("gfx")
+    if comp_gfx:
+        notes.append(f"comp GPU gfx {fmt(comp_gfx, 2)} ms/frame")
     warned = sum(1 for r in cell["runs"] if r.get("warning"))
     if warned:
         notes.append(f"{warned} run(s) warned: {next(r['warning'] for r in cell['runs'] if r.get('warning'))}")

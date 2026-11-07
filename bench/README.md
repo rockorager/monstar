@@ -157,7 +157,8 @@ dgpu_w?, gpu_busy_pct?}`; `cpu {client_pct, compositor_pct, workload_pct}` (%
 of one core); `frames {committed, presented, discarded, missed_refreshes,
 late_frames, refresh_ms, refresh_source, interval_ms [], render_ms [],
 gpu_ms [], commit_to_present_ms [], size}`; `memory {client, compositor: {rss_kb, pss_kb,
-peak_rss_kb}}`; `gpu {client_engine_ms, client_memory_kb}` from DRM fdinfo;
+peak_rss_kb}}`; `gpu {client_engine_ms, client_memory_kb, compositor_engine_ms,
+compositor_memory_kb}` from DRM fdinfo;
 `latency {key_to_present_ms [], key_to_commit_ms [], key_to_receive_ms [],
 key_to_flip_ms [] | null, keys, unmatched, input}`; `flood {wall_s, bytes,
 mb_per_s, complete}`; `window`, `effective`, `kms_flips`, `kms_fbs`,

@@ -264,6 +264,7 @@ class Bench:
         if self.kms_flips:
             self.helper.call("vblank_start")
         fd0 = metrics.drm_fdinfo(client)
+        comp_fd0 = metrics.drm_fdinfo(comp)
         self.sampler.start()
         ticks0 = self.snapshot([client, comp] + family0)
         rapl0 = self.helper.call("rapl")
@@ -313,6 +314,7 @@ class Bench:
         ticks1 = self.snapshot([client, comp] + family1)
         gpu = self.sampler.stop()
         fd1 = metrics.drm_fdinfo(client)
+        comp_fd1 = metrics.drm_fdinfo(comp)
         if self.kms_flips:
             flips = self.helper.call("vblank_stop")["flips"]
         seconds = (t1 - t0) / 1e9
@@ -335,11 +337,13 @@ class Bench:
             "memory": {"client": metrics.memory(client), "compositor": metrics.memory(comp)},
         }
         sample["power"].update({k: v for k, v in gpu.items() if v is not None})
+        engine_ms = lambda a, b: {k: round((v - a["engine_ns"].get(k, 0)) / 1e6, 3) for k, v in b["engine_ns"].items()}
         if fd0 and fd1:
-            sample["gpu"] = {
-                "client_engine_ms": {k: round((v - fd0["engine_ns"].get(k, 0)) / 1e6, 3) for k, v in fd1["engine_ns"].items()},
-                "client_memory_kb": fd1["memory_kb"],
-            }
+            sample["gpu"] = {"client_engine_ms": engine_ms(fd0, fd1), "client_memory_kb": fd1["memory_kb"]}
+        if comp_fd0 and comp_fd1:
+            # The compositor's GPU time: importing, uploading and compositing.
+            sample.setdefault("gpu", {}).update(compositor_engine_ms=engine_ms(comp_fd0, comp_fd1),
+                                                compositor_memory_kb=comp_fd1["memory_kb"])
         if workload.latency:
             sample["latency"] = metrics.match_latency(sent, events, flips)
             sample["latency"]["input"] = self.keyboard.name
