@@ -97,6 +97,9 @@ glyph_clip_x: ?PixelRange = null,
 rendered_rects: std.ArrayList(PixelRect),
 cell_damage_tracker: CellDamageTracker,
 track_cell_damage: bool,
+/// measureDirtyDamage already measured the current state; the next
+/// renderDirty consumes the result instead of measuring again.
+cell_damage_measured: bool = false,
 partial_cell_raster: bool,
 /// Scratch codepoints for cluster-width measurement of overlay text.
 codepoint_scratch: std.ArrayList(u21),
@@ -265,6 +268,7 @@ pub fn render(
     height: u31,
 ) !void {
     std.debug.assert(pixelBufferFits(pixels, self.pixelStride(width), width, height));
+    self.cell_damage_measured = false;
 
     if (state.rows == 0 or state.cols == 0) {
         fillRect(pixels, self.pixelStride(width), width, height, 0, 0, width, height, self.backgroundPixel(state.colors.background));
@@ -462,7 +466,8 @@ pub fn renderDirty(
         }
         return;
     }
-    if (self.track_cell_damage) try self.measureCellDamage(state);
+    if (self.track_cell_damage and !self.cell_damage_measured) try self.measureCellDamage(state);
+    self.cell_damage_measured = false;
     try self.row_overhang.resize(self.alloc, state.rows, false);
 
     const rows = state.row_data.slice();
@@ -513,6 +518,24 @@ pub fn renderDirty(
         }
         rendered_until = @max(rendered_until, end);
     }
+}
+
+/// Measure the dirty rows' cell damage ahead of renderDirty and return how
+/// many cells it would repaint, letting callers prefer a full render (and
+/// skip stale-buffer repair) when most of the grid changed. Returns null
+/// when renderDirty would not use cell damage.
+pub fn measureDirtyDamage(self: *Renderer, state: *const vt.RenderState) !?usize {
+    if (!self.partial_cell_raster or self.font.multi_row_overhang) return null;
+    if (state.rows == 0 or state.cols == 0) return null;
+    try self.measureCellDamage(state);
+    self.cell_damage_measured = true;
+    var cells: usize = 0;
+    for (state.row_data.items(.dirty)[0..state.rows], 0..) |dirty, y| {
+        if (!dirty) continue;
+        const range = self.cell_damage_tracker.damageForRow(y) orelse continue;
+        cells += range.end - range.start;
+    }
+    return cells;
 }
 
 fn recordRenderedRect(
@@ -590,17 +613,56 @@ fn measureCellDamage(self: *Renderer, state: *const vt.RenderState) !void {
         if (!dirty) continue;
         const cells = all_cells[y].slice();
         const fingerprints = try self.cell_damage_tracker.rowScratch(cols);
-        for (0..cols) |x| {
-            fingerprints[x] = self.cellFingerprint(
-                state,
-                cells,
-                all_selections[y],
-                x,
-                @intCast(y),
-            );
+        if (self.rowHasVisualState(state, all_selections[y], @intCast(y))) {
+            for (0..cols) |x| {
+                fingerprints[x] = self.cellFingerprint(
+                    state,
+                    cells,
+                    all_selections[y],
+                    x,
+                    @intCast(y),
+                );
+            }
+        } else {
+            // Most rows carry no cursor, selection, link, or search state:
+            // their fingerprints are just the cell contents.
+            const raws = cells.items(.raw);
+            const styles = cells.items(.style);
+            const graphemes = cells.items(.grapheme);
+            for (fingerprints, raws[0..cols], styles[0..cols], graphemes[0..cols]) |*fingerprint, raw, style, grapheme| {
+                fingerprint.* = .{
+                    .raw = raw,
+                    .style = if (raw.style_id == 0) .{} else style,
+                    .grapheme = if (raw.content_tag == .codepoint_grapheme)
+                        std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(grapheme))
+                    else
+                        0,
+                    .visual = 0,
+                    .cursor_style = 0,
+                };
+            }
         }
         self.cell_damage_tracker.measureRow(y, cells.items(.raw), fingerprints);
     }
+}
+
+/// Whether any cell of row `y` may have a nonzero `visual` or
+/// `cursor_style` fingerprint field.
+fn rowHasVisualState(
+    self: *const Renderer,
+    state: *const vt.RenderState,
+    selection: ?[2]vt.size.CellCountInt,
+    y: u31,
+) bool {
+    if (selection != null or self.hyperlink_hints or self.search_matches.len > 0) return true;
+    if (state.cursor.visible) {
+        if (state.cursor.viewport) |viewport| if (viewport.y == y) return true;
+    }
+    for ([_]?LinkRange{ self.link_range, self.search_range }) |maybe_range| {
+        const range = maybe_range orelse continue;
+        if (y >= range.start.y and y <= range.end.y) return true;
+    }
+    return false;
 }
 
 fn cellFingerprint(
@@ -1425,7 +1487,9 @@ fn prepareRowCells(
     const y_px: u31 = y * font.cell_height;
     const graphemes = cells.items(.grapheme);
     var bg_run: BgRun = .{};
-    for (0..cols) |x| {
+    // Partial repaints only shape the text runs touching their cells.
+    const scan = textScanRange(raws, cell_range, cols);
+    for (scan.start..scan.end) |x| {
         const style: vt.Style = if (raws[x].style_id == 0) .{} else styles[x];
         self.face_scratch.items[x] = face: {
             switch (raws[x].content_tag) {
@@ -1568,6 +1632,16 @@ fn prepareRowCells(
     }
 }
 
+/// Cells whose faces and colors the text runs touching `range` need: the
+/// range widened to the surrounding text so runs shape completely.
+fn textScanRange(raws: []const vt.Cell, range: CellRange, cols: usize) CellRange {
+    var start = range.start;
+    while (start > 0 and CellDamageTracker.cellHasText(raws[start - 1])) start -= 1;
+    var end = range.end;
+    while (end < cols and CellDamageTracker.cellHasText(raws[end])) end += 1;
+    return .{ .start = start, .end = end };
+}
+
 /// A pending run of adjacent equal-color cell backgrounds.
 const BgRun = struct {
     active: bool = false,
@@ -1635,9 +1709,11 @@ fn renderRowForegroundCells(
     // Text pass: shape and draw runs of consecutive cells with the same
     // style and font face.
     const faces = self.face_scratch.items;
-    var run_start: u31 = 0;
-    var x: u31 = 0;
-    while (x < cols) : (x += 1) {
+    const scan = textScanRange(raws, cell_range, cols);
+    const scan_end: u31 = @intCast(scan.end);
+    var run_start: u31 = @intCast(scan.start);
+    var x: u31 = run_start;
+    while (x < scan_end) : (x += 1) {
         const has_text = switch (raws[x].content_tag) {
             .codepoint => raws[x].content.codepoint.data != 0 and
                 raws[x].content.codepoint.data != ' ' and
@@ -1658,8 +1734,8 @@ fn renderRowForegroundCells(
             run_start = if (has_text) x else x + 1;
         }
     }
-    if (run_start <= range_end and cols >= range_start) {
-        try self.drawRun(raws, styles, graphemes, run_start, cols, cols, y, pixels, width, height);
+    if (run_start <= range_end and scan_end >= range_start) {
+        try self.drawRun(raws, styles, graphemes, run_start, scan_end, cols, y, pixels, width, height);
     }
 
     // Decoration pass: underlines, strikethrough, overline, and hyperlink

@@ -568,7 +568,13 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
             damage.* = .full;
         },
         .partial => {
-            if (!repairToPreviousFrame(job)) {
+            // Repairing a stale buffer and then repainting most cells costs
+            // more than one full render that needs no repair.
+            const damaged_cells = try self.renderer.measureDirtyDamage(self.state);
+            const grid_cells = @as(usize, self.state.rows) * self.state.cols;
+            if ((damaged_cells != null and damaged_cells.? * 2 > grid_cells) or
+                !repairToPreviousFrame(job))
+            {
                 clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
                 try self.renderer.render(self.state, grid_pixels, job.grid_width, job.grid_height);
                 damage.* = .full;
@@ -749,6 +755,87 @@ test "unchanged dirty rows report no damage" {
 
     try std.testing.expectEqual(Damage.none, damage);
     try std.testing.expectEqual(@as(usize, 0), raster.renderer.rendered_rects.items.len);
+}
+
+test "full-screen repaints render changed cells unless most cells changed" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?25lab cd ef\r\nab cd ef\r\nab cd ef\r\nab cd ef");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16, .{});
+    defer font.deinit(alloc);
+    var raster = try AsyncRaster.init(font.discovery(), .{ .r = 1, .g = 2, .b = 3 }, null, null, null, 255, false, &state);
+    defer raster.deinit();
+
+    const width: u31 = raster.font.cell_width * 8;
+    const height: u31 = raster.font.cell_height * 4;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    const expected = try alloc.alloc(u32, pixels.len);
+    defer alloc.free(expected);
+    const job: Job = .{
+        .pixels = pixels,
+        .source_pixels = null,
+        .width = width,
+        .height = height,
+        .grid_x = 0,
+        .grid_y = 0,
+        .grid_width = width,
+        .grid_height = height,
+        .age = 1,
+        .generation = 1,
+        .focused = true,
+        .hyperlink_hints = false,
+        .link_range = null,
+        .search_range = null,
+        .search_matches = &.{},
+        .search_background = .{ .r = 1, .g = 2, .b = 3 },
+        .search_foreground = .{ .r = 4, .g = 5, .b = 6 },
+        .preedit = null,
+        .link_hint = null,
+        .search = null,
+        .search_no_match = false,
+        .scrollbar = null,
+        .kitty_items = &.{},
+        .overlay_dirty = false,
+        .scroll_shift = null,
+        .repair = .none,
+    };
+    var damage: Damage = .none;
+    try raster.renderJob(job, &damage);
+
+    const repaints = [_][]const u8{
+        // A TUI redraw from home that changes one word.
+        "\x1b[Hab cd ef\r\nab cd ef\r\nab XY ef\r\nab cd ef",
+        // A redraw that changes every cell.
+        "\x1b[Hgh ij kl\r\ngh ij kl\r\ngh ij kl\r\ngh ij kl",
+    };
+    for (repaints, [_]Damage{ .partial, .full }) |repaint, expected_damage| {
+        for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+        state.dirty = .false;
+        stream.nextSlice(repaint);
+        try state.update(alloc, &term);
+        try std.testing.expectEqual(@as(@TypeOf(state.dirty), .partial), state.dirty);
+        for (state.row_data.items(.dirty)) |dirty| try std.testing.expect(dirty);
+
+        try raster.renderJob(job, &damage);
+        try std.testing.expectEqual(expected_damage, damage);
+        if (expected_damage == .partial) {
+            const rects = raster.renderer.rendered_rects.items;
+            try std.testing.expectEqual(@as(usize, 1), rects.len);
+            try std.testing.expectEqual(@as(u32, 2 * raster.font.cell_height), rects[0].y);
+            try std.testing.expect(rects[0].width < width);
+        }
+        try raster.renderer.render(&state, expected, width, height);
+        try std.testing.expectEqualSlices(u32, expected, pixels);
+    }
 }
 
 test "primary and alternate screen scroll pixels match full repaint" {

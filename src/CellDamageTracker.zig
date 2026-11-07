@@ -145,12 +145,13 @@ pub fn measureRow(
     }
     if (first == self.cols) {
         self.stats.unchanged_dirty_rows += 1;
-    } else {
-        const row_damage = expandCellDamage(previous, raw_cells, .{ .start = first, .end = end });
-        self.damage.items[row] = row_damage;
-        self.stats.spanned_cells += row_damage.end - row_damage.start;
+        return;
     }
-    @memcpy(previous, current);
+    const row_damage = expandCellDamage(previous, raw_cells, .{ .start = first, .end = end });
+    self.damage.items[row] = row_damage;
+    self.stats.spanned_cells += row_damage.end - row_damage.start;
+    // Unchanged fingerprints outside [first, end) are already stored.
+    @memcpy(previous[first..end], current[first..end]);
     self.fingerprint_valid.set(row);
 }
 
@@ -276,7 +277,7 @@ fn textRunEndRaw(cells: []const vt.Cell, end: usize) usize {
     return result;
 }
 
-fn cellHasText(cell: vt.Cell) bool {
+pub fn cellHasText(cell: vt.Cell) bool {
     return switch (cell.content_tag) {
         .codepoint => cell.content.codepoint.data != 0 and
             cell.content.codepoint.data != ' ' and

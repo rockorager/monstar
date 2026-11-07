@@ -7161,9 +7161,12 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         if (self.async_job.scrollbar != null and new_scrollbar == null) {
             self.render_state.dirty = .full;
         }
-        if (self.render_state.dirty == .partial and self.allRenderRowsDirty()) {
-            self.render_state.dirty = .full;
-        }
+        // Full-screen repaints (TUIs redrawing from the home position) dirty
+        // every row while usually changing few cells. Keep them partial so
+        // the worker can measure cell damage; it falls back to a full render
+        // when most cells changed. In-place row rotations still qualify for
+        // scroll reuse below.
+        const all_rows_dirty = self.render_state.dirty == .partial and self.allRenderRowsDirty();
         // Snapshot overlay inputs; the worker cannot safely read App state.
         // The previous job's copies are dead: only one job exists at a time.
         const hovered = if (hyperlink_hints) self.hovered_link else null;
@@ -7206,7 +7209,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             self.render_state.dirty = .full;
         }
         overlay_dirty = overlay_dirty or kitty_changed;
-        if (overlay_dirty or self.render_state.dirty != .full) scroll = null;
+        if (overlay_dirty or (self.render_state.dirty != .full and !all_rows_dirty)) scroll = null;
         // Nothing to draw: content is clean and every overlay input
         // matches the previous job. Parse batches that only stream
         // kitty payload bytes land here; submitting would burn a job
