@@ -1,0 +1,10 @@
+/text*.txt
+/bin-*/
+/vkgrid/vkgrid
+/vkgrid/*.inc
+/vkgrid/grid.*.h
+/vkgrid/xdg-shell-*
+/tools/gbmtime
+/tools/metrics
+/tools/probe
+__pycache__/

@@ -1,0 +1,12 @@
+{"label": "hypr-fs/shm scanout=0", "seconds": 10.08, "cpu": {"monstar": 8.4, "Hyprland": 8.8}, "rapl_pkg_w": 5.71, "ppt_w": 5.94, "gpu_busy_pct": 4.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/udmabuf scanout=0", "seconds": 10.09, "cpu": {"monstar": 6.8, "Hyprland": 8.3}, "rapl_pkg_w": 4.48, "ppt_w": 4.47, "gpu_busy_pct": 2.7, "flips_per_s": 60.0}
+{"label": "hypr-fs/gbm scanout=1", "seconds": 10.09, "cpu": {"monstar": 14.0, "Hyprland": 2.9}, "rapl_pkg_w": 5.16, "ppt_w": 5.6, "gpu_busy_pct": 0.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.7, "Hyprland": 4.5}, "rapl_pkg_w": 4.73, "ppt_w": 4.87, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 8.8, "Hyprland": 9.9}, "rapl_pkg_w": 5.53, "ppt_w": 5.3, "gpu_busy_pct": 4.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/udmabuf scanout=0", "seconds": 10.09, "cpu": {"monstar": 6.6, "Hyprland": 7.8}, "rapl_pkg_w": 4.66, "ppt_w": 4.66, "gpu_busy_pct": 2.4, "flips_per_s": 60.0}
+{"label": "hypr-fs/gbm scanout=1", "seconds": 10.08, "cpu": {"monstar": 13.7, "Hyprland": 3.2}, "rapl_pkg_w": 5.49, "ppt_w": 5.62, "gpu_busy_pct": 0.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.5, "Hyprland": 4.8}, "rapl_pkg_w": 4.74, "ppt_w": 4.91, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 8.4, "Hyprland": 9.2}, "rapl_pkg_w": 5.65, "ppt_w": 5.49, "gpu_busy_pct": 4.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/udmabuf scanout=0", "seconds": 10.08, "cpu": {"monstar": 6.9, "Hyprland": 8.3}, "rapl_pkg_w": 4.67, "ppt_w": 4.85, "gpu_busy_pct": 2.6, "flips_per_s": 60.0}
+{"label": "hypr-fs/gbm scanout=1", "seconds": 10.09, "cpu": {"monstar": 13.4, "Hyprland": 4.1}, "rapl_pkg_w": 5.38, "ppt_w": 6.1, "gpu_busy_pct": 0.0, "flips_per_s": 60.0}
+{"label": "hypr-fs/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.5, "Hyprland": 5.1}, "rapl_pkg_w": 4.6, "ppt_w": 4.54, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}

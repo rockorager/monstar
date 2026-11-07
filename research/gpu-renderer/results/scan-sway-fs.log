@@ -1,0 +1,12 @@
+{"label": "sway-fs/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 11.6, "sway": 9.3}, "rapl_pkg_w": 4.96, "ppt_w": 5.06, "gpu_busy_pct": 3.6, "flips_per_s": 60.1}
+{"label": "sway-fs/udmabuf scanout=0", "seconds": 10.08, "cpu": {"monstar": 8.3, "sway": 5.9}, "rapl_pkg_w": 5.07, "ppt_w": 5.08, "gpu_busy_pct": 3.0, "flips_per_s": 60.0}
+{"label": "sway-fs/gbm scanout=1", "seconds": 10.09, "cpu": {"monstar": 13.7, "sway": 2.8}, "rapl_pkg_w": 4.83, "ppt_w": 5.34, "gpu_busy_pct": 0.0, "flips_per_s": 60.0}
+{"label": "sway-fs/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.3, "sway": 3.8}, "rapl_pkg_w": 4.76, "ppt_w": 5.15, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}
+{"label": "sway-fs/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 8.2, "sway": 7.3}, "rapl_pkg_w": 5.25, "ppt_w": 5.34, "gpu_busy_pct": 2.0, "flips_per_s": 60.0}
+{"label": "sway-fs/udmabuf scanout=0", "seconds": 10.09, "cpu": {"monstar": 7.7, "sway": 5.5}, "rapl_pkg_w": 5.28, "ppt_w": 5.31, "gpu_busy_pct": 3.0, "flips_per_s": 60.0}
+{"label": "sway-fs/gbm scanout=1", "seconds": 10.09, "cpu": {"monstar": 14.2, "sway": 2.5}, "rapl_pkg_w": 5.25, "ppt_w": 5.63, "gpu_busy_pct": 0.0, "flips_per_s": 60.0}
+{"label": "sway-fs/vkgrid scanout=0", "seconds": 10.09, "cpu": {"vkgrid": 2.1, "sway": 3.9}, "rapl_pkg_w": 4.82, "ppt_w": 5.02, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}
+{"label": "sway-fs/shm scanout=0", "seconds": 10.08, "cpu": {"monstar": 8.6, "sway": 7.7}, "rapl_pkg_w": 5.25, "ppt_w": 5.27, "gpu_busy_pct": 2.0, "flips_per_s": 60.0}
+{"label": "sway-fs/udmabuf scanout=0", "seconds": 10.08, "cpu": {"monstar": 7.0, "sway": 5.6}, "rapl_pkg_w": 5.26, "ppt_w": 5.57, "gpu_busy_pct": 3.0, "flips_per_s": 60.0}
+{"label": "sway-fs/gbm scanout=1", "seconds": 10.09, "cpu": {"monstar": 13.7, "sway": 2.9}, "rapl_pkg_w": 5.06, "ppt_w": 5.78, "gpu_busy_pct": 0.0, "flips_per_s": 60.0}
+{"label": "sway-fs/vkgrid scanout=0", "seconds": 10.09, "cpu": {"vkgrid": 2.2, "sway": 3.7}, "rapl_pkg_w": 4.75, "ppt_w": 4.95, "gpu_busy_pct": 6.1, "flips_per_s": 60.0}

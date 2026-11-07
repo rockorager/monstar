@@ -1,0 +1,12 @@
+{"label": "hypr-comp/shm scanout=0", "seconds": 10.08, "cpu": {"monstar": 6.7, "Hyprland": 12.8}, "rapl_pkg_w": -6492.64, "ppt_w": 5.73, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}
+{"label": "hypr-comp/udmabuf scanout=0", "seconds": 10.08, "cpu": {"monstar": 6.8, "Hyprland": 7.2}, "rapl_pkg_w": 5.3, "ppt_w": 5.38, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}
+{"label": "hypr-comp/gbm scanout=0", "seconds": 10.09, "cpu": {"monstar": 8.5, "Hyprland": 7.1}, "rapl_pkg_w": 5.56, "ppt_w": 5.61, "gpu_busy_pct": 5.0, "flips_per_s": 60.1}
+{"label": "hypr-comp/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.6, "Hyprland": 7.2}, "rapl_pkg_w": 5.53, "ppt_w": 5.62, "gpu_busy_pct": 9.9, "flips_per_s": 60.0}
+{"label": "hypr-comp/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 6.1, "Hyprland": 13.4}, "rapl_pkg_w": 5.51, "ppt_w": 5.63, "gpu_busy_pct": 6.0, "flips_per_s": 60.1}
+{"label": "hypr-comp/udmabuf scanout=0", "seconds": 10.09, "cpu": {"monstar": 7.8, "Hyprland": 7.5}, "rapl_pkg_w": 5.21, "ppt_w": 5.28, "gpu_busy_pct": 6.0, "flips_per_s": 60.1}
+{"label": "hypr-comp/gbm scanout=0", "seconds": 10.08, "cpu": {"monstar": 8.9, "Hyprland": 6.9}, "rapl_pkg_w": 5.6, "ppt_w": 5.83, "gpu_busy_pct": 5.0, "flips_per_s": 60.0}
+{"label": "hypr-comp/vkgrid scanout=0", "seconds": 10.09, "cpu": {"vkgrid": 2.6, "Hyprland": 7.2}, "rapl_pkg_w": 5.64, "ppt_w": 5.47, "gpu_busy_pct": 9.9, "flips_per_s": 60.0}
+{"label": "hypr-comp/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 11.9, "Hyprland": 10.8}, "rapl_pkg_w": 5.1, "ppt_w": 5.1, "gpu_busy_pct": 6.0, "flips_per_s": 60.1}
+{"label": "hypr-comp/udmabuf scanout=0", "seconds": 10.08, "cpu": {"monstar": 7.5, "Hyprland": 7.7}, "rapl_pkg_w": 5.13, "ppt_w": 5.11, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}
+{"label": "hypr-comp/gbm scanout=0", "seconds": 10.08, "cpu": {"monstar": 11.9, "Hyprland": 7.2}, "rapl_pkg_w": 5.37, "ppt_w": 5.61, "gpu_busy_pct": 5.8, "flips_per_s": 60.0}
+{"label": "hypr-comp/vkgrid scanout=0", "seconds": 10.09, "cpu": {"vkgrid": 2.7, "Hyprland": 7.2}, "rapl_pkg_w": 5.64, "ppt_w": 5.66, "gpu_busy_pct": 9.8, "flips_per_s": 60.1}

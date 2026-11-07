@@ -1,0 +1,26 @@
+{"label": "vulkan/shm/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.26, "ppt_w": 3.23, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "vulkan/shm/scroll60", "seconds": 10.08, "cpu": {"monstar": 11.2, "sway": 15.1}, "rapl_pkg_w": 6.08, "ppt_w": 6.09, "gpu_busy_pct": 10.6, "flips_per_s": 59.9}
+{"label": "vulkan/shm/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 10.1, "sway": 14.6}, "rapl_pkg_w": 6.2, "ppt_w": 7.0, "gpu_busy_pct": 10.5, "flips_per_s": 59.9}
+{"label": "vulkan/shm/flood", "seconds": 10.08, "cpu": {"monstar": 163.5, "sway": 5.5}, "rapl_pkg_w": 32.47, "ppt_w": 32.37, "gpu_busy_pct": 6.0, "flips_per_s": 59.9}
+{"label": "vulkan/shm/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.33, "ppt_w": 3.44, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "vulkan/shm/scroll60", "seconds": 10.08, "cpu": {"monstar": 10.1, "sway": 10.0}, "rapl_pkg_w": 6.18, "ppt_w": 6.38, "gpu_busy_pct": 10.2, "flips_per_s": 60.0}
+{"label": "vulkan/shm/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 9.1, "sway": 7.6}, "rapl_pkg_w": 5.83, "ppt_w": 5.87, "gpu_busy_pct": 8.8, "flips_per_s": 59.9}
+{"label": "vulkan/shm/flood", "seconds": 10.08, "cpu": {"monstar": 166.2, "sway": 6.1}, "rapl_pkg_w": 32.87, "ppt_w": 33.13, "gpu_busy_pct": 6.0, "flips_per_s": 59.9}
+vulkan/shm latency {"n": 120, "matched": 120, "extra_flips": 242, "flips": 365, "p50": 12.062782, "p90": 19.553402, "p99": 20.592841, "min": 3.862726, "max": 20.880317, "mean": 12.3967511}
+{"label": "vulkan/udmabuf/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.32, "ppt_w": 3.41, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "vulkan/udmabuf/scroll60", "seconds": 10.08, "cpu": {"monstar": 10.2, "sway": 5.6}, "rapl_pkg_w": 5.61, "ppt_w": 5.87, "gpu_busy_pct": 7.5, "flips_per_s": 59.9}
+{"label": "vulkan/udmabuf/scroll60-short", "seconds": 10.08, "cpu": {"monstar": 9.7, "sway": 5.4}, "rapl_pkg_w": 5.53, "ppt_w": 5.49, "gpu_busy_pct": 6.8, "flips_per_s": 59.9}
+{"label": "vulkan/udmabuf/flood", "seconds": 10.08, "cpu": {"monstar": 164.1, "sway": 1.6}, "rapl_pkg_w": 32.14, "ppt_w": 31.87, "gpu_busy_pct": 5.0, "flips_per_s": 59.8}
+{"label": "vulkan/udmabuf/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.36, "ppt_w": 3.64, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "vulkan/udmabuf/scroll60", "seconds": 10.09, "cpu": {"monstar": 10.6, "sway": 5.6}, "rapl_pkg_w": 5.7, "ppt_w": 5.84, "gpu_busy_pct": 7.6, "flips_per_s": 59.9}
+{"label": "vulkan/udmabuf/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 9.4, "sway": 5.5}, "rapl_pkg_w": 5.67, "ppt_w": 5.88, "gpu_busy_pct": 7.1, "flips_per_s": 59.9}
+{"label": "vulkan/udmabuf/flood", "seconds": 10.08, "cpu": {"monstar": 165.5, "sway": 1.4}, "rapl_pkg_w": 32.22, "ppt_w": 32.17, "gpu_busy_pct": 5.0, "flips_per_s": 59.8}
+vulkan/udmabuf latency {"n": 120, "matched": 120, "extra_flips": 240, "flips": 363, "p50": 14.073993, "p90": 19.476825, "p99": 20.332808, "min": 4.085906, "max": 20.438169, "mean": 13.298500691666668}
+{"label": "vulkan/vkgrid/idle", "seconds": 10.09, "cpu": {"vkgrid": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.38, "ppt_w": 3.85, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "vulkan/vkgrid/scroll60", "seconds": 10.09, "cpu": {"vkgrid": 2.7, "sway": 5.7}, "rapl_pkg_w": 6.1, "ppt_w": 6.09, "gpu_busy_pct": 11.9, "flips_per_s": 59.9}
+{"label": "vulkan/vkgrid/idle", "seconds": 10.09, "cpu": {"vkgrid": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.29, "ppt_w": 3.52, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "vulkan/vkgrid/scroll60", "seconds": 10.08, "cpu": {"vkgrid": 2.6, "sway": 5.6}, "rapl_pkg_w": 6.27, "ppt_w": 6.24, "gpu_busy_pct": 12.0, "flips_per_s": 59.9}
+vulkan/vkgrid latency {"n": 120, "matched": 120, "extra_flips": 240, "flips": 363, "p50": 13.020234, "p90": 19.588263, "p99": 20.883975, "min": 4.564067, "max": 21.45016, "mean": 12.75405005}
+vulkan/shm/1 {"n": 150, "matched": 150, "extra_flips": 301, "flips": 454, "p50": 12.270956, "p90": 19.618219, "p99": 20.669865, "min": 4.234884, "max": 20.707206, "mean": 12.28185504}
+vulkan/udmabuf/1 {"n": 150, "matched": 150, "extra_flips": 303, "flips": 456, "p50": 12.063974, "p90": 19.224592, "p99": 20.400845, "min": 3.897346, "max": 20.410257, "mean": 12.060860826666667}
+vulkan/vkgrid/1 {"n": 150, "matched": 150, "extra_flips": 301, "flips": 454, "p50": 13.226616, "p90": 19.631651, "p99": 21.011263, "min": 4.374029, "max": 21.111364, "mean": 13.149608653333333}

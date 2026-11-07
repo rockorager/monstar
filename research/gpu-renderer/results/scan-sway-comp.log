@@ -1,0 +1,12 @@
+{"label": "sway-comp/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 6.1, "sway": 5.7}, "rapl_pkg_w": 5.22, "ppt_w": 5.54, "gpu_busy_pct": 2.0, "flips_per_s": 60.1}
+{"label": "sway-comp/udmabuf scanout=0", "seconds": 10.09, "cpu": {"monstar": 7.4, "sway": 5.6}, "rapl_pkg_w": 4.9, "ppt_w": 4.7, "gpu_busy_pct": 3.8, "flips_per_s": 60.0}
+{"label": "sway-comp/gbm scanout=1", "seconds": 10.09, "cpu": {"monstar": 12.4, "sway": 2.6}, "rapl_pkg_w": 4.9, "ppt_w": 5.17, "gpu_busy_pct": 0.0, "flips_per_s": 60.1}
+{"label": "sway-comp/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.0, "sway": 6.2}, "rapl_pkg_w": 5.55, "ppt_w": 5.53, "gpu_busy_pct": 7.0, "flips_per_s": 60.1}
+{"label": "sway-comp/shm scanout=0", "seconds": 10.09, "cpu": {"monstar": 6.5, "sway": 7.7}, "rapl_pkg_w": 5.36, "ppt_w": 5.31, "gpu_busy_pct": 3.0, "flips_per_s": 60.1}
+{"label": "sway-comp/udmabuf scanout=0", "seconds": 10.08, "cpu": {"monstar": 6.4, "sway": 5.8}, "rapl_pkg_w": 5.1, "ppt_w": 5.39, "gpu_busy_pct": 3.0, "flips_per_s": 60.1}
+{"label": "sway-comp/gbm scanout=1", "seconds": 10.08, "cpu": {"monstar": 11.9, "sway": 2.7}, "rapl_pkg_w": 5.0, "ppt_w": 4.95, "gpu_busy_pct": 0.0, "flips_per_s": 60.0}
+{"label": "sway-comp/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.1, "sway": 6.1}, "rapl_pkg_w": 5.6, "ppt_w": 5.49, "gpu_busy_pct": 7.1, "flips_per_s": 60.0}
+{"label": "sway-comp/shm scanout=0", "seconds": 10.08, "cpu": {"monstar": 7.8, "sway": 6.7}, "rapl_pkg_w": 5.39, "ppt_w": 5.63, "gpu_busy_pct": 2.0, "flips_per_s": 60.0}
+{"label": "sway-comp/udmabuf scanout=0", "seconds": 10.09, "cpu": {"monstar": 6.4, "sway": 5.8}, "rapl_pkg_w": 5.21, "ppt_w": 5.42, "gpu_busy_pct": 3.0, "flips_per_s": 60.1}
+{"label": "sway-comp/gbm scanout=1", "seconds": 10.09, "cpu": {"monstar": 12.2, "sway": 2.7}, "rapl_pkg_w": 4.83, "ppt_w": 4.99, "gpu_busy_pct": 0.0, "flips_per_s": 60.1}
+{"label": "sway-comp/vkgrid scanout=0", "seconds": 10.08, "cpu": {"vkgrid": 2.1, "sway": 6.0}, "rapl_pkg_w": 5.61, "ppt_w": 5.57, "gpu_busy_pct": 7.0, "flips_per_s": 60.0}

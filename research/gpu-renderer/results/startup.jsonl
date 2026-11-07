@@ -1,0 +1,11 @@
+{"label": "startup/monstar-shm", "first_flip_ms": {"n": 15, "p50": 38.72, "min": 28.6, "max": 42.68}}
+{"label": "startup/monstar-udmabuf", "first_flip_ms": {"n": 15, "p50": 33.77, "min": 25.57, "max": 45.72}}
+{"label": "startup/vkgrid-sequential", "first_flip_ms": {"n": 15, "p50": 44.09, "min": 37.09, "max": 52.36}, "first_flip_after_first present queued_ms": {"n": 15, "p50": 44.09, "min": 37.09, "max": 52.36}}
+{"label": "startup/vkgrid-overlap", "first_flip_ms": {"n": 15, "p50": 38.21, "min": 29.44, "max": 46.24}, "first_flip_after_first present queued_ms": {"n": 15, "p50": 38.21, "min": 29.44, "max": 46.24}}
+{"label": "startup/vkgrid-overlap-v2", "first_flip_ms": {"n": 15, "p50": 33.96, "min": 25.02, "max": 41.46}, "first_flip_after_first present queued_ms": {"n": 15, "p50": 37.97, "min": 29.45, "max": 44.13}}
+{"label": "startup/monstar-shm-cold", "first_flip_ms": {"n": 1, "p50": 71.0, "min": 71.0, "max": 71.0}}
+{"label": "startup/monstar-shm-cold", "first_flip_ms": {"n": 1, "p50": 73.17, "min": 73.17, "max": 73.17}}
+{"label": "startup/monstar-shm-cold", "first_flip_ms": {"n": 1, "p50": 63.43, "min": 63.43, "max": 63.43}}
+{"label": "startup/vkgrid-seq-cold", "first_flip_ms": {"n": 1, "p50": 113.66, "min": 113.66, "max": 113.66}}
+{"label": "startup/vkgrid-seq-cold", "first_flip_ms": {"n": 1, "p50": 104.93, "min": 104.93, "max": 104.93}}
+{"label": "startup/vkgrid-seq-cold", "first_flip_ms": {"n": 1, "p50": 96.22, "min": 96.22, "max": 96.22}}

@@ -1,0 +1,14 @@
+{"label": "baseline/sway-only-gles2", "seconds": 10.09, "cpu": {"sway": 0.0}, "rapl_pkg_w": 3.18, "ppt_w": 3.4, "gpu_busy_pct": 0.0, "flips_per_s": 0.1}
+{"label": "monstar-shm-gles2/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.19, "ppt_w": 3.14, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "monstar-shm-gles2/scroll60", "seconds": 10.08, "cpu": {"monstar": 24.5, "sway": 9.7}, "rapl_pkg_w": 7.18, "ppt_w": 7.15, "gpu_busy_pct": 2.7, "flips_per_s": 59.9}
+{"label": "monstar-shm-gles2/flood", "seconds": 10.08, "cpu": {"monstar": 168.7, "sway": 5.4}, "rapl_pkg_w": 32.47, "ppt_w": 32.7, "gpu_busy_pct": 2.0, "flips_per_s": 59.9}
+{"label": "monstar-shm-gles2/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 21.5, "sway": 10.8}, "rapl_pkg_w": 6.26, "ppt_w": 6.67, "gpu_busy_pct": 3.0, "flips_per_s": 59.9}
+{"label": "monstar-shm-gles2/scroll60-short-Adwaita Mono", "seconds": 8.07, "cpu": {"monstar": 8.7, "sway": 11.4}, "rapl_pkg_w": 5.32, "ppt_w": 5.41, "gpu_busy_pct": 2.7, "flips_per_s": 59.9}
+{"label": "monstar-shm-gles2/scroll60-short-Liberation Mono", "seconds": 8.07, "cpu": {"monstar": 9.4, "sway": 11.8}, "rapl_pkg_w": 5.26, "ppt_w": 5.19, "gpu_busy_pct": 3.0, "flips_per_s": 59.9}
+{"label": "monstar-udmabuf-gles2/scroll60-short-adwaita", "seconds": 8.07, "cpu": {"monstar": 8.7, "sway": 6.1}, "rapl_pkg_w": 5.17, "ppt_w": 5.24, "gpu_busy_pct": 3.0, "flips_per_s": 59.9}
+{"label": "monstar-udmabuf-gles2/scroll60-short-adwaita-fullscreen", "seconds": 8.07, "cpu": {"monstar": 9.7, "sway": 6.1}, "rapl_pkg_w": 5.16, "ppt_w": 5.45, "gpu_busy_pct": 3.1, "flips_per_s": 59.8}
+{"label": "vkgrid-gles2/scroll60", "seconds": 8.07, "cpu": {"vkgrid": 2.1, "sway": 6.3}, "rapl_pkg_w": 5.21, "ppt_w": 5.0, "gpu_busy_pct": 3.9, "flips_per_s": 60.0}
+{"label": "vkgrid-gles2/scroll60", "seconds": 8.07, "cpu": {"vkgrid": 2.0, "sway": 6.3}, "rapl_pkg_w": 5.78, "ppt_w": 5.82, "gpu_busy_pct": 8.3, "flips_per_s": 59.8}
+{"label": "vkgrid-gles2/scroll60-fullscreen", "seconds": 8.07, "cpu": {"vkgrid": 2.0, "sway": 6.2}, "rapl_pkg_w": 5.74, "ppt_w": 5.68, "gpu_busy_pct": 9.0, "flips_per_s": 59.9}
+{"label": "vkgrid-gles2/scroll60-fullscreen-scanout", "seconds": 8.06, "cpu": {"vkgrid": 2.0, "sway": 4.0}, "rapl_pkg_w": 4.71, "ppt_w": 4.99, "gpu_busy_pct": 6.1, "flips_per_s": 59.9}
+{"label": "vkgrid-gles2/scroll60-fullscreen-directscanout", "seconds": 8.07, "cpu": {"vkgrid": 2.1, "sway": 3.7}, "rapl_pkg_w": 5.13, "ppt_w": 5.35, "gpu_busy_pct": 6.0, "flips_per_s": 60.0}

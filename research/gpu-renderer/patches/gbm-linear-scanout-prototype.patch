@@ -1,0 +1,165 @@
+diff --git a/build.zig b/build.zig
+index 97c3e02..134ce5c 100644
+--- a/build.zig
++++ b/build.zig
+@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
+     root_module.addImport("wayland", wayland_mod);
+     root_module.linkSystemLibrary("wayland-client", .{});
+     root_module.linkSystemLibrary("wayland-cursor", .{});
++    root_module.linkSystemLibrary("gbm", .{});
+ 
+     const ghostty_dep = b.lazyDependency("ghostty", .{
+         .target = target,
+diff --git a/src/ShmBuffer.zig b/src/ShmBuffer.zig
+index 435f1e9..430f25a 100644
+--- a/src/ShmBuffer.zig
++++ b/src/ShmBuffer.zig
+@@ -13,6 +13,24 @@ const zwp = wayland.client.zwp;
+ /// published through linux-dmabuf (LINEAR) instead of wl_shm.
+ pub var dmabuf: ?*zwp.LinuxDmabufV1 = null;
+ var udmabuf_dev: posix.fd_t = -1;
++/// Prototype: with MONSTAR_GBM=1, each buffer also owns a scanout-capable
++/// LINEAR GBM buffer that is published instead; commits copy pixels into it.
++pub var use_gbm = false;
++var gbm_device: ?*anyopaque = null;
++
++extern fn gbm_create_device(fd: c_int) ?*anyopaque;
++extern fn gbm_bo_create(dev: *anyopaque, width: u32, height: u32, format: u32, flags: u32) ?*anyopaque;
++extern fn gbm_bo_get_fd(bo: *anyopaque) c_int;
++extern fn gbm_bo_get_stride(bo: *anyopaque) u32;
++extern fn gbm_bo_get_modifier(bo: *anyopaque) u64;
++extern fn gbm_bo_destroy(bo: *anyopaque) void;
++
++const Gbm = struct {
++    bo: *anyopaque,
++    fd: posix.fd_t,
++    stride: u32,
++    map: []align(std.heap.page_size_min) u8,
++};
+ 
+ wl_buffer: *wl.Buffer,
+ pool: *wl.ShmPool,
+@@ -27,6 +45,7 @@ rendering: bool,
+ /// 0 means no commit attempt has been recorded.
+ frame: u64,
+ udmabuf_fd: posix.fd_t = -1,
++gbm: ?Gbm = null,
+ 
+ pub const Format = enum {
+     xrgb8888,
+@@ -61,7 +80,11 @@ pub fn create(
+     const pool = try shm.createPool(fd, @intCast(capacity));
+     errdefer pool.destroy();
+     var udmabuf_fd: posix.fd_t = -1;
+-    const wl_buffer = if (dmabuf != null) blk: {
++    var gbm: ?Gbm = null;
++    const wl_buffer = if (use_gbm) blk: {
++        gbm = try createGbm(width, height);
++        break :blk try gbmBuffer(gbm.?, width, height, format);
++    } else if (dmabuf != null) blk: {
+         udmabuf_fd = try createUdmabuf(fd, capacity);
+         break :blk try dmabufBuffer(udmabuf_fd, width, height, dimensions.stride, format);
+     } else try pool.createBuffer(0, width, height, dimensions.stride, shmFormat(format));
+@@ -80,6 +103,7 @@ pub fn create(
+         .rendering = false,
+         .frame = 0,
+         .udmabuf_fd = udmabuf_fd,
++        .gbm = gbm,
+     };
+     wl_buffer.setListener(*ShmBuffer, bufferListener, self);
+     return self;
+@@ -109,7 +133,13 @@ pub fn reshape(self: *ShmBuffer, width: u31, height: u31, format: Format) !void
+         }
+     }
+ 
+-    const wl_buffer = if (self.udmabuf_fd >= 0)
++    if (self.gbm) |g| {
++        destroyGbm(g);
++        self.gbm = try createGbm(width, height);
++    }
++    const wl_buffer = if (self.gbm) |g|
++        try gbmBuffer(g, width, height, format)
++    else if (self.udmabuf_fd >= 0)
+         try dmabufBuffer(self.udmabuf_fd, width, height, dimensions.stride, format)
+     else
+         try self.pool.createBuffer(0, width, height, dimensions.stride, shmFormat(format));
+@@ -128,9 +158,54 @@ pub fn destroy(self: *ShmBuffer, alloc: std.mem.Allocator) void {
+     posix.munmap(self.data);
+     _ = linux.close(self.fd);
+     if (self.udmabuf_fd >= 0) _ = linux.close(self.udmabuf_fd);
++    if (self.gbm) |g| destroyGbm(g);
+     alloc.destroy(self);
+ }
+ 
++/// Copy the rendered pixels into the published GBM buffer. The prototype
++/// copies the whole frame; a real version would copy the damage accumulated
++/// since this buffer's previous commit.
++pub fn publish(self: *ShmBuffer) void {
++    const g = self.gbm orelse return;
++    const row_bytes = @as(usize, self.width) * 4;
++    for (0..self.height) |y| {
++        @memcpy(g.map[y * g.stride ..][0..row_bytes], self.data[y * row_bytes ..][0..row_bytes]);
++    }
++}
++
++fn createGbm(width: u31, height: u31) !Gbm {
++    if (gbm_device == null) {
++        const rc = linux.open("/dev/dri/renderD128", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
++        if (linux.errno(rc) != .SUCCESS) return error.GbmUnavailable;
++        gbm_device = gbm_create_device(@intCast(rc)) orelse return error.GbmUnavailable;
++    }
++    const GBM_BO_USE_SCANOUT = 1 << 0;
++    const GBM_BO_USE_LINEAR = 1 << 4;
++    const bo = gbm_bo_create(gbm_device.?, width, height, 0x34325258, GBM_BO_USE_SCANOUT | GBM_BO_USE_LINEAR) orelse
++        return error.GbmAllocFailed;
++    errdefer gbm_bo_destroy(bo);
++    const fd = gbm_bo_get_fd(bo);
++    if (fd < 0) return error.GbmAllocFailed;
++    const stride = gbm_bo_get_stride(bo);
++    const map = try posix.mmap(null, @as(usize, stride) * height, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
++    std.log.info("gbm buffer {d}x{d} stride {d} modifier 0x{x}", .{ width, height, stride, gbm_bo_get_modifier(bo) });
++    return .{ .bo = bo, .fd = fd, .stride = stride, .map = map };
++}
++
++fn destroyGbm(g: Gbm) void {
++    posix.munmap(g.map);
++    _ = linux.close(g.fd);
++    gbm_bo_destroy(g.bo);
++}
++
++fn gbmBuffer(g: Gbm, width: u31, height: u31, format: Format) !*wl.Buffer {
++    const params = try dmabuf.?.createParams();
++    defer params.destroy();
++    params.add(g.fd, 0, 0, g.stride, 0, 0); // DRM_FORMAT_MOD_LINEAR
++    std.debug.assert(format == .xrgb8888);
++    return params.createImmed(width, height, 0x34325258, .{});
++}
++
+ fn createUdmabuf(memfd: posix.fd_t, size: usize) !posix.fd_t {
+     if (udmabuf_dev < 0) {
+         const rc = linux.open("/dev/udmabuf", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+diff --git a/src/Window.zig b/src/Window.zig
+index 8f9789f..029bfd4 100644
+--- a/src/Window.zig
++++ b/src/Window.zig
+@@ -875,6 +875,7 @@ pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
+         self.frame_pending = true;
+     }
+ 
++    buffer.publish();
+     self.surface.attach(buffer.wl_buffer, 0, 0);
+     if (self.surface.getVersion() >= wl.Surface.damage_buffer_since_version) {
+         switch (damage) {
+@@ -1046,8 +1047,11 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, globals: *
+                     globals.shm = registry.bind(global.name, wl.Shm, @min(global.version, wl.Shm.generated_version)) catch return;
+             } else if (std.mem.orderZ(u8, global.interface, zwp.LinuxDmabufV1.interface.name) == .eq) {
+                 // Prototype: CPU raster into udmabuf-wrapped memfds (MONSTAR_UDMABUF=1).
+-                if (ShmBuffer.dmabuf == null and std.c.getenv("MONSTAR_UDMABUF") != null and global.version >= 3)
++                if (ShmBuffer.dmabuf == null and (std.c.getenv("MONSTAR_UDMABUF") != null or std.c.getenv("MONSTAR_GBM") != null) and global.version >= 3)
++                {
+                     ShmBuffer.dmabuf = registry.bind(global.name, zwp.LinuxDmabufV1, 3) catch return;
++                    ShmBuffer.use_gbm = std.c.getenv("MONSTAR_GBM") != null;
++                }
+             } else if (std.mem.orderZ(u8, global.interface, xdg.WmBase.interface.name) == .eq) {
+                 if (globals.wm_base == null)
+                     globals.wm_base = registry.bind(global.name, xdg.WmBase, @min(global.version, xdg.WmBase.generated_version)) catch return;

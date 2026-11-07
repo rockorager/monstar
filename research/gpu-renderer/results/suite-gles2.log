@@ -1,0 +1,38 @@
+{"label": "gles2/shm/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.21, "ppt_w": 3.06, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/shm/scroll60", "seconds": 10.09, "cpu": {"monstar": 8.6, "sway": 8.3}, "rapl_pkg_w": 5.31, "ppt_w": 5.68, "gpu_busy_pct": 2.7, "flips_per_s": 59.9}
+{"label": "gles2/shm/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 8.2, "sway": 9.8}, "rapl_pkg_w": 5.28, "ppt_w": 5.41, "gpu_busy_pct": 2.8, "flips_per_s": 59.9}
+{"label": "gles2/shm/flood", "seconds": 10.08, "cpu": {"monstar": 164.0, "sway": 5.7}, "rapl_pkg_w": 32.63, "ppt_w": 32.77, "gpu_busy_pct": 2.0, "flips_per_s": 59.9}
+{"label": "gles2/shm/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.28, "ppt_w": 3.37, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/shm/scroll60", "seconds": 10.09, "cpu": {"monstar": 9.1, "sway": 10.0}, "rapl_pkg_w": 5.36, "ppt_w": 5.26, "gpu_busy_pct": 2.9, "flips_per_s": 59.9}
+{"label": "gles2/shm/scroll60-short", "seconds": 10.08, "cpu": {"monstar": 8.3, "sway": 9.0}, "rapl_pkg_w": 5.35, "ppt_w": 5.38, "gpu_busy_pct": 2.8, "flips_per_s": 59.9}
+{"label": "gles2/shm/flood", "seconds": 10.08, "cpu": {"monstar": 165.6, "sway": 6.0}, "rapl_pkg_w": 32.16, "ppt_w": 32.12, "gpu_busy_pct": 2.0, "flips_per_s": 59.8}
+{"label": "gles2/shm/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.36, "ppt_w": 3.58, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/shm/scroll60", "seconds": 10.08, "cpu": {"monstar": 8.9, "sway": 10.1}, "rapl_pkg_w": 5.59, "ppt_w": 5.97, "gpu_busy_pct": 2.9, "flips_per_s": 59.9}
+{"label": "gles2/shm/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 8.8, "sway": 11.1}, "rapl_pkg_w": 5.37, "ppt_w": 5.56, "gpu_busy_pct": 2.9, "flips_per_s": 60.0}
+{"label": "gles2/shm/flood", "seconds": 10.08, "cpu": {"monstar": 165.5, "sway": 5.9}, "rapl_pkg_w": 31.97, "ppt_w": 31.91, "gpu_busy_pct": 2.0, "flips_per_s": 59.9}
+gles2/shm latency {"n": 120, "matched": 120, "extra_flips": 240, "flips": 363, "p50": 11.315608, "p90": 18.013611, "p99": 20.220615, "min": 4.237537, "max": 20.68649, "mean": 11.433130408333334}
+{"label": "gles2/udmabuf/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.15, "ppt_w": 3.34, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/udmabuf/scroll60", "seconds": 10.08, "cpu": {"monstar": 9.4, "sway": 6.0}, "rapl_pkg_w": 5.15, "ppt_w": 5.21, "gpu_busy_pct": 3.2, "flips_per_s": 59.9}
+{"label": "gles2/udmabuf/scroll60-short", "seconds": 10.08, "cpu": {"monstar": 9.2, "sway": 6.0}, "rapl_pkg_w": 5.25, "ppt_w": 5.44, "gpu_busy_pct": 3.0, "flips_per_s": 59.9}
+{"label": "gles2/udmabuf/flood", "seconds": 10.08, "cpu": {"monstar": 164.8, "sway": 1.4}, "rapl_pkg_w": 32.07, "ppt_w": 32.3, "gpu_busy_pct": 2.0, "flips_per_s": 59.9}
+{"label": "gles2/udmabuf/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.35, "ppt_w": 3.44, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/udmabuf/scroll60", "seconds": 10.08, "cpu": {"monstar": 9.3, "sway": 6.0}, "rapl_pkg_w": 5.28, "ppt_w": 5.39, "gpu_busy_pct": 3.2, "flips_per_s": 59.9}
+{"label": "gles2/udmabuf/scroll60-short", "seconds": 10.08, "cpu": {"monstar": 8.4, "sway": 6.1}, "rapl_pkg_w": 5.18, "ppt_w": 5.24, "gpu_busy_pct": 3.1, "flips_per_s": 59.9}
+{"label": "gles2/udmabuf/flood", "seconds": 10.08, "cpu": {"monstar": 164.1, "sway": 1.7}, "rapl_pkg_w": 31.26, "ppt_w": 31.47, "gpu_busy_pct": 2.0, "flips_per_s": 59.9}
+{"label": "gles2/udmabuf/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.61, "ppt_w": 3.61, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/udmabuf/scroll60", "seconds": 10.08, "cpu": {"monstar": 9.2, "sway": 6.0}, "rapl_pkg_w": 5.44, "ppt_w": 5.3, "gpu_busy_pct": 3.2, "flips_per_s": 59.9}
+{"label": "gles2/udmabuf/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 8.5, "sway": 5.9}, "rapl_pkg_w": 5.24, "ppt_w": 5.31, "gpu_busy_pct": 3.0, "flips_per_s": 60.0}
+{"label": "gles2/udmabuf/flood", "seconds": 10.08, "cpu": {"monstar": 164.9, "sway": 1.7}, "rapl_pkg_w": 31.35, "ppt_w": 31.1, "gpu_busy_pct": 2.0, "flips_per_s": 59.9}
+gles2/udmabuf latency {"n": 120, "matched": 120, "extra_flips": 242, "flips": 365, "p50": 14.503249, "p90": 18.947056, "p99": 20.730092, "min": 4.342492, "max": 20.817163, "mean": 13.235674625}
+{"label": "gles2/vkgrid/idle", "seconds": 10.09, "cpu": {"vkgrid": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.13, "ppt_w": 3.41, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/vkgrid/scroll60", "seconds": 10.08, "cpu": {"vkgrid": 2.1, "sway": 6.5}, "rapl_pkg_w": 5.77, "ppt_w": 5.8, "gpu_busy_pct": 8.8, "flips_per_s": 59.9}
+{"label": "gles2/vkgrid/idle", "seconds": 10.09, "cpu": {"vkgrid": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.24, "ppt_w": 3.5, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/vkgrid/scroll60", "seconds": 10.09, "cpu": {"vkgrid": 2.0, "sway": 6.3}, "rapl_pkg_w": 5.67, "ppt_w": 5.71, "gpu_busy_pct": 8.7, "flips_per_s": 59.9}
+{"label": "gles2/vkgrid/idle", "seconds": 10.09, "cpu": {"vkgrid": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.15, "ppt_w": 3.32, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/vkgrid/scroll60", "seconds": 10.08, "cpu": {"vkgrid": 2.0, "sway": 6.4}, "rapl_pkg_w": 5.73, "ppt_w": 5.83, "gpu_busy_pct": 8.8, "flips_per_s": 59.9}
+gles2/vkgrid latency {"n": 120, "matched": 120, "extra_flips": 240, "flips": 363, "p50": 13.14554, "p90": 20.057796, "p99": 21.127752, "min": 4.610631, "max": 21.643929, "mean": 13.048424983333332}
+{"label": "gles2/shm-nimbus/idle", "seconds": 10.09, "cpu": {"monstar": 0.0, "sway": 0.0}, "rapl_pkg_w": 3.07, "ppt_w": 3.13, "gpu_busy_pct": 0.0, "flips_per_s": 0.0}
+{"label": "gles2/shm-nimbus/scroll60", "seconds": 10.09, "cpu": {"monstar": 25.9, "sway": 8.3}, "rapl_pkg_w": 7.1, "ppt_w": 7.78, "gpu_busy_pct": 2.5, "flips_per_s": 59.9}
+{"label": "gles2/shm-nimbus/scroll60-short", "seconds": 10.09, "cpu": {"monstar": 20.5, "sway": 9.2}, "rapl_pkg_w": 6.2, "ppt_w": 6.84, "gpu_busy_pct": 2.7, "flips_per_s": 59.9}
+{"label": "gles2/shm-nimbus/flood", "seconds": 10.08, "cpu": {"monstar": 168.9, "sway": 6.0}, "rapl_pkg_w": 32.23, "ppt_w": 32.25, "gpu_busy_pct": 2.0, "flips_per_s": 59.9}
+gles2/shm-nimbus latency {"n": 120, "matched": 120, "extra_flips": 241, "flips": 364, "p50": 12.638766, "p90": 18.618709, "p99": 20.547178, "min": 4.281582, "max": 20.684187, "mean": 12.427938208333334}

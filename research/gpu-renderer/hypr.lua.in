@@ -1,0 +1,11 @@
+hl.monitor({ output = "eDP-1", mode = "1920x1200@60", position = "0x0", scale = 1 })
+hl.config({
+    general = { gaps_in = 0, gaps_out = @GAPS@, border_size = 0 },
+    decoration = { rounding = 0, shadow = { enabled = false }, blur = { enabled = false } },
+    animations = { enabled = false },
+    misc = { disable_hyprland_logo = true, disable_splash_rendering = true, force_default_wallpaper = 0, vrr = 0, disable_watchdog_warning = true },
+    xwayland = { enabled = false },
+    render = { direct_scanout = 1 },
+    cursor = { inactive_timeout = 1 },
+    ecosystem = { no_update_news = true, no_donation_nag = true },
+})

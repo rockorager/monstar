@@ -1,0 +1,8 @@
+{"label": "4k120-gles2/vkgrid/scroll120", "seconds": 10.06, "cpu": {"vkgrid": 2.3, "sway": 5.9}, "rapl_pkg_w": 10.67, "ppt_w": 10.51, "gpu_busy_pct": 40.4, "flips_per_s": 11.3}
+{"label": "4k120-gles2/vkgrid/scroll120", "seconds": 10.06, "cpu": {"vkgrid": 1.7, "sway": 4.5}, "rapl_pkg_w": 10.61, "ppt_w": 10.72, "gpu_busy_pct": 38.4, "flips_per_s": 11.5}
+{"label": "4k120-gles2/vkgrid/scroll120", "seconds": 10.06, "cpu": {"vkgrid": 2.4, "sway": 3.8}, "rapl_pkg_w": 10.89, "ppt_w": 11.08, "gpu_busy_pct": 55.4, "flips_per_s": 19.2}
+{"label": "4k120-gles2/vkgrid/scroll120", "seconds": 10.06, "cpu": {"vkgrid": 2.0, "sway": 4.3}, "rapl_pkg_w": 10.98, "ppt_w": 11.26, "gpu_busy_pct": 55.7, "flips_per_s": 19.2}
+{"label": "4k120-gles2/shm/scroll120", "seconds": 10.08, "cpu": {"monstar": 33.2, "sway": 27.4}, "rapl_pkg_w": 13.7, "ppt_w": 14.12, "gpu_busy_pct": 0.0, "flips_per_s": 19.0}
+{"label": "4k120-gles2/shm/scroll120", "seconds": 10.08, "cpu": {"monstar": 32.0, "sway": 26.9}, "rapl_pkg_w": 13.46, "ppt_w": 13.62, "gpu_busy_pct": 0.0, "flips_per_s": 19.4}
+{"label": "4k120-gles2/udmabuf/scroll120", "seconds": 10.09, "cpu": {"monstar": 34.0, "sway": 2.6}, "rapl_pkg_w": 9.52, "ppt_w": 10.7, "gpu_busy_pct": 0.0, "flips_per_s": 19.2}
+{"label": "4k120-gles2/udmabuf/scroll120", "seconds": 10.09, "cpu": {"monstar": 35.4, "sway": 2.6}, "rapl_pkg_w": 9.71, "ppt_w": 10.53, "gpu_busy_pct": 0.0, "flips_per_s": 19.1}
