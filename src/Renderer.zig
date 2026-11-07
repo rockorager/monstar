@@ -1089,7 +1089,7 @@ fn scaledKittyRgba(
 
     const scaled = try self.alloc.alloc(u8, scaled_len);
     errdefer self.alloc.free(scaled);
-    try resizeRgba(source, viewport.source_width, viewport.source_height, scaled, viewport.pixel_width, viewport.pixel_height);
+    try resizeRgba(self.alloc, source, viewport.source_width, viewport.source_height, scaled, viewport.pixel_width, viewport.pixel_height);
     self.kitty_scale_count += 1;
     if (!cacheable) return .{ .bytes = scaled, .cached = false };
 
@@ -1295,6 +1295,7 @@ fn copyKittySourceRgba(
 }
 
 fn resizeRgba(
+    alloc: std.mem.Allocator,
     source: []const u8,
     source_width: u32,
     source_height: u32,
@@ -1302,6 +1303,14 @@ fn resizeRgba(
     dest_width: u32,
     dest_height: u32,
 ) !void {
+    // Upscaling is the common Kitty case (small images and video frames
+    // stretched over a cell area), and animated content rescales every
+    // frame. Bilinear filtering matches GPU terminals' texture sampling and
+    // is several times cheaper than stb's floating-point filter pipeline,
+    // which remains for downscaling where it avoids aliasing.
+    if (dest_width >= source_width and dest_height >= source_height) {
+        return upscaleRgbaBilinear(alloc, source, source_width, source_height, dest, dest_width, dest_height);
+    }
     if (c.stbir_resize_uint8(
         source.ptr,
         @intCast(source_width),
@@ -1313,6 +1322,104 @@ fn resizeRgba(
         @intCast(dest_width * 4),
         4,
     ) == 0) return error.ImageResizeFailed;
+}
+
+/// Fixed-point bilinear resampling of RGBA bytes with pixel-center
+/// alignment and edge clamping. Channels interpolate independently in
+/// encoded space, like the stb path.
+fn upscaleRgbaBilinear(
+    alloc: std.mem.Allocator,
+    source: []const u8,
+    source_width: u32,
+    source_height: u32,
+    dest: []u8,
+    dest_width: u32,
+    dest_height: u32,
+) !void {
+    std.debug.assert(source_width > 0 and source_height > 0);
+    std.debug.assert(dest_width >= source_width and dest_height >= source_height);
+    std.debug.assert(source.len >= @as(usize, source_width) * source_height * 4);
+    std.debug.assert(dest.len >= @as(usize, dest_width) * dest_height * 4);
+    const row_len = @as(usize, dest_width) * 4;
+
+    const columns = try alloc.alloc(SourcePosition, dest_width);
+    defer alloc.free(columns);
+    for (columns, 0..) |*column, dx| column.* = sourcePosition(dx, source_width, dest_width);
+
+    // The two source rows bracketing the current output row, filtered
+    // horizontally to value * 256. Upscaling revisits each row pair for
+    // several output rows, so keep them until the bracket moves.
+    const filtered = try alloc.alloc(u16, row_len * 2);
+    defer alloc.free(filtered);
+    var top = filtered[0..row_len];
+    var bottom = filtered[row_len..];
+    var top_y: ?u32 = null;
+    var bottom_y: ?u32 = null;
+
+    for (0..dest_height) |dy| {
+        const pos = sourcePosition(dy, source_height, dest_height);
+        const y0 = pos.index;
+        const y1 = @min(y0 + 1, source_height - 1);
+        if (top_y != y0) {
+            if (bottom_y == y0) {
+                std.mem.swap([]u16, &top, &bottom);
+                bottom_y = top_y;
+            } else {
+                filterRgbaRow(source, source_width, y0, columns, top);
+            }
+            top_y = y0;
+        }
+        if (bottom_y != y1) {
+            filterRgbaRow(source, source_width, y1, columns, bottom);
+            bottom_y = y1;
+        }
+
+        const out = dest[dy * row_len ..][0..row_len];
+        const wb: u32 = pos.weight;
+        const wt: u32 = 256 - wb;
+        const V = @Vector(16, u32);
+        var i: usize = 0;
+        while (i + 16 <= out.len) : (i += 16) {
+            const t: V = @as(@Vector(16, u16), top[i..][0..16].*);
+            const b: V = @as(@Vector(16, u16), bottom[i..][0..16].*);
+            const mixed = (t * @as(V, @splat(wt)) + b * @as(V, @splat(wb)) + @as(V, @splat(1 << 15))) >> @splat(16);
+            out[i..][0..16].* = @as(@Vector(16, u8), @intCast(mixed));
+        }
+        while (i < out.len) : (i += 1) {
+            out[i] = @intCast((top[i] * wt + bottom[i] * wb + (1 << 15)) >> 16);
+        }
+    }
+}
+
+/// A source sample position: `index` blended toward `index + 1` by
+/// `weight / 256`.
+const SourcePosition = struct { index: u32, weight: u16 };
+
+fn sourcePosition(dest_index: usize, source_len: u32, dest_len: u32) SourcePosition {
+    // Destination pixel center in source pixel coordinates, minus half a
+    // source pixel so the position is relative to source pixel centers;
+    // 8 fractional bits.
+    const center = @as(i64, @intCast((2 * dest_index + 1) * source_len * 256 / (2 * @as(u64, dest_len)))) - 128;
+    if (center <= 0) return .{ .index = 0, .weight = 0 };
+    const index: u32 = @intCast(center >> 8);
+    if (index >= source_len - 1) return .{ .index = source_len - 1, .weight = 0 };
+    return .{ .index = index, .weight = @intCast(center & 255) };
+}
+
+/// Horizontally interpolate source row `y` at each column position,
+/// writing value * 256 per channel.
+fn filterRgbaRow(source: []const u8, source_width: u32, y: u32, columns: []const SourcePosition, out: []u16) void {
+    std.debug.assert(out.len == columns.len * 4);
+    const row = source[@as(usize, y) * source_width * 4 ..][0 .. @as(usize, source_width) * 4];
+    for (columns, 0..) |column, dx| {
+        const x1 = @min(column.index + 1, source_width - 1);
+        const left: @Vector(4, u16) = @as(@Vector(4, u8), row[column.index * 4 ..][0..4].*);
+        const right: @Vector(4, u16) = @as(@Vector(4, u8), row[x1 * 4 ..][0..4].*);
+        const right_weight: @Vector(4, u16) = @splat(column.weight);
+        const left_weight: @Vector(4, u16) = @splat(256 - column.weight);
+        // 255 * 256 fits u16, and the weights sum to 256.
+        out[dx * 4 ..][0..4].* = left * left_weight + right * right_weight;
+    }
 }
 
 fn blendRgba(
@@ -2120,6 +2227,71 @@ test "scaled kitty placement reuses cached rgba variant" {
     try std.testing.expectEqualSlices(u32, &first, &pixels);
     try std.testing.expectEqual(@as(usize, 1), renderer.kitty_scale_count);
     try std.testing.expectEqual(@as(u32, 1), renderer.kitty_scale_cache.count());
+}
+
+test "upscaled kitty placement interpolates bilinearly between pixel centers" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, .{});
+    defer font.deinit(alloc);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    // Red varies with x, green with y, and blue is lit only at (1, 1), so
+    // it checks the two-dimensional weights.
+    const image: KittyImage = .{
+        .id = 18,
+        .width = 2,
+        .height = 2,
+        .format = .rgba,
+        .data = .{ .complete = &.{
+            0, 0,   0, 255, 255, 0,   0,   255,
+            0, 255, 0, 255, 255, 255, 255, 255,
+        } },
+        .generation = 1,
+    };
+    const viewport: KittyPlacementViewport = .{
+        .viewport_col = 0,
+        .viewport_row = 0,
+        .offset_x = 0,
+        .offset_y = 0,
+        .pixel_width = 4,
+        .pixel_height = 4,
+        .source_x = 0,
+        .source_y = 0,
+        .source_width = 2,
+        .source_height = 2,
+    };
+    var pixels: [16]u32 = @splat(0xff000000);
+    try renderer.renderKittyPlacement(&pixels, 4, 4, image, viewport);
+
+    // At 2x, destination centers fall at source positions -0.25 (clamped),
+    // 0.25, 0.75, and 1.25 (clamped): weights 0, 1/4, 3/4, 1, rounded.
+    const ramp = [4]u32{ 0, 64, 191, 255 };
+    const blue = [4][4]u32{
+        .{ 0, 0, 0, 0 },
+        .{ 0, 16, 48, 64 },
+        .{ 0, 48, 143, 191 },
+        .{ 0, 64, 191, 255 },
+    };
+    for (0..4) |y| {
+        for (0..4) |x| {
+            const expected = 0xff000000 | ramp[x] << 16 | ramp[y] << 8 | blue[y][x];
+            try std.testing.expectEqual(expected, pixels[y * 4 + x]);
+        }
+    }
+
+    // A non-integer ratio must stay centered: a mirrored ramp maps to
+    // mirrored output.
+    const source = [_]u8{ 0, 0, 0, 0, 128, 128, 128, 128, 255, 255, 255, 255 };
+    var dest: [7 * 4]u8 = undefined;
+    try resizeRgba(alloc, &source, 3, 1, &dest, 7, 1);
+    try std.testing.expectEqual(@as(u8, 0), dest[0]);
+    try std.testing.expectEqual(@as(u8, 255), dest[6 * 4]);
+    for (0..7) |x| {
+        const sum = @as(i32, dest[x * 4]) + dest[(6 - x) * 4];
+        try std.testing.expect(@abs(sum - 255) <= 1);
+        if (x > 0) try std.testing.expect(dest[x * 4] >= dest[(x - 1) * 4]);
+    }
 }
 
 test "scaled kitty cache protects a stable working set of 33 across frames" {
