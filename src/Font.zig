@@ -108,15 +108,24 @@ pub const FaceStyle = enum(u2) {
 
 const style_count = std.enums.values(FaceStyle).len;
 
-/// Immutable Fontconfig results. Rasterizers need independent FreeType,
-/// HarfBuzz, and glyph-cache state, but can safely share these read-only
-/// candidate lists instead of repeating font discovery.
+/// Fontconfig results shared by every rasterizer at one size. Rasterizers
+/// need independent FreeType, HarfBuzz, and glyph-cache state, but can share
+/// these read-only candidate lists instead of repeating font discovery.
+///
+/// Startup only needs each style's best match. The full sorted fallback
+/// lists cost several times more on systems with many fonts, so each one is
+/// built on first use, by whichever thread first needs a fallback.
 pub const Discovery = struct {
     refs: std.atomic.Value(usize),
     family: [:0]u8,
     size_px: f64,
     adjustments: Config.MetricAdjustments,
-    sort_sets: [style_count]*c.FcFontSet,
+    /// Best match per style; immutable after initialization.
+    primary_patterns: [style_count]*c.FcPattern,
+    /// Lazily built fallback lists; null until first use. Written once
+    /// under `sort_mutex`, then immutable.
+    sort_sets: [style_count]std.atomic.Value(?*c.FcFontSet),
+    sort_mutex: std.atomic.Mutex,
 
     fn init(
         family: [:0]const u8,
@@ -125,17 +134,17 @@ pub const Discovery = struct {
     ) Error!*Discovery {
         if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
 
-        var sort_sets_opt: [style_count]?*c.FcFontSet = @splat(null);
+        var patterns_opt: [style_count]?*c.FcPattern = @splat(null);
         errdefer {
-            for (sort_sets_opt) |sort_set| {
-                if (sort_set) |set| c.FcFontSetDestroy(set);
+            for (patterns_opt) |pattern| {
+                if (pattern) |p| c.FcPatternDestroy(p);
             }
         }
         inline for (comptime std.enums.values(FaceStyle)) |style| {
-            sort_sets_opt[@backingInt(style)] = try fontSort(family, size_px, style);
+            patterns_opt[@backingInt(style)] = try fontMatch(family, size_px, style);
         }
-        var sort_sets: [style_count]*c.FcFontSet = undefined;
-        for (sort_sets_opt, 0..) |sort_set, i| sort_sets[i] = sort_set.?;
+        var patterns: [style_count]*c.FcPattern = undefined;
+        for (patterns_opt, 0..) |pattern, i| patterns[i] = pattern.?;
 
         const alloc = std.heap.smp_allocator;
         const family_copy = try alloc.dupeSentinel(u8, family, 0);
@@ -146,13 +155,31 @@ pub const Discovery = struct {
             .family = family_copy,
             .size_px = size_px,
             .adjustments = adjustments,
-            .sort_sets = sort_sets,
+            .primary_patterns = patterns,
+            .sort_sets = @splat(.init(null)),
+            .sort_mutex = .unlocked,
         };
         return self;
     }
 
-    /// Acquire one owning reference. Reference-count operations are thread-safe;
-    /// the shared discovery data is immutable after initialization.
+    /// The fallback candidate list for `style`, building it on first use.
+    /// Thread-safe. Null when Fontconfig cannot produce one, which leaves
+    /// only the primary and embedded faces as candidates.
+    pub fn sortSet(self: *Discovery, style: FaceStyle) ?*c.FcFontSet {
+        const slot = &self.sort_sets[@backingInt(style)];
+        if (slot.load(.acquire)) |set| return set;
+        while (!self.sort_mutex.tryLock()) std.Thread.yield() catch {};
+        defer self.sort_mutex.unlock();
+        if (slot.load(.acquire)) |set| return set;
+        const set = fontSort(self.family, self.size_px, style) catch |err| {
+            log.warn("fallback font list for {} unavailable: {}", .{ style, err });
+            return null;
+        };
+        slot.store(set, .release);
+        return set;
+    }
+
+    /// Acquire one owning reference. Reference-count operations are thread-safe.
     pub fn ref(self: *Discovery) void {
         const previous = self.refs.fetchAdd(1, .monotonic);
         std.debug.assert(previous > 0);
@@ -165,7 +192,10 @@ pub const Discovery = struct {
         std.debug.assert(previous > 0);
         if (previous != 1) return;
 
-        for (self.sort_sets) |sort_set| c.FcFontSetDestroy(sort_set);
+        for (self.primary_patterns) |pattern| c.FcPatternDestroy(pattern);
+        for (&self.sort_sets) |*slot| {
+            if (slot.load(.acquire)) |set| c.FcFontSetDestroy(set);
+        }
         const alloc = std.heap.smp_allocator;
         alloc.free(self.family);
         alloc.destroy(self);
@@ -758,9 +788,9 @@ fn bitmapRow(bitmap: c.FT_Bitmap, height: u31, y: usize) usize {
     return if (bitmap.pitch < 0) height - 1 - y else y;
 }
 
-fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle) Error!*c.FcFontSet {
+fn stylePattern(family: [:0]const u8, size_px: f64, style: FaceStyle) Error!*c.FcPattern {
     const pattern = c.FcPatternCreate() orelse return error.FontLoadFailed;
-    defer c.FcPatternDestroy(pattern);
+    errdefer c.FcPatternDestroy(pattern);
     _ = c.FcPatternAddString(pattern, c.FC_FAMILY, family.ptr);
     _ = c.FcPatternAddDouble(pattern, c.FC_PIXEL_SIZE, size_px);
     _ = c.FcPatternAddInteger(pattern, c.FC_SPACING, c.FC_MONO);
@@ -769,6 +799,26 @@ fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle) Error!*c.FcFon
     if (c.FcConfigSubstitute(null, pattern, c.FcMatchPattern) != c.FcTrue)
         return error.FontLoadFailed;
     c.FcDefaultSubstitute(pattern);
+    return pattern;
+}
+
+/// The best match alone: the same candidate a sort would rank first, at a
+/// fraction of the cost because nothing is sorted or trimmed.
+fn fontMatch(family: [:0]const u8, size_px: f64, style: FaceStyle) Error!*c.FcPattern {
+    const pattern = try stylePattern(family, size_px, style);
+    defer c.FcPatternDestroy(pattern);
+    var result: c.FcResult = undefined;
+    const match = c.FcFontMatch(null, pattern, &result) orelse return error.FontNotFound;
+    if (result != c.FcResultMatch) {
+        c.FcPatternDestroy(match);
+        return error.FontNotFound;
+    }
+    return match;
+}
+
+fn fontSort(family: [:0]const u8, size_px: f64, style: FaceStyle) Error!*c.FcFontSet {
+    const pattern = try stylePattern(family, size_px, style);
+    defer c.FcPatternDestroy(pattern);
 
     var result: c.FcResult = undefined;
     const sort_set = c.FcFontSort(null, pattern, c.FcTrue, null, &result) orelse
@@ -782,13 +832,13 @@ fn loadPrimaryStyle(
     alloc: std.mem.Allocator,
     faces: *std.ArrayList(Face),
     ft_lib: c.FT_Library,
-    sort_sets: [style_count]*c.FcFontSet,
+    primary_patterns: [style_count]*c.FcPattern,
     style: FaceStyle,
     size_px: f64,
     metrics: GlyphMetrics,
 ) ?u16 {
-    const regular = sort_sets[@backingInt(FaceStyle.regular)].*.fonts[0];
-    const styled = sort_sets[@backingInt(style)].*.fonts[0];
+    const regular = primary_patterns[@backingInt(FaceStyle.regular)];
+    const styled = primary_patterns[@backingInt(style)];
     if (samePatternFace(regular, styled)) return null;
 
     const new_face = loadFromPattern(ft_lib, styled, size_px, metrics) catch return null;
@@ -834,7 +884,7 @@ pub fn init(
 pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) Error!Font {
     discovery_data.ref();
     errdefer discovery_data.unref();
-    const sort_sets = discovery_data.sort_sets;
+    const primary_patterns = discovery_data.primary_patterns;
     const size_px = discovery_data.size_px;
 
     var ft_lib: c.FT_Library = undefined;
@@ -855,7 +905,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     }
     {
         // Preserve integer grid geometry independently of fractional outlines.
-        var primary = try loadFromPattern(ft_lib, sort_sets[@backingInt(FaceStyle.regular)].*.fonts[0], @round(size_px), .{});
+        var primary = try loadFromPattern(ft_lib, primary_patterns[@backingInt(FaceStyle.regular)], @round(size_px), .{});
         errdefer primary.deinit(alloc);
         try faces.append(alloc, primary);
     }
@@ -914,7 +964,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     var primary_faces: [style_count]u16 = @splat(0);
     inline for (comptime std.enums.values(FaceStyle)) |style| {
         if (style == .regular) continue;
-        if (loadPrimaryStyle(alloc, &faces, ft_lib, sort_sets, style, size_px, .{
+        if (loadPrimaryStyle(alloc, &faces, ft_lib, primary_patterns, style, size_px, .{
             .cell_width = cell_width,
             .cell_height = cell_height,
             .baseline = baseline,
@@ -928,12 +978,11 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         primary_ascii[@backingInt(style)] = faceCoversPrintableAscii(&faces.items[face_idx]);
     }
 
-    log.info("loaded primary face ({s}) cell {d}x{d} baseline {d}, {d} fallback candidates", .{
+    log.info("loaded primary face ({s}) cell {d}x{d} baseline {d}", .{
         discovery_data.family,
         cell_width,
         cell_height,
         baseline,
-        sort_sets[@backingInt(FaceStyle.regular)].*.nfont - 1,
     });
 
     // Sprite metrics. Line thickness follows the font's underline
@@ -1271,7 +1320,10 @@ pub const ClusterCandidates = struct {
 
     fn nextSortCandidate(self: *ClusterCandidates, alloc: std.mem.Allocator, color_only: bool) ?u16 {
         const font = self.font;
-        const sort_set = font.discovery_data.sort_sets[@backingInt(self.style)];
+        const sort_set = font.discovery_data.sortSet(self.style) orelse {
+            self.sort_index = std.math.maxInt(usize);
+            return null;
+        };
         const nfont: usize = @intCast(sort_set.*.nfont);
         const start: usize = if (self.style == .regular) 1 else 0;
         var i: usize = @max(self.sort_index, start);
@@ -1376,7 +1428,8 @@ fn loadFallbackAt(
     style: FaceStyle,
     sort_index: usize,
 ) ?u16 {
-    const pattern = self.discovery_data.sort_sets[@backingInt(style)].*.fonts[sort_index];
+    // Only reached from nextSortCandidate, which built this style's list.
+    const pattern = self.discovery_data.sort_sets[@backingInt(style)].load(.acquire).?.*.fonts[sort_index];
     const key: SortFaceKey = .{ .style = style, .sort_index = @intCast(sort_index) };
 
     if (self.sort_faces.get(key)) |loaded| {
