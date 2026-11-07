@@ -1593,6 +1593,7 @@ fn prepareRowCells(
     try self.reverse_scratch.resize(self.alloc, cols);
     const y_px: u31 = y * font.cell_height;
     const graphemes = cells.items(.grapheme);
+    const default_bg_pixel = self.backgroundPixel(colors.background);
     var bg_run: BgRun = .{};
     // Partial repaints only shape the text runs touching their cells.
     const scan = textScanRange(raws, cell_range, cols);
@@ -1608,14 +1609,12 @@ fn prepareRowCells(
             const extras: []const u21 =
                 if (raws[x].content_tag == .codepoint_grapheme) graphemes[x] else &.{};
             if (cp == ' ' and extras.len == 0) break :face 0;
+            const face_style: Font.FaceStyle = .init(style.flags.bold, style.flags.italic);
+            if (extras.len == 0) break :face self.font.faceForCluster(self.alloc, &.{cp}, face_style);
             self.cluster_scratch.clearRetainingCapacity();
             try self.cluster_scratch.append(self.alloc, cp);
             try self.cluster_scratch.appendSlice(self.alloc, extras);
-            break :face self.font.faceForCluster(
-                self.alloc,
-                self.cluster_scratch.items,
-                .init(style.flags.bold, style.flags.italic),
-            );
+            break :face self.font.faceForCluster(self.alloc, self.cluster_scratch.items, face_style);
         };
         var fg = style.fg(.{ .default = colors.foreground, .palette = &colors.palette });
         var bg = style.bg(&raws[x], &colors.palette);
@@ -1672,7 +1671,7 @@ fn prepareRowCells(
             } else if (bg) |bg_color|
                 if (background_uses_alpha) self.backgroundPixel(bg_color) else argb(bg_color)
             else switch (backgrounds) {
-                .all => self.backgroundPixel(colors.background),
+                .all => default_bg_pixel,
                 else => null,
             };
             if (color) |pixel| {

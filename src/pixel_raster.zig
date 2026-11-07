@@ -5,6 +5,7 @@
 //! blending; images and other shapes blend uncorrected.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vt = @import("ghostty-vt");
 const Font = @import("Font.zig");
 
@@ -71,6 +72,21 @@ pub fn fillRect(
 /// to a scalar dword loop (LLVM unrolls the enclosing row loop instead
 /// of vectorizing), capping background fills at 4 bytes per store.
 fn fillSpan(dst: []u32, color: u32) void {
+    // Whole-row background fills of large frames miss the cache. Fast
+    // string stores avoid the read-for-ownership of each destination line,
+    // which vector stores pay; short cell spans stay on the vector path.
+    if (comptime builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm) {
+        if (dst.len >= 1024) {
+            var d = dst.ptr;
+            var n = dst.len;
+            asm volatile ("rep stosl"
+                : [d] "+{rdi}" (d),
+                  [n] "+{rcx}" (n),
+                : [c] "{eax}" (color),
+                : .{ .memory = true });
+            return;
+        }
+    }
     const V = @Vector(8, u32);
     const splat: V = @splat(color);
     var i: usize = 0;
@@ -480,6 +496,16 @@ test "fillRect clips to a view while honoring framebuffer stride" {
     try std.testing.expectEqual(@as(u32, 0xffabcdef), pixels[6]);
     for ([_]usize{ 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14 }) |i| {
         try std.testing.expectEqual(untouched, pixels[i]);
+    }
+
+    // Row-wide spans take the long-fill path; it must stop exactly at the
+    // span end on each row.
+    const stride = 1203;
+    var wide: [stride * 3]u32 = @splat(untouched);
+    fillRect(&wide, stride, 1201, 3, 1, 1, 1200, 1, 0xff102030);
+    for (wide, 0..) |px, i| {
+        const filled = i / stride == 1 and i % stride >= 1 and i % stride < 1201;
+        try std.testing.expectEqual(if (filled) @as(u32, 0xff102030) else untouched, px);
     }
 }
 
