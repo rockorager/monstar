@@ -2122,7 +2122,7 @@ fn reloadConfig(self: *App) void {
 
     const arena = arena_state.allocator();
     var new_config = if (self.config_path) |path|
-        Config.loadPath(arena, path)
+        Config.loadPath(arena, self.environ, path)
     else
         Config.load(arena, self.environ);
     for (self.config_overrides) |override| {

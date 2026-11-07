@@ -175,7 +175,19 @@ Other settings:
 - **palette** — Override one palette entry by index `0`–`255`; repeat the key
   for more entries.
 
-Press `Ctrl+Shift+,` or send `SIGUSR1` to reload the configuration:
+Load more files with repeatable `config-file` entries. As in Ghostty, each
+named file loads after the whole file that names it, so it overrides that file
+wherever the entry appears. A leading `?` ignores a missing file, `~/` is
+relative to `HOME`, and other relative paths are relative to the including
+file:
+
+```conf
+config-file = ?"~/.local/state/omarchy/current/theme/monstar.conf"
+config-file = local.conf
+```
+
+Press `Ctrl+Shift+,` or send `SIGUSR1` to reload the configuration, including
+every included file:
 
 ```sh
 pkill -USR1 monstar

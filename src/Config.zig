@@ -195,18 +195,76 @@ pub fn load(arena: std.mem.Allocator, environ: std.process.Environ) Config {
         return .{};
     };
 
-    return loadPath(arena, path);
+    return loadPath(arena, environ, path);
 }
 
-/// Load a specific config file. Missing or unreadable file means defaults.
-pub fn loadPath(arena: std.mem.Allocator, path: [:0]const u8) Config {
-    const text = readFile(arena, path) orelse return .{};
-    log.info("loaded {s}", .{path});
-    return parse(arena, text);
+/// Load a specific config file and the files its `config-file` entries name.
+/// A missing or unreadable main file means defaults.
+pub fn loadPath(arena: std.mem.Allocator, environ: std.process.Environ, path: [:0]const u8) Config {
+    var config: Config = .{};
+    config.loadFiles(arena, environ, path) catch warn("out of memory while loading {s}", .{path});
+    return config;
 }
 
 pub fn parse(arena: std.mem.Allocator, text: []const u8) Config {
     var config: Config = .{};
+    config.parseLines(arena, "config", text, null);
+    return config;
+}
+
+const ConfigFile = struct {
+    path: [:0]const u8,
+    optional: bool,
+};
+
+/// Like Ghostty, `config-file` entries load in order after the whole file
+/// naming them, so they override it regardless of position; files named by
+/// an included file queue behind the ones already pending. A file already
+/// loaded is skipped, which also breaks cycles.
+fn loadFiles(self: *Config, arena: std.mem.Allocator, environ: std.process.Environ, path: [:0]const u8) error{OutOfMemory}!void {
+    var files: std.ArrayList(ConfigFile) = .empty;
+    const main_path = try std.fs.path.resolve(arena, &.{path});
+    try files.append(arena, .{ .path = try arena.dupeSentinel(u8, main_path, 0), .optional = true });
+    var includes: std.ArrayList([]const u8) = .empty;
+    var index: usize = 0;
+    next: while (index < files.items.len) : (index += 1) {
+        const file = files.items[index];
+        for (files.items[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier.path, file.path)) {
+                warn("config-file {s} was already loaded, ignoring", .{file.path});
+                continue :next;
+            }
+        }
+        const text = readFile(arena, file.path) orelse {
+            if (!file.optional) warn("config-file {s} could not be read, ignoring", .{file.path});
+            continue;
+        };
+        log.info("loaded {s}", .{file.path});
+
+        includes.clearRetainingCapacity();
+        self.parseLines(arena, file.path, text, &includes);
+        for (includes.items) |value| {
+            const include = parseConfigFile(arena, environ, std.fs.path.dirname(file.path), value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidValue => {
+                    warn("{s}: invalid config-file '{s}', ignoring", .{ file.path, value });
+                    continue;
+                },
+            };
+            try files.append(arena, include);
+        }
+    }
+}
+
+/// Apply each line in order. `config-file` values are collected into
+/// `includes` for the caller to load; without a list they are unknown keys.
+fn parseLines(
+    self: *Config,
+    arena: std.mem.Allocator,
+    source: []const u8,
+    text: []const u8,
+    includes: ?*std.ArrayList([]const u8),
+) void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     var line_no: usize = 0;
     while (lines.next()) |raw_line| {
@@ -215,22 +273,49 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Config {
         if (line.len == 0 or line[0] == '#') continue;
 
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
-            warn("line {d}: missing '=', ignoring: {s}", .{ line_no, line });
+            warn("{s}:{d}: missing '=', ignoring: {s}", .{ source, line_no, line });
             continue;
         };
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
         if (value.len == 0) {
-            warn("line {d}: empty value for '{s}', ignoring", .{ line_no, key });
+            warn("{s}:{d}: empty value for '{s}', ignoring", .{ source, line_no, key });
             continue;
         }
 
-        config.set(arena, key, value) catch |err| switch (err) {
-            error.UnknownKey => warn("line {d}: unknown key '{s}', ignoring", .{ line_no, key }),
-            else => warn("line {d}: invalid value for '{s}': {s}", .{ line_no, key, value }),
+        if (includes) |list| if (std.mem.eql(u8, key, "config-file")) {
+            list.append(arena, value) catch warn("{s}:{d}: out of memory, ignoring config-file", .{ source, line_no });
+            continue;
+        };
+        self.set(arena, key, value) catch |err| switch (err) {
+            error.UnknownKey => warn("{s}:{d}: unknown key '{s}', ignoring", .{ source, line_no, key }),
+            else => warn("{s}:{d}: invalid value for '{s}': {s}", .{ source, line_no, key, value }),
         };
     }
-    return config;
+}
+
+/// Ghostty's `config-file` syntax: a leading `?` makes a missing file silent,
+/// surrounding double quotes are removed (so `"?name"` names a file starting
+/// with `?`), `~/` is relative to HOME, and other relative paths are relative
+/// to `dir`, the directory of the file containing the entry.
+fn parseConfigFile(
+    arena: std.mem.Allocator,
+    environ: std.process.Environ,
+    dir: ?[]const u8,
+    value: []const u8,
+) error{ InvalidValue, OutOfMemory }!ConfigFile {
+    var name = value;
+    const optional = std.mem.startsWith(u8, name, "?");
+    if (optional) name = name[1..];
+    if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') name = name[1 .. name.len - 1];
+    if (name.len == 0) return error.InvalidValue;
+
+    const path = if (std.mem.startsWith(u8, name, "~/")) path: {
+        const home = environ.getPosix("HOME") orelse return error.InvalidValue;
+        if (!std.fs.path.isAbsolute(home)) return error.InvalidValue;
+        break :path try std.fs.path.resolve(arena, &.{ home, name[2..] });
+    } else try std.fs.path.resolve(arena, &.{ dir orelse ".", name });
+    return .{ .path = try arena.dupeSentinel(u8, path, 0), .optional = optional };
 }
 
 /// Resolve configured theme names after the config file and command-line
@@ -1344,4 +1429,42 @@ test "config and named themes ignore empty and relative XDG_CONFIG_HOME" {
             );
         }
     }
+}
+
+test "config-file entries load after their file, in queue order, once each" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try tmp.dir.createDirPath(io, "home/.config/monstar/sub");
+    try tmp.dir.createDirPath(io, "home/state");
+    for ([_][2][]const u8{
+        .{
+            "home/.config/monstar/config",
+            \\config-file = ?"~/state/theme.conf"
+            \\config-file = sub/a.conf
+            \\config-file = ?missing.conf
+            \\config-file = "?literal.conf"
+            \\background = #000001
+            \\font-size = 10
+        },
+        .{ "home/state/theme.conf", "background = #000002\nfont-family = Theme\n" },
+        // Relative to sub/, and the cycle back to the main file must not
+        // reapply its font-size.
+        .{ "home/.config/monstar/sub/a.conf", "config-file = b.conf\nconfig-file = ../config\nfont-family = A\nfont-size = 11\n" },
+        .{ "home/.config/monstar/sub/b.conf", "font-family = B\n" },
+        .{ "home/.config/monstar/?literal.conf", "app-id = literal\n" },
+    }) |file| try tmp.dir.writeFile(io, .{ .sub_path = file[0], .data = file[1] });
+
+    const home = try tmp.dir.realPathFileAlloc(io, "home", arena);
+    const home_entry = try std.fmt.allocPrintSentinel(arena, "HOME={s}", .{home}, 0);
+    const environ: std.process.Environ = .{ .block = .{ .slice = &.{home_entry.ptr} } };
+    const config = load(arena, environ);
+    try std.testing.expectEqual(vt.color.RGB{ .r = 0, .g = 0, .b = 2 }, config.background.?);
+    try std.testing.expectEqualStrings("B", config.font_family);
+    try std.testing.expectEqual(FontSize{ .points = 11 }, config.font_size);
+    try std.testing.expectEqualStrings("literal", config.app_id);
 }

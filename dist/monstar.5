@@ -39,6 +39,39 @@ font-size = 12.5
 theme = light:Rose Pine Dawn,dark:Rose Pine
 window-padding-x = 4,8
 .EE
+.SH INCLUDING FILES
+.TP
+.BI config-file " = path"
+Load another configuration file.
+Repeat the setting to load several files.
+Like Ghostty, each named file is loaded after the entire file that names it,
+in the order named, so its settings override that file regardless of where the
+entry appears.
+Files named by an included file are loaded after the files already pending.
+A file is loaded at most once; a repeated or cyclic entry is reported and
+ignored.
+.IP
+A leading
+.B ?
+suppresses the warning when the file is missing.
+Surrounding double quotes are removed, so
+.B \(dq?name\(dq
+names a file that begins with
+.BR ? .
+A path beginning with
+.B ~/
+is relative to
+.BR HOME ;
+other relative paths are relative to the directory of the file containing the
+entry.
+For example:
+.EX
+config-file = ?"~/.local/state/omarchy/current/theme/monstar.conf"
+.EE
+.IP
+Included files are read again on every reload.
+This setting is only accepted in configuration files, not with
+.BR \-o .
 .SH RELOADING
 Press
 .B Ctrl+Shift+,

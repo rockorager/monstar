@@ -267,7 +267,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
     const arena = init.arena.allocator();
 
     var config = if (cli.config_path) |path|
-        Config.loadPath(arena, path)
+        Config.loadPath(arena, init.minimal.environ, path)
     else
         Config.load(arena, init.minimal.environ);
     for (cli.config_overrides) |override| {
