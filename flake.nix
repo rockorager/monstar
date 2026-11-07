@@ -18,6 +18,7 @@
         pkgs.freetype
         pkgs.harfbuzz
         pkgs.libxkbcommon
+        pkgs.vulkan-headers
       ];
     in
     {

@@ -17,6 +17,7 @@ depends=(
 )
 makedepends=(
   'ncurses'
+  'vulkan-headers'
   'wayland-protocols>=1.49'
   'zig>=0.17.0'
 )
@@ -24,6 +25,7 @@ optdepends=(
   'noto-fonts-emoji: emoji support'
   'noto-fonts-cjk: CJK font support'
   'systemd: launch additional terminal windows as user services'
+  'vulkan-icd-loader: GPU rendering with renderer = vulkan'
   'xdg-desktop-portal: open links and files through a desktop portal'
   'xdg-utils: open links when a desktop portal is unavailable'
 )

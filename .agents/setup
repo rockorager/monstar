@@ -42,6 +42,7 @@ if command -v apt-get >/dev/null 2>&1; then
     libfontconfig-dev \
     libfreetype-dev \
     libharfbuzz-dev \
+    libvulkan-dev \
     libwayland-dev \
     libxkbcommon-dev \
     ncurses-bin \

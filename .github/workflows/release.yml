@@ -42,6 +42,7 @@ jobs:
             libfontconfig1-dev \
             libfreetype-dev \
             libharfbuzz-dev \
+            libvulkan-dev \
             libwayland-dev \
             libxkbcommon-dev \
             ncurses-bin \
