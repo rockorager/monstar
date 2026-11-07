@@ -230,7 +230,8 @@ def render_markdown(doc):
         out.append(f"- Machine: {mach['cpu'].get('model')}; GPU {gpus}; kernel {mach.get('kernel')}; "
                    f"Mesa {mach.get('mesa') or '—'}; governor {mach['cpu'].get('governor') or '—'}")
         out.append(f"- Display: {disp.get('output')} {disp.get('width')}x{disp.get('height')}@{disp.get('refresh_hz')} "
-                   f"scale {disp.get('scale')}")
+                   f"scale {disp.get('scale')}"
+                   + "".join(f"; {k} = {v}" for k, v in (sess.get("options") or {}).items()))
         out.append(f"- Monstar: {mon.get('version')} ({run['settings'].get('repetitions')} reps; "
                    f"input {run['settings'].get('input')})")
         out.append(f"- Measurements: {measurement_line(run)}")

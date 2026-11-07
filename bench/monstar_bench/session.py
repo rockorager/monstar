@@ -213,27 +213,48 @@ class Hyprland(Session):
                 "make": focused.get("make"), "model": focused.get("model")}
 
     def dispatch(self, lua, classic):
-        """Hyprland 0.5x's Lua config changed the dispatcher syntax; try the
-        Lua form first and fall back to the classic dispatcher."""
-        out = self.ctl("dispatch", lua, check=False).strip().lower()
+        """Hyprland 0.55+ with a Lua config takes only Lua dispatchers
+        (`hyprctl dispatch 'hl.dsp...'`, printing "ok"); older releases take
+        only the classic ones. Try Lua first."""
+        out = self.ctl("dispatch", lua, check=False).strip()
         if out == "ok":
             return
-        out = self.ctl("dispatch", *classic, check=False).strip().lower()
-        if out != "ok":
-            raise SessionError(f"hyprctl dispatch {' '.join(classic)} failed: {out}")
+        classic_out = self.ctl("dispatch", *classic, check=False).strip()
+        if classic_out != "ok":
+            raise SessionError(f"hyprctl dispatch {lua} failed: {out}")
+
+    @staticmethod
+    def workspace_selector(name):
+        # Numbered workspaces are selected by id; "name:3" does not find them.
+        return name if name.lstrip("-").isdigit() else f"name:{name}"
+
+    def focus_workspace(self, name):
+        selector = self.workspace_selector(name)
+        self.dispatch(f'hl.dsp.focus({{ workspace = "{selector}" }})', ["workspace", selector])
 
     def prepare(self):
         self.previous_workspace = self.query("activeworkspace").get("name")
-        self.dispatch(f'hl.dsp.workspace.focus("name:{BENCH_WORKSPACE}")', ["workspace", f"name:{BENCH_WORKSPACE}"])
+        self.focus_workspace(BENCH_WORKSPACE)
 
     def restore(self):
         previous = getattr(self, "previous_workspace", None)
         if previous:
             try:
-                self.dispatch(f'hl.dsp.workspace.focus("{previous}")', ["workspace", f"name:{previous}"])
+                self.focus_workspace(previous)
             except SessionError:
                 pass
             self.previous_workspace = None
+
+    def describe(self):
+        # direct_scanout (default 0) decides whether fullscreen dma-buf
+        # clients are offered to KMS at all, which changes their frame rate.
+        out = super().describe()
+        try:
+            option = json.loads(self.ctl("getoption", "render:direct_scanout", "-j"))
+            out["options"] = {"render:direct_scanout": option.get("int")}
+        except (SessionError, ValueError):
+            pass
+        return out
 
     def window(self, app_id):
         for client in self.query("clients"):
