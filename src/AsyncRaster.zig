@@ -543,10 +543,11 @@ fn renderJob(self: *AsyncRaster, job: Job, damage: *Damage) !void {
     }
     if (job.scroll_shift) |shift| {
         clearPadding(job, self.renderer.backgroundPixel(self.state.colors.background));
-        // Ink crossing row boundaries cannot be reused independently: a
-        // discarded row may have painted into a retained row's pixels.
+        // Retained pixels must not hold ink from a discarded row. Upward
+        // glyph overhang is tracked per row; downward overhang only exists
+        // when the cell is shrunk below the font's natural height.
         if (!self.font.neighbor_row_overhang and
-            self.renderer.row_overhang.count() == 0 and
+            !self.renderer.scrollDiscardsInk(self.state.rows, shift) and
             scrollFromPreviousFrame(job, shift, self.font.cell_height))
         {
             try self.renderer.shiftCellState(self.state.rows, self.state.cols, shift);
@@ -844,13 +845,18 @@ test "primary and alternate screen scroll pixels match full repaint" {
     for ([_]bool{ false, true }) |stale| {
         for ([_]?Config.MetricModifier{ null, .{ .percent = -25 } }) |cell_height| {
             for ([_][]const u8{ "", "\x1b[?1049h" }) |screen| {
-                for ([_]isize{ 1, -1 }) |shift| {
+                // The second text inks above every row but the first: breve
+                // and double-acute capitals exceed the ascender.
+                for ([_][]const u8{
+                    "Ågj\r\n\x1b[31msecond\r\n\x1b[32mc\u{301}\r\npq",
+                    "a\r\n\u{150}b\r\n\u{102}c\r\n\u{150}d",
+                }, 0..) |text, text_index| for ([_]isize{ 1, -1 }) |shift| {
                     var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 12, .rows = 4 });
                     defer term.deinit(alloc);
                     var stream = term.vtStream();
                     defer stream.deinit();
                     stream.nextSlice(screen);
-                    stream.nextSlice("Ågj\r\n\x1b[31msecond\r\n\x1b[32mc\u{301}\r\npq");
+                    stream.nextSlice(text);
                     var state: vt.RenderState = .empty;
                     defer state.deinit(alloc);
                     try state.update(alloc, &term);
@@ -913,12 +919,15 @@ test "primary and alternate screen scroll pixels match full repaint" {
                         job.source_pixels = previous;
                     }
                     try raster.renderJob(job, &damage);
-                    try std.testing.expectEqual(cell_height == null, raster.renderer.cellDamageStats().dirty_rows > 0);
+                    // Overhanging rows are reused, except that moving down
+                    // discards the inking last row and repaints everything.
+                    const reused = cell_height == null and !(text_index == 1 and shift < 0);
+                    try std.testing.expectEqual(reused, raster.renderer.cellDamageStats().dirty_rows > 0);
                     var reference: Renderer = try .init(alloc, &font, .{});
                     defer reference.deinit();
                     try reference.render(&state, expected, width, height);
                     try std.testing.expectEqualSlices(u32, expected, pixels);
-                }
+                };
             }
         }
     }

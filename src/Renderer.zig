@@ -117,6 +117,8 @@ kitty_scale_count: usize = 0,
 buffer_stride: u31 = 0,
 /// Unclipped grid, including the extra bottom row during precision scrolling.
 scroll_pixels: std.ArrayList(u32) = .empty,
+/// One row strip saved by renderDirty while repainting the row below it.
+strip_scratch: std.ArrayList(u32) = .empty,
 
 const kitty_scale_cache_max_entries = 32;
 const kitty_scale_cache_max_bytes = 32 * 1024 * 1024;
@@ -222,6 +224,7 @@ pub fn deinit(self: *Renderer) void {
     self.clearKittyScaleCache();
     self.kitty_scale_cache.deinit(self.alloc);
     self.scroll_pixels.deinit(self.alloc);
+    self.strip_scratch.deinit(self.alloc);
     self.* = undefined;
 }
 
@@ -441,9 +444,10 @@ pub fn renderWithKittyItems(
 /// Draw only rows marked dirty in `state`, preserving other pixels.
 /// A dirty row's neighbors are repainted only when the row_overhang
 /// bits demand it: the row above when the dirty row's previous
-/// content inked into it, the row below when its ink reaches into the
-/// dirty row's freshly cleared strip. Modified grid-pixel rectangles
-/// are recorded in `rendered_rects` for repair and surface damage.
+/// content inked into it, and the row below's ink, clipped to the
+/// dirty row, when it reaches into the dirty row's freshly cleared
+/// strip. Modified grid-pixel rectangles are recorded in
+/// `rendered_rects` for repair and surface damage.
 pub fn renderDirty(
     self: *Renderer,
     state: *vt.RenderState,
@@ -476,47 +480,67 @@ pub fn renderDirty(
     const all_dirty = rows.items(.dirty);
     var rendered_until: usize = 0;
     for (all_dirty[0..state.rows], 0..) |dirty, y| {
-        if (!dirty) continue;
-        if (self.partial_cell_raster and self.cell_damage_tracker.damageForRow(y) == null) continue;
-        const expand_up = y > 0 and
-            (self.font.neighbor_row_overhang or self.row_overhang.isSet(y));
-        const expand_down = y + 1 < state.rows and
-            (self.font.neighbor_row_overhang or self.row_overhang.isSet(y + 1));
-        const start = y - @intFromBool(expand_up);
-        const end = y + 1 + @intFromBool(expand_down);
-        var row = @max(start, rendered_until);
-        while (row < end) : (row += 1) {
-            const cell_damage = if (self.partial_cell_raster and
-                row == y and start == y and end == y + 1)
-                self.cell_damage_tracker.damageForRow(y)
-            else
-                null;
-            if (cell_damage) |cell_range| {
-                try self.renderRowCells(
-                    state,
-                    all_cells[row].slice(),
-                    all_selections[row],
-                    cell_range,
-                    @intCast(row),
-                    pixels,
-                    width,
-                    height,
-                );
-                try self.recordRenderedRect(cell_range, row, state.cols, width, height);
-            } else {
-                try self.renderRow(
-                    state,
-                    all_cells[row].slice(),
-                    all_selections[row],
-                    @intCast(row),
-                    pixels,
-                    width,
-                    height,
-                );
-                try self.recordRenderedRect(.{ .start = 0, .end = state.cols }, row, state.cols, width, height);
+        if (!dirty or !self.rowRepaints(y)) continue;
+        if (self.font.neighbor_row_overhang) {
+            // Shrunk cells ink in both directions; repaint both neighbors.
+            for (@max(y -| 1, rendered_until)..@min(state.rows, y + 2)) |row| {
+                try self.repaintRow(state, row, null, pixels, width, height);
             }
+            rendered_until = @min(state.rows, y + 2);
+            continue;
         }
-        rendered_until = @max(rendered_until, end);
+        const inks_up = y > 0 and self.row_overhang.isSet(y);
+        const inked_from_below = y + 1 < state.rows and self.row_overhang.isSet(y + 1);
+        if (inks_up and y - 1 >= rendered_until) {
+            // Clear the ink this row's previous content left above it. The
+            // row above is unchanged, so its own ink above stays as it is.
+            const keep = y >= 2 and self.row_overhang.isSet(y - 1);
+            if (keep) try self.saveStrip(y - 2, pixels, width, height);
+            try self.repaintRow(state, y - 1, null, pixels, width, height);
+            if (keep) self.restoreStrip(y - 2, pixels, width, height);
+        }
+        const cell_damage = if (self.partial_cell_raster and !inks_up and !inked_from_below)
+            self.cell_damage_tracker.damageForRow(y)
+        else
+            null;
+        try self.repaintRow(state, y, cell_damage, pixels, width, height);
+        if (inked_from_below and !(all_dirty[y + 1] and self.rowRepaints(y + 1))) {
+            // Redraw the unchanged row below only where it inks into this
+            // row's freshly cleared strip.
+            const strip_end: u31 = @intCast(@min(@as(u64, y + 1) * self.font.cell_height, height));
+            const below = all_cells[y + 1].slice();
+            try self.prepareRow(state, below, all_selections[y + 1], @intCast(y + 1), pixels, width, strip_end, .none);
+            try self.renderRowForeground(state, below, @intCast(y + 1), pixels, width, strip_end);
+        }
+        rendered_until = y + 1;
+    }
+}
+
+/// Whether renderDirty repaints dirty row `y` at all.
+fn rowRepaints(self: *const Renderer, y: usize) bool {
+    return !self.partial_cell_raster or self.cell_damage_tracker.damageForRow(y) != null;
+}
+
+/// Repaint row `y` entirely, or only `cell_range` when given, and record the
+/// modified rectangle.
+fn repaintRow(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    y: usize,
+    cell_range: ?CellRange,
+    pixels: []u32,
+    width: u31,
+    height: u31,
+) !void {
+    const rows = state.row_data.slice();
+    const cells = rows.items(.cells)[y].slice();
+    const selection = rows.items(.selection)[y];
+    if (cell_range) |range| {
+        try self.renderRowCells(state, cells, selection, range, @intCast(y), pixels, width, height);
+        try self.recordRenderedRect(range, y, state.cols, width, height);
+    } else {
+        try self.renderRow(state, cells, selection, @intCast(y), pixels, width, height);
+        try self.recordRenderedRect(.{ .start = 0, .end = state.cols }, y, state.cols, width, height);
     }
 }
 
@@ -536,6 +560,24 @@ pub fn measureDirtyDamage(self: *Renderer, state: *const vt.RenderState) !?usize
         cells += range.end - range.start;
     }
     return cells;
+}
+
+fn stripPixels(self: *const Renderer, y: usize, width: u31, height: u31) struct { start: usize, end: usize } {
+    const stride: usize = self.pixelStride(width);
+    const top = @min(y * self.font.cell_height, height);
+    const bottom = @min((y + 1) * self.font.cell_height, height);
+    return .{ .start = top * stride, .end = if (bottom > top) (bottom - 1) * stride + width else top * stride };
+}
+
+fn saveStrip(self: *Renderer, y: usize, pixels: []const u32, width: u31, height: u31) !void {
+    const strip = self.stripPixels(y, width, height);
+    try self.strip_scratch.resize(self.alloc, strip.end - strip.start);
+    @memcpy(self.strip_scratch.items, pixels[strip.start..strip.end]);
+}
+
+fn restoreStrip(self: *Renderer, y: usize, pixels: []u32, width: u31, height: u31) void {
+    const strip = self.stripPixels(y, width, height);
+    @memcpy(pixels[strip.start..strip.end], self.strip_scratch.items);
 }
 
 fn recordRenderedRect(
@@ -727,6 +769,18 @@ pub fn shiftCellState(self: *Renderer, rows: usize, cols: usize, shift_rows: isi
     }
 
     if (self.track_cell_damage) try self.cell_damage_tracker.shift(rows, cols, shift_rows);
+}
+
+/// Whether moving the framebuffer by `shift_rows` (see shiftCellState) would
+/// keep ink from a row that scrolls out. Moving content up keeps each
+/// retained row's lower neighbor, and ink above the grid is clipped either
+/// way. Moving content down discards the row below the new last row, whose
+/// glyphs may have inked into it. Call before shiftCellState.
+pub fn scrollDiscardsInk(self: *const Renderer, rows: usize, shift_rows: isize) bool {
+    std.debug.assert(shift_rows != 0 and @abs(shift_rows) < rows);
+    if (shift_rows > 0) return false;
+    if (self.row_overhang.bit_length != rows) return true;
+    return self.row_overhang.isSet(rows - @abs(shift_rows));
 }
 
 pub fn renderPreedit(
@@ -3321,6 +3375,49 @@ test "extreme cell height shrinking falls back to full damage" {
         .width = width,
         .height = height,
     }, renderer.rendered_rects.items[0]);
+}
+
+test "dirty row render repaints chained overhang rows like a full render" {
+    const alloc = std.testing.allocator;
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 4 });
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    // Breve and double-acute capitals exceed the ascender in common
+    // monospace faces, so rows 1-3 each ink into the row above.
+    stream.nextSlice("\x1b[?25labcd\r\n\u{102}\u{150}\u{102}\u{150}\r\n\u{150}\u{102}\u{150}\u{102}\r\n\u{102}\u{150}\u{102}\u{150}");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var font: Font = try .init(alloc, "monospace", 16, .{});
+    defer font.deinit(alloc);
+    try std.testing.expect(!font.neighbor_row_overhang);
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const width: u31 = font.cell_width * 4;
+    const height: u31 = font.cell_height * 4;
+    const dirty_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(dirty_pixels);
+    const full_pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(full_pixels);
+
+    try renderer.render(&state, dirty_pixels, width, height);
+    try std.testing.expect(renderer.row_overhang.isSet(2) and renderer.row_overhang.isSet(3));
+    state.dirty = .false;
+    for (state.row_data.items(.dirty)) |*dirty| dirty.* = false;
+
+    // Repainting row 3 clears ink row 3 left in row 2, so row 2 is
+    // repainted; row 2 in turn inks into row 1 and must not blend twice.
+    stream.nextSlice("\x1b[4;1Hwxyz");
+    try state.update(alloc, &term);
+
+    try renderer.renderDirty(&state, dirty_pixels, width, height);
+    try renderer.render(&state, full_pixels, width, height);
+    try std.testing.expectEqualSlices(u32, full_pixels, dirty_pixels);
 }
 
 test "cell damage render matches full render for sparse row churn" {
