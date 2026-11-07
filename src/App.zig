@@ -236,6 +236,10 @@ scrollbar_fd: posix.fd_t,
 kitty_animation_fd: posix.fd_t,
 /// Idle scheduler for incremental cold scrollback compression.
 compression_fd: posix.fd_t,
+/// Debounces terminal resizes during an interactive window resize.
+resize_fd: posix.fd_t,
+/// The layout's grid size has not been applied to the terminal and pty yet.
+resize_pending: bool,
 compression_activity: u64,
 scrollbar_alpha: u8,
 scrollbar_fading: bool,
@@ -311,6 +315,9 @@ const scrollbar_fade_duration_ms = 150;
 const scrollbar_fade_interval_ms = 15;
 const compression_idle_ms = 250;
 const compression_step_ms = 1;
+/// Quiet period after the last interactive-resize configure before the
+/// terminal reflows, like Ghostty's resize coalescing.
+const resize_delay_ms = 25;
 const scrollbar_default_alpha = 150;
 const scrollbar_hover_alpha = 220;
 const scrollbar_width = 6;
@@ -676,6 +683,9 @@ pub fn init(
     const compression_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(compression_fd);
 
+    const resize_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(resize_fd);
+
     // Scope confirmation ran concurrently with the window setup above,
     // so this rarely waits; the child stays gated until its migration
     // is confirmed (or abandoned).
@@ -767,6 +777,8 @@ pub fn init(
         .scrollbar_fd = scrollbar_fd,
         .kitty_animation_fd = kitty_animation_fd,
         .compression_fd = compression_fd,
+        .resize_fd = resize_fd,
+        .resize_pending = false,
         .compression_activity = term.compressionActivity(),
         .scrollbar_alpha = 0,
         .scrollbar_fading = false,
@@ -1832,6 +1844,7 @@ pub fn deinit(self: *App) void {
     if (self.pending_open_uri) |uri| self.alloc.free(uri);
     self.deinitDbus();
     _ = std.os.linux.close(self.compression_fd);
+    _ = std.os.linux.close(self.resize_fd);
     _ = std.os.linux.close(self.kitty_animation_fd);
     _ = std.os.linux.close(self.scrollbar_fd);
     _ = std.os.linux.close(self.search_fd);
@@ -1885,6 +1898,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.scrollbar_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.kitty_animation_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.resize_fd, .events = posix.POLL.IN, .revents = 0 },
     } ++ @as([Clipboard.max_outgoing_transfers]posix.pollfd, @splat(.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }));
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1903,7 +1917,8 @@ pub fn run(self: *App) !void {
     const scrollbar_fd = &fds[14];
     const kitty_animation_fd = &fds[15];
     const compression_fd = &fds[16];
-    const outgoing_clipboard_fds = fds[17..][0..Clipboard.max_outgoing_transfers];
+    const resize_fd = &fds[17];
+    const outgoing_clipboard_fds = fds[18..][0..Clipboard.max_outgoing_transfers];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         self.expireDbusRequests();
@@ -2023,6 +2038,10 @@ pub fn run(self: *App) !void {
 
         if (compression_fd.revents & posix.POLL.IN != 0) {
             self.fireScrollbackCompression();
+        }
+
+        if (resize_fd.revents & posix.POLL.IN != 0) {
+            self.fireResize();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -7635,19 +7654,37 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     );
     const layout_changed = !std.meta.eql(layout, self.layout);
     self.layout = layout;
-    const cols = layout.columns;
-    const rows = layout.rows;
-    const grid_width_px = layout.grid_width;
-    const grid_height_px = layout.grid_height;
-    const terminal_width_px = std.math.mul(u32, cols, self.font.cell_width) catch std.math.maxInt(u32);
-    const terminal_height_px = std.math.mul(u32, rows, self.font.cell_height) catch std.math.maxInt(u32);
-    const pixels_changed = terminal_width_px != self.term.width_px or terminal_height_px != self.term.height_px;
-    const cells_changed = cols != self.term.cols or rows != self.term.rows;
-    if (!cells_changed and !pixels_changed and !layout_changed) return;
+    if (!layout_changed and !self.terminalSizeStale()) return;
 
     self.stopFling();
     self.resetSmoothScroll();
-    if (cells_changed or pixels_changed) {
+    // A column change reflows the whole scrollback, which takes tens of
+    // milliseconds with a full history. During an interactive resize the
+    // compositor sends a configure every frame, so wait until the drag
+    // pauses; meanwhile the current grid renders into the new geometry.
+    if (self.window.resizing and (layout.columns != self.term.cols or self.resize_pending)) {
+        self.resize_pending = true;
+        const delay = timespecFromNs(resize_delay_ms * std.time.ns_per_ms);
+        _ = setTimer(self.resize_fd, .{ .it_value = delay, .it_interval = .{ .sec = 0, .nsec = 0 } }, "resize");
+    } else {
+        try self.applyTerminalSize();
+    }
+    self.geometry_redraw = true;
+    self.needs_redraw = true;
+    self.syncScrollbarHover();
+    self.syncHoveredLink(true);
+}
+
+/// Resize the terminal and pty to the current layout's grid.
+fn applyTerminalSize(self: *App) !void {
+    if (self.resize_pending) {
+        self.resize_pending = false;
+        _ = setTimer(self.resize_fd, disarmed_timer, "resize");
+    }
+    const cols = self.layout.columns;
+    const rows = self.layout.rows;
+    if (self.terminalSizeStale()) {
+        const cells_changed = cols != self.term.cols or rows != self.term.rows;
         if (cells_changed) log.debug("resize to {d}x{d} cells", .{ cols, rows });
         try self.term.resize(self.alloc, .{
             .cols = cols,
@@ -7662,11 +7699,29 @@ fn resizeForConfig(self: *App, width: u31, height: u31, config: Config) anyerror
     try self.pty.setWinsize(.{
         .row = rows,
         .col = cols,
-        .xpixel = @intCast(grid_width_px),
-        .ypixel = @intCast(grid_height_px),
+        .xpixel = @intCast(self.layout.grid_width),
+        .ypixel = @intCast(self.layout.grid_height),
     });
     if (self.term.modes.get(.in_band_size_reports)) self.sendSizeReport();
-    self.geometry_redraw = true;
+}
+
+/// The terminal's cell grid or pixel size differs from the layout's.
+fn terminalSizeStale(self: *const App) bool {
+    const cols = self.layout.columns;
+    const rows = self.layout.rows;
+    const width_px = std.math.mul(u32, cols, self.font.cell_width) catch std.math.maxInt(u32);
+    const height_px = std.math.mul(u32, rows, self.font.cell_height) catch std.math.maxInt(u32);
+    return cols != self.term.cols or rows != self.term.rows or
+        width_px != self.term.width_px or height_px != self.term.height_px;
+}
+
+fn fireResize(self: *App) void {
+    _ = readTimer(self.resize_fd) orelse return;
+    if (!self.resize_pending) return;
+    self.applyTerminalSize() catch |err| {
+        log.warn("deferred resize failed: {}", .{err});
+        return;
+    };
     self.needs_redraw = true;
     self.syncScrollbarHover();
     self.syncHoveredLink(true);
