@@ -294,7 +294,7 @@ fn shapeClusterWith(
 
 test "cache separates identical runs by fallback style" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
     var shaper: TextShaper = try .init(alloc, &font);
     defer shaper.deinit();
@@ -313,7 +313,7 @@ test "cache separates identical runs by fallback style" {
 
 test "missing glyph repair preserves ownership on allocation failure" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
     // A Unicode noncharacter has no fallback face, so repair must retain tofu.
     try std.testing.expect(!font.face(0).hasCodepoint(0x10ffff));
@@ -351,7 +351,7 @@ test "missing glyph repair preserves ownership on allocation failure" {
 
 test "normal and repair shaping retain fractional metrics with identity transform" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 25.25, .{});
+    var font: Font = try .init(alloc, "monospace", 25.25, .{}, null);
     defer font.deinit(alloc);
     var shaper: TextShaper = try .init(alloc, &font);
     defer shaper.deinit();

@@ -49,8 +49,9 @@ gamma-2.2 approximation has been replaced with piecewise sRGB.
 
 Scalable text uses fractional physical sizes through `FT_Set_Char_Size`,
 `FT_LOAD_TARGET_LIGHT | FT_LOAD_NO_BITMAP`, and `FT_RENDER_MODE_NORMAL` grayscale
-coverage. Native Adobe CFF stem darkening is enabled. HarfBuzz uses the same
-load flags and preserves 26.6 advances and offsets. Terminal cells remain
+coverage. Native Adobe CFF stem darkening is enabled unless `font-thicken`
+replaces it. HarfBuzz uses the same load flags and preserves 26.6 advances and
+offsets. Terminal cells remain
 integer-sized: each cluster starts at its grid origin, with fractional pen
 positions preserved inside the cluster.
 

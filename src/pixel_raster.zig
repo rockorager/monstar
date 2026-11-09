@@ -421,7 +421,7 @@ const TextCorrection = struct {
 };
 
 /// Rec. 709 relative luminance of 16-bit linear-light channels, in [0, 65535].
-fn luminance(rgb: [3]u32) u32 {
+pub fn luminance(rgb: [3]u32) u32 {
     // The weights sum to 65536, so grays keep their exact channel value.
     return @intCast((13933 * @as(u64, rgb[0]) + 46871 * @as(u64, rgb[1]) + 4732 * @as(u64, rgb[2]) + 32768) >> 16);
 }

@@ -15,7 +15,9 @@ const std = @import("std");
 const build_options = @import("build_options");
 const c = @import("c");
 const uucode = @import("uucode");
+const vt = @import("ghostty-vt");
 const Config = @import("Config.zig");
+const pixel_raster = @import("pixel_raster.zig");
 const resize = @import("resize.zig");
 const sprite = @import("sprite.zig");
 
@@ -121,6 +123,8 @@ pub const Discovery = struct {
     family: [:0]u8,
     size_px: f64,
     adjustments: Config.MetricAdjustments,
+    /// Core Text-style thickening strength, or null when off.
+    thicken: ?Config.ThickenStrength,
     /// Best match per style; immutable after initialization.
     primary_patterns: [style_count]*c.FcPattern,
     /// Lazily built fallback lists; null until first use. Written once
@@ -132,6 +136,7 @@ pub const Discovery = struct {
         family: [:0]const u8,
         size_px: f64,
         adjustments: Config.MetricAdjustments,
+        thicken: ?Config.ThickenStrength,
     ) Error!*Discovery {
         if (c.FcInit() != c.FcTrue) return error.FontLoadFailed;
 
@@ -156,6 +161,7 @@ pub const Discovery = struct {
             .family = family_copy,
             .size_px = size_px,
             .adjustments = adjustments,
+            .thicken = thicken,
             .primary_patterns = patterns,
             .sort_sets = @splat(.init(null)),
             .sort_mutex = .unlocked,
@@ -211,6 +217,9 @@ pub const Face = struct {
     cell_width: u31,
     cell_height: u31,
     baseline: u31,
+    /// Stroke growth applied to outline glyphs at each thickening level, in
+    /// 26.6 pixels.
+    thicken: [thicken_levels]c.FT_Pos,
 
     fn load(
         ft_lib: c.FT_Library,
@@ -257,6 +266,7 @@ pub const Face = struct {
             .cell_width = metrics.cell_width,
             .cell_height = metrics.cell_height,
             .baseline = metrics.baseline,
+            .thicken = metrics.thicken,
         };
     }
 
@@ -301,12 +311,13 @@ pub const Face = struct {
         constraint_width: u2,
         constrain_alpha: bool,
     ) Error!*const Glyph {
-        return self.glyphPhase(alloc, index, constraint_width, constrain_alpha, .{});
+        return self.glyphPhase(alloc, index, constraint_width, constrain_alpha, .{}, 0);
     }
 
     /// Like glyph, but rasterizes outline text at a screen-space subpixel
-    /// phase. Bearings already include the phase: blit only at the floored
-    /// integer origin. Cell-fitted symbols and color/bitmap faces ignore it.
+    /// phase and thickening level (see Font.thickenLevel). Bearings already
+    /// include the phase: blit only at the floored integer origin.
+    /// Cell-fitted symbols ignore the phase; color/bitmap faces ignore both.
     pub fn glyphPhase(
         self: *Face,
         alloc: std.mem.Allocator,
@@ -314,13 +325,16 @@ pub const Face = struct {
         constraint_width: u2,
         constrain_alpha: bool,
         phase: Phase,
+        thicken_level: u3,
     ) Error!*const Glyph {
-        const text_outline = c.FT_IS_SCALABLE(self.ft_face) and !c.FT_HAS_COLOR(self.ft_face) and !constrain_alpha;
+        std.debug.assert(thicken_level < thicken_levels);
+        const outline_face = c.FT_IS_SCALABLE(self.ft_face) and !c.FT_HAS_COLOR(self.ft_face);
         const key: GlyphKey = .{
             .index = index,
             .constraint_width = constraint_width,
             .constrain_alpha = constrain_alpha,
-            .phase = if (text_outline) phase else .{},
+            .phase = if (outline_face and !constrain_alpha) phase else .{},
+            .thicken_level = if (outline_face) thicken_level else 0,
         };
         const gop = try self.glyphs.getOrPut(alloc, key);
         if (gop.found_existing) return gop.value_ptr;
@@ -334,6 +348,16 @@ pub const Face = struct {
         defer c.FT_Set_Transform(self.ft_face, &matrix, &delta);
         if (c.FT_Load_Glyph(self.ft_face, index, loadFlags(self.ft_face)) != 0)
             return error.FontLoadFailed;
+        const thicken = self.thicken[key.thicken_level];
+        if (thicken > 0 and self.ft_face.*.glyph.*.format == c.FT_GLYPH_FORMAT_OUTLINE) {
+            // FreeType keeps the left and bottom edges fixed. Core Text grows
+            // strokes evenly left and right but only upward, keeping the
+            // baseline crisp, so recenter horizontally.
+            const outline = &self.ft_face.*.glyph.*.outline;
+            if (c.FT_Outline_EmboldenXY(outline, thicken, thicken) != 0)
+                return error.FontLoadFailed;
+            c.FT_Outline_Translate(outline, -@divTrunc(thicken, 2), 0);
+        }
         if (c.FT_Render_Glyph(self.ft_face.*.glyph, c.FT_RENDER_MODE_NORMAL) != 0)
             return error.FontLoadFailed;
 
@@ -530,6 +554,7 @@ const GlyphKey = struct {
     constraint_width: u2,
     constrain_alpha: bool,
     phase: Phase,
+    thicken_level: u3,
 };
 
 /// Fractions of a physical pixel, in 26.6 units; y increases down the screen.
@@ -589,7 +614,49 @@ const GlyphMetrics = struct {
     cell_width: u31 = 0,
     cell_height: u31 = 0,
     baseline: u31 = 0,
+    thicken: [thicken_levels]c.FT_Pos = @splat(0),
 };
+
+/// Core Text's font smoothing grows strokes by one of five amounts, chosen
+/// by the fill color's relative luminance. Measured on macOS 27.2, the
+/// background does not matter, and the gray cut points below also hold for
+/// colored fills compared by luminance.
+const thicken_levels = 5;
+const thicken_cut_grays = [thicken_levels - 1]u8{ 100, 165, 208, 241 };
+/// Stroke growth per pixel of font size at each level, before the cap.
+const thicken_rates = [thicken_levels]f64{ 0.0113, 0.0113 * 1.43, 0.0113 * 1.85, 0.0113 * 2.24, 0.0113 * 2.64 };
+
+/// The level whose stroke growth Core Text uses for text drawn in `rgb`.
+fn colorThickenLevel(rgb: [3]u8) u3 {
+    const y = pixel_raster.luminance(.{ pixel_raster.decode[rgb[0]], pixel_raster.decode[rgb[1]], pixel_raster.decode[rgb[2]] });
+    var level: u3 = 0;
+    for (thicken_cut_grays) |gray| level += @intFromBool(y >= pixel_raster.decode[gray]);
+    return level;
+}
+
+/// Stroke growth in 26.6 pixels for each level at `size_px`, capped near
+/// 0.6 px as Core Text does. A fixed strength is the gray Ghostty draws its
+/// masks with, so every level gets that gray's growth.
+fn thickenStrokes(size_px: f64, strength: ?Config.ThickenStrength) [thicken_levels]c.FT_Pos {
+    var strokes: [thicken_levels]c.FT_Pos = undefined;
+    for (&strokes, thicken_rates) |*stroke, rate| {
+        stroke.* = @intFromFloat(@round(@min(0.6, rate * size_px) * 64));
+    }
+    return switch (strength orelse return @splat(0)) {
+        .auto => strokes,
+        .gray => |gray| @splat(strokes[colorThickenLevel(.{ gray, gray, gray })]),
+    };
+}
+
+/// The thickening level for a glyph drawn in `foreground`. Only automatic
+/// thickening distinguishes colors; otherwise every glyph shares level 0.
+pub fn thickenLevel(self: *const Font, foreground: vt.color.RGB) u3 {
+    const strength = self.discovery_data.thicken orelse return 0;
+    return switch (strength) {
+        .auto => colorThickenLevel(.{ foreground.r, foreground.g, foreground.b }),
+        .gray => 0,
+    };
+}
 
 const GlyphFormat = enum { alpha, bgra };
 
@@ -852,10 +919,11 @@ pub fn init(
     family: [:0]const u8,
     size_px: f64,
     adjustments: Config.MetricAdjustments,
+    thicken: ?Config.ThickenStrength,
 ) Error!Font {
     std.debug.assert(size_px > 0);
 
-    const discovery_data = try Discovery.init(family, size_px, adjustments);
+    const discovery_data = try Discovery.init(family, size_px, adjustments, thicken);
     defer discovery_data.unref();
     return initWithDiscovery(alloc, discovery_data);
 }
@@ -874,7 +942,8 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
     errdefer _ = c.FT_Done_FreeType(ft_lib);
 
     // Adobe's CFF stem darkening compensates for linear-light coverage.
-    var no_darkening: c.FT_Bool = 0;
+    // Thickening replaces it rather than stacking on top of it.
+    var no_darkening: c.FT_Bool = @intFromBool(discovery_data.thicken != null);
     if (c.FT_Property_Set(ft_lib, "cff", "no-stem-darkening", &no_darkening) != 0)
         return error.FontLoadFailed;
 
@@ -924,9 +993,11 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
         }
         break :width @intCast(metrics.max_advance >> 6);
     };
+    const thicken = thickenStrokes(size_px, discovery_data.thicken);
     primary.cell_width = cell_width;
     primary.cell_height = cell_height;
     primary.baseline = baseline;
+    primary.thicken = thicken;
     if (c.FT_IS_SCALABLE(primary.ft_face)) {
         if (c.FT_Set_Char_Size(primary.ft_face, 0, @intFromFloat(@round(size_px * 64)), 72, 72) != 0)
             return error.FontLoadFailed;
@@ -939,6 +1010,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
             .cell_width = cell_width,
             .cell_height = cell_height,
             .baseline = baseline,
+            .thicken = thicken,
         }) catch |err| {
             log.warn("embedded symbols font failed to load: {}", .{err});
             break :embedded null;
@@ -955,6 +1027,7 @@ pub fn initWithDiscovery(alloc: std.mem.Allocator, discovery_data: *Discovery) E
             .cell_width = cell_width,
             .cell_height = cell_height,
             .baseline = baseline,
+            .thicken = thicken,
         })) |idx| {
             primary_faces[@backingInt(style)] = idx;
         }
@@ -1430,6 +1503,7 @@ fn loadFallbackAt(
         .cell_width = self.cell_width,
         .cell_height = self.cell_height,
         .baseline = self.baseline,
+        .thicken = thickenStrokes(self.size_px, self.discovery_data.thicken),
     }) catch {
         self.sort_faces.put(alloc, key, failed_face) catch {};
         return null;
@@ -1497,9 +1571,79 @@ fn loadFromPattern(
     return Face.load(ft_lib, @ptrCast(file), index, size_px, metrics);
 }
 
+test "thickening grows strokes upward and evenly sideways" {
+    const alloc = std.testing.allocator;
+    var plain: Font = try .init(alloc, "DejaVu Sans Mono", 32, .{}, null);
+    defer plain.deinit(alloc);
+    var thick: Font = try .init(alloc, "DejaVu Sans Mono", 32, .{}, .{ .gray = 255 });
+    defer thick.deinit(alloc);
+    // 0.0113 * 2.64 * 32 px exceeds the 0.6 px cap.
+    try std.testing.expectEqual(@as(c.FT_Pos, 38), thick.face(0).thicken[0]);
+    try std.testing.expectEqual(plain.cell_width, thick.cell_width);
+
+    const index = c.FT_Get_Char_Index(plain.face(0).ft_face, 'l');
+    const a = try plain.face(0).glyph(alloc, index, 1, false);
+    const b = try thick.face(0).glyph(alloc, index, 1, false);
+    try std.testing.expect(coverageSum(b.bitmap) > coverageSum(a.bitmap) * 105 / 100);
+    // The baseline row stays put while the top grows.
+    try std.testing.expectEqual(a.bearing_y - @as(i32, a.height), b.bearing_y - @as(i32, b.height));
+    try std.testing.expect(b.bearing_y >= a.bearing_y);
+    // The ink centroid stays within a tenth of a pixel horizontally.
+    const shift = inkCentroidX(b) - inkCentroidX(a);
+    try std.testing.expect(@abs(shift) < 0.1);
+}
+
+test "automatic thickening follows text luminance like Core Text" {
+    // Level transitions measured with Core Text on macOS 27.2.
+    const cases = [_]struct { rgb: [3]u8, level: u3 }{
+        .{ .rgb = .{ 99, 99, 99 }, .level = 0 },
+        .{ .rgb = .{ 100, 100, 100 }, .level = 1 },
+        .{ .rgb = .{ 165, 165, 165 }, .level = 2 },
+        .{ .rgb = .{ 207, 207, 207 }, .level = 2 },
+        .{ .rgb = .{ 208, 208, 208 }, .level = 3 },
+        .{ .rgb = .{ 240, 240, 240 }, .level = 3 },
+        .{ .rgb = .{ 241, 241, 241 }, .level = 4 },
+        .{ .rgb = .{ 200, 0, 0 }, .level = 0 },
+        .{ .rgb = .{ 255, 0, 0 }, .level = 1 },
+        .{ .rgb = .{ 0, 240, 0 }, .level = 2 },
+        .{ .rgb = .{ 0, 248, 0 }, .level = 3 },
+        .{ .rgb = .{ 0, 0, 255 }, .level = 0 },
+        .{ .rgb = .{ 208, 208, 0 }, .level = 2 },
+        .{ .rgb = .{ 216, 216, 0 }, .level = 3 },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.level, colorThickenLevel(case.rgb));
+
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "DejaVu Sans Mono", 16, .{}, .auto);
+    defer font.deinit(alloc);
+    const white = font.thickenLevel(.{ .r = 255, .g = 255, .b = 255 });
+    const black = font.thickenLevel(.{ .r = 0, .g = 0, .b = 0 });
+    const index = c.FT_Get_Char_Index(font.face(0).ft_face, 'e');
+    const light = try font.face(0).glyphPhase(alloc, index, 1, false, .{}, white);
+    const dark = try font.face(0).glyphPhase(alloc, index, 1, false, .{}, black);
+    try std.testing.expect(coverageSum(light.bitmap) > coverageSum(dark.bitmap));
+}
+
+fn coverageSum(bitmap: []const u8) u64 {
+    var sum: u64 = 0;
+    for (bitmap) |coverage| sum += coverage;
+    return sum;
+}
+
+fn inkCentroidX(g: *const Glyph) f64 {
+    var weighted: f64 = 0;
+    var total: f64 = 0;
+    for (g.bitmap, 0..) |coverage, i| {
+        const x: f64 = @floatFromInt(@as(i32, @intCast(i % g.width)) + g.bearing_x);
+        weighted += (x + 0.5) * @as(f64, @floatFromInt(coverage));
+        total += @floatFromInt(coverage);
+    }
+    return weighted / total;
+}
+
 test "load monospace font and rasterize a glyph" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
 
     try std.testing.expect(font.cell_width > 0);
@@ -1516,7 +1660,7 @@ test "load monospace font and rasterize a glyph" {
 
 test "rasterizers share discovery but own face state" {
     const alloc = std.testing.allocator;
-    var first: Font = try .init(alloc, "monospace", 16, .{});
+    var first: Font = try .init(alloc, "monospace", 16, .{}, null);
     var first_live = true;
     defer if (first_live) first.deinit(alloc);
     var second: Font = try .initWithDiscovery(alloc, first.discovery());
@@ -1539,7 +1683,7 @@ test "styled primary faces are selected when available" {
     try std.testing.expectEqual(FaceStyle.bold_italic, FaceStyle.init(true, true));
 
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
 
     const bold_idx = font.primary_faces[@backingInt(FaceStyle.bold)];
@@ -1549,7 +1693,7 @@ test "styled primary faces are selected when available" {
 
 test "embedded symbols face serves nerd font codepoints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1572,7 +1716,7 @@ test "embedded symbols face serves nerd font codepoints" {
 
 test "alpha symbols do not upscale for double-cell constraints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1592,7 +1736,7 @@ test "alpha symbols do not upscale for double-cell constraints" {
 
 test "alpha symbols fit within single-cell constraints" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
 
     const embedded = font.embedded_face orelse return error.SkipZigTest;
@@ -1611,7 +1755,7 @@ test "alpha symbols fit within single-cell constraints" {
 
 test "fallback face for a codepoint the primary lacks" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
 
     // ASCII stays on the primary face.
@@ -1632,7 +1776,7 @@ test "fallback face for a codepoint the primary lacks" {
 
 test "emoji presentation wins over a covering primary unless VS15 forces text" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "DejaVu Sans Mono", 16, .{});
+    var font: Font = try .init(alloc, "DejaVu Sans Mono", 16, .{}, null);
     defer font.deinit(alloc);
 
     const cp: u21 = 0x26A1; // high voltage defaults to emoji
@@ -1659,7 +1803,7 @@ test "emoji presentation wins over a covering primary unless VS15 forces text" {
 
 test "color emoji fallback rasterizes as scaled BGRA" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 16, .{});
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer font.deinit(alloc);
 
     const cp: u21 = 0x1F600; // grinning face
@@ -1672,7 +1816,7 @@ test "color emoji fallback rasterizes as scaled BGRA" {
     try std.testing.expect(glyph_index != 0);
     const g = try fallback.glyph(alloc, glyph_index, 2, false);
     try std.testing.expectEqual(GlyphFormat.bgra, g.format);
-    try std.testing.expectEqual(g, try fallback.glyphPhase(alloc, glyph_index, 2, false, .{ .x = 13, .y = 47 }));
+    try std.testing.expectEqual(g, try fallback.glyphPhase(alloc, glyph_index, 2, false, .{ .x = 13, .y = 47 }, 4));
     try std.testing.expect(g.width <= font.cell_width * 2);
     try std.testing.expect(g.height <= font.cell_height);
     try std.testing.expect(g.bearing_x >= 0);
@@ -1687,10 +1831,10 @@ test "color emoji fallback rasterizes as scaled BGRA" {
 
 test "cell height adjustment changes metrics and centers the baseline" {
     const alloc = std.testing.allocator;
-    var natural: Font = try .init(alloc, "monospace", 16, .{});
+    var natural: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer natural.deinit(alloc);
 
-    var expanded: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .percent = 100 } });
+    var expanded: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .percent = 100 } }, null);
     defer expanded.deinit(alloc);
     try std.testing.expectEqual(natural.cell_height * 2, expanded.cell_height);
     try std.testing.expectEqual(natural.cell_width, expanded.cell_width);
@@ -1699,19 +1843,19 @@ test "cell height adjustment changes metrics and centers the baseline" {
         expanded.baseline,
     );
 
-    var tighter: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .absolute = -2 } });
+    var tighter: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .absolute = -2 } }, null);
     defer tighter.deinit(alloc);
     try std.testing.expectEqual(natural.cell_height - 2, tighter.cell_height);
     try std.testing.expectEqual(natural.baseline - 1, tighter.baseline);
 
-    var odd_tighter: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .absolute = -1 } });
+    var odd_tighter: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .absolute = -1 } }, null);
     defer odd_tighter.deinit(alloc);
     try std.testing.expectEqual(natural.cell_height - 1, odd_tighter.cell_height);
     try std.testing.expectEqual(natural.baseline - 1, odd_tighter.baseline);
 
     // Extreme shrinking remains valid even when natural decoration thickness
     // exceeds the adjusted cell.
-    var minimum: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .percent = -100 } });
+    var minimum: Font = try .init(alloc, "monospace", 16, .{ .cell_height = .{ .percent = -100 } }, null);
     defer minimum.deinit(alloc);
     try std.testing.expectEqual(@as(u31, 1), minimum.cell_height);
     try std.testing.expect(minimum.baseline <= minimum.cell_height);
@@ -1720,14 +1864,14 @@ test "cell height adjustment changes metrics and centers the baseline" {
 
 test "thickness adjustments apply per line kind and keep positions" {
     const alloc = std.testing.allocator;
-    var natural: Font = try .init(alloc, "monospace", 16, .{});
+    var natural: Font = try .init(alloc, "monospace", 16, .{}, null);
     defer natural.deinit(alloc);
     var adjusted: Font = try .init(alloc, "monospace", 16, .{
         .box_thickness = .{ .absolute = 2 },
         .underline_thickness = .{ .percent = 200 },
         .strikethrough_thickness = .{ .absolute = -100 },
         .cursor_thickness = .{ .absolute = 1 },
-    });
+    }, null);
     defer adjusted.deinit(alloc);
 
     const base = natural.sprite_metrics;
@@ -1744,9 +1888,9 @@ test "thickness adjustments apply per line kind and keep positions" {
 
 test "fractional sizing preserves the integer terminal grid" {
     const alloc = std.testing.allocator;
-    var integer: Font = try .init(alloc, "monospace", 25, .{});
+    var integer: Font = try .init(alloc, "monospace", 25, .{}, null);
     defer integer.deinit(alloc);
-    var fractional: Font = try .init(alloc, "monospace", 25.25, .{});
+    var fractional: Font = try .init(alloc, "monospace", 25.25, .{}, null);
     defer fractional.deinit(alloc);
     try std.testing.expectEqual(integer.cell_width, fractional.cell_width);
     try std.testing.expectEqual(integer.cell_height, fractional.cell_height);
@@ -1785,14 +1929,14 @@ test "line thickness rounds fractional pixels up" {
 
 test "phase cache and bearings match direct negative FreeType translation" {
     const alloc = std.testing.allocator;
-    var font: Font = try .init(alloc, "monospace", 25.25, .{});
+    var font: Font = try .init(alloc, "monospace", 25.25, .{}, null);
     defer font.deinit(alloc);
     const glyph_face = font.face(0);
     const idx = c.FT_Get_Char_Index(glyph_face.ft_face, 'j');
     const zero_bitmap = (try glyph_face.glyph(alloc, idx, 1, false)).bitmap.ptr;
-    const phased = try glyph_face.glyphPhase(alloc, idx, 1, false, .{ .x = 51, .y = 43 });
+    const phased = try glyph_face.glyphPhase(alloc, idx, 1, false, .{ .x = 51, .y = 43 }, 0);
     try std.testing.expect(zero_bitmap != phased.bitmap.ptr);
-    try std.testing.expectEqual(phased, try glyph_face.glyphPhase(alloc, idx, 1, false, .{ .x = 51, .y = 43 }));
+    try std.testing.expectEqual(phased, try glyph_face.glyphPhase(alloc, idx, 1, false, .{ .x = 51, .y = 43 }, 0));
     try std.testing.expectEqual(@as(u32, 2), glyph_face.glyphs.count());
 
     // Independent full translation: x=-13/64, screen y=-21/64. Integer
@@ -1814,7 +1958,7 @@ test "phase cache and bearings match direct negative FreeType translation" {
 
     // Cell-fitted symbols deliberately reuse one raster regardless of phase.
     const fitted = (try glyph_face.glyph(alloc, idx, 1, true)).bitmap.ptr;
-    try std.testing.expectEqual(fitted, (try glyph_face.glyphPhase(alloc, idx, 1, true, .{ .x = 7, .y = 31 })).bitmap.ptr);
+    try std.testing.expectEqual(fitted, (try glyph_face.glyphPhase(alloc, idx, 1, true, .{ .x = 7, .y = 31 }, 0)).bitmap.ptr);
     var restored: c.FT_Vector = undefined;
     c.FT_Get_Transform(glyph_face.ft_face, null, &restored);
     try std.testing.expectEqual(delta.x, restored.x);

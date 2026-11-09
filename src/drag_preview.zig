@@ -44,6 +44,7 @@ pub const TextStyle = struct {
     font_family: [:0]const u8,
     font_size: Config.FontSize,
     metric_adjustments: Config.MetricAdjustments,
+    font_thicken: ?Config.ThickenStrength,
     foreground: vt.color.RGB,
     background: vt.color.RGB,
 };
@@ -64,7 +65,7 @@ pub fn text(
     const ratio: f64 = if (scale_x == 0 or scale_y == 0) 1 else @as(f64, @floatFromInt(scale_x)) / @as(f64, @floatFromInt(scale_y));
     const size_px = Config.fontSizePixels(style.font_size, @as(u32, scale) * 120) * ratio;
     if (size_px > max_font_px) return error.TooLarge;
-    var font: Font = try .init(alloc, style.font_family, @max(1, size_px), style.metric_adjustments);
+    var font: Font = try .init(alloc, style.font_family, @max(1, size_px), style.metric_adjustments, style.font_thicken);
     defer font.deinit(alloc);
 
     var codepoints: std.ArrayList(u21) = .empty;
@@ -113,7 +114,7 @@ pub fn text(
             const face = font.face(face_index);
             const index = c.FT_Get_Char_Index(face.ft_face, cp);
             if (index == 0) break :glyph null;
-            break :glyph try face.glyph(alloc, index, span, glyph_constraints.isSymbol(cp));
+            break :glyph try face.glyphPhase(alloc, index, span, glyph_constraints.isSymbol(cp), .{}, font.thickenLevel(style.foreground));
         };
         if (glyph) |g| raster.blitGlyph(pixels.argb, pixels.width, pixels.width, pixels.height, g, x + g.bearing_x, baseline - g.bearing_y, color, false, null);
         x += @as(i32, cluster.width) * font.cell_width;
@@ -146,6 +147,7 @@ test "text previews fit the buffer scale and honor background opacity" {
         .font_family = "monospace",
         .font_size = .{ .pixels = 13 },
         .metric_adjustments = .{},
+        .font_thicken = null,
         .foreground = .{ .r = 255, .g = 255, .b = 255 },
         .background = .{ .r = 0, .g = 0, .b = 200 },
     };

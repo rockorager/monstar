@@ -265,6 +265,36 @@ The default is
 .BR 12pt ,
 equivalent to 16 logical pixels at 96 DPI.
 .TP
+.BI font-thicken " = true|false"
+Thicken outline glyphs the way macOS font smoothing does, as Ghostty's
+setting of the same name does through Core Text.
+Strokes grow evenly left and right and only upward, by an amount that grows
+with the physical font size up to 0.6 pixels.
+Thickening replaces FreeType's stem darkening for CFF fonts.
+Color and bitmap glyphs and built-in sprites are unchanged.
+The default is
+.BR false .
+.TP
+.BI font-thicken-strength " = auto|0-255"
+Choose how much
+.B font-thicken
+grows strokes.
+.B auto
+follows each glyph's text color as macOS does: text with higher luminance
+grows more, up to about 2.6 times as much for white as for black.
+A number uses one gray level's macOS amount for every glyph, as Ghostty's
+setting of the same name does:
+.B 0
+matches dark text on macOS and
+.B 255
+matches white text.
+Has no effect unless
+.B font-thicken
+is
+.BR true .
+The default is
+.BR auto .
+.TP
 .BI adjust-cell-height " = pixels|percent%"
 Adjust the height derived from the font metrics.
 A signed integer adds or removes physical pixels; a percentage scales the

@@ -28,6 +28,7 @@ pub fn run(init: std.process.Init) !void {
         config.font_family,
         font_size_px,
         config.metric_adjustments,
+        config.fontThicken(),
     );
     defer font.deinit(alloc);
     var renderer: Renderer = try .init(alloc, &font, .{});

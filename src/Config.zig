@@ -111,6 +111,10 @@ font_family: [:0]const u8 = "monospace",
 /// pixels. Both apply the output's fractional scale during rasterization.
 font_size: FontSize = .{ .points = 12 },
 metric_adjustments: MetricAdjustments = .{},
+/// Thicken outline glyphs the way macOS font smoothing does, as Ghostty's
+/// `font-thicken` does through Core Text. Strokes grow with the font size.
+font_thicken: bool = false,
+font_thicken_strength: ThickenStrength = .auto,
 /// Minimum window padding in logical pixels. One configured value applies to
 /// both sides; two values are left/right for X and top/bottom for Y.
 window_padding_x: WindowPadding = .{},
@@ -185,6 +189,12 @@ copy_highlight: ?vt.color.RGB = null,
 copy_highlight_foreground: ?vt.color.RGB = null,
 palette: [256]?vt.color.RGB = @splat(null),
 
+/// How much `font_thicken` grows strokes. `auto` follows each glyph's text
+/// color as macOS does: lighter text grows more. A gray level from 0 to 255
+/// uses that gray's macOS amount for every glyph, like Ghostty's
+/// `font-thicken-strength`: 0 is the lightest (dark text on macOS) and 255
+/// the heaviest (white text on macOS).
+pub const ThickenStrength = union(enum) { auto, gray: u8 };
 pub const LinuxCgroup = enum { never, always };
 /// `auto` presents frames as udmabuf-backed dma-bufs and quietly falls back to
 /// wl_shm; `dmabuf` does the same but warns when it falls back; `shm` always
@@ -357,6 +367,11 @@ pub fn resolveThemes(
     }
 }
 
+/// The thickening strength fonts should use, or null when it is off.
+pub fn fontThicken(self: Config) ?ThickenStrength {
+    return if (self.font_thicken) self.font_thicken_strength else null;
+}
+
 pub const SetError = error{ InvalidValue, UnknownKey, OutOfMemory };
 
 pub fn applyOverride(self: *Config, arena: std.mem.Allocator, text: []const u8) SetError!void {
@@ -374,6 +389,18 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
         self.font_family = try arena.dupeSentinel(u8, value, 0);
     } else if (std.mem.eql(u8, key, "font-size")) {
         self.font_size = try parseFontSize(value);
+    } else if (std.mem.eql(u8, key, "font-thicken")) {
+        self.font_thicken = if (std.mem.eql(u8, value, "true"))
+            true
+        else if (std.mem.eql(u8, value, "false"))
+            false
+        else
+            return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "font-thicken-strength")) {
+        self.font_thicken_strength = if (std.mem.eql(u8, value, "auto"))
+            .auto
+        else
+            .{ .gray = std.fmt.parseInt(u8, value, 10) catch return error.InvalidValue };
     } else if (std.mem.eql(u8, key, "adjust-cell-height")) {
         self.metric_adjustments.cell_height = try parseMetricModifier(value);
     } else if (std.mem.eql(u8, key, "adjust-box-thickness")) {
@@ -1026,6 +1053,19 @@ test "mouse scroll multiplier forms and clamps" {
     try config.set(std.testing.allocator, "mouse-scroll-multiplier", "precision:0,discrete:20000");
     try std.testing.expectEqual(@as(f64, 0.01), config.mouse_scroll_multiplier.precision);
     try std.testing.expectEqual(@as(f64, 10_000), config.mouse_scroll_multiplier.discrete);
+}
+
+test "font thickening needs the flag and accepts auto or strengths 0 to 255" {
+    var config: Config = .{};
+    try std.testing.expectEqual(@as(?ThickenStrength, null), config.fontThicken());
+    try config.set(std.testing.allocator, "font-thicken", "true");
+    try std.testing.expectEqual(@as(?ThickenStrength, .auto), config.fontThicken());
+    try config.set(std.testing.allocator, "font-thicken-strength", "0");
+    try std.testing.expectEqual(@as(?ThickenStrength, .{ .gray = 0 }), config.fontThicken());
+    try config.set(std.testing.allocator, "font-thicken-strength", "auto");
+    try std.testing.expectEqual(@as(?ThickenStrength, .auto), config.fontThicken());
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "font-thicken-strength", "256"));
+    try std.testing.expectError(error.InvalidValue, config.set(std.testing.allocator, "font-thicken", "yes"));
 }
 
 test "inertial scrolling accepts booleans" {

@@ -99,7 +99,7 @@ pub fn run(init: std.process.Init) !void {
     var config = Config.load(arena, init.minimal.environ);
     try config.resolveThemes(init.io, arena, init.minimal.environ);
     const font_size_px = Config.fontSizePixels(config.font_size, 120);
-    var font: Font = try .init(alloc, config.font_family, font_size_px, config.metric_adjustments);
+    var font: Font = try .init(alloc, config.font_family, font_size_px, config.metric_adjustments, config.fontThicken());
     defer font.deinit(alloc);
 
     var colors = try config.terminalColors(alloc, .dark);
