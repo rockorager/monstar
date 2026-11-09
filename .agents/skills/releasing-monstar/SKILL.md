@@ -106,12 +106,13 @@ Update both version declarations to `X.Y.Z`:
 Keep them identical. Monstar derives development identifiers from Git:
 
 - An exact clean `vX.Y.Z` tag reports `X.Y.Z`.
-- Other Git commits report `X.Y.Z-dev.<distance>+g<sha>`.
+- Other Git commits report `X.Y.Z-dev.<distance>+g<sha>`, using the declared
+  version when it is newer than the nearest tag and that tag's next patch
+  version otherwise.
 - Dirty builds append `.dirty`.
 - Source archives without Git metadata report `X.Y.Z`.
 
-If development has continued after the previous release, `release_version`
-must be newer than that release tag.
+Building an exact `vX.Y.Z` tag fails unless both declarations name `X.Y.Z`.
 
 ## 4. Verify the release commit
 
@@ -174,11 +175,10 @@ recovery decision is made. Do not rewrite release history automatically.
 
 ## 7. Resume development
 
-After the release succeeds, ask for the next intended version. Before landing
-another development commit, update both `release_version` and `.version` to a
-version newer than `X.Y.Z`; otherwise Monstar intentionally rejects a
-development build whose intended version is not newer than its nearest tag.
+After the release succeeds, development builds report the next patch version,
+such as `X.Y.(Z+1)-dev.<distance>+g<sha>`, until the declarations change. If
+the user names the next intended version, update both `release_version` and
+`.version` to it in a separate commit.
 
-Make the post-release version bump a separate commit. Do not modify the
-immutable notes for `X.Y.Z` except to correct a material factual error with an
-explicitly reviewed follow-up.
+Do not modify the immutable notes for `X.Y.Z` except to correct a material
+factual error with an explicitly reviewed follow-up.

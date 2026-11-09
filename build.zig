@@ -331,10 +331,13 @@ fn versionString(b: *std.Build) []const u8 {
         if (release_version.order(tagged_version) != .eq)
             std.process.fatal("release version {s} does not match tag {s}", .{ release, tag });
         if (!dirty) return release;
-    } else if (release_version.order(tagged_version) != .gt) {
-        std.process.fatal("release version {s} must be newer than tag {s}", .{ release, tag });
     }
-    return developmentVersion(b, release, distance, hash[1..], dirty);
+    // Without a bump, X.Y.Z-dev would sort before the tag it builds on.
+    const base = if (release_version.order(tagged_version) == .gt)
+        release
+    else
+        b.fmt("{d}.{d}.{d}", .{ tagged_version.major, tagged_version.minor, tagged_version.patch + 1 });
+    return developmentVersion(b, base, distance, hash[1..], dirty);
 }
 
 fn developmentVersion(
