@@ -61,23 +61,24 @@ pub fn collectKittyPlacements(
         image.data = image.renderData();
         image.animation = null;
         if (image.data.bytes() == null) continue;
+        const viewport = clampKittySource(.{
+            .viewport_col = placement.x,
+            .viewport_row = placement.y,
+            .offset_x = placement.offset_x,
+            .offset_y = placement.offset_y,
+            .pixel_width = placement.width,
+            .pixel_height = placement.height,
+            .source_x = placement.source_x,
+            .source_y = placement.source_y,
+            .source_width = placement.source_width,
+            .source_height = placement.source_height,
+        }, image.width, image.height) orelse continue;
         try placements.append(alloc, .{
             .image_id = placement.image_id,
             .placement_id = placement.protocol.kitty.placement_id,
             .z = placement.z,
             .image = image,
-            .viewport = .{
-                .viewport_col = placement.x,
-                .viewport_row = placement.y,
-                .offset_x = placement.offset_x,
-                .offset_y = placement.offset_y,
-                .pixel_width = placement.width,
-                .pixel_height = placement.height,
-                .source_x = placement.source_x,
-                .source_y = placement.source_y,
-                .source_width = placement.source_width,
-                .source_height = placement.source_height,
-            },
+            .viewport = viewport,
         });
     }
 
@@ -98,6 +99,36 @@ pub fn collectKittyPlacements(
         font.cell_height,
     );
     return placements.toOwnedSlice(alloc);
+}
+
+/// Intersect the viewport's source rect with the image, shrinking the
+/// destination by the same proportion so unscaled placements stay
+/// unscaled. Returns null when no source pixels remain.
+///
+/// Ghostty rounds a placeholder run's source origin and size separately,
+/// so a run in an image centered by an odd pixel count can extend one
+/// pixel past the image; the renderers index image bytes assuming the
+/// source rect lies inside it.
+fn clampKittySource(
+    viewport: KittyPlacementViewport,
+    image_width: u32,
+    image_height: u32,
+) ?KittyPlacementViewport {
+    var result = viewport;
+    result.source_x = @min(viewport.source_x, image_width);
+    result.source_y = @min(viewport.source_y, image_height);
+    result.source_width = @min(viewport.source_width, image_width - result.source_x);
+    result.source_height = @min(viewport.source_height, image_height - result.source_y);
+    if (result.source_width == 0 or result.source_height == 0) return null;
+    result.pixel_width = shrinkDest(viewport.pixel_width, viewport.source_width, result.source_width);
+    result.pixel_height = shrinkDest(viewport.pixel_height, viewport.source_height, result.source_height);
+    return result;
+}
+
+fn shrinkDest(dest: u32, source: u32, clamped: u32) u32 {
+    if (clamped == source) return dest;
+    std.debug.assert(clamped < source);
+    return @intCast(@as(u64, dest) * clamped / source);
 }
 
 /// True when two snapshots would render identical placements: same
@@ -388,6 +419,59 @@ test "collect relative kitty placement rooted at virtual placeholders" {
     try std.testing.expectEqual(@as(i32, 5), items[2].z);
     try std.testing.expectEqual(@as(i32, 2), items[2].viewport.viewport_col);
     try std.testing.expectEqual(@as(i32, 3), items[2].viewport.viewport_row);
+}
+
+test "collect clamps placeholder source rects to the image" {
+    const alloc = std.testing.allocator;
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
+    defer font.deinit(alloc);
+    var terminal: vt.Terminal = try .init(std.testing.io, alloc, .{ .rows = 5, .cols = 5 });
+    defer terminal.deinit(alloc);
+    // 10px cells: a 10x19 image in a 1x2 grid is centered by half a pixel
+    // at the top and bottom.
+    terminal.width_px = terminal.cols * 10;
+    terminal.height_px = terminal.rows * 10;
+    terminal.modes.set(.grapheme_cluster, true);
+
+    const storage = &terminal.screens.active.kitty_images;
+    const pixels = try alloc.alloc(u8, 10 * 19 * 4);
+    @memset(pixels, 0xff);
+    try storage.addImage(std.testing.io, alloc, terminal.screens.active, .{
+        .id = 1,
+        .width = 10,
+        .height = 19,
+        .format = .rgba,
+        .data = .{ .complete = pixels },
+    });
+    try storage.addPlacement(std.testing.io, alloc, terminal.screens.active, 1, 1, .{
+        .location = .virtual,
+        .columns = 1,
+        .rows = 2,
+    });
+
+    try terminal.setAttribute(.{ .@"256_fg" = 1 });
+    terminal.screens.active.cursorAbsolute(1, 1);
+    try terminal.printString("\u{10EEEE}\u{0305}\u{0305}");
+    terminal.screens.active.cursorAbsolute(1, 2);
+    try terminal.printString("\u{10EEEE}\u{030D}\u{0305}");
+
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &terminal);
+    const items = try collectKittyPlacements(&font, alloc, &terminal, &state);
+    defer alloc.free(items);
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+
+    // Ghostty rounds the bottom run to source rows 10..20; row 19 does
+    // not exist. It must stay an unscaled 9-row draw.
+    const bottom = for (items) |item| {
+        if (item.viewport.viewport_row == 2) break item.viewport;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 10), bottom.source_y);
+    try std.testing.expectEqual(@as(u32, 9), bottom.source_height);
+    try std.testing.expectEqual(@as(u32, 9), bottom.pixel_height);
+    try std.testing.expectEqual(@as(u32, 10), bottom.source_width);
+    try std.testing.expectEqual(@as(u32, 10), bottom.pixel_width);
 }
 
 test "collect drops kitty placements with overflowing geometry" {
