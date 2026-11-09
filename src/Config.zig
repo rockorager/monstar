@@ -113,7 +113,7 @@ font_size: FontSize = .{ .points = 12 },
 metric_adjustments: MetricAdjustments = .{},
 /// Thicken outline glyphs the way macOS font smoothing does, as Ghostty's
 /// `font-thicken` does through Core Text. Strokes grow with the font size.
-font_thicken: bool = false,
+font_thicken: bool = true,
 font_thicken_strength: ThickenStrength = .auto,
 /// Minimum window padding in logical pixels. One configured value applies to
 /// both sides; two values are left/right for X and top/bottom for Y.
@@ -1055,12 +1055,13 @@ test "mouse scroll multiplier forms and clamps" {
     try std.testing.expectEqual(@as(f64, 10_000), config.mouse_scroll_multiplier.discrete);
 }
 
-test "font thickening needs the flag and accepts auto or strengths 0 to 255" {
+test "font thickening defaults to auto and accepts auto or strengths 0 to 255" {
     var config: Config = .{};
+    try std.testing.expectEqual(@as(?ThickenStrength, .auto), config.fontThicken());
+    try config.set(std.testing.allocator, "font-thicken", "false");
+    try config.set(std.testing.allocator, "font-thicken-strength", "0");
     try std.testing.expectEqual(@as(?ThickenStrength, null), config.fontThicken());
     try config.set(std.testing.allocator, "font-thicken", "true");
-    try std.testing.expectEqual(@as(?ThickenStrength, .auto), config.fontThicken());
-    try config.set(std.testing.allocator, "font-thicken-strength", "0");
     try std.testing.expectEqual(@as(?ThickenStrength, .{ .gray = 0 }), config.fontThicken());
     try config.set(std.testing.allocator, "font-thicken-strength", "auto");
     try std.testing.expectEqual(@as(?ThickenStrength, .auto), config.fontThicken());
