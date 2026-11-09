@@ -107,7 +107,10 @@ fallback families, define a virtual family such as `Monstar Custom` in
 By default, `background-opacity` affects only the default terminal background
 and padding. Set `background-opacity-cells = true` to apply it to explicit cell
 background colors too. Monstar requests compositor-provided blur whenever the
-background is translucent; set `background-blur = false` to keep it clear.
+background is translucent; set `background-blur = false` to keep it clear, or
+`background-blur = always` to request blur even when the background is opaque,
+for compositors that make whole windows translucent with their own opacity
+rules.
 
 Leave `theme` unset to follow the desktop light/dark preference with Monstar's
 built-in Fluent 2 color schemes. Load bundled iTerm2 color schemes by name. Put
