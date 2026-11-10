@@ -470,7 +470,6 @@ const AppStreamHandler = struct {
                 self.app.syncCursorShape();
             },
             .set_mode => {
-                if (value.mode == .report_color_scheme) self.app.sendColorSchemeReport();
                 if (value.mode == .in_band_size_reports) {
                     self.app.in_band_reports = true;
                     self.app.sendSizeReport();
@@ -478,9 +477,6 @@ const AppStreamHandler = struct {
                 self.app.syncCursorShape();
             },
             .restore_mode => {
-                if (value.mode == .report_color_scheme and self.app.term.modes.get(.report_color_scheme)) {
-                    self.app.sendColorSchemeReport();
-                }
                 if (value.mode == .in_band_size_reports) {
                     const enabled = self.app.term.modes.get(.in_band_size_reports);
                     self.app.in_band_reports = enabled;
@@ -3400,6 +3396,46 @@ test "portal appearance values map to application preferences" {
     try std.testing.expect(!portalReducedMotion(0));
     try std.testing.expect(portalReducedMotion(1));
     try std.testing.expect(!portalReducedMotion(99));
+}
+
+test "mode 2031 reports only on query, not when enabled or restored" {
+    const alloc = std.testing.allocator;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.alloc = alloc;
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    app.stream = .init(.{
+        .allocator = alloc,
+        .handler = .{ .app = app, .terminal_handler = .init(&app.term) },
+    });
+    defer app.stream.deinit();
+    app.stream.handler.terminal_handler.effects = .readonly;
+    app.stream.handler.terminal_handler.effects.write_pty = effectWritePty;
+    app.stream.handler.terminal_handler.effects.color_scheme = effectColorScheme;
+    app.write_queue = .empty;
+    defer app.write_queue.deinit(alloc);
+    // A backlog keeps replies in the queue without a child.
+    try app.write_queue.append(alloc, 0);
+    app.write_queue_offset = 0;
+    app.pty.master = -1;
+    app.color_scheme = .light;
+    // Mode changes resync the pointer shape.
+    app.window = try alloc.create(Window);
+    defer alloc.destroy(app.window);
+    app.window.cursor_shape = .text;
+    app.keyboard.state = null;
+    app.hovered_link = null;
+    app.mouse_shape_explicit = false;
+    app.scrollbar_hovered = false;
+    app.scrollbar_drag = null;
+    app.scrollbar_alpha = 0;
+
+    // Shells such as fish enable 2031 at every prompt; an unsolicited
+    // report there can land in their command line. Only the query replies.
+    app.stream.nextSlice("\x1b[?2031h\x1b[?2031s\x1b[?2031l\x1b[?2031r\x1b[?996n");
+    try std.testing.expect(app.term.modes.get(.report_color_scheme));
+    try std.testing.expectEqualStrings("\x1b[?997;2n", app.write_queue.items[1..]);
 }
 
 /// DEC mode 2048 (in-band size reports): the terminal must send a size
