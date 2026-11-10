@@ -24,9 +24,6 @@ const log = std.log.scoped(.udmabuf);
 
 display: *wl.Display,
 manager: *zwp.LinuxDmabufV1,
-/// Warn instead of noting falling back to wl_shm, because the user asked for
-/// dma-buf presentation.
-required: bool,
 device: Device = .unopened,
 formats: std.EnumArray(Format, FormatState) = .initFill(.unsupported),
 
@@ -46,10 +43,10 @@ const FormatState = enum {
 
 /// Takes ownership of `manager`, which must be bound at version 3 so the
 /// compositor advertises its format and modifier pairs.
-pub fn create(alloc: std.mem.Allocator, display: *wl.Display, manager: *zwp.LinuxDmabufV1, required: bool) !*Udmabuf {
+pub fn create(alloc: std.mem.Allocator, display: *wl.Display, manager: *zwp.LinuxDmabufV1) !*Udmabuf {
     std.debug.assert(manager.getVersion() >= 3);
     const self = try alloc.create(Udmabuf);
-    self.* = .{ .display = display, .manager = manager, .required = required };
+    self.* = .{ .display = display, .manager = manager };
     manager.setListener(*Udmabuf, managerListener, self);
     return self;
 }
@@ -76,7 +73,7 @@ pub fn wrap(self: *Udmabuf, memfd: posix.fd_t, size: usize) ?posix.fd_t {
         .unopened => device: {
             const rc = linux.open("/dev/udmabuf", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
             if (linux.errno(rc) != .SUCCESS) {
-                self.fallback("/dev/udmabuf unavailable ({t})", .{linux.errno(rc)});
+                fallback("/dev/udmabuf unavailable ({t})", .{linux.errno(rc)});
                 self.device = .unavailable;
                 return null;
             }
@@ -114,7 +111,7 @@ pub fn createBuffer(
     switch (self.formats.get(format)) {
         .rejected => return null,
         .unsupported => {
-            self.fallback("compositor does not advertise LINEAR {t}", .{format});
+            fallback("compositor does not advertise LINEAR {t}", .{format});
             self.formats.set(format, .rejected);
             return null;
         },
@@ -129,16 +126,15 @@ pub fn createBuffer(
                 log.warn("dma-buf import check failed: {}", .{err});
                 break :blk null;
             };
-            if (buffer == null) self.fallback("compositor rejected a LINEAR {t} udmabuf", .{format});
+            if (buffer == null) fallback("compositor rejected a LINEAR {t} udmabuf", .{format});
             self.formats.set(format, if (buffer != null) .verified else .rejected);
             return buffer;
         },
     }
 }
 
-fn fallback(self: *const Udmabuf, comptime format: []const u8, args: anytype) void {
-    const message = format ++ "; presenting with wl_shm";
-    if (self.required) log.warn(message, args) else log.info(message, args);
+fn fallback(comptime format: []const u8, args: anytype) void {
+    log.warn(format ++ "; presenting with wl_shm", args);
 }
 
 const ImportResult = union(enum) {

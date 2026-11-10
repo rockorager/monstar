@@ -199,9 +199,9 @@ pub const LinuxCgroup = enum { never, always };
 /// background, for compositors that make whole windows translucent; they
 /// skip blur behind windows they draw opaque.
 pub const BackgroundBlur = enum { never, translucent, always };
-/// `auto` presents frames as udmabuf-backed dma-bufs and quietly falls back to
-/// wl_shm; `dmabuf` does the same but warns when it falls back; `shm` always
-/// uses wl_shm.
+/// `auto` and `shm` use wl_shm. `dmabuf` presents frames as udmabuf-backed
+/// dma-bufs and warns when it falls back to wl_shm; it is opt-in because some
+/// drivers, such as NVIDIA's, show stale pixels from these buffers.
 pub const Presentation = enum { auto, shm, dmabuf };
 pub const RendererKind = enum { cpu, vulkan };
 pub const VulkanStartup = enum { @"cpu-first", wait };

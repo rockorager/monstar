@@ -27,7 +27,7 @@ registry: *wl.Registry,
 registry_state: *Globals,
 compositor: *wl.Compositor,
 shm: *wl.Shm,
-/// Null when the compositor lacks linux-dmabuf v3 or presentation is `shm`.
+/// Null unless presentation is `dmabuf` and the compositor has linux-dmabuf v3.
 udmabuf: ?*Udmabuf,
 wm_base: *xdg.WmBase,
 activation: ?*xdg.ActivationV1,
@@ -293,11 +293,11 @@ pub fn create(
             if (presentation == .dmabuf) log.warn("compositor lacks linux-dmabuf v3; presenting with wl_shm", .{});
             break :udmabuf null;
         };
-        if (presentation == .shm) {
+        if (presentation != .dmabuf) {
             manager.destroy();
             break :udmabuf null;
         }
-        break :udmabuf Udmabuf.create(alloc, display, manager, presentation == .dmabuf) catch |err| {
+        break :udmabuf Udmabuf.create(alloc, display, manager) catch |err| {
             manager.destroy();
             return err;
         };

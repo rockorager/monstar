@@ -132,14 +132,18 @@ creation is unavailable.
 Choose how rendered frames reach the compositor.
 The default,
 .BR auto ,
+and
+.B shm
+use wl_shm.
+.B dmabuf
 shares each frame's memory with the compositor as a dma-buf created through
 .IR /dev/udmabuf ,
 which spares the compositor a copy on every frame, and falls back to wl_shm
-when the device is unavailable or the compositor cannot import the buffer.
-.B dmabuf
-behaves the same but logs a warning when it falls back.
-.B shm
-always uses wl_shm.
+with a warning when the device is unavailable or the compositor cannot import
+the buffer.
+Some drivers, including NVIDIA's proprietary driver, can show stale or
+corrupted pixels with
+.BR dmabuf .
 .TP
 .BI renderer " = cpu|vulkan"
 Choose the rasterizer.
