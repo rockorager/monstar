@@ -10,6 +10,9 @@
         (system: (lib.systems.elaborate system).isLinux)
         lib.systems.flakeExposed;
       forAllSystems = lib.genAttrs linuxSystems;
+      version = builtins.head
+        (builtins.match ''.*[.]version = "([^"]+)".*''
+          (builtins.readFile ./build.zig.zon));
       buildInputs = pkgs: [
         pkgs.wayland
         pkgs.wayland-scanner
@@ -29,7 +32,7 @@
         {
           default = pkgs.stdenv.mkDerivation (finalAttrs: {
             pname = "monstar";
-            version = "1.1.0";
+            inherit version;
             src = self;
 
             nativeBuildInputs = [ pkgs.zig_0_17 pkgs.pkg-config pkgs.ncurses ];
