@@ -13,16 +13,6 @@
       version = builtins.head
         (builtins.match ''.*[.]version = "([^"]+)".*''
           (builtins.readFile ./build.zig.zon));
-      buildInputs = pkgs: [
-        pkgs.wayland
-        pkgs.wayland-scanner
-        pkgs.wayland-protocols
-        pkgs.fontconfig
-        pkgs.freetype
-        pkgs.harfbuzz
-        pkgs.libxkbcommon
-        pkgs.vulkan-headers
-      ];
     in
     {
       packages = forAllSystems (system:
@@ -36,7 +26,16 @@
             src = self;
 
             nativeBuildInputs = [ pkgs.zig_0_17 pkgs.pkg-config pkgs.ncurses ];
-            buildInputs = buildInputs pkgs;
+            buildInputs = [
+              pkgs.wayland
+              pkgs.wayland-scanner
+              pkgs.wayland-protocols
+              pkgs.fontconfig
+              pkgs.freetype
+              pkgs.harfbuzz
+              pkgs.libxkbcommon
+              pkgs.vulkan-headers
+            ];
 
             zigDeps = pkgs.zig_0_17.fetchDeps {
               inherit (finalAttrs) src pname version;
@@ -83,16 +82,5 @@
           program = lib.getExe' self.packages.${system}.default "monstar";
         };
       });
-
-      devShells = forAllSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          default = pkgs.mkShell {
-            nativeBuildInputs = [ pkgs.zig_0_17 pkgs.pkg-config pkgs.ncurses ];
-            buildInputs = buildInputs pkgs;
-          };
-        });
     };
 }
