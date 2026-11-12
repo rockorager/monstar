@@ -6,11 +6,13 @@ If `hostname` is `e2b.local` or `/proc/1/mountinfo` contains `/e2b/`, you are
 running in an Amp orb. Treat it as a disposable Linux sandbox, not the user's
 local machine.
 
-For new orbs, `.agents/setup` provisions Zig and the headless Wayland debugging
-stack. After setup, use `monstar-sway-headless` to start a Sway/wlroots
-headless compositor. Useful client-side tools include `grim` for screenshots,
-`wf-recorder` for recordings, `wtype` for virtual keyboard input, and
-`wl-vptr-click` for virtual pointer clicks.
+For new orbs, `.agents/setup` installs the system libraries, the toolchain
+`mise.toml` pins (linking mise's shims into `~/.local/bin`, since the agent's
+shells do not activate mise), the Wayland schemas from `just setup`, and the
+headless Wayland debugging stack. After setup, use `monstar-sway-headless` to
+start a Sway/wlroots headless compositor. Useful client-side tools include
+`grim` for screenshots, `wf-recorder` for recordings, `wtype` for virtual
+keyboard input, and `wl-vptr-click` for virtual pointer clicks.
 
 When recording UI demos in an orb, run the compositor in the shared `dev` tmux
 session and point clients at its runtime, usually:
@@ -25,6 +27,27 @@ inline on GitHub, also make a small GIF with `ffmpeg` and embed that with
 Markdown image syntax. GitHub's public CLI/API does not expose the web UI's
 `user-attachments` upload endpoint; a practical CLI-only workaround is to upload
 demo media as release assets and link/embed those URLs in the PR body.
+
+## Toolchain and Recipes
+
+mise and just set up development. `mise install` installs what `mise.toml`
+pins (zig, bs, just, shellcheck, shfmt; `mise.lock` holds their checksums), and
+`just setup` fetches the pinned Wayland schemas. To move a pin, change it in
+`mise.toml` and run `mise lock --platform linux-x64,linux-arm64`.
+
+The justfile is the interface; `just --list` shows every recipe. Recipes build
+with bs, a fast Debug-mode Zig compiler, when it is installed, and upstream Zig
+otherwise. Release builds (`just install`, `just dist`) always use upstream Zig.
+
+```bash
+just build          # zig-out/bin/monstar
+just run            # on the Wayland display
+just test           # unit tests and the formatting check
+just lint           # zig fmt, shellcheck, shfmt, just --fmt
+just fmt            # format what lint checks
+just ci             # build, test, and lint
+just zig=zig ci     # any recipe with upstream Zig instead of bs, as CI runs
+```
 
 ## Zig Development
 

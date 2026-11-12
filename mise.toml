@@ -1,0 +1,11 @@
+# The development toolchain: `mise install` installs these, and
+# `just setup` fetches the Wayland schemas older distributions lack.
+# The system libraries come from the system (README.md).
+
+[tools]
+# bs compiles this exact release's std, and hands C sources to its zig cc.
+zig = "0.17.1"
+"github:baskingspot/bs" = "0.1.1"
+just = "1.59.0"
+shellcheck = "0.11.0"
+shfmt = "3.14.1"

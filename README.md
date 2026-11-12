@@ -413,11 +413,23 @@ Building requires:
 - Dev libs for wayland, fontconfig, freeType, harfbuzz, and xkbcommon
 - Monstar negotiates protocol versions at runtime to support older compositors
 
+[mise](https://mise.jdx.dev) installs the development toolchain that
+`mise.toml` pins: Zig 0.17.1, [bs](https://github.com/baskingspot/bs) (a fast
+Debug-mode Zig compiler), just, shellcheck, and shfmt. `just setup` fetches the
+pinned Wayland schemas for distributions that ship older ones. The justfile
+builds with bs when it is installed, and upstream Zig otherwise:
+
 ```sh
-zig build
-zig build fmt
-zig build test
+mise install
+just setup
+just build
+just test
+just lint
+just ci          # build, test, and lint
+just zig=zig ci  # the same with upstream Zig, as CI runs it
 ```
+
+`just --list` shows every recipe.
 
 Development builds can include the headless rendering benchmarks with
 `-Dbenchmarks=true`, which enables `monstar --bench`.

@@ -16,7 +16,7 @@ AUR_PACKAGE="${1:-}"
 PKGBUILD="${2:-}"
 
 case "$AUR_PACKAGE" in
-  monstar|monstar-bin|monstar-git) ;;
+  monstar | monstar-bin | monstar-git) ;;
   *)
     echo "usage: $0 <monstar|monstar-bin|monstar-git> <PKGBUILD>" >&2
     exit 1
@@ -39,9 +39,9 @@ echo "==> Copying PKGBUILD..."
 cp -f "$PKGBUILD" "$AUR_DIR/PKGBUILD"
 
 echo "==> Generating .SRCINFO..."
-if command -v makepkg >/dev/null 2>&1; then
+if command -v makepkg > /dev/null 2>&1; then
   (cd "$AUR_DIR" && makepkg --printsrcinfo > .SRCINFO)
-elif command -v docker >/dev/null 2>&1; then
+elif command -v docker > /dev/null 2>&1; then
   echo "==> makepkg not found on host, using docker (archlinux:latest)..."
   docker run --rm \
     --user "$(id -u):$(id -g)" \

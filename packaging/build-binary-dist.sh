@@ -13,7 +13,7 @@ source "$SCRIPT_DIR/release-version.sh"
 ARCH="$(uname -m)"
 OS="linux"
 case "$ARCH" in
-  x86_64|aarch64) ;;
+  x86_64 | aarch64) ;;
   *)
     echo "error: unsupported release architecture '$ARCH'" >&2
     exit 1
@@ -40,7 +40,7 @@ if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
 fi
 
 TERMINFO="$STAGING_DIR/${ARCHIVE_ROOT}/share/terminfo" \
-  infocmp -x monstar >/dev/null
+  infocmp -x monstar > /dev/null
 
 echo "==> Creating release tarball dist/${TARBALL_NAME}..."
 tar -czf "dist/${TARBALL_NAME}" -C "$STAGING_DIR" "${ARCHIVE_ROOT}"
