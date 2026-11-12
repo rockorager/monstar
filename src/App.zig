@@ -166,6 +166,8 @@ selection_fg_override: ?vt.color.RGB,
 copy_highlight: vt.color.RGB,
 copy_highlight_fg: vt.color.RGB,
 copy_highlight_active: bool,
+/// Time since the last copy while its corner brackets animate.
+copy_brackets_elapsed_ms: ?u16,
 /// Configured cursor fill when OSC 12 has not set a VT cursor color.
 cursor_color: Config.TerminalColor,
 /// Configured text color beneath a focused block cursor.
@@ -232,7 +234,7 @@ last_scroll_time_ms: ?u32,
 sync_output_fd: posix.fd_t,
 /// Timer for ghostty-vt selection autoscroll while dragging past an edge.
 selection_autoscroll_fd: posix.fd_t,
-/// One-shot timer restoring the normal selection color after a copy.
+/// Ticks the post-copy brackets, then restores the normal selection color.
 copy_highlight_fd: posix.fd_t,
 /// One-shot timer that clears stale OSC 9;4 taskbar progress.
 taskbar_progress_fd: posix.fd_t,
@@ -321,6 +323,16 @@ const scrollbar_hold_ms = 700;
 // Fluent durationFast with curveAccelerateMin for a small exiting overlay.
 const scrollbar_fade_duration_ms = 150;
 const scrollbar_fade_interval_ms = 15;
+// Post-copy corner brackets snap in from farther out with a slight
+// overshoot, hold, then retract into their corners. Lengths are logical.
+const copy_brackets_interval_ms = 8;
+const copy_brackets_enter_ms = 250;
+const copy_brackets_exit_ms = 500;
+const copy_brackets_duration_ms = 700;
+const copy_brackets_gap = 4.0;
+const copy_brackets_travel = 16.0;
+const copy_brackets_arm = 10.0;
+const copy_brackets_thickness = 2;
 const compression_idle_ms = 250;
 const compression_step_ms = 1;
 /// Quiet period after the last interactive-resize configure before the
@@ -748,6 +760,7 @@ pub fn init(
         .copy_highlight = config.effectiveCopyHighlight(.dark),
         .copy_highlight_fg = config.effectiveCopyHighlightForeground(.dark),
         .copy_highlight_active = false,
+        .copy_brackets_elapsed_ms = null,
         .cursor_color = config.effectiveCursorColor(.dark),
         .cursor_text = config.effectiveCursorText(.dark),
         .window = window,
@@ -1707,6 +1720,7 @@ fn setReducedMotion(self: *App, reduced_motion: bool) void {
         self.hideScrollbar();
         self.syncHoveredLink(true);
     }
+    if (reduced_motion and self.copy_brackets_elapsed_ms != null) self.endCopyHighlight();
 }
 
 fn handleNotificationActivationToken(self: *App, message: *const DbusConnection.Message) void {
@@ -2025,7 +2039,7 @@ pub fn run(self: *App) !void {
         }
 
         if (copy_highlight_fd.revents & posix.POLL.IN != 0) {
-            self.fireCopyHighlightTimeout();
+            self.fireCopyHighlight();
         }
 
         if (fling_fd.revents & posix.POLL.IN != 0) {
@@ -4252,24 +4266,109 @@ fn copyToClipboard(self: *App) void {
     if (self.clipboard.claim(.clipboard, text, self.last_serial)) self.flashCopyHighlight();
 }
 
+/// Recolor the selection for copy-highlight-duration and, unless reduced
+/// motion is requested, animate corner brackets around it.
 fn flashCopyHighlight(self: *App) void {
-    if (self.config.copy_highlight_duration == 0) return;
-    if (!setTimer(self.copy_highlight_fd, .{
-        .it_value = timespecFromNs(@as(u64, self.config.copy_highlight_duration) * std.time.ns_per_ms),
+    const duration = self.config.copy_highlight_duration;
+    if (duration == 0) return;
+    const brackets = !self.reduced_motion;
+    const spec: std.os.linux.itimerspec = if (brackets) spec: {
+        const interval = timespecFromNs(copy_brackets_interval_ms * std.time.ns_per_ms);
+        break :spec .{ .it_value = interval, .it_interval = interval };
+    } else .{
+        .it_value = timespecFromNs(@as(u64, duration) * std.time.ns_per_ms),
         .it_interval = .{ .sec = 0, .nsec = 0 },
-    }, "copy highlight")) return;
-    if (self.copy_highlight_active) return;
-
+    };
+    if (!setTimer(self.copy_highlight_fd, spec, "copy highlight")) return;
+    self.copy_brackets_elapsed_ms = if (brackets) 0 else null;
     self.copy_highlight_active = true;
     self.requestFullAsyncRedraw();
 }
 
-fn fireCopyHighlightTimeout(self: *App) void {
-    _ = readTimer(self.copy_highlight_fd) orelse return;
-    if (!self.copy_highlight_active) return;
+fn fireCopyHighlight(self: *App) void {
+    const expirations = readTimer(self.copy_highlight_fd) orelse return;
+    // Without brackets the timer is a one-shot for the flash itself.
+    const elapsed = self.copy_brackets_elapsed_ms orelse return self.endCopyHighlight();
+    const now = @min(copy_brackets_duration_ms, @as(u64, elapsed) + expirations * copy_brackets_interval_ms);
+    const duration = self.config.copy_highlight_duration;
+    if (now < copy_brackets_duration_ms) {
+        self.copy_brackets_elapsed_ms = @intCast(now);
+        if (now >= duration) self.copy_highlight_active = false;
+        self.requestFullAsyncRedraw();
+        return;
+    }
+    // A flash configured to outlast the brackets finishes on a one-shot.
+    if (self.copy_highlight_active and now < duration) {
+        self.copy_brackets_elapsed_ms = null;
+        if (setTimer(self.copy_highlight_fd, .{
+            .it_value = timespecFromNs((duration - now) * std.time.ns_per_ms),
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+        }, "copy highlight")) {
+            self.requestFullAsyncRedraw();
+            return;
+        }
+    }
+    self.endCopyHighlight();
+}
 
+fn endCopyHighlight(self: *App) void {
+    _ = setTimer(self.copy_highlight_fd, disarmed_timer, "copy highlight");
+    if (!self.copy_highlight_active and self.copy_brackets_elapsed_ms == null) return;
     self.copy_highlight_active = false;
+    self.copy_brackets_elapsed_ms = null;
     self.requestFullAsyncRedraw();
+}
+
+fn currentCopyBrackets(self: *const App) ?Renderer.CopyBrackets {
+    const elapsed = self.copy_brackets_elapsed_ms orelse return null;
+    return copyBracketsFrame(elapsed, self.window.scale120, self.copy_highlight);
+}
+
+fn copyBracketsFrame(elapsed_ms: u16, scale120: u32, color: vt.color.RGB) Renderer.CopyBrackets {
+    std.debug.assert(elapsed_ms < copy_brackets_duration_ms);
+    const ms: f64 = @floatFromInt(elapsed_ms);
+    const enter = easeOutBack(@min(1.0, ms / copy_brackets_enter_ms));
+    const exit = std.math.clamp((ms - copy_brackets_exit_ms) / (copy_brackets_duration_ms - copy_brackets_exit_ms), 0.0, 1.0);
+    const scale = @as(f64, @floatFromInt(scale120)) / 120.0;
+    return .{
+        // Overshoot pulls the brackets at most 1.6 logical pixels inside the rest gap.
+        .gap = @intFromFloat(@round((copy_brackets_gap + copy_brackets_travel * (1.0 - enter)) * scale)),
+        .arm = @intFromFloat(@round(copy_brackets_arm * (1.0 - exit * exit) * scale)),
+        .thickness = Window.physicalDimension(copy_brackets_thickness, scale120),
+        .color = color,
+    };
+}
+
+/// CSS easeOutBack: rises past 1 by about 10% before settling at 1.
+fn easeOutBack(t: f64) f64 {
+    std.debug.assert(t >= 0.0 and t <= 1.0);
+    const c1 = 1.70158;
+    const c3 = c1 + 1.0;
+    return 1.0 + c3 * std.math.pow(f64, t - 1.0, 3) + c1 * std.math.pow(f64, t - 1.0, 2);
+}
+
+test "copy brackets snap in, hold, and retract into their corners" {
+    const color: vt.color.RGB = .{ .r = 0xfd, .g = 0xea, .b = 0x3d };
+    const start = copyBracketsFrame(0, 240, color);
+    try std.testing.expectEqual(@as(u31, 40), start.gap);
+    try std.testing.expectEqual(@as(u31, 20), start.arm);
+    try std.testing.expectEqual(@as(u31, 4), start.thickness);
+
+    // easeOutBack overshoots, so the brackets pass inside their rest gap.
+    var min_gap: u31 = start.gap;
+    var elapsed: u16 = 0;
+    while (elapsed < copy_brackets_enter_ms) : (elapsed += copy_brackets_interval_ms) {
+        min_gap = @min(min_gap, copyBracketsFrame(elapsed, 240, color).gap);
+    }
+    try std.testing.expect(min_gap < 8 and min_gap > 0);
+
+    const held = copyBracketsFrame(copy_brackets_exit_ms, 240, color);
+    try std.testing.expectEqual(@as(u31, 8), held.gap);
+    try std.testing.expectEqual(@as(u31, 20), held.arm);
+
+    const retracting = copyBracketsFrame(copy_brackets_duration_ms - 1, 240, color);
+    try std.testing.expectEqual(@as(u31, 8), retracting.gap);
+    try std.testing.expect(retracting.arm < held.arm / 4);
 }
 
 /// Ask the offer's owner to stream its contents into a pipe; the read
@@ -7180,6 +7279,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         self.tickKittyAnimations();
         const has_kitty_graphics = self.term.screens.active.kitty_images.placements.count() > 0;
         const new_scrollbar = self.currentScrollbarThumb();
+        const new_copy_brackets = self.currentCopyBrackets();
         // Detection must precede update(). Both the previous and next frame
         // must be free of overlays because their pixels do not move with
         // terminal rows.
@@ -7189,6 +7289,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             self.async_job.link_hint == null and
             self.search == null and self.async_job.search == null and
             new_scrollbar == null and self.async_job.scrollbar == null and
+            new_copy_brackets == null and self.async_job.copy_brackets == null and
             !has_kitty_graphics and self.async_job.kitty.len == 0)
         {
             scroll = try self.scroll_detector.detect(self.alloc, &self.render_state, &self.term);
@@ -7220,7 +7321,9 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         // If terminal state (rather than the fade timer) removed the last
         // overlay, redraw its old pixels instead of repairing from a buffer
         // that still contains the thumb.
-        if (self.async_job.scrollbar != null and new_scrollbar == null) {
+        if ((self.async_job.scrollbar != null and new_scrollbar == null) or
+            (self.async_job.copy_brackets != null and new_copy_brackets == null))
+        {
             self.render_state.dirty = .full;
         }
         // Full-screen repaints (TUIs redrawing from the home position) dirty
@@ -7248,8 +7351,9 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             !std.meta.eql(self.async_job.link_range, new_range) or
             !std.meta.eql(self.async_job.search_range, new_search_range) or
             !std.mem.eql(bool, self.async_job.search_matches.items, new_search_matches.items) or
-            !std.meta.eql(self.async_job.scrollbar, new_scrollbar);
-        try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_search, new_search_no_match, new_range, new_search_range, new_search_matches, new_scrollbar, hyperlink_hints);
+            !std.meta.eql(self.async_job.scrollbar, new_scrollbar) or
+            !std.meta.eql(self.async_job.copy_brackets, new_copy_brackets);
+        try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_search, new_search_no_match, new_range, new_search_range, new_search_matches, new_scrollbar, new_copy_brackets, hyperlink_hints);
         new_search_matches = .empty;
         var kitty_changed = false;
         if (has_kitty_graphics) {
@@ -7282,9 +7386,10 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         // Keep link affordances consistent with the stale snapshot.
         hyperlink_hints = self.async_job.hyperlink_hints;
         // Full-surface scrollbar coordinates belong to the old geometry.
-        // Remove the thumb while synchronized output holds the old terminal
-        // snapshot; the current geometry is picked up when the freeze ends.
-        if (self.async_job.scrollbar != null) self.render_state.dirty = .full;
+        // Remove the thumb and copy brackets while synchronized output holds
+        // the old terminal snapshot; the current geometry is picked up when
+        // the freeze ends.
+        if (self.async_job.scrollbar != null or self.async_job.copy_brackets != null) self.render_state.dirty = .full;
     }
     std.debug.assert(self.held_frame == null);
     const target = self.acquireFrameTarget() catch |err| {
@@ -7343,6 +7448,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .search = self.async_job.search,
         .search_no_match = self.async_job.search_no_match,
         .scrollbar = if (frozen) null else self.async_job.scrollbar,
+        .copy_brackets = if (frozen) null else self.async_job.copy_brackets,
         .kitty_items = self.async_job.kitty,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,

@@ -166,7 +166,8 @@ inertial_scrolling: bool = true,
 smooth_scrolling: bool = true,
 /// User keybindings, backed by the config arena. Defaults are resolved separately.
 keybinds: std.ArrayList(keybind.Binding) = .empty,
-/// Duration of the post-copy selection flash in milliseconds; 0 disables it.
+/// Duration of the post-copy selection flash in milliseconds; 0 disables it
+/// and the corner brackets that accompany it.
 copy_highlight_duration: u32 = 200,
 /// Effective alpha of the default terminal background. Keeping this as an
 /// 8-bit value matches the wl_shm buffer and makes the opaque fast path exact.

@@ -14,6 +14,7 @@ link_range: ?Renderer.LinkRange = null,
 search_range: ?Renderer.LinkRange = null,
 search_matches: std.ArrayList(bool) = .empty,
 scrollbar: ?Renderer.ScrollbarThumb = null,
+copy_brackets: ?Renderer.CopyBrackets = null,
 hyperlink_hints: bool = false,
 kitty: []Renderer.KittyRenderItem = &.{},
 
@@ -36,6 +37,7 @@ pub fn replaceOverlays(
     search_range: ?Renderer.LinkRange,
     search_matches: std.ArrayList(bool),
     scrollbar: ?Renderer.ScrollbarThumb,
+    copy_brackets: ?Renderer.CopyBrackets,
     hyperlink_hints: bool,
 ) !void {
     var new_preedit: ?[]u8 = null;
@@ -59,6 +61,7 @@ pub fn replaceOverlays(
     self.search_range = search_range;
     self.search_matches = matches;
     self.scrollbar = scrollbar;
+    self.copy_brackets = copy_brackets;
     self.hyperlink_hints = hyperlink_hints;
 }
 

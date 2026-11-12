@@ -169,7 +169,9 @@ Other settings:
   Set to `false` for whole-row scrolling. Scrolling sent to applications stays
   discrete.
 - **copy-highlight-duration** — Post-copy selection flash in milliseconds;
-  `0` disables the flash (default `200`).
+  `0` disables the flash (default `200`). Unless the desktop requests reduced
+  motion, corner brackets in the `copy-highlight` color also snap around the
+  copied selection.
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for
   scrolling, new windows, clipboard, and sending text. See
   [Keybindings](#keybindings) below.

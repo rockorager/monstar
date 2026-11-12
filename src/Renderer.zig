@@ -34,6 +34,16 @@ const search_match_alpha = 128;
 const faint_alpha = 128;
 
 pub const ScrollbarThumb = pixel_raster.ScrollbarThumb;
+/// One frame of the post-copy corner brackets around the visible selection.
+/// Lengths are physical pixels.
+pub const CopyBrackets = struct {
+    /// Gap between the selection's bounding box and the inner bracket edges.
+    gap: u31,
+    /// Length of each arm, measured from the bracket's outer corner.
+    arm: u31,
+    thickness: u31,
+    color: vt.color.RGB,
+};
 pub const KittyRenderItem = kitty_graphics.KittyRenderItem;
 pub const collectKittyPlacements = kitty_graphics.collectKittyPlacements;
 pub const kittyItemsEqual = kitty_graphics.kittyItemsEqual;
@@ -920,6 +930,78 @@ pub fn drawScrollbarThumb(
         thumb,
         argb(state.colors.foreground),
     );
+}
+
+/// Draw corner brackets around the bounding box of the selected cells in
+/// `state`. `canvas` is the full surface, so brackets may extend into the
+/// padding; the grid starts at (`grid_x`, `grid_y`) and its rows are cropped
+/// by `scroll_offset` pixels as in drawScrolled.
+pub fn drawCopyBrackets(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    canvas: Canvas,
+    grid_x: u31,
+    grid_y: u31,
+    grid_height: u31,
+    scroll_offset: u31,
+    brackets: CopyBrackets,
+) !void {
+    std.debug.assert(scroll_offset < self.font.cell_height);
+    if (brackets.arm == 0 or brackets.thickness == 0) return;
+    const rows = @as(usize, state.rows) + if (scroll_offset != 0) @as(usize, state.overscan.below) else 0;
+    const selections = state.row_data.items(.selection)[0..rows];
+    var first_row: ?usize = null;
+    var last_row: usize = 0;
+    var first_col: usize = std.math.maxInt(usize);
+    var last_col: usize = 0;
+    for (selections, 0..) |selection, y| {
+        const range = selection orelse continue;
+        if (first_row == null) first_row = y;
+        last_row = y;
+        first_col = @min(first_col, range[0]);
+        last_col = @max(last_col, range[1]);
+    }
+    const top_row = first_row orelse return;
+
+    const cw: i64 = self.font.cell_width;
+    const ch: i64 = self.font.cell_height;
+    const grid_top: i64 = grid_y;
+    const grid_bottom: i64 = grid_top + grid_height;
+    const x0 = grid_x + @as(i64, @intCast(first_col)) * cw;
+    const x1 = grid_x + @as(i64, @intCast(last_col + 1)) * cw;
+    // A selection continuing past the viewport is boxed at the grid edge.
+    const y0 = std.math.clamp(grid_top + @as(i64, @intCast(top_row)) * ch - scroll_offset, grid_top, grid_bottom);
+    const y1 = std.math.clamp(grid_top + @as(i64, @intCast(last_row + 1)) * ch - scroll_offset, grid_top, grid_bottom);
+    if (y1 <= y0) return;
+
+    const gap: i64 = brackets.gap;
+    const t: i64 = brackets.thickness;
+    const arm: i64 = @max(brackets.arm, brackets.thickness);
+    // Outer corners of the bracket frame, kept on the surface so a selection
+    // touching an unpadded window edge still shows all four brackets.
+    const left = @max(x0 - gap - t, 0);
+    const right = @min(x1 + gap + t, canvas.width);
+    const top = @max(y0 - gap - t, 0);
+    const bottom = @min(y1 + gap + t, canvas.height);
+    const color = argb(brackets.color);
+    const bars = [_][4]i64{
+        .{ left, top, left + arm, top + t },
+        .{ left, top, left + t, top + arm },
+        .{ right - arm, top, right, top + t },
+        .{ right - t, top, right, top + arm },
+        .{ left, bottom - t, left + arm, bottom },
+        .{ left, bottom - arm, left + t, bottom },
+        .{ right - arm, bottom - t, right, bottom },
+        .{ right - t, bottom - arm, right, bottom },
+    };
+    for (bars) |bar| {
+        const bx0 = std.math.clamp(bar[0], 0, canvas.width);
+        const by0 = std.math.clamp(bar[1], 0, canvas.height);
+        const bx1 = std.math.clamp(bar[2], 0, canvas.width);
+        const by1 = std.math.clamp(bar[3], 0, canvas.height);
+        if (bx1 <= bx0 or by1 <= by0) continue;
+        try canvas.fillRect(@intCast(bx0), @intCast(by0), @intCast(bx1 - bx0), @intCast(by1 - by0), color);
+    }
 }
 
 const OverlayPosition = enum { bottom_left, top_right };
@@ -3172,6 +3254,82 @@ test "render rectangular selection spans" {
             try std.testing.expectEqual(expected, pixels[px]);
         }
     }
+}
+
+test "copy brackets frame the bounding box of a stream selection" {
+    const alloc = std.testing.allocator;
+
+    var font: Font = try .init(alloc, "monospace", 16, .{}, null);
+    defer font.deinit(alloc);
+
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 5 });
+    defer term.deinit(alloc);
+
+    // The first row starts late and the last ends early, but the middle row
+    // spans the grid, so the box covers every column of rows 1 to 3.
+    const screen = term.screens.active;
+    try screen.select(vt.Selection.init(
+        screen.pages.pin(.{ .active = .{ .x = 5, .y = 1 } }).?,
+        screen.pages.pin(.{ .active = .{ .x = 2, .y = 3 } }).?,
+        false,
+    ));
+    var state: vt.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &term);
+
+    var renderer: Renderer = try .init(alloc, &font, .{});
+    defer renderer.deinit();
+
+    const pad: u31 = 10;
+    const width: u31 = font.cell_width * 8 + pad * 2;
+    const height: u31 = font.cell_height * 5 + pad * 2;
+    const pixels = try alloc.alloc(u32, @as(usize, width) * height);
+    defer alloc.free(pixels);
+    @memset(pixels, 0);
+
+    const color: vt.color.RGB = .{ .r = 0xfd, .g = 0xea, .b = 0x3d };
+    try renderer.drawCopyBrackets(&state, .cpu(pixels, width, width, height), pad, pad, font.cell_height * 5, 0, .{
+        .gap = 2,
+        .arm = 6,
+        .thickness = 2,
+        .color = color,
+    });
+
+    // Outer frame: 4 px (gap + thickness) outside rows 1-3 and columns 0-7.
+    const left: usize = pad - 4;
+    const right: usize = pad + font.cell_width * 8 + 4;
+    const top: usize = pad + font.cell_height - 4;
+    const bottom: usize = pad + font.cell_height * 4 + 4;
+    const at = struct {
+        fn f(p: []const u32, w: u31, x: usize, y: usize) u32 {
+            return p[y * w + x];
+        }
+    }.f;
+    const ink = argb(color);
+    // Each corner's outer pixel and the far ends of both arms are inked.
+    for ([_][2]usize{ .{ left, top }, .{ right - 1, top }, .{ left, bottom - 1 }, .{ right - 1, bottom - 1 } }) |corner| {
+        try std.testing.expectEqual(ink, at(pixels, width, corner[0], corner[1]));
+    }
+    try std.testing.expectEqual(ink, at(pixels, width, left + 5, top));
+    try std.testing.expectEqual(ink, at(pixels, width, left, top + 5));
+    try std.testing.expectEqual(ink, at(pixels, width, right - 6, bottom - 1));
+    try std.testing.expectEqual(ink, at(pixels, width, right - 1, bottom - 6));
+    // Arms stop at their length, and nothing is drawn inside the gap.
+    try std.testing.expectEqual(@as(u32, 0), at(pixels, width, left + 6, top));
+    try std.testing.expectEqual(@as(u32, 0), at(pixels, width, left, top + 6));
+    try std.testing.expectEqual(@as(u32, 0), at(pixels, width, left + 2, top + 2));
+    try std.testing.expectEqual(@as(u32, 0), at(pixels, width, right - 7, top));
+
+    // Without padding the left brackets move onto the surface edge.
+    @memset(pixels, 0);
+    try renderer.drawCopyBrackets(&state, .cpu(pixels, width, width, height), 0, pad, font.cell_height * 5, 0, .{
+        .gap = 2,
+        .arm = 6,
+        .thickness = 2,
+        .color = color,
+    });
+    try std.testing.expectEqual(ink, at(pixels, width, 0, top + 5));
+    try std.testing.expectEqual(ink, at(pixels, width, 5, bottom - 1));
 }
 
 test "render kitty image placement" {

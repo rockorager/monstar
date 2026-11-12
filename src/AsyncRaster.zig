@@ -69,6 +69,8 @@ pub const Job = struct {
     search_no_match: bool,
     /// Transient right-edge scrollback indicator in full-surface pixels.
     scrollbar: ?Renderer.ScrollbarThumb,
+    /// Corner brackets around the selection after a copy.
+    copy_brackets: ?Renderer.CopyBrackets = null,
     /// Visible kitty placements, resolved on the main thread with image
     /// data repointed at cache-pinned copies; empty when no graphics are
     /// visible.
@@ -93,7 +95,7 @@ pub const Job = struct {
     fn hasOverlay(self: *const Job) bool {
         return self.preedit != null or self.link_hint != null or
             self.search != null or self.search_matches.len > 0 or
-            self.scrollbar != null or
+            self.scrollbar != null or self.copy_brackets != null or
             self.kitty_items.len > 0;
     }
 };
@@ -572,6 +574,9 @@ fn renderJobOn(self: *AsyncRaster, job: Job, canvas: Canvas, damage: *Damage) !v
         }
         if (job.scrollbar) |thumb| {
             try self.renderer.drawScrollbarThumb(self.state, canvas, thumb);
+        }
+        if (job.copy_brackets) |brackets| {
+            try self.renderer.drawCopyBrackets(self.state, canvas, job.grid_x, job.grid_y, job.grid_height, job.scroll_offset, brackets);
         }
         damage.* = .full;
         return;
