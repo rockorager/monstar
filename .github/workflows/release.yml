@@ -1,17 +1,18 @@
 name: Release & AUR Package
 
+# `just release` pushes a vX.Y.Z tag with its release commit; this builds
+# that tag, publishes the GitHub release, and updates the AUR packages.
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Release tag to build (e.g. v1.0.1)'
-        required: true
-        type: string
+  push:
+    tags:
+      - "v[0-9]*"
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -28,7 +29,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
 
       - name: Install system dependencies
@@ -59,7 +60,7 @@ jobs:
 
       - name: Build release binary package
         env:
-          PICI_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+          PICI_TAG: ${{ github.ref_name }}
         run: just dist
 
       - name: Store binary tarball
@@ -77,7 +78,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
 
       - name: Fetch binary tarballs
@@ -89,15 +90,42 @@ jobs:
 
       - name: Build source archive and AUR PKGBUILDs
         env:
-          PICI_TAG: ${{ github.event.release.tag_name || inputs.tag_name }}
+          PICI_TAG: ${{ github.ref_name }}
         run: ./packaging/build-source-dist.sh
 
-      - name: Upload assets to GitHub Release
+      - name: Checksum
+        working-directory: dist
+        run: sha256sum -- monstar-*.tar.gz >SHA256SUMS
+
+      # Checked-in notes describe a release when it has them; otherwise the
+      # notes list the commits since the previous release.
+      - name: Write release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes="docs/releases/${TAG#v}.md"
+          if [ -s "$notes" ]; then
+            cp "$notes" "$RUNNER_TEMP/notes.md"
+          elif previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$TAG^" 2>/dev/null); then
+            git log --no-merges --format='- %s' --invert-grep -E --grep='^release: [0-9]+\.[0-9]+\.[0-9]+$' \
+              "$previous..$TAG" >"$RUNNER_TEMP/notes.md"
+          else
+            : >"$RUNNER_TEMP/notes.md"
+          fi
+
+      # A rerun after a later step failed finds the release published and
+      # replaces its assets instead.
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
         run: |
-          TAG="${{ github.event.release.tag_name || inputs.tag_name }}"
-          gh release upload "$TAG" dist/monstar-*.tar.gz --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/monstar-*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" --verify-tag --title "Monstar ${TAG#v}" \
+              --notes-file "$RUNNER_TEMP/notes.md" dist/monstar-*.tar.gz dist/SHA256SUMS
+          fi
 
       - name: Setup SSH key for AUR
         uses: webfactory/ssh-agent@v0.9.0

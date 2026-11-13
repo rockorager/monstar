@@ -47,6 +47,7 @@ just lint           # zig fmt, shellcheck, shfmt, just --fmt
 just fmt            # format what lint checks
 just ci             # build, test, and lint
 just zig=zig ci     # any recipe with upstream Zig instead of bs, as CI runs
+just release [X.Y.Z] # release origin/main; see the releasing-monstar skill
 ```
 
 ## Zig Development

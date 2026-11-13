@@ -43,4 +43,5 @@ package() {
   cd "$srcdir/monstar-${pkgver}-${CARCH}-linux"
   mkdir -p "$pkgdir/usr"
   cp -r bin share "$pkgdir/usr/"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

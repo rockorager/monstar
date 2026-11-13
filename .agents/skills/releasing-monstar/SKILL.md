@@ -1,61 +1,31 @@
 ---
 name: releasing-monstar
-description: Prepares and tags Monstar releases using semantic versions, checked-in release notes, and guarded verification. Use when drafting release notes, cutting a release, creating a version tag, or checking release readiness.
+description: Prepares and cuts Monstar releases with checked-in release notes and `just release`. Use when drafting release notes, cutting a release, creating a version tag, or checking release readiness.
 ---
 
 # Releasing Monstar
 
-Prepare portable Monstar releases whose source of truth is a Git commit, a
-signed semantic-version tag, and checked-in Markdown release notes. Publishing
-is the responsibility of the repository's configured CI.
+A Monstar release is a signed `vX.Y.Z` tag on a `release: X.Y.Z` commit that sets `.version` in `build.zig.zon`. `just release [X.Y.Z]` makes that commit on top of `origin/main`, tags it, and pushes both atomically; the Release workflow then builds the tag, publishes the GitHub release with its tarballs and `SHA256SUMS`, and updates the AUR packages. Never edit the version in `build.zig.zon` by hand.
 
 ## Release contract
 
-- Use versions in `X.Y.Z` form and tags in `vX.Y.Z` form.
-- Store notes at `docs/releases/X.Y.Z.md`.
-- Commit the version and release notes before creating the tag.
-- Create the tag from that clean release commit.
-- Treat hosted release pages and downloadable artifacts as projections of the
-  tag and checked-in notes, not as primary release data.
-- Keep notes provider-neutral. Do not add forge-generated compare links,
-  provider-specific boilerplate, or publishing instructions to them.
-- Let configured CI publish the release. Do not manually publish unless the
-  user explicitly requests an exception.
+- Versions are `X.Y.Z` and tags `vX.Y.Z`. `just release` with no version releases the newest tag's next patch.
+- Notes live at `docs/releases/X.Y.Z.md` and are committed to `main` before the release. The workflow publishes that file as the release description; without it, the release lists the commits since the previous tag.
+- Development builds report `X.Y.(Z+1)-dev.<distance>+g<sha>` after `vX.Y.Z`, or the version in `build.zig.zon` when it is newer. An exact clean tag reports `X.Y.Z`.
 
-## Safety rules
+## Approvals
 
-- Never discard, stage, or commit unrelated work. If unrelated changes prevent
-  a clean release commit, report them and stop.
-- Never create a tag, push a commit, or push a tag without explicit approval
-  for that action. Approval to tag does not imply approval to push.
-- Create signed tags. If signing is unavailable, stop rather than silently
-  creating an unsigned tag.
-- Never move, replace, or delete a published tag without explicit approval and
-  a clear explanation of the consequences.
-- Do not change CI configuration as part of a release unless separately asked.
+- `just release` pushes to `main` and pushes a tag, so run it only after the user explicitly approves releasing that version. Approval to write notes does not cover releasing.
+- Pushing the notes commit is a separate push and needs its own approval.
+- Never move, replace, or delete a published tag without explicit approval and a clear explanation of the consequences.
 
 ## 1. Establish the release
 
-1. Confirm the requested version and release date.
-2. Confirm the current branch and inspect `git status --short --branch`.
-3. Fetch remote state without changing the worktree, then confirm the release
-   commit will be based on the intended branch and is not behind its upstream.
-4. Confirm `vX.Y.Z` does not already exist locally or remotely.
-5. Find the previous reachable Monstar release tag with:
+1. Confirm the version, or that the next patch is intended. Choose minor for new features and patch for fixes alone.
+2. Fetch, then find the previous release with `git describe --tags --abbrev=0 --match 'v[0-9]*' origin/main`.
+3. Read the commits and diffs since that tag. Describe user-visible outcomes, not every commit subject or internal refactor.
 
-   ```sh
-   git describe --tags --abbrev=0 --match 'v[0-9]*'
-   ```
-
-   If there is no previous tag, treat this as the first release. Do not pull
-   unrelated or inherited project history into the notes.
-6. Inspect the commit range and relevant diffs. Describe user-visible outcomes,
-   not every commit subject or internal refactor.
-7. Inspect the configured CI and verify that a `vX.Y.Z` tag will run the release
-   pipeline and that the pipeline consumes `docs/releases/X.Y.Z.md`. If that
-   contract is absent, report it before tagging.
-
-## 2. Write portable release notes
+## 2. Write the release notes
 
 Create `docs/releases/X.Y.Z.md` with this shape:
 
@@ -81,104 +51,14 @@ Released YYYY-MM-DD.
 - User-visible defects that were corrected.
 ```
 
-Keep only sections that have content. Add `## Upgrade notes` when users must
-take action. For the first release, summarize the supported experience and
-major capabilities instead of fabricating a change comparison.
+Keep only sections that have content. Add `## Upgrade notes` when users must take action. The notes stand alone when read from a source archive or another forge, so keep them free of compare links, forge boilerplate, and publishing instructions. Verify every claim against the code or documentation, and call out breaking changes, migrations, known limitations, and changed requirements.
 
-Release notes must:
+Commit the notes alone, for example `docs: add release notes for X.Y.Z`, and push them to `main` once the user approves that push.
 
-- Stand alone when read from a source archive or another forge.
-- Be factual and verified against the code or documentation.
-- Lead with impact and omit implementation trivia.
-- Call out breaking changes, migrations, known limitations, and changed
-  requirements when applicable.
-- Avoid empty sections, raw commit dumps, and unverified claims.
+## 3. Release
 
-The checked-in file is the exact release description that CI should publish.
+1. Wait until CI on `origin/main` has passed; `just release` refuses otherwise.
+2. With the user's approval, run `just release X.Y.Z` (or `just release` for the next patch). It prints the notes file it found, the `build.zig.zon` diff, and the workflow URL. Tags are signed; if signing fails, nothing is tagged or pushed. If `main` moved since the fetch, nothing is pushed; run it again.
+3. Watch the Release workflow through completion. Confirm the release page shows the notes, both `monstar-X.Y.Z-<arch>-linux.tar.gz` tarballs, the source archive, and `SHA256SUMS`, and that the AUR packages moved to `X.Y.Z`.
 
-## 3. Set the intended version
-
-Update both version declarations to `X.Y.Z`:
-
-- `release_version` in `build.zig`
-- `.version` in `build.zig.zon`
-
-Keep them identical. Monstar derives development identifiers from Git:
-
-- An exact clean `vX.Y.Z` tag reports `X.Y.Z`.
-- Other Git commits report `X.Y.Z-dev.<distance>+g<sha>`, using the declared
-  version when it is newer than the nearest tag and that tag's next patch
-  version otherwise.
-- Dirty builds append `.dirty`.
-- Source archives without Git metadata report `X.Y.Z`.
-
-Building an exact `vX.Y.Z` tag fails unless both declarations name `X.Y.Z`.
-
-## 4. Verify the release commit
-
-Run checks in this order:
-
-```sh
-zig build test --summary all
-zig build --summary all
-zig build -Doptimize=fast --summary all
-zig build fmt
-```
-
-Formatting stays last. Report the exact pass, failure, and skip counts; do not
-hide known warnings. Then inspect the binary version:
-
-```sh
-./zig-out/bin/monstar --version
-```
-
-Before tagging, a clean release commit is still a development build and should
-report the intended `X.Y.Z` plus a development identifier.
-
-Review `git diff --check`, the complete release diff, and the final status.
-Commit only the intended version declarations and release note. Follow the
-repository's commit-message guidance and use a release-focused subject such as
-`release: prepare X.Y.Z` with a body explaining the release boundary.
-
-## 5. Tag and verify
-
-After the release commit is clean and the user explicitly approves tagging,
-create a signed annotated tag:
-
-```sh
-git tag -s vX.Y.Z -m "Monstar X.Y.Z"
-```
-
-Build from the tagged commit and verify the stable identifier:
-
-```sh
-zig build -Doptimize=fast --summary all
-./zig-out/bin/monstar --version
-```
-
-The output must be exactly `monstar X.Y.Z`. Inspect the tag signature and
-target before proposing a push. If verification fails, stop. Do not move or
-delete the tag without approval.
-
-## 6. Push and observe CI
-
-After explicit push approval:
-
-1. Push the release commit.
-2. Push `vX.Y.Z` without pushing unrelated tags.
-3. Observe the configured CI through completion.
-4. Confirm that published notes match `docs/releases/X.Y.Z.md` and that any
-   artifacts identify themselves as `X.Y.Z`.
-
-If CI fails after publication, report the failure and preserve the tag while a
-recovery decision is made. Do not rewrite release history automatically.
-
-## 7. Resume development
-
-After the release succeeds, development builds report the next patch version,
-such as `X.Y.(Z+1)-dev.<distance>+g<sha>`, until the declarations change. If
-the user names the next intended version, update both `release_version` and
-`.version` to it in a separate commit.
-
-Do not modify the immutable notes for `X.Y.Z` except to correct a material
-factual error with an explicitly reviewed follow-up.
+If the workflow fails after the tag is pushed, report the failure and keep the tag while a recovery decision is made. A rerun of the failed jobs replaces the release's assets instead of failing on the existing release.

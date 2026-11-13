@@ -42,8 +42,15 @@ fi
 TERMINFO="$STAGING_DIR/${ARCHIVE_ROOT}/share/terminfo" \
   infocmp -x monstar > /dev/null
 
+cp LICENSE README.md "$STAGING_DIR/${ARCHIVE_ROOT}/"
+
+# The same commit gives the same archive: sorted, owned by root so packages
+# need not fix ownership, dated by the commit, and gzipped without a name or
+# timestamp.
 echo "==> Creating release tarball dist/${TARBALL_NAME}..."
-tar -czf "dist/${TARBALL_NAME}" -C "$STAGING_DIR" "${ARCHIVE_ROOT}"
+tar -C "$STAGING_DIR" --sort=name --owner=0 --group=0 --numeric-owner \
+  --mtime="@$(git log -1 --format=%ct)" -cf - "${ARCHIVE_ROOT}" |
+  gzip -9 -n > "dist/${TARBALL_NAME}"
 echo "==> SHA256: $(sha256sum "dist/${TARBALL_NAME}" | cut -d' ' -f1)"
 
 if [ -n "${ARTIFACTS_DIR:-}" ]; then
