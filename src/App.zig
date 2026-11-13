@@ -4162,8 +4162,15 @@ fn finishSelection(self: *App) void {
     self.selection_gesture.release(&self.term, .{ .pin = self.pinAtPointer() });
     self.selection_rectangle = false;
     self.stopSelectionAutoscrollTimer();
-    // Finished selections claim the primary selection, X style.
+    // Finished selections claim the primary selection, X style, and with
+    // copy-on-select = clipboard the clipboard too. Unlike an explicit copy,
+    // they do not flash.
+    if (self.config.copy_on_select == .off) return;
     self.copyToPrimary();
+    if (self.config.copy_on_select == .clipboard) {
+        const text = self.selectionText() orelse return;
+        _ = self.clipboard.claim(.clipboard, text, self.last_serial);
+    }
 }
 
 fn applySelection(self: *App, selection: ?vt.Selection, clear_if_null: bool) void {

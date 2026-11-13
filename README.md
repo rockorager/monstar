@@ -172,6 +172,10 @@ Other settings:
   `0` disables the flash (default `200`). Unless the desktop requests reduced
   motion, corner brackets in the `copy-highlight` color also snap around the
   copied selection.
+- **copy-on-select** — Where a finished mouse selection is copied: `true`
+  copies it to the primary selection, `clipboard` copies it to both the
+  primary selection and the clipboard, and `false` copies nothing (default
+  `true`).
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for
   scrolling, new windows, clipboard, and sending text. See
   [Keybindings](#keybindings) below.
