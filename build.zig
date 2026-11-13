@@ -1,7 +1,9 @@
 const std = @import("std");
 const Scanner = @import("wayland").Scanner;
 
-const release_version: std.SemanticVersion = .{ .major = 1, .minor = 2, .patch = 0 };
+// The version a `release: X.Y.Z` commit sets in build.zig.zon.
+const release_version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch
+    @compileError("build.zig.zon's .version is not a semantic version");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
