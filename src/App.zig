@@ -252,6 +252,13 @@ kitty_animation_fd: posix.fd_t,
 compression_fd: posix.fd_t,
 /// Debounces terminal resizes during an interactive window resize.
 resize_fd: posix.fd_t,
+/// Periodic blink phase timer, armed only while `cursor_blink_armed`.
+cursor_blink_fd: posix.fd_t,
+/// The terminal requests a blinking cursor (DECSCUSR or DEC mode 12)
+/// while the focused, unsuspended window shows it.
+cursor_blink_armed: bool,
+/// Blink phase; false hides a blinking cursor in the next render snapshot.
+cursor_blink_visible: bool,
 /// The layout's grid size has not been applied to the terminal and pty yet.
 resize_pending: bool,
 compression_activity: u64,
@@ -337,6 +344,8 @@ const copy_brackets_gap = 4.0;
 const copy_brackets_travel = 16.0;
 const copy_brackets_arm = 10.0;
 const copy_brackets_thickness = 2;
+/// Matches Ghostty's blink phase length.
+const cursor_blink_interval_ms = 600;
 const compression_idle_ms = 250;
 const compression_step_ms = 1;
 /// Quiet period after the last interactive-resize configure before the
@@ -737,6 +746,9 @@ pub fn init(
     const resize_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(resize_fd);
 
+    const cursor_blink_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(cursor_blink_fd);
+
     // Scope confirmation ran concurrently with the window setup above,
     // so this rarely waits; the child stays gated until its migration
     // is confirmed (or abandoned).
@@ -831,6 +843,9 @@ pub fn init(
         .kitty_animation_fd = kitty_animation_fd,
         .compression_fd = compression_fd,
         .resize_fd = resize_fd,
+        .cursor_blink_fd = cursor_blink_fd,
+        .cursor_blink_armed = false,
+        .cursor_blink_visible = true,
         .resize_pending = false,
         .compression_activity = term.compressionActivity(),
         .scrollbar_alpha = 0,
@@ -1893,6 +1908,7 @@ pub fn deinit(self: *App) void {
     self.deinitDbus();
     _ = std.os.linux.close(self.compression_fd);
     _ = std.os.linux.close(self.resize_fd);
+    _ = std.os.linux.close(self.cursor_blink_fd);
     _ = std.os.linux.close(self.kitty_animation_fd);
     _ = std.os.linux.close(self.scrollbar_fd);
     _ = std.os.linux.close(self.search_fd);
@@ -1951,6 +1967,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.resize_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = if (self.rex_client) |client| client.ready_fd else -1, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.cursor_blink_fd, .events = posix.POLL.IN, .revents = 0 },
     } ++ @as([Clipboard.max_outgoing_transfers]posix.pollfd, @splat(.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }));
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1972,12 +1989,14 @@ pub fn run(self: *App) !void {
     const resize_fd = &fds[17];
     const vulkan_fd = &fds[18];
     const rex_snapshot_fd = &fds[19];
-    const outgoing_clipboard_fds = fds[20..][0..Clipboard.max_outgoing_transfers];
+    const cursor_blink_fd = &fds[20];
+    const outgoing_clipboard_fds = fds[21..][0..Clipboard.max_outgoing_transfers];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         self.expireDbusRequests();
         self.expireClipboardTransfers();
         self.syncScrollbackCompression();
+        self.syncCursorBlink(false);
         wl_fd.events = posix.POLL.IN;
         dbus_fd.fd = self.dbus_fd;
         async_fd.fd = if (self.async_raster_loader) |*loader|
@@ -2100,6 +2119,10 @@ pub fn run(self: *App) !void {
 
         if (resize_fd.revents & posix.POLL.IN != 0) {
             self.fireResize();
+        }
+
+        if (cursor_blink_fd.revents & posix.POLL.IN != 0) {
+            self.fireCursorBlink();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -2962,6 +2985,9 @@ fn syncPtyOutput(self: *App, consumed: bool) void {
     self.syncScrollbarHover();
     if (consumed) self.refreshSearch();
     if (consumed) self.syncHoveredLink(true);
+    // Like Ghostty, output (including the echo of typed keys) restarts
+    // the blink phase so the cursor stays visible while it moves.
+    if (consumed) self.syncCursorBlink(true);
 }
 
 fn drainPtyTail(fd: posix.fd_t, stream: anytype) !bool {
@@ -6548,6 +6574,93 @@ fn armScrollbackCompression(self: *App, delay_ms: u64) void {
     }, "scrollback compression");
 }
 
+/// Arm the blink timer while the terminal requests a blinking cursor that
+/// the focused, unsuspended window shows, so steady cursors never wake the
+/// loop. `reset` restarts an armed timer in the visible phase.
+fn syncCursorBlink(self: *App, reset: bool) void {
+    const armed = self.term.modes.get(.cursor_blinking) and
+        self.term.modes.get(.cursor_visible) and
+        self.focused and !self.window.suspended;
+    if (armed == self.cursor_blink_armed and !(armed and reset)) return;
+    self.cursor_blink_armed = armed;
+    if (!self.cursor_blink_visible) {
+        self.cursor_blink_visible = true;
+        self.needs_redraw = true;
+    }
+    const interval = timespecFromNs(cursor_blink_interval_ms * std.time.ns_per_ms);
+    const spec: std.os.linux.itimerspec = if (armed)
+        .{ .it_value = interval, .it_interval = interval }
+    else
+        disarmed_timer;
+    _ = setTimer(self.cursor_blink_fd, spec, "cursor blink");
+}
+
+fn fireCursorBlink(self: *App) void {
+    const expirations = readTimer(self.cursor_blink_fd) orelse return;
+    // A stalled loop may have missed phases; an even count lands back on
+    // the current one.
+    if (!self.cursor_blink_armed or expirations % 2 == 0) return;
+    self.cursor_blink_visible = !self.cursor_blink_visible;
+    self.needs_redraw = true;
+}
+
+test "DECSCUSR blink styles drive the cursor blink timer" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    const app = try alloc.create(App);
+    defer alloc.destroy(app);
+    app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer app.term.deinit(alloc);
+    var stream = app.term.vtStream();
+    defer stream.deinit();
+    app.window = try alloc.create(Window);
+    defer alloc.destroy(app.window);
+    app.window.suspended = false;
+    app.focused = true;
+    app.needs_redraw = false;
+    app.cursor_blink_fd = try createTimerFd();
+    defer _ = linux.close(app.cursor_blink_fd);
+    app.cursor_blink_armed = false;
+    app.cursor_blink_visible = true;
+
+    const blink_ns = cursor_blink_interval_ms * std.time.ns_per_ms;
+    var timer: linux.itimerspec = undefined;
+
+    // The default cursor is steady.
+    app.syncCursorBlink(false);
+    try std.testing.expect(!app.cursor_blink_armed);
+
+    stream.nextSlice("\x1b[5 q");
+    app.syncCursorBlink(false);
+    try std.testing.expect(app.cursor_blink_armed);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.timerfd_gettime(app.cursor_blink_fd, &timer)));
+    try std.testing.expectEqual(@as(isize, blink_ns), timer.it_interval.nsec);
+
+    // Output during the hidden phase shows the cursor again at once.
+    app.cursor_blink_visible = false;
+    app.syncCursorBlink(true);
+    try std.testing.expect(app.cursor_blink_visible);
+    try std.testing.expect(app.needs_redraw);
+
+    // A steady style stops blinking and never leaves the cursor hidden.
+    app.cursor_blink_visible = false;
+    stream.nextSlice("\x1b[6 q");
+    app.syncCursorBlink(false);
+    try std.testing.expect(!app.cursor_blink_armed);
+    try std.testing.expect(app.cursor_blink_visible);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.timerfd_gettime(app.cursor_blink_fd, &timer)));
+    try std.testing.expectEqualDeep(disarmed_timer, timer);
+
+    // Unfocused windows draw a steady hollow cursor.
+    stream.nextSlice("\x1b[1 q");
+    app.focused = false;
+    app.syncCursorBlink(false);
+    try std.testing.expect(!app.cursor_blink_armed);
+    app.focused = true;
+    app.syncCursorBlink(false);
+    try std.testing.expect(app.cursor_blink_armed);
+}
+
 fn startSearch(self: *App) void {
     if (self.search != null) return;
     self.search = ScrollbackSearch.init(&self.term) catch |err| {
@@ -7527,6 +7640,13 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         }
         if (self.scroll_offset != self.render_scroll_offset) self.render_state.dirty = .full;
         self.render_scroll_offset = self.scroll_offset;
+        // Hide the cursor in its blink-off phase. update() rereads
+        // visibility from terminal modes, so this lasts one snapshot, and
+        // dirtyCursorRows repaints the cursor cell on each phase change.
+        // An unfocused window keeps its steady hollow cursor.
+        if (self.render_state.cursor.blinking and self.focused and !self.cursor_blink_visible) {
+            self.render_state.cursor.visible = false;
+        }
         self.dirtyCursorRows(old_cursor);
         // If terminal state (rather than the fade timer) removed the last
         // overlay, redraw its old pixels instead of repairing from a buffer
