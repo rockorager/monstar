@@ -484,6 +484,8 @@ fn buildEnvp(
         const value = std.mem.span(e);
         if (std.mem.startsWith(u8, value, "TERM=")) continue;
         if (std.mem.startsWith(u8, value, "COLORTERM=")) continue;
+        if (std.mem.startsWith(u8, value, "TERM_PROGRAM=")) continue;
+        if (std.mem.startsWith(u8, value, "TERM_PROGRAM_VERSION=")) continue;
         if (cwd != null and std.mem.startsWith(u8, value, "PWD=")) continue;
         // The launcher token belongs to our window, not the shell or its children.
         if (std.mem.startsWith(u8, value, "XDG_ACTIVATION_TOKEN=")) continue;
@@ -495,6 +497,9 @@ fn buildEnvp(
     if (cwd) |path| try list.append(arena, try std.mem.joinZ(arena, "", &.{ "PWD=", path }));
     try list.append(arena, try std.mem.joinZ(arena, "", &.{ "TERM=", term }));
     try list.append(arena, "COLORTERM=truecolor");
+    // Identifies Monstar to programs even when TERM names another terminal.
+    try list.append(arena, "TERM_PROGRAM=monstar");
+    try list.append(arena, "TERM_PROGRAM_VERSION=" ++ build_options.version);
     // Another TERM must resolve from the system database, not only ours.
     if (!has_terminfo and std.mem.eql(u8, term, "monstar")) {
         var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -518,6 +523,8 @@ test "shell environment excludes the launch activation token and telemetry path"
         "MONSTAR_FRAME_TELEMETRY=/run/user/1000/frames.jsonl",
         "TERM=old-terminal",
         "COLORTERM=old-color",
+        "TERM_PROGRAM=old-terminal",
+        "TERM_PROGRAM_VERSION=0.0.1",
         "TERMINFO=/custom/terminfo",
         "KEEP=value",
     };
@@ -529,6 +536,8 @@ test "shell environment excludes the launch activation token and telemetry path"
             "KEEP=value",
             try std.mem.concat(arena_state.allocator(), u8, &.{ "TERM=", term }),
             "COLORTERM=truecolor",
+            "TERM_PROGRAM=monstar",
+            "TERM_PROGRAM_VERSION=" ++ build_options.version,
         };
         const actual = std.mem.span(child);
         try std.testing.expectEqual(expected.len, actual.len);
