@@ -6418,7 +6418,10 @@ fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
 
 fn applyPendingIme(self: *App) void {
     if (self.search != null) {
-        if (self.ime_pending_commit) |commit| self.appendSearchText(commit);
+        if (self.ime_pending_commit) |commit| {
+            self.appendSearchText(commit);
+            self.window.hidePointer();
+        }
         self.setImePreedit(self.ime_pending_preedit);
         self.resetPendingIme();
         return;
@@ -6426,6 +6429,7 @@ fn applyPendingIme(self: *App) void {
     if (self.ime_pending_commit) |commit| {
         if (commit.len > 0) {
             if (self.rex_client) |client| client.paste(commit) else self.writePty(commit);
+            self.window.hidePointer();
             self.stopFling();
             self.resetSmoothScroll();
             self.clearSelection();
@@ -6930,6 +6934,7 @@ fn handleSearchKey(self: *App, event: vt.input.KeyEvent) void {
         return;
     }
 
+    if (!event.key.modifier()) self.window.hidePointer();
     switch (event.key) {
         .escape => self.finishSearch(false),
         .enter, .numpad_enter => self.finishSearch(true),
@@ -7062,6 +7067,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     // and snaps a scrolled-back viewport to the bottom (ghostty's
     // selection-clear-on-typing behavior).
     if (wrote and action != .release and !event.key.modifier()) {
+        self.window.hidePointer();
         self.stopFling();
         self.resetSmoothScroll();
         self.clearSelection();
@@ -7103,6 +7109,9 @@ test "fixed shortcuts consume repeats and releases only with matching modifiers"
     defer _ = linux.close(app.selection_autoscroll_fd);
     app.keyboard = try .init();
     defer app.keyboard.deinit();
+    app.window = try alloc.create(Window);
+    defer alloc.destroy(app.window);
+    app.window.pointer_enter_serial = null;
 
     const names: c.xkb_rule_names = .{ .layout = "us", .options = "" };
     const keymap = c.xkb_keymap_new_from_names(app.keyboard.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse

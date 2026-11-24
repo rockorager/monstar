@@ -50,6 +50,9 @@ cursor_theme: ?*wl.CursorTheme,
 cursor_surface: ?*wl.Surface,
 cursor_shape: CursorShape,
 pointer_enter_serial: ?u32,
+/// Set by typing and cleared by pointer activity or the next enter. While
+/// set, shape changes are recorded but not sent to the compositor.
+pointer_hidden: bool,
 /// Clipboard: managers create sources (copy); devices carry offers
 /// (paste) and set selections. Null when the compositor lacks them.
 data_manager: ?*wl.DataDeviceManager,
@@ -421,6 +424,7 @@ pub fn create(
         .cursor_surface = cursor_surface,
         .cursor_shape = .text,
         .pointer_enter_serial = null,
+        .pointer_hidden = false,
         .data_manager = globals.data_manager,
         .data_device = data_device,
         .primary_manager = globals.primary_manager,
@@ -607,6 +611,22 @@ pub fn setCursorShape(self: *Window, shape: CursorShape) void {
     self.applyCursorShape();
 }
 
+/// Hide the pointer while it is over the window, until it next moves,
+/// clicks, scrolls, or re-enters.
+pub fn hidePointer(self: *Window) void {
+    const serial = self.pointer_enter_serial orelse return;
+    const pointer = self.pointer orelse return;
+    if (self.pointer_hidden) return;
+    self.pointer_hidden = true;
+    pointer.setCursor(serial, null, 0, 0);
+}
+
+fn showPointer(self: *Window) void {
+    if (!self.pointer_hidden) return;
+    self.pointer_hidden = false;
+    self.applyCursorShape();
+}
+
 /// Select whether future render buffers carry alpha. Existing busy buffers
 /// cannot be destroyed until wl_buffer.release, so they are retired lazily.
 /// After startup, callers must invalidate any in-flight or held frame.
@@ -732,6 +752,7 @@ pub fn setTextInputCursorRect(self: *Window, rect: TextInputRect) void {
 
 fn applyCursorShape(self: *Window) void {
     const serial = self.pointer_enter_serial orelse return;
+    if (self.pointer_hidden) return;
     if (self.cursor_shape_device) |device| {
         device.setShape(serial, self.cursor_shape);
         return;
@@ -1393,12 +1414,97 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, self: *Window) void 
     switch (event) {
         .enter => |enter| {
             self.pointer_enter_serial = enter.serial;
+            self.pointer_hidden = false;
             self.applyCursorShape();
         },
         .leave => self.pointer_enter_serial = null,
+        .motion, .button, .axis => self.showPointer(),
         else => {},
     }
     if (self.pointer_fn) |pointer_fn| pointer_fn(self.render_ctx.?, event);
+}
+
+test "typing hides the pointer until pointer activity or the next enter" {
+    const linux = std.os.linux;
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[1]);
+    const display = try wl.Display.connectToFd(fds[0]);
+    defer display.disconnect();
+    const registry = try display.getRegistry();
+    defer registry.destroy();
+    const compositor = try registry.bind(1, wl.Compositor, 4);
+    defer compositor.destroy();
+    const surface = try compositor.createSurface();
+    defer surface.destroy();
+    const seat = try registry.bind(2, wl.Seat, 5);
+    defer destroySeat(seat);
+    const manager = try registry.bind(3, wp.CursorShapeManagerV1, 1);
+    defer manager.destroy();
+    const pointer = try seat.getPointer();
+    defer destroyPointer(pointer);
+    const device = try manager.getPointer(pointer);
+    defer device.destroy();
+
+    var window: Window = undefined;
+    window.pointer = pointer;
+    window.cursor_shape_device = device;
+    window.cursor_shape = .text;
+    window.pointer_enter_serial = null;
+    window.pointer_hidden = false;
+    window.pointer_fn = null;
+    pointer.setListener(*Window, pointerListener, &window);
+
+    var wire: [512]u8 align(4) = undefined;
+    try std.testing.expectEqual(.SUCCESS, display.flush());
+    while (@as(isize, @bitCast(linux.read(fds[1], &wire, wire.len))) > 0) {}
+
+    const Wire = struct {
+        fn send(fd: std.posix.fd_t, d: *wl.Display, words: []const u32) !void {
+            const bytes = std.mem.sliceAsBytes(words);
+            try std.testing.expectEqual(bytes.len, linux.write(fd, bytes.ptr, bytes.len));
+            try std.testing.expectEqual(.SUCCESS, d.dispatch());
+        }
+        fn expectSent(fd: std.posix.fd_t, d: *wl.Display, buf: []align(4) u8, words: []const u32) !void {
+            try std.testing.expectEqual(.SUCCESS, d.flush());
+            const n: isize = @bitCast(linux.read(fd, buf.ptr, buf.len));
+            const sent: usize = if (n > 0) @intCast(n) else 0;
+            try std.testing.expectEqualSlices(u32, words, @alignCast(std.mem.bytesAsSlice(u32, buf[0..sent])));
+        }
+    };
+    const pointer_id = pointer.getId();
+    const device_id = device.getId();
+    const set_shape = (16 << 16) | 1;
+    const set_cursor = (24 << 16) | 0;
+    const text: u32 = @backingInt(CursorShape.text);
+    const hand: u32 = @backingInt(CursorShape.pointer);
+
+    // enter(serial 7) applies the current shape.
+    try Wire.send(fds[1], display, &.{ pointer_id, (24 << 16) | 0, 7, surface.getId(), 0, 0 });
+    try Wire.expectSent(fds[1], display, &wire, &.{ device_id, set_shape, 7, text });
+
+    // Hiding sends one null-surface set_cursor; shape changes while hidden
+    // are remembered but not sent.
+    window.hidePointer();
+    window.hidePointer();
+    window.setCursorShape(.pointer);
+    try Wire.expectSent(fds[1], display, &wire, &.{ pointer_id, set_cursor, 7, 0, 0, 0 });
+
+    // motion restores the latest shape.
+    try Wire.send(fds[1], display, &.{ pointer_id, (20 << 16) | 2, 0, 0, 0 });
+    try Wire.expectSent(fds[1], display, &wire, &.{ device_id, set_shape, 7, hand });
+
+    // A hidden pointer that leaves comes back on the next enter.
+    window.hidePointer();
+    try Wire.send(fds[1], display, &.{ pointer_id, (16 << 16) | 1, 8, surface.getId() });
+    window.hidePointer();
+    try Wire.send(fds[1], display, &.{ pointer_id, (24 << 16) | 0, 9, surface.getId(), 0, 0 });
+    try Wire.expectSent(fds[1], display, &wire, &.{ pointer_id, set_cursor, 7, 0, 0, 0, device_id, set_shape, 9, hand });
 }
 
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Window) void {
