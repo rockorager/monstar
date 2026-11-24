@@ -1,0 +1,5 @@
+{
+  // Add this entry to ~/.config/omarchy/extensions/omarchy-menu.jsonc to put
+  // a "Rex hosts" row on the Omarchy menu (Super+Space).
+  "rex": {"icon":"󰒋","label":"Rex hosts","description":"Open a shell on a Rex host","action":"$HOME/.local/bin/rex-launch"},
+}

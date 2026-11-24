@@ -1,0 +1,101 @@
+#!/bin/bash
+# Pick a Rex host from `rex hosts` in the Omarchy menu, then a new shell or
+# one of its running monstar shells, and open a monstar window on it.
+
+set -euo pipefail
+
+host_icon=$'\U000F048B'  # nf-md-server
+new_icon=$'\U000F0415'   # nf-md-plus
+shell_icon=$'\U000F018D' # nf-md-console
+
+# The first endpoint monstar can use: it has no TLS yet, and a socket path
+# only works where the socket exists.
+usable_endpoint() {
+  local endpoint
+  for endpoint in "$@"; do
+    case $endpoint in
+      https://*) continue ;;
+      unix://*) [[ -S ${endpoint#unix://} ]] || continue ;;
+      /*) [[ -S $endpoint ]] || continue ;;
+    esac
+    printf '%s\n' "$endpoint"
+    return 0
+  done
+  return 1
+}
+
+# The menu returns "label<TAB>subtext"; these map that back to a choice.
+declare -A endpoint_of label_of
+options=("$host_icon"$'\t'"This machine"$'\t'"local")
+endpoint_of["This machine"$'\t'"local"]=local
+label_of["This machine"$'\t'"local"]=""
+while IFS=$'\t' read -r label endpoints; do
+  read -ra list <<< "$endpoints"
+  endpoint=$(usable_endpoint "${list[@]}") || continue
+  options+=("$host_icon"$'\t'"$label"$'\t'"$endpoint")
+  endpoint_of["$label"$'\t'"$endpoint"]=$endpoint
+  label_of["$label"$'\t'"$endpoint"]=$label
+done < <(rex hosts --json | jq -r '.hosts[].host | [.label, (.endpoints | join(" "))] | @tsv')
+
+choice=$(omarchy-menu-select "Rex hosts" "${options[@]}") || exit 0
+endpoint=${endpoint_of[$choice]}
+server=()
+[[ -n ${label_of[$choice]} ]] && server=(-S "${label_of[$choice]}")
+
+# The host's monstar shells and what each runs. One `rex do` script asks
+# for all of them over a single connection, since connecting to a remote
+# host can take most of a second.
+read -r -d '' shells_query << 'EOF' || true
+local sid
+for _, s in ipairs(rex.call("session.list").sessions or {}) do
+  if s.label == "monstar" then sid = s.session_id end
+end
+if not sid then return {} end
+rex.call("session.attach", { session_id = sid })
+local shells = {}
+for _, b in ipairs(rex.call("session.list_blocks", { session_id = sid }).blocks or {}) do
+  local args = { session_id = sid, block_id = b.block_id }
+  local ok, p = pcall(rex.call, "com.superlogical.terminal.process", args)
+  if ok then
+    local _, t = pcall(rex.call, "com.superlogical.terminal.title", args)
+    local f = p.foreground or p.child or {}
+    shells[#shells + 1] = {
+      block_id = b.block_id,
+      owner = b.owner or "",
+      title = type(t) == "table" and t.title or "",
+      program = f.name or "shell",
+      cwd = f.cwd or "",
+    }
+  end
+end
+return shells
+EOF
+
+# Detached shells first. A host without the session has none, and an empty
+# result comes back as {} rather than [].
+options=("$new_icon"$'\t'"New shell")
+declare -A block_of
+# Fields are joined with the unit separator because read collapses runs of
+# whitespace separators, which would drop an empty owner.
+while IFS=$'\x1f' read -r block owner title program cwd; do
+  state=detached
+  [[ -n $owner ]] && state="open elsewhere"
+  label=${title:-$program}
+  # The block ID's tail keeps rows with the same title and directory apart.
+  subtext="$cwd · $state · ${block: -6}"
+  options+=("$shell_icon"$'\t'"$label"$'\t'"$subtext")
+  block_of["$label"$'\t'"$subtext"]=$block
+done < <(rex "${server[@]}" "do" -e "$shells_query" --json 2> /dev/null |
+  jq -r 'if type == "array" then sort_by(.owner != "")[] | [.block_id, .owner, .title, .program, .cwd] | join("\u001f") else empty end')
+
+args=(--rex "$endpoint")
+if ((${#options[@]} > 1)); then
+  choice=$(omarchy-menu-select "Shells" "${options[@]}") || exit 0
+  [[ -n ${block_of[$choice]:-} ]] && args+=(--rex-block "${block_of[$choice]}")
+fi
+
+# Launch through uwsm like Omarchy's own apps, so the window gets its own
+# session scope.
+launcher=()
+command -v uwsm-app > /dev/null && launcher=(uwsm-app --)
+exec "${launcher[@]}" monstar "${args[@]}"

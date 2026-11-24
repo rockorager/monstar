@@ -94,15 +94,15 @@ test *ARGS:
 [group("lint")]
 lint:
     zig fmt --check build.zig build.zig.zon src
-    shellcheck .agents/setup packaging/*.sh
-    shfmt -i 2 -ci -sr --diff .agents/setup packaging/*.sh
+    shellcheck .agents/setup packaging/*.sh extras/omarchy/rex-launch
+    shfmt -i 2 -ci -sr --diff .agents/setup packaging/*.sh extras/omarchy/rex-launch
     just --unstable --fmt --check
 
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
     zig fmt build.zig build.zig.zon src
-    shfmt -i 2 -ci -sr --write .agents/setup packaging/*.sh
+    shfmt -i 2 -ci -sr --write .agents/setup packaging/*.sh extras/omarchy/rex-launch
     just --unstable --fmt
 
 [doc("Release origin/main as vVERSION, the next patch version by default; CI builds and publishes it")]
