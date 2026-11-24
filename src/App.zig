@@ -29,6 +29,7 @@ const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
 const Link = @import("Link.zig");
 const Pty = @import("Pty.zig");
+const rex = @import("rex.zig");
 const ReadPipeline = @import("ReadPipeline.zig");
 const Renderer = @import("Renderer.zig");
 const AsyncRaster = @import("AsyncRaster.zig");
@@ -199,6 +200,9 @@ write_queue_offset: usize = 0,
 child_exited: bool,
 /// Keep the window open after the child exits.
 hold: bool,
+/// The Rex block standing in for the child (`--rex`). `pty.master` is then
+/// the client's socket, and `child_pid` is 0.
+rex_client: ?*rex.Client,
 /// Session bus connection, used for notifications and future desktop settings.
 /// `void` when built with `-Ddbus=false`.
 dbus: DbusHandle,
@@ -390,6 +394,8 @@ pub const InitOptions = struct {
     title: [:0]const u8 = "monstar",
     initial_size: InitialSize = .default,
     hold: bool = false,
+    /// Run a new Rex shell block on this target instead of `path`.
+    rex: ?[]const u8 = null,
 };
 
 const StartupSize = struct {
@@ -620,7 +626,25 @@ pub fn init(
         if (dbus_connection) |*connection| connection.deinit();
     };
 
-    var pty: Pty = try .open(.{
+    // The client's thread ends once the pty's deinit closes its socket,
+    // so this errdefer must run after that one.
+    var rex_client: ?*rex.Client = null;
+    errdefer if (rex_client) |client| client.deinit();
+    var pty: Pty = if (options.rex) |target| pty: {
+        const client, const fd = try rex.Client.start(alloc, io, environ, .{
+            .target = target,
+            .size = .{
+                .columns = startup_size.cols,
+                .rows = startup_size.rows,
+                .cell_width_px = font.cell_width,
+                .cell_height_px = font.cell_height,
+            },
+            .theme = rexTheme(&term.colors, .dark),
+            .kitty_image_storage_limit = config.image_storage_limit,
+        });
+        rex_client = client;
+        break :pty .{ .master = fd, .slave = -1, .gate = -1 };
+    } else try .open(.{
         .row = startup_size.rows,
         .col = startup_size.cols,
         .xpixel = @intCast(startup_size.cols * font.cell_width),
@@ -636,10 +660,10 @@ pub fn init(
     // released once both are confirmed below. Always false with
     // -Ddbus=false, since scope creation is a systemd1 D-Bus call.
     const use_cgroup_scope = if (build_options.enable_dbus)
-        config.linux_cgroup == .always and dbus_connection != null and cgroup.systemdBooted()
+        config.linux_cgroup == .always and dbus_connection != null and cgroup.systemdBooted() and rex_client == null
     else
         false;
-    const child_pid = try pty.spawn(path, argv, envp, .{
+    const child_pid = if (rex_client != null) 0 else try pty.spawn(path, argv, envp, .{
         .cwd = if (options.working_directory) |cwd| cwd.ptr else null,
         .gate_child = use_cgroup_scope,
     });
@@ -777,6 +801,7 @@ pub fn init(
         .write_queue = .empty,
         .child_exited = false,
         .hold = options.hold,
+        .rex_client = rex_client,
         .dbus = dbus_connection,
         .dbus_fd = -1,
         .pending_open_uri = null,
@@ -853,7 +878,8 @@ pub fn init(
 
     // Handle sequences that need responses or side effects.
     var effects: Effects = .readonly;
-    effects.write_pty = effectWritePty;
+    // The Rex server's terminal answers queries itself.
+    if (rex_client == null) effects.write_pty = effectWritePty;
     effects.device_attributes = effectDeviceAttributes;
     effects.enquiry = effectEnquiry;
     effects.size = effectSize;
@@ -1710,7 +1736,8 @@ fn handlePortalSettingChanged(self: *App, message: *const DbusConnection.Message
 fn setColorScheme(self: *App, color_scheme: vt.device_status.ColorScheme, report: bool) void {
     self.color_scheme = color_scheme;
     self.applyColorDefaults();
-    if (report and self.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport();
+    // Rex reports the scheme it is sent itself.
+    if (report and self.rex_client == null and self.term.modes.get(.report_color_scheme)) self.sendColorSchemeReport();
 }
 
 fn setReducedMotion(self: *App, reduced_motion: bool) void {
@@ -1840,6 +1867,7 @@ pub fn deinit(self: *App) void {
     self.hangupChild();
     self.pipeline.deinit();
     self.pty.deinit();
+    if (self.rex_client) |client| client.deinit();
     self.cancelDrag();
     self.selection_gesture.deinit(&self.term);
     if (self.async_raster_loader) |*loader| loader.deinit();
@@ -1919,6 +1947,7 @@ pub fn run(self: *App) !void {
         .{ .fd = self.compression_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.resize_fd, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = if (self.rex_client) |client| client.ready_fd else -1, .events = posix.POLL.IN, .revents = 0 },
     } ++ @as([Clipboard.max_outgoing_transfers]posix.pollfd, @splat(.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }));
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1939,7 +1968,8 @@ pub fn run(self: *App) !void {
     const compression_fd = &fds[16];
     const resize_fd = &fds[17];
     const vulkan_fd = &fds[18];
-    const outgoing_clipboard_fds = fds[19..][0..Clipboard.max_outgoing_transfers];
+    const rex_snapshot_fd = &fds[19];
+    const outgoing_clipboard_fds = fds[20..][0..Clipboard.max_outgoing_transfers];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         self.expireDbusRequests();
@@ -2021,6 +2051,9 @@ pub fn run(self: *App) !void {
 
         if (pty_write_fd.revents & posix.POLL.OUT != 0) {
             self.flushWriteQueue();
+        }
+        if (rex_snapshot_fd.revents & posix.POLL.IN != 0) {
+            try self.installRexSnapshot();
         }
         if (pipeline_fd.revents & posix.POLL.IN != 0) {
             try self.drainPipeline();
@@ -2115,8 +2148,9 @@ fn hangupChild(self: *App) void {
     if (self.child_exited) {
         return;
     }
+    // For Rex, closing the client's socket closes the block.
     self.pty.closeMaster();
-    _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
+    if (self.child_pid > 0) _ = std.os.linux.kill(self.child_pid, std.os.linux.SIG.HUP);
 }
 
 /// Signal events arrived. SIGCHLD is the only place the terminal decides
@@ -2135,7 +2169,7 @@ fn drainSignals(self: *App) !void {
         }
     }
     if (saw_sigusr1) self.reloadConfig();
-    if (saw_sigchld) {
+    if (saw_sigchld and self.rex_client == null) {
         if (try Pty.tryWait(self.child_pid)) |status| {
             log.debug("child exited with status {d}", .{status});
             self.child_exited = true;
@@ -2768,6 +2802,53 @@ fn applyColorDefaultsForConfig(self: *App, config: Config) void {
     self.copy_highlight_fg = config.effectiveCopyHighlightForeground(self.color_scheme);
     self.cursor_color = config.effectiveCursorColor(self.color_scheme);
     self.cursor_text = config.effectiveCursorText(self.color_scheme);
+    if (self.rex_client) |client| client.setTheme(rexTheme(&self.term.colors, self.color_scheme));
+}
+
+/// The colors a Rex block answers queries with: the terminal's defaults.
+fn rexTheme(colors: *const vt.Terminal.Colors, scheme: vt.device_status.ColorScheme) rex.Theme {
+    return .{
+        .foreground = colors.foreground.default orelse .{ .r = 0xff, .g = 0xff, .b = 0xff },
+        .background = colors.background.default orelse .{ .r = 0, .g = 0, .b = 0 },
+        .cursor = colors.cursor.default,
+        .palette = colors.palette.original.*,
+        .scheme = scheme,
+    };
+}
+
+/// Adopt the terminal restored from a Rex block's snapshot in place of the
+/// empty one the window started with, then let the block's live output
+/// through. Nothing has been fed to the old terminal, so only state that
+/// refers to it is reset.
+fn installRexSnapshot(self: *App) !void {
+    const client = self.rex_client.?;
+    var decoded = client.takeSnapshot() orelse return;
+    defer decoded.deinit(self.alloc);
+
+    self.selection_gesture.deinit(&self.term);
+    self.selection_gesture = .init;
+    if (self.search) |*search| {
+        search.deinit(self.alloc, &self.term);
+        self.search = null;
+        self.stopSearchTimer();
+    }
+    self.term.deinit(self.alloc);
+    // The stream refers to the terminal by address, so it stays valid.
+    self.term = decoded.toOwned();
+    self.term.flags.dirty.clear = true;
+    self.term.screens.active.pages.setMaxBytes(self.config.scrollback_limit);
+    self.term.setKittyGraphicsLoadingLimits(.allWithTempDir(tmpDirPath(self.environ)));
+    self.applyColorDefaults();
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => |bytes| self.stream.nextSlice(bytes),
+    }
+    self.compression_activity = self.term.compressionActivity();
+    self.active_screen = self.term.screens.active_key;
+    self.requestFullAsyncRedraw();
+    if (self.terminalSizeStale()) try self.applyTerminalSize();
+    self.syncPtyOutput(true);
+    client.snapshotInstalled();
 }
 
 fn selectionBackgroundForRender(self: *const App) vt.color.RGB {
@@ -2845,7 +2926,8 @@ fn resetRuntimeFontSize(self: *App) void {
 /// of the loop; rearm() keeps the eventfd hot while batches remain.
 ///
 /// The master can never return EIO/EOF because Pty.spawn retains a
-/// slave fd in this process; only SIGCHLD ends the session.
+/// slave fd in this process; only SIGCHLD ends the session. A Rex client
+/// closes its socket when the block ends, which ends the session instead.
 fn drainPipeline(self: *App) !void {
     self.pipeline.clearReady();
     var consumed = false;
@@ -2857,7 +2939,15 @@ fn drainPipeline(self: *App) !void {
         self.needs_redraw = true;
     }
     self.pipeline.rearm();
-    if (self.pipeline.hasFailed()) return error.PtyReadFailed;
+    if (self.pipeline.hasFailed()) {
+        if (self.rex_client == null) return error.PtyReadFailed;
+        while (self.pipeline.take()) |batch| {
+            self.stream.nextSlice(batch);
+            self.pipeline.release();
+            consumed = true;
+        }
+        self.child_exited = true;
+    }
     self.syncPtyOutput(consumed);
 }
 
@@ -3337,6 +3427,7 @@ test "busy OSC 52 read replies empty without disturbing the active transfer" {
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
     app.pty.master = output[1];
+    app.rex_client = null;
     app.clipboard.transfer_fd = incoming[0];
     app.clipboard.transfer_action = .{ .osc52_read = .{ .kind = 'c', .mime = "UTF8_STRING" } };
 
@@ -3433,6 +3524,7 @@ test "mode 2031 reports only on query, not when enabled or restored" {
     try app.write_queue.append(alloc, 0);
     app.write_queue_offset = 0;
     app.pty.master = -1;
+    app.rex_client = null;
     app.color_scheme = .light;
     // Mode changes resync the pointer shape.
     app.window = try alloc.create(Window);
@@ -3467,6 +3559,8 @@ fn syncInBandSizeReports(self: *App) void {
 }
 
 fn sendSizeReport(self: *App) void {
+    // Rex reports the size it is sent itself.
+    if (self.rex_client != null) return;
     var buf: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     vt.size_report.encode(&writer, .mode_2048, self.currentSize()) catch return;
@@ -4413,6 +4507,7 @@ test "expired Kitty read fails and unblocks the next queued request" {
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
     app.pty.master = output[1];
+    app.rex_client = null;
     app.clipboard.transfer_fd = incoming[0];
     app.clipboard.transfer_deadline_ms = 0;
     try app.kitty_clipboard.handle(.{ .metadata = "type=read:id=first", .payload = "dGV4dC9wbGFpbg==", .terminator = .st });
@@ -4587,6 +4682,7 @@ test "Kitty writes decode STRING before claiming UTF-8 selections" {
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
     app.pty.master = output[1];
+    app.rex_client = null;
     app.last_serial = 17;
 
     // C3 A9 must remain two Latin-1 characters even though it is valid UTF-8.
@@ -4657,6 +4753,7 @@ test "oversized Kitty read replies fail explicitly and retire the request" {
     defer alloc.destroy(app);
     app.alloc = alloc;
     app.pty.master = fds[1];
+    app.rex_client = null;
     app.write_queue = .empty;
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
@@ -4758,6 +4855,8 @@ fn writeTerminalPaste(
         null;
     defer if (decoded) |text| self.alloc.free(text);
     const text = decoded orelse data;
+    // The block brackets and filters the paste by its own modes.
+    if (self.rex_client) |client| return client.paste(text);
     // The stream handler emits 4096-byte writes, but the bounded PTY queue
     // can reject a later chunk (including the closing bracket). Encode the
     // entire paste first so writePty accepts or rejects it atomically.
@@ -4799,6 +4898,7 @@ test "ordinary STRING pastes and text drops decode Latin-1" {
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
     app.pty.master = output[1];
+    app.rex_client = null;
 
     // C3 A9 is valid UTF-8 too, but STRING still means two Latin-1 characters.
     const latin1 = "caf\xe9 \xa3\xff \xc3\xa9\n";
@@ -4842,7 +4942,8 @@ test "terminal paste is atomic at the PTY backlog limit" {
     app.write_queue = try .initCapacity(alloc, max_pty_write_queue);
     defer app.write_queue.deinit(alloc);
     app.write_queue_offset = 0;
-    app.pty.master = -1; // The existing backlog must keep all input queued.
+    app.pty.master = -1;
+    app.rex_client = null; // The existing backlog must keep all input queued.
 
     // Cross libghostty's streaming boundary and require both sanitization
     // and newline handling, rather than just checking the output length.
@@ -5367,6 +5468,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     defer stream.deinit();
     app.write_queue = .empty;
     defer app.write_queue.deinit(alloc);
+    app.rex_client = null;
     // A backlog keeps actual encoded PTY input in the queue without a child.
     try app.write_queue.append(alloc, 0);
     app.write_queue_offset = 0;
@@ -6010,7 +6112,25 @@ fn sendMouseEvent(self: *App, event: vt.input.MouseEncodeEvent) void {
     });
     opts.any_button_pressed = event.action == .press or self.mouse_button != null;
     vt.input.encodeMouse(&writer, event, opts) catch return;
-    self.writePty(writer.buffered());
+    if (writer.buffered().len == 0) return;
+    const client = self.rex_client orelse return self.writePty(writer.buffered());
+    // The block encodes the event itself, from the cell under the pointer.
+    const x = cellIndex(event.pos.x, self.layout.padding.left, self.font.cell_width, self.term.cols);
+    const y = cellIndex(event.pos.y, self.layout.padding.top, self.font.cell_height, self.term.rows);
+    if (event.action == .press) switch (event.button orelse .unknown) {
+        .four => return client.wheel(x, y, 0, -1),
+        .five => return client.wheel(x, y, 0, 1),
+        .six => return client.wheel(x, y, -1, 0),
+        .seven => return client.wheel(x, y, 1, 0),
+        else => {},
+    };
+    client.mouse(event, x, y);
+}
+
+/// The cell containing surface pixel `pos`, clamped to the grid.
+fn cellIndex(pos: f32, padding: u32, cell_size: u32, count: u16) u16 {
+    const cell = @floor((pos - @as(f32, @floatFromInt(padding))) / @as(f32, @floatFromInt(cell_size)));
+    return @intFromFloat(std.math.clamp(cell, 0, @as(f32, @floatFromInt(count -| 1))));
 }
 
 /// Pointer position in physical (buffer) pixels, as mouse encoding expects.
@@ -6127,6 +6247,7 @@ test "keyboard removal cancels repeat and reports focus loss once" {
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
     app.pty.master = fds[1];
+    app.rex_client = null;
     app.write_queue = .empty;
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
@@ -6151,7 +6272,7 @@ fn setFocus(self: *App, focused: bool) void {
         var buf: [vt.input.max_focus_encode_size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         vt.input.encodeFocus(&writer, if (focused) .gained else .lost) catch return;
-        self.writePty(writer.buffered());
+        if (self.rex_client) |client| client.focus(focused) else self.writePty(writer.buffered());
     }
 }
 
@@ -6207,7 +6328,7 @@ fn applyPendingIme(self: *App) void {
     }
     if (self.ime_pending_commit) |commit| {
         if (commit.len > 0) {
-            self.writePty(commit);
+            if (self.rex_client) |client| client.paste(commit) else self.writePty(commit);
             self.stopFling();
             self.resetSmoothScroll();
             self.clearSelection();
@@ -6785,6 +6906,7 @@ test "fixed shortcuts consume repeats and releases only with matching modifiers"
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
     app.pty.master = fds[1];
+    app.rex_client = null;
     app.fling_active = false;
     app.scroll_offset = 0;
     app.wheel_scroll_pixels = 0;
@@ -6920,7 +7042,9 @@ fn encodeAndWriteKey(self: *App, event: vt.input.KeyEvent) bool {
     };
     const bytes = writer.buffered();
     if (bytes.len == 0) return false;
-    self.writePty(bytes);
+    // The block encodes the key itself; the local encoding only decides,
+    // from the same modes, whether the key is input.
+    if (self.rex_client) |client| client.key(event) else self.writePty(bytes);
     return true;
 }
 
@@ -6930,6 +7054,7 @@ const max_pty_write_queue = 4 * 1024 * 1024;
 /// Accept the entire write or drop it before emitting any bytes. Reserve the
 /// possible backlog first so neither backpressure nor OOM truncates a reply.
 fn writePty(self: *App, bytes: []const u8) void {
+    if (self.rex_client) |client| return client.write(bytes);
     std.debug.assert(self.write_queue_offset <= self.write_queue.items.len);
     const pending = self.write_queue.items.len - self.write_queue_offset;
     if (bytes.len > max_pty_write_queue -| pending) {
@@ -7000,6 +7125,7 @@ test "maximum clipboard response survives write backpressure in order" {
     defer alloc.destroy(app);
     app.alloc = alloc;
     app.pty.master = fds[1];
+    app.rex_client = null;
     app.write_queue = .empty;
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
@@ -7045,6 +7171,7 @@ test "PTY limit and allocation failure reject before writing a prefix" {
     defer alloc.destroy(app);
     app.alloc = alloc;
     app.pty.master = fds[1];
+    app.rex_client = null;
     app.write_queue = .empty;
     app.write_queue_offset = 0;
     defer app.write_queue.deinit(alloc);
@@ -7069,6 +7196,7 @@ test "PTY enqueue counts unread bytes and amortizes compaction" {
     const app = try alloc.create(App);
     defer alloc.destroy(app);
     app.alloc = alloc;
+    app.rex_client = null;
     app.write_queue = try .initCapacity(alloc, max_pty_write_queue);
     defer app.write_queue.deinit(alloc);
     app.write_queue.items.len = max_pty_write_queue;
@@ -8098,7 +8226,12 @@ fn applyTerminalSize(self: *App) !void {
         });
         if (cells_changed) self.refreshSearch();
     }
-    try self.pty.setWinsize(.{
+    if (self.rex_client) |client| client.resize(.{
+        .columns = cols,
+        .rows = rows,
+        .cell_width_px = self.font.cell_width,
+        .cell_height_px = self.font.cell_height,
+    }) else try self.pty.setWinsize(.{
         .row = rows,
         .col = cols,
         .xpixel = @intCast(self.layout.grid_width),

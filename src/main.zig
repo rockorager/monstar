@@ -111,6 +111,9 @@ const CliOptions = struct {
     hold: bool = false,
     command_mode: CommandMode = .shell,
     command: []const [:0]const u8 = &.{},
+    /// `--rex TARGET`: run a new Rex terminal block on TARGET instead of a
+    /// local command.
+    rex: ?[:0]const u8 = null,
 };
 
 const CliError = error{InvalidCli} || std.mem.Allocator.Error;
@@ -156,6 +159,8 @@ const CliParser = struct {
                 continue;
             } else if (try self.longValue(arg, "--working-directory")) |value| {
                 try self.setWorkingDirectory(value);
+            } else if (try self.pathOption(arg, "--rex", &self.cli.rex)) {
+                continue;
             } else if (std.mem.eql(u8, arg, "--hold")) {
                 self.cli.hold = true;
             } else if (try self.configOption(arg, "--app-id", "app-id")) {
@@ -177,6 +182,7 @@ const CliParser = struct {
             }
         }
 
+        if (self.cli.rex != null and self.cli.command.len > 0) return error.InvalidCli;
         self.cli.config_overrides = try self.overrides.toOwnedSlice(self.arena);
         return self.cli;
     }
@@ -288,6 +294,7 @@ fn printUsage(init: std.process.Init) !void {
         \\usage: monstar [options]
         \\       monstar [options] -e command [args...]
         \\       monstar [options] -- command...
+        \\       monstar [options] --rex TARGET
         \\
         \\Options:
         \\  -h, --help                         Show this help
@@ -303,6 +310,9 @@ fn printUsage(init: std.process.Init) !void {
         \\  -o key=value                       Override a config key
         \\  -e command [args...]               Execute command directly
         \\  -- command...                      Run command through /bin/sh -c
+        \\      --rex TARGET                   Open a new shell on a Rex server:
+        \\                                     local, HOST[:PORT], http://HOST[:PORT],
+        \\                                     or unix:///PATH
         \\
     );
 }
@@ -354,6 +364,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
             .title = cli.title,
             .initial_size = initialSize(cli.initial_size, config),
             .hold = cli.hold,
+            .rex = cli.rex,
         },
     );
     defer app.deinit();
@@ -576,8 +587,10 @@ test {
     _ = @import("ReadPipeline.zig");
     _ = Renderer;
     _ = @import("resize.zig");
+    _ = @import("rex.zig");
     _ = @import("ScrollbackSearch.zig");
     _ = @import("ScrollDetector.zig");
+    _ = @import("WebSocket.zig");
     _ = @import("pixel_copy.zig");
     _ = @import("pixel_raster.zig");
     _ = @import("sprite.zig");
@@ -803,6 +816,19 @@ test "parse CLI double dash command uses shell mode" {
     try std.testing.expectEqual(.shell, cli.command_mode);
     try std.testing.expectEqualStrings("echo", cli.command[0]);
     try std.testing.expectEqualStrings("hello", cli.command[1]);
+}
+
+test "parse CLI rex target replaces the command" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const gui_cli = try parseCli(arena, &.{ "--rex=xps", "--title", "remote" });
+    try std.testing.expectEqual(.run, gui_cli.action);
+    try std.testing.expectEqualStrings("xps", gui_cli.rex.?);
+    try std.testing.expectEqualStrings("remote", gui_cli.title);
+
+    try std.testing.expectError(error.InvalidCli, parseCli(arena, &.{ "--rex", "xps", "-e", "htop" }));
 }
 
 test "parse CLI rejects double dash without a command" {

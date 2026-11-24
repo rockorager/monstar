@@ -70,6 +70,16 @@ monstar --working-directory ~/src \
   -o background-opacity=0.95
 ```
 
+Pass `--rex` to open a new shell on a [Rex](https://www.superlogical.com/rex)
+server instead of a local command. The target is `local`, a host with a Rex
+tailnet listener (`--extra-listen tailnet://:7297`), `http://host:port`, or
+`unix:///path`. Each window is one shell in the server's `monstar` session,
+and closing the window closes the shell:
+
+```sh
+monstar --rex xps
+```
+
 Run `monstar --help`, `man monstar`, or `man 5 monstar` for the complete
 command and configuration reference.
 

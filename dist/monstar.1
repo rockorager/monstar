@@ -15,6 +15,11 @@ monstar \- a small Wayland terminal emulator
 .RI [ options ]
 .B \-\-
 .I command...
+.br
+.B monstar
+.RI [ options ]
+.B \-\-rex
+.I target
 .SH DESCRIPTION
 .B monstar
 is a Wayland terminal emulator written in Zig and built on Ghostty's terminal
@@ -73,6 +78,22 @@ Unknown keys and invalid values make the command line invalid.
 See
 .BR monstar (5)
 for available keys.
+.TP
+.BI \-\-rex " target"
+Open a new shell on a Rex server instead of running a local command.
+The shell runs in a new window of the server's
+.B monstar
+session, and closing the monstar window closes it.
+.I target
+is
+.B local
+for this machine's server,
+.IR host [: port ]
+for a listener on a tailnet address (port 7297 by default),
+.BI http:// host\fR[\fP: port\fR]\fP\fR,
+or
+.BI unix:// path\fR.
+HTTPS endpoints are not supported.
 .TP
 .BI \-\-title " title"
 Set the initial window title.
