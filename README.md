@@ -188,6 +188,10 @@ Other settings:
   copies it to the primary selection, `clipboard` copies it to both the
   primary selection and the clipboard, and `false` copies nothing (default
   `true`).
+- **clipboard-read** — Whether applications, including ones on SSH hosts,
+  may read the clipboard and primary selection with OSC 52: `allow` or
+  `deny` (default `allow`). `deny` answers reads as if the clipboard were
+  empty and keeps OSC 52 copying working.
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for
   scrolling, new windows, clipboard, and sending text. See
   [Keybindings](#keybindings) below.

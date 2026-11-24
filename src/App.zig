@@ -3109,7 +3109,10 @@ fn writeKittyColorValue(writer: *std.Io.Writer, color: vt.color.RGB) !void {
 
 fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
     if (data.len == 1 and data[0] == '?') {
-        self.beginOsc52Read(kind);
+        switch (self.config.clipboard_read) {
+            .allow => self.beginOsc52Read(kind),
+            .deny => self.writeOsc52ClipboardReport(kind, ""),
+        }
         return;
     }
 
@@ -3449,6 +3452,71 @@ test "busy OSC 52 read replies empty without disturbing the active transfer" {
     const completed_len = try posix.read(output[0], &buf);
     try std.testing.expectEqualStrings("\x1b]52;c;aGVsbG8=\x07", buf[0..completed_len]);
     try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
+}
+
+test "clipboard-read deny answers OSC 52 reads empty while a selection is offered" {
+    const alloc = std.testing.allocator;
+    const linux = std.os.linux;
+    for ([_]Config.ClipboardRead{ .allow, .deny }) |policy| {
+        var fds: [2]posix.fd_t = undefined;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+            0,
+            &fds,
+        )));
+        defer _ = linux.close(fds[1]);
+        const display = try wl.Display.connectToFd(fds[0]);
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        const device = try registry.bind(1, wl.DataDevice, 3);
+        defer device.release();
+
+        var output: [2]posix.fd_t = undefined;
+        try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true, .NONBLOCK = true })));
+        defer _ = linux.close(output[0]);
+        defer _ = linux.close(output[1]);
+        const app = try alloc.create(App);
+        defer alloc.destroy(app);
+        app.alloc = alloc;
+        app.config = .{ .clipboard_read = policy };
+        app.clipboard = .init(alloc, null, null);
+        defer app.clipboard.deinit();
+        app.clipboard.setDevices(device, null);
+        app.write_queue = .empty;
+        app.write_queue_offset = 0;
+        defer app.write_queue.deinit(alloc);
+        app.pty.master = output[1];
+        app.rex_client = null;
+
+        // Play the compositor: offer a text/plain selection on the device.
+        const offer_id: u32 = 0xff000000;
+        const device_id = device.getId();
+        const events = [_]u32{
+            device_id, (12 << 16) | 0, offer_id, // wl_data_device.data_offer
+            offer_id, (24 << 16) | 0, 11, // wl_data_offer.offer
+        } ++ std.mem.bytesToValue([3]u32, "text/plain\x00\x00") ++ [_]u32{
+            device_id, (12 << 16) | 5, offer_id, // wl_data_device.selection
+        };
+        const bytes = std.mem.sliceAsBytes(&events);
+        try std.testing.expectEqual(bytes.len, linux.write(fds[1], bytes.ptr, bytes.len));
+        try std.testing.expectEqual(.SUCCESS, display.dispatch());
+
+        app.setOsc52Clipboard('c', "?");
+        var buf: [64]u8 = undefined;
+        switch (policy) {
+            .allow => {
+                try std.testing.expect(app.clipboard.transferFd() >= 0);
+                try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
+            },
+            .deny => {
+                try std.testing.expectEqual(@as(posix.fd_t, -1), app.clipboard.transferFd());
+                const n = try posix.read(output[0], &buf);
+                try std.testing.expectEqualStrings("\x1b]52;c;\x07", buf[0..n]);
+            },
+        }
+    }
 }
 
 test "PNG decode rejects oversized dimensions before rasterization" {

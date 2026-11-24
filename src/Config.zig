@@ -171,6 +171,9 @@ keybinds: std.ArrayList(keybind.Binding) = .empty,
 copy_highlight_duration: u32 = 200,
 /// Where a finished mouse selection is copied.
 copy_on_select: CopyOnSelect = .primary,
+/// Whether applications may read the clipboard and primary selection with
+/// OSC 52. OSC 5522 reads keep their own paste grants.
+clipboard_read: ClipboardRead = .allow,
 /// Effective alpha of the default terminal background. Keeping this as an
 /// 8-bit value matches the wl_shm buffer and makes the opaque fast path exact.
 background_opacity: u8 = 255,
@@ -205,6 +208,9 @@ pub const BackgroundBlur = enum { never, translucent, always };
 /// Parsed from Ghostty's values: `false` is `off`, `true` is `primary`, and
 /// `clipboard` copies to both the primary selection and the clipboard.
 pub const CopyOnSelect = enum { off, primary, clipboard };
+/// `deny` answers OSC 52 reads with an empty report, as for an empty
+/// clipboard, and keeps OSC 52 writes working.
+pub const ClipboardRead = enum { allow, deny };
 /// `auto` and `shm` use wl_shm. `dmabuf` presents frames as udmabuf-backed
 /// dma-bufs and warns when it falls back to wl_shm; it is opt-in because some
 /// drivers, such as NVIDIA's, show stale pixels from these buffers.
@@ -499,6 +505,8 @@ pub fn set(self: *Config, arena: std.mem.Allocator, key: []const u8, value: []co
             .clipboard
         else
             return error.InvalidValue;
+    } else if (std.mem.eql(u8, key, "clipboard-read")) {
+        self.clipboard_read = std.meta.stringToEnum(ClipboardRead, value) orelse return error.InvalidValue;
     } else if (std.mem.eql(u8, key, "background-opacity")) {
         self.background_opacity = try parseOpacity(value);
     } else if (std.mem.eql(u8, key, "background-blur")) {
@@ -868,6 +876,7 @@ test "defaults" {
     }).?.scroll_page_lines);
     try std.testing.expectEqual(@as(u32, 200), config.copy_highlight_duration);
     try std.testing.expectEqual(CopyOnSelect.primary, config.copy_on_select);
+    try std.testing.expectEqual(ClipboardRead.allow, config.clipboard_read);
     try std.testing.expectEqual(@as(u8, 255), config.background_opacity);
     try std.testing.expectEqual(BackgroundBlur.translucent, config.background_blur);
     try std.testing.expect(!config.background_opacity_cells);
@@ -917,6 +926,8 @@ test "parse config" {
         \\copy-highlight-duration = 250
         \\copy-on-select = clipboard
         \\copy-on-select = primary
+        \\clipboard-read = deny
+        \\clipboard-read = ask
         \\background-opacity = 0.8
         \\background-blur = false
         \\background-opacity-cells = true
@@ -964,6 +975,8 @@ test "parse config" {
     try std.testing.expectEqual(@as(u32, 250), config.copy_highlight_duration);
     // `primary` is the internal tag name, not a config value.
     try std.testing.expectEqual(CopyOnSelect.clipboard, config.copy_on_select);
+    // Ghostty's `ask` is not supported; it keeps the previous value.
+    try std.testing.expectEqual(ClipboardRead.deny, config.clipboard_read);
     try std.testing.expectEqual(@as(u8, 204), config.background_opacity);
     try std.testing.expectEqual(BackgroundBlur.never, config.background_blur);
     try std.testing.expect(config.background_opacity_cells);
