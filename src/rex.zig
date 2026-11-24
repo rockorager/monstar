@@ -332,23 +332,43 @@ const Block = struct {
     block_id: []const u8,
 };
 
+/// The ID of the `monstar` session, allocated with `arena`, or null when
+/// the server has none.
+fn findSession(control: *Control, alloc: std.mem.Allocator, arena: std.mem.Allocator) !?[]const u8 {
+    // An empty tuple would serialize as [], which Rex rejects.
+    var sessions = try control.call(alloc, "session.list", struct {}{});
+    defer sessions.deinit();
+    const list = field(field(sessions.value, "payload") orelse return null, "sessions") orelse return null;
+    if (list != .array) return null;
+    for (list.array.items) |session| {
+        const label = stringField(session, "label") orelse continue;
+        if (!std.mem.eql(u8, label, session_label)) continue;
+        return try arena.dupe(u8, stringField(session, "session_id") orelse stringField(session, "id") orelse continue);
+    }
+    return null;
+}
+
+/// Attach the connection to the `monstar` session and return its block
+/// `block_id`, which may be detached or open in another window.
+fn existingBlock(control: *Control, alloc: std.mem.Allocator, arena: std.mem.Allocator, block_id: []const u8) !Block {
+    const session_id = try findSession(control, alloc, arena) orelse return error.BlockNotFound;
+    (try control.call(alloc, "session.attach", .{ .session_id = session_id })).deinit();
+    var blocks = try control.call(alloc, "session.list_blocks", .{ .session_id = session_id });
+    defer blocks.deinit();
+    const list = field(field(blocks.value, "payload") orelse .null, "blocks") orelse return error.ProtocolError;
+    if (list != .array) return error.ProtocolError;
+    for (list.array.items) |block| {
+        const id = stringField(block, "block_id") orelse continue;
+        if (std.mem.eql(u8, id, block_id)) return .{ .session_id = session_id, .block_id = try arena.dupe(u8, id) };
+    }
+    return error.BlockNotFound;
+}
+
 /// Open a new shell block in the `monstar` session, creating the session
 /// if it does not exist, and attach the connection to the session.
 fn newShellBlock(control: *Control, alloc: std.mem.Allocator, arena: std.mem.Allocator) !Block {
     const layout = .{ .block = .{ .flavor = shell_flavor } };
-
-    // An empty tuple would serialize as [], which Rex rejects.
-    var sessions = try control.call(alloc, "session.list", struct {}{});
-    defer sessions.deinit();
-    const existing: ?[]const u8 = existing: {
-        const list = field(field(sessions.value, "payload") orelse break :existing null, "sessions") orelse break :existing null;
-        if (list != .array) break :existing null;
-        for (list.array.items) |session| {
-            const label = stringField(session, "label") orelse continue;
-            if (std.mem.eql(u8, label, session_label)) break :existing stringField(session, "session_id") orelse stringField(session, "id");
-        }
-        break :existing null;
-    };
+    const existing = try findSession(control, alloc, arena);
 
     // A session can only be changed by a connection attached to it. If it
     // ended since it was listed, start a new one instead.
@@ -361,7 +381,7 @@ fn newShellBlock(control: *Control, alloc: std.mem.Allocator, arena: std.mem.All
         var window = try control.call(alloc, "session.new_window", .{ .session_id = session_id, .layout = layout });
         defer window.deinit();
         const block_id = firstBlockId(field(window.value, "payload") orelse .null) orelse return error.ProtocolError;
-        return .{ .session_id = try arena.dupe(u8, session_id), .block_id = try arena.dupe(u8, block_id) };
+        return .{ .session_id = session_id, .block_id = try arena.dupe(u8, block_id) };
     }
 
     var created = try control.call(alloc, "session.create", .{
@@ -518,6 +538,8 @@ pub const Client = struct {
     io: std.Io,
     environ: std.process.Environ,
     target: []const u8,
+    /// The existing block to attach to, or null for a new shell.
+    block_id: ?[]const u8,
     kitty_image_storage_limit: usize,
     /// The thread's end of the socket pair.
     fd: posix.fd_t,
@@ -535,9 +557,13 @@ pub const Client = struct {
     input: std.ArrayList(Input) = .empty,
     snapshot: ?vt.snapshot.Decoded = null,
     snapshot_installed: bool = false,
+    detaching: bool = false,
 
     pub const Options = struct {
         target: []const u8,
+        /// Attach to this block in the `monstar` session instead of
+        /// opening a new shell.
+        block_id: ?[]const u8 = null,
         /// Sent as soon as the block exists, so its snapshot is cut at
         /// the window's size.
         size: Size,
@@ -552,6 +578,8 @@ pub const Client = struct {
         errdefer alloc.destroy(self);
         const target = try alloc.dupe(u8, options.target);
         errdefer alloc.free(target);
+        const block_id = if (options.block_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (block_id) |id| alloc.free(id);
 
         var fds: [2]i32 = undefined;
         if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) != .SUCCESS)
@@ -569,6 +597,7 @@ pub const Client = struct {
             .io = io,
             .environ = environ,
             .target = target,
+            .block_id = block_id,
             .kitty_image_storage_limit = options.kitty_image_storage_limit,
             .fd = fds[1],
             .wake_fd = wake_fd,
@@ -590,7 +619,16 @@ pub const Client = struct {
         _ = linux.close(self.wake_fd);
         _ = linux.close(self.ready_fd);
         self.alloc.free(self.target);
+        if (self.block_id) |id| self.alloc.free(id);
         self.alloc.destroy(self);
+    }
+
+    /// Leave the shell running and end the session, so the window closes
+    /// without closing the block. Its output keeps arriving until then.
+    pub fn detach(self: *Client) void {
+        self.lock();
+        self.detaching = true;
+        self.unlockAndWake();
     }
 
     pub fn resize(self: *Client, size: Size) void {
@@ -692,6 +730,7 @@ pub const Client = struct {
         theme: ?Theme,
         input: std.ArrayList(Input),
         snapshot_installed: bool,
+        detaching: bool,
 
         fn deinit(mail: *Mail, alloc: std.mem.Allocator) void {
             for (mail.input.items) |item| alloc.free(item.bytes);
@@ -709,6 +748,7 @@ pub const Client = struct {
             .theme = self.theme,
             .input = self.input,
             .snapshot_installed = self.snapshot_installed,
+            .detaching = self.detaching,
         };
         self.size = null;
         self.theme = null;
@@ -727,6 +767,7 @@ pub const Client = struct {
             const reason = if (failure.len > 0) failure else switch (err) {
                 error.TlsUnsupported => "https endpoints are not supported yet; use http:// or a tailnet listener",
                 error.InvalidEndpoint => "not a Rex endpoint",
+                error.BlockNotFound => "no such shell in the monstar session",
                 else => @errorName(err),
             };
             const message = std.fmt.bufPrint(&buf, "\r\nmonstar: rex {s}: {s}\r\n[press any key to close]", .{ self.target, reason }) catch "";
@@ -779,7 +820,11 @@ pub const Client = struct {
             else => return error.ProtocolError,
         }
 
-        const block = try newShellBlock(&control, alloc, arena);
+        const block = if (self.block_id) |id|
+            try existingBlock(&control, alloc, arena, id)
+        else
+            try newShellBlock(&control, alloc, arena);
+        // Set when the block must outlive this window.
         var closed = false;
         defer if (!closed) {
             // Rex drops requests still running when their connection
@@ -797,7 +842,10 @@ pub const Client = struct {
         {
             var mail = self.takeMail();
             defer mail.deinit(alloc);
-            try self.deliver(&control, block, &mail);
+            if (try self.deliver(&control, block, &mail)) {
+                closed = true;
+                return;
+            }
         }
 
         var data, const nonce = try openData(&control, alloc, io, endpoint, block);
@@ -828,7 +876,10 @@ pub const Client = struct {
             if (fds[3].revents & posix.POLL.IN != 0) {
                 var mail = self.takeMail();
                 defer mail.deinit(alloc);
-                try self.deliver(&control, block, &mail);
+                if (try self.deliver(&control, block, &mail)) {
+                    closed = true;
+                    return;
+                }
                 if (mail.snapshot_installed) {
                     if (held) |*bytes| {
                         try WebSocket.writeAll(self.fd, bytes.items);
@@ -904,8 +955,9 @@ pub const Client = struct {
         bump(self.ready_fd);
     }
 
-    /// Send what the App posted, input in the order it was queued.
-    fn deliver(self: *Client, control: *Control, block: Block, mail: *const Mail) !void {
+    /// Send what the App posted, input in the order it was queued. Returns
+    /// true once a detach has released the block.
+    fn deliver(self: *Client, control: *Control, block: Block, mail: *const Mail) !bool {
         const alloc = self.alloc;
         if (mail.size) |size| {
             _ = try control.send(alloc, "com.superlogical.terminal.resize", .{
@@ -932,6 +984,10 @@ pub const Client = struct {
             },
             .event => try control.sendEvent(alloc, block, item.bytes),
         };
+        if (!mail.detaching) return false;
+        // Waiting for the reply also lets the input sent before it land.
+        (try control.call(alloc, "session.disown_block", .{ .session_id = block.session_id, .block_ids = .{block.block_id} })).deinit();
+        return true;
     }
 };
 

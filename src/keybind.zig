@@ -32,6 +32,8 @@ const uucode = @import("uucode");
 
 pub const Action = union(enum) {
     new_window,
+    /// Close a `--rex` window but leave its shell running on the server.
+    rex_detach,
     scroll_page_lines: i16,
     copy_to_clipboard,
     paste_from_clipboard,
@@ -64,6 +66,7 @@ const defaults = [_]Binding{
     .{ .trigger = .{ .key = .{ .physical = .arrow_up }, .mods = .{ .shift = true } }, .action = .{ .scroll_page_lines = -1 } },
     .{ .trigger = .{ .key = .{ .physical = .arrow_down }, .mods = .{ .shift = true } }, .action = .{ .scroll_page_lines = 1 } },
     .{ .trigger = .{ .key = .{ .unicode = 'n' }, .mods = .{ .ctrl = true, .shift = true } }, .action = .new_window },
+    .{ .trigger = .{ .key = .{ .unicode = 'd' }, .mods = .{ .super = true } }, .action = .rex_detach },
 };
 
 /// Only single-key triggers and the actions in Action are supported;
@@ -88,6 +91,8 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8) error{ InvalidValue, O
         .unbind
     else if (std.mem.eql(u8, action_text, "new_window"))
         .new_window
+    else if (std.mem.eql(u8, action_text, "rex_detach"))
+        .rex_detach
     else if (std.mem.eql(u8, action_text, "copy_to_clipboard"))
         .copy_to_clipboard
     else if (std.mem.eql(u8, action_text, "paste_from_clipboard"))

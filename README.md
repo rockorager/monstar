@@ -74,10 +74,12 @@ Pass `--rex` to open a new shell on a [Rex](https://www.superlogical.com/rex)
 server instead of a local command. The target is `local`, a host with a Rex
 tailnet listener (`--extra-listen tailnet://:7297`), `http://host:port`, or
 `unix:///path`. Each window is one shell in the server's `monstar` session,
-and closing the window closes the shell:
+and closing the window closes the shell. Super+D closes the window but leaves
+the shell running, and `--rex-block` opens a window on it again:
 
 ```sh
 monstar --rex xps
+monstar --rex xps --rex-block block:01a20d64-cc52-7054-973c-4555d07099a5
 ```
 
 Run `monstar --help`, `man monstar`, or `man 5 monstar` for the complete

@@ -114,6 +114,9 @@ const CliOptions = struct {
     /// `--rex TARGET`: run a new Rex terminal block on TARGET instead of a
     /// local command.
     rex: ?[:0]const u8 = null,
+    /// `--rex-block ID`: attach to this block in the server's `monstar`
+    /// session instead of opening a new shell.
+    rex_block: ?[:0]const u8 = null,
 };
 
 const CliError = error{InvalidCli} || std.mem.Allocator.Error;
@@ -161,6 +164,8 @@ const CliParser = struct {
                 try self.setWorkingDirectory(value);
             } else if (try self.pathOption(arg, "--rex", &self.cli.rex)) {
                 continue;
+            } else if (try self.pathOption(arg, "--rex-block", &self.cli.rex_block)) {
+                continue;
             } else if (std.mem.eql(u8, arg, "--hold")) {
                 self.cli.hold = true;
             } else if (try self.configOption(arg, "--app-id", "app-id")) {
@@ -183,6 +188,7 @@ const CliParser = struct {
         }
 
         if (self.cli.rex != null and self.cli.command.len > 0) return error.InvalidCli;
+        if (self.cli.rex_block != null and self.cli.rex == null) return error.InvalidCli;
         self.cli.config_overrides = try self.overrides.toOwnedSlice(self.arena);
         return self.cli;
     }
@@ -313,6 +319,8 @@ fn printUsage(init: std.process.Init) !void {
         \\      --rex TARGET                   Open a new shell on a Rex server:
         \\                                     local, HOST[:PORT], http://HOST[:PORT],
         \\                                     or unix:///PATH
+        \\      --rex-block ID                 With --rex, attach to a running shell
+        \\                                     of the server's monstar session
         \\
     );
 }
@@ -365,6 +373,7 @@ fn gui(init: std.process.Init, cli: CliOptions) !void {
             .initial_size = initialSize(cli.initial_size, config),
             .hold = cli.hold,
             .rex = cli.rex,
+            .rex_block = cli.rex_block,
         },
     );
     defer app.deinit();
@@ -829,6 +838,10 @@ test "parse CLI rex target replaces the command" {
     try std.testing.expectEqualStrings("remote", gui_cli.title);
 
     try std.testing.expectError(error.InvalidCli, parseCli(arena, &.{ "--rex", "xps", "-e", "htop" }));
+
+    const attach_cli = try parseCli(arena, &.{ "--rex-block", "block:1", "--rex", "xps" });
+    try std.testing.expectEqualStrings("block:1", attach_cli.rex_block.?);
+    try std.testing.expectError(error.InvalidCli, parseCli(arena, &.{ "--rex-block", "block:1" }));
 }
 
 test "parse CLI rejects double dash without a command" {

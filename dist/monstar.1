@@ -84,6 +84,11 @@ Open a new shell on a Rex server instead of running a local command.
 The shell runs in a new window of the server's
 .B monstar
 session, and closing the monstar window closes it.
+.B Super+D
+closes the window but leaves the shell running; see
+.B rex_detach
+in
+.BR monstar (5).
 .I target
 is
 .B local
@@ -94,6 +99,19 @@ for a listener on a tailnet address (port 7297 by default),
 or
 .BI unix:// path\fR.
 HTTPS endpoints are not supported.
+.TP
+.BI \-\-rex\-block " id"
+With
+.BR \-\-rex ,
+open a window on a running shell of the server's
+.B monstar
+session, such as one left running with
+.BR Super+D ,
+instead of starting a new one.
+.I id
+is the block ID that
+.B rex api call -s monstar session.list_blocks
+reports.
 .TP
 .BI \-\-title " title"
 Set the initial window title.

@@ -443,6 +443,11 @@ down, and zero consumes the key without moving. N must be between -32768 and
 32767.
 .B new_window
 opens an independent window in the current directory.
+.B rex_detach
+closes a
+.B \-\-rex
+window but leaves its shell running on the server; in other windows the key
+goes to the application.
 .B copy_to_clipboard
 and
 .B paste_from_clipboard
@@ -470,6 +475,7 @@ The default bindings are:
 keybind = shift+up=scroll_page_lines:-1
 keybind = shift+down=scroll_page_lines:1
 keybind = ctrl+shift+n=new_window
+keybind = super+d=rex_detach
 .fi
 .PP
 For example, add a five-line shortcut, remove the default up shortcut, send

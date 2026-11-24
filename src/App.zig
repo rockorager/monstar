@@ -396,6 +396,8 @@ pub const InitOptions = struct {
     hold: bool = false,
     /// Run a new Rex shell block on this target instead of `path`.
     rex: ?[]const u8 = null,
+    /// With `rex`, attach to this existing block instead.
+    rex_block: ?[]const u8 = null,
 };
 
 const StartupSize = struct {
@@ -633,6 +635,7 @@ pub fn init(
     var pty: Pty = if (options.rex) |target| pty: {
         const client, const fd = try rex.Client.start(alloc, io, environ, .{
             .target = target,
+            .block_id = options.rex_block,
             .size = .{
                 .columns = startup_size.cols,
                 .rows = startup_size.rows,
@@ -6761,6 +6764,7 @@ const KeyBindingAction = union(enum) {
     top,
     bottom,
     new_window,
+    rex_detach,
     copy_to_clipboard,
     paste_from_clipboard,
     text: []const u8,
@@ -6778,6 +6782,7 @@ fn keyBindingAction(
         return switch (action) {
             .unbind => .passthrough,
             .new_window => .new_window,
+            .rex_detach => .rex_detach,
             .copy_to_clipboard => .copy_to_clipboard,
             .paste_from_clipboard => .paste_from_clipboard,
             .text => |bytes| .{ .text = bytes },
@@ -6828,6 +6833,8 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
         .passthrough => {},
         // Consume the matching repeats and releases too, like fixed shortcuts.
         .new_window => return if (action == .press) self.spawnNewWindow(),
+        // A local window has no shell to leave running; the key is input.
+        .rex_detach => if (self.rex_client) |client| return if (action == .press) client.detach(),
         .copy_to_clipboard => return if (action == .press) self.copyToClipboard(),
         .paste_from_clipboard => return if (action == .press) self.beginPaste(.clipboard),
         // Bound text replaces the key's encoding on press and repeat, like
@@ -8532,6 +8539,18 @@ test "new_window defaults to ctrl+shift+n and can be rebound on either screen" {
         try std.testing.expectEqual(KeyBindingAction.new_window, keyBindingAction(&config, screen, alt_n).?);
         try std.testing.expectEqual(KeyBindingAction.passthrough, keyBindingAction(&config, screen, ctrl_shift_n).?);
     }
+}
+
+test "rex_detach defaults to super+d and can be rebound" {
+    var config: Config = .{};
+    defer config.keybinds.deinit(std.testing.allocator);
+    const super_d: vt.input.KeyEvent = .{ .key = .key_d, .utf8 = "d", .unshifted_codepoint = 'd', .mods = .{ .super = true } };
+    const ctrl_shift_d: vt.input.KeyEvent = .{ .key = .key_d, .utf8 = "D", .unshifted_codepoint = 'd', .mods = .{ .ctrl = true, .shift = true } };
+    try std.testing.expectEqual(KeyBindingAction.rex_detach, keyBindingAction(&config, .alternate, super_d).?);
+    try std.testing.expectEqual(null, keyBindingAction(&config, .primary, ctrl_shift_d));
+
+    try config.set(std.testing.allocator, "keybind", "ctrl+shift+d=rex_detach");
+    try std.testing.expectEqual(KeyBindingAction.rex_detach, keyBindingAction(&config, .primary, ctrl_shift_d).?);
 }
 
 test "scrollback search scrolls a history match into the viewport" {
