@@ -1003,21 +1003,25 @@ pub fn endExternalCommit(self: *Window) void {
     }
 }
 
-/// Destroy shm buffers the compositor has released, once an external
-/// presenter has replaced them. Returns whether any remain.
-pub fn releaseIdleBuffers(self: *Window) bool {
+/// Destroy shm buffers other than `keep` that the compositor has released:
+/// all of them once an external presenter has replaced them, or the spares
+/// beyond the newest frame once the window goes idle. Returns whether any
+/// buffers other than `keep` remain.
+pub fn releaseIdleBuffers(self: *Window, keep: ?*Buffer) bool {
     var kept: usize = 0;
+    var others = false;
     for (self.buffers.items) |buffer| {
-        if (buffer.busy or buffer.rendering) {
+        if (buffer == keep or buffer.busy or buffer.rendering) {
             self.buffers.items[kept] = buffer;
             kept += 1;
+            if (buffer != keep) others = true;
             continue;
         }
         if (self.newest_buffer == buffer) self.newest_buffer = null;
         buffer.destroy(self.alloc);
     }
     self.buffers.items.len = kept;
-    return kept > 0;
+    return others;
 }
 
 test "launcher activation follows the first buffer commit exactly once" {

@@ -24,7 +24,8 @@ fd: posix.fd_t,
 data: []align(std.heap.page_size_min) u8,
 /// Null presents through wl_shm only.
 udmabuf: ?*Udmabuf,
-/// dma-buf view of all of `data`, recreated when the pool grows.
+/// dma-buf view of the pages the current shape uses, recreated when their
+/// count changes.
 udmabuf_fd: ?posix.fd_t,
 width: u31,
 height: u31,
@@ -73,7 +74,7 @@ pub fn create(
 
     const pool = try shm.createPool(fd, @intCast(capacity));
     errdefer pool.destroy();
-    const udmabuf_fd = if (udmabuf) |value| value.wrap(fd, capacity) else null;
+    const udmabuf_fd = if (udmabuf) |value| value.wrap(fd, usedBytes(dimensions.size)) else null;
     errdefer if (udmabuf_fd) |value| {
         _ = linux.close(value);
     };
@@ -105,6 +106,8 @@ pub fn reshape(self: *ShmBuffer, width: u31, height: u31, format: Format) !void 
     std.debug.assert(!self.busy and !self.rendering);
     std.debug.assert(width > 0 and height > 0);
     const dimensions = try bufferDimensions(width, height);
+    const used = usedBytes(dimensions.size);
+    const old_used = usedBytes(@as(usize, self.stride) * @sizeOf(u32) * self.height);
     if (dimensions.size > self.data.len) {
         const capacity = try grownBufferCapacity(self.data.len, dimensions.size);
         if (linux.errno(linux.ftruncate(self.fd, @intCast(capacity))) != .SUCCESS) return error.ShmFailed;
@@ -119,10 +122,18 @@ pub fn reshape(self: *ShmBuffer, width: u31, height: u31, format: Format) !void 
         self.pool.resize(@intCast(capacity));
         posix.munmap(self.data);
         self.data = data;
-        // A udmabuf covers a fixed range; the grown tail needs a new one.
-        if (self.udmabuf_fd) |fd| _ = linux.close(fd);
-        self.udmabuf_fd = if (self.udmabuf) |udmabuf| udmabuf.wrap(self.fd, capacity) else null;
     }
+    if (used < old_used) {
+        // The pool cannot shrink, but F_SEAL_SHRINK still allows freeing the
+        // pages past the new shape. Failure only leaves them resident.
+        const mode = linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE;
+        _ = linux.fallocate(self.fd, mode, @intCast(used), @intCast(self.data.len - used));
+    }
+    if (used != old_used) if (self.udmabuf) |udmabuf| {
+        // A udmabuf pins every page it covers, so it covers only the used ones.
+        if (self.udmabuf_fd) |fd| _ = linux.close(fd);
+        self.udmabuf_fd = udmabuf.wrap(self.fd, used);
+    };
 
     const created = try createWlBuffer(self.pool, self.udmabuf, self.udmabuf_fd, width, height, dimensions.stride, format);
     created.buffer.setListener(*ShmBuffer, bufferListener, self);
@@ -192,6 +203,11 @@ fn bufferDimensions(width: u31, height: u31) !BufferDimensions {
     return .{ .stride = @intCast(stride), .size = size };
 }
 
+/// Bytes of the pool a shape of `size` bytes occupies, in whole pages.
+fn usedBytes(size: usize) usize {
+    return std.mem.alignForward(usize, size, std.heap.page_size_min);
+}
+
 fn grownBufferCapacity(current: usize, required: usize) !usize {
     const max_capacity: usize = std.math.maxInt(i32);
     if (required > max_capacity) return error.ShmBufferTooLarge;
@@ -216,4 +232,46 @@ test "SHM buffer capacity grows geometrically and remains page aligned" {
     const grown = try grownBufferCapacity(initial, initial + 1);
     try std.testing.expect(grown >= initial + initial / 2);
     try std.testing.expectEqual(@as(usize, 0), grown % std.heap.page_size_min);
+}
+
+test "shrinking a buffer frees the pages past its new shape" {
+    // libwayland only queues the requests; nothing reads the other end.
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &fds,
+    )));
+    defer _ = linux.close(fds[1]);
+    const display = try wl.Display.connectToFd(fds[0]);
+    defer display.disconnect();
+    const registry = try display.getRegistry();
+    defer registry.destroy();
+    const shm = try registry.bind(1, wl.Shm, 1);
+    defer shm.destroy();
+
+    const buffer = try create(std.testing.allocator, shm, null, 256, 256, .xrgb8888);
+    defer buffer.destroy(std.testing.allocator);
+    try buffer.reshape(512, 512, .xrgb8888);
+    @memset(buffer.pixels(), 0xff00ff);
+    const large = buffer.data.len;
+    try std.testing.expect(residentBytes(buffer.data) >= 512 * 512 * 4);
+
+    // A width that is not a stride multiple checks that the padded rows stay.
+    try buffer.reshape(100, 37, .xrgb8888);
+    try std.testing.expectEqual(large, buffer.data.len);
+    const used = usedBytes(@as(usize, buffer.stride) * @sizeOf(u32) * buffer.height);
+    try std.testing.expectEqual(used, residentBytes(buffer.data));
+    try std.testing.expectEqual(@as(u32, 0xff00ff), buffer.pixels()[buffer.pixels().len - 1]);
+}
+
+fn residentBytes(data: []align(std.heap.page_size_min) u8) usize {
+    const page = std.heap.page_size_min;
+    var vec: [4096]u8 = undefined;
+    std.debug.assert(data.len / page <= vec.len);
+    posix.mincore(data.ptr, data.len, &vec) catch unreachable;
+    var pages: usize = 0;
+    for (vec[0 .. data.len / page]) |entry| pages += entry & 1;
+    return pages * page;
 }

@@ -254,6 +254,8 @@ compression_fd: posix.fd_t,
 resize_fd: posix.fd_t,
 /// Periodic blink phase timer, armed only while `cursor_blink_armed`.
 cursor_blink_fd: posix.fd_t,
+/// Frees spare shm buffers once CPU-rendered frames stop for a while.
+spare_buffers_fd: posix.fd_t,
 /// The terminal requests a blinking cursor (DECSCUSR or DEC mode 12)
 /// while the focused, unsuspended window shows it.
 cursor_blink_armed: bool,
@@ -346,6 +348,8 @@ const copy_brackets_arm = 10.0;
 const copy_brackets_thickness = 2;
 /// Matches Ghostty's blink phase length.
 const cursor_blink_interval_ms = 600;
+/// Quiet period after the last CPU frame before spare buffers are freed.
+const spare_buffers_idle_ms = 1000;
 const compression_idle_ms = 250;
 const compression_step_ms = 1;
 /// Quiet period after the last interactive-resize configure before the
@@ -749,6 +753,9 @@ pub fn init(
     const cursor_blink_fd = try createTimerFd();
     errdefer _ = std.os.linux.close(cursor_blink_fd);
 
+    const spare_buffers_fd = try createTimerFd();
+    errdefer _ = std.os.linux.close(spare_buffers_fd);
+
     // Scope confirmation ran concurrently with the window setup above,
     // so this rarely waits; the child stays gated until its migration
     // is confirmed (or abandoned).
@@ -844,6 +851,7 @@ pub fn init(
         .compression_fd = compression_fd,
         .resize_fd = resize_fd,
         .cursor_blink_fd = cursor_blink_fd,
+        .spare_buffers_fd = spare_buffers_fd,
         .cursor_blink_armed = false,
         .cursor_blink_visible = true,
         .resize_pending = false,
@@ -1909,6 +1917,7 @@ pub fn deinit(self: *App) void {
     _ = std.os.linux.close(self.compression_fd);
     _ = std.os.linux.close(self.resize_fd);
     _ = std.os.linux.close(self.cursor_blink_fd);
+    _ = std.os.linux.close(self.spare_buffers_fd);
     _ = std.os.linux.close(self.kitty_animation_fd);
     _ = std.os.linux.close(self.scrollbar_fd);
     _ = std.os.linux.close(self.search_fd);
@@ -1968,6 +1977,7 @@ pub fn run(self: *App) !void {
         .{ .fd = -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = if (self.rex_client) |client| client.ready_fd else -1, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = self.cursor_blink_fd, .events = posix.POLL.IN, .revents = 0 },
+        .{ .fd = self.spare_buffers_fd, .events = posix.POLL.IN, .revents = 0 },
     } ++ @as([Clipboard.max_outgoing_transfers]posix.pollfd, @splat(.{ .fd = -1, .events = posix.POLL.OUT, .revents = 0 }));
     const wl_fd = &fds[0];
     const pipeline_fd = &fds[1];
@@ -1990,7 +2000,8 @@ pub fn run(self: *App) !void {
     const vulkan_fd = &fds[18];
     const rex_snapshot_fd = &fds[19];
     const cursor_blink_fd = &fds[20];
-    const outgoing_clipboard_fds = fds[21..][0..Clipboard.max_outgoing_transfers];
+    const spare_buffers_fd = &fds[21];
+    const outgoing_clipboard_fds = fds[22..][0..Clipboard.max_outgoing_transfers];
 
     while (self.window.running and (!self.child_exited or self.hold)) {
         self.expireDbusRequests();
@@ -2123,6 +2134,10 @@ pub fn run(self: *App) !void {
 
         if (cursor_blink_fd.revents & posix.POLL.IN != 0) {
             self.fireCursorBlink();
+        }
+
+        if (spare_buffers_fd.revents & posix.POLL.IN != 0) {
+            self.fireSpareBuffers();
         }
 
         if (taskbar_progress_fd.revents & posix.POLL.IN != 0) {
@@ -6571,6 +6586,23 @@ fn fireScrollbackCompression(self: *App) void {
     }
 }
 
+/// Restart the idle countdown that frees spare shm buffers. A single buffer
+/// is the minimum, so there is nothing to count down for.
+fn armSpareBuffers(self: *App) void {
+    if (self.window.buffers.items.len < 2) return;
+    _ = setTimer(self.spare_buffers_fd, .{
+        .it_value = timespecFromNs(spare_buffers_idle_ms * std.time.ns_per_ms),
+        .it_interval = .{ .sec = 0, .nsec = 0 },
+    }, "spare buffers");
+}
+
+/// Keep only the newest frame's buffer, which seeds partial redraws. A spare
+/// the compositor still holds is retried after another idle period.
+fn fireSpareBuffers(self: *App) void {
+    _ = readTimer(self.spare_buffers_fd) orelse return;
+    if (self.window.releaseIdleBuffers(self.window.newest_buffer)) self.armSpareBuffers();
+}
+
 fn armScrollbackCompression(self: *App, delay_ms: u64) void {
     _ = setTimer(self.compression_fd, .{
         .it_value = timespecFromNs(delay_ms * std.time.ns_per_ms),
@@ -7892,7 +7924,10 @@ fn commitFinishedFrame(self: *App, frame: FrameTarget) void {
         return;
     };
     const result = switch (frame) {
-        .shm => |buffer| self.window.commitRender(buffer, surface_damage),
+        .shm => |buffer| result: {
+            self.armSpareBuffers();
+            break :result self.window.commitRender(buffer, surface_damage);
+        },
         .gpu => |size| self.presentVulkanFrame(size.width, size.height, surface_damage),
     };
     result catch |err| {
@@ -7989,7 +8024,7 @@ fn presentVulkanFrame(self: *App, width: u31, height: u31, damage: Window.Damage
         .rects => |rects| rects,
     });
     self.window.endExternalCommit();
-    if (self.vulkan.shm_leftover) self.vulkan.shm_leftover = self.window.releaseIdleBuffers();
+    if (self.vulkan.shm_leftover) self.vulkan.shm_leftover = self.window.releaseIdleBuffers(null);
 }
 
 fn startVulkanLoad(self: *App) void {
