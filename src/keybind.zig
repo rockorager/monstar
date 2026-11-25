@@ -40,7 +40,25 @@ pub const Action = union(enum) {
     /// Bytes written to the pty. Ghostty's `text:` (Zig string literal
     /// escapes) and `csi:` (prefixed with ESC [) both decode to this.
     text: []const u8,
+    pipe: Pipe,
     unbind,
+};
+
+/// `pipe_<source>:<command>`: a Monstar action, not a Ghostty one.
+pub const Pipe = struct {
+    source: Source,
+    /// Runs as `/bin/sh -c <command>` with the text on stdin.
+    command: [:0]const u8,
+
+    pub const Source = enum {
+        /// The last OSC 133 command output.
+        command_output,
+        /// The rows on screen, which are scrollback while scrolled back.
+        viewport,
+        /// All scrollback and the active screen.
+        screen,
+        selection,
+    };
 };
 
 pub const Binding = struct {
@@ -71,7 +89,7 @@ const defaults = [_]Binding{
 
 /// Only single-key triggers and the actions in Action are supported;
 /// unsupported Ghostty sequences, flags and actions are errors. Text action
-/// bytes are allocated with `alloc` and owned by the caller.
+/// bytes and pipe commands are allocated with `alloc` and owned by the caller.
 pub fn parse(alloc: std.mem.Allocator, input: []const u8) error{ InvalidValue, OutOfMemory }!Binding {
     // Skip '=' when it is the trigger key, e.g. ctrl+==scroll_page_lines:-1
     // or =+ctrl=scroll_page_lines:-1 (the key need not follow the modifiers).
@@ -103,9 +121,23 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8) error{ InvalidValue, O
         .{ .text = try std.mem.concat(alloc, u8, &.{ "\x1b[", try nonEmpty(action_text["csi:".len..]) }) }
     else if (std.mem.startsWith(u8, action_text, "text:"))
         .{ .text = try parseText(alloc, try nonEmpty(action_text["text:".len..])) }
+    else if (try parsePipe(alloc, action_text)) |pipe|
+        .{ .pipe = pipe }
     else
         return error.InvalidValue;
     return .{ .trigger = trigger, .action = action };
+}
+
+/// The command is taken verbatim, without `text:` escapes.
+fn parsePipe(alloc: std.mem.Allocator, action_text: []const u8) error{ InvalidValue, OutOfMemory }!?Pipe {
+    inline for (comptime std.enums.values(Pipe.Source)) |source| {
+        const prefix = "pipe_" ++ @tagName(source) ++ ":";
+        if (std.mem.startsWith(u8, action_text, prefix)) return .{
+            .source = source,
+            .command = try alloc.dupeSentinel(u8, try nonEmpty(action_text[prefix.len..]), 0),
+        };
+    }
+    return null;
 }
 
 fn nonEmpty(text: []const u8) error{InvalidValue}![]const u8 {
@@ -284,7 +316,8 @@ test "Ghostty single-key syntax and action parameters" {
         "a=unknown",             "a=unbind:1",                "a=new_window:1",             "ctrl+not-a-key=unbind",   "a>b=unbind",
         "global:a=unbind",       "chain=unbind",              "catch_all=unbind",           "\xff=unbind",             "a=csi:",
         "a=text:",               "a=text:\\q",                "a=text:\\x1",                "a=text:ok\\",             "a=text:\\u{110000}",
-        "a=copy_to_clipboard:1", "a=paste_from_clipboard:1",  "ctrl+nope=text:x",
+        "a=copy_to_clipboard:1", "a=paste_from_clipboard:1",  "ctrl+nope=text:x",           "a=pipe_screen",           "a=pipe_screen:",
+        "a=pipe_scrollback:cat", "a=pipe_:cat",
     }) |text| try std.testing.expectError(error.InvalidValue, parse(std.testing.allocator, text));
 }
 
@@ -304,6 +337,26 @@ test "text, csi, and clipboard actions" {
     );
     try std.testing.expectEqual(Action.copy_to_clipboard, (try parse(arena, "ctrl+insert=copy_to_clipboard")).action);
     try std.testing.expectEqual(Action.paste_from_clipboard, (try parse(arena, "shift+Insert=paste_from_clipboard")).action);
+}
+
+test "pipe actions keep the command verbatim" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `=`, quotes, and backslashes after the action are the shell's.
+    const scrollback = try parse(arena, "ctrl+shift+e=pipe_screen:f=$(mktemp) && cat > \"$f\" && printf '\\n'");
+    try std.testing.expectEqual(Pipe.Source.screen, scrollback.action.pipe.source);
+    try std.testing.expectEqualStrings("f=$(mktemp) && cat > \"$f\" && printf '\\n'", scrollback.action.pipe.command);
+    for ([_]struct { text: []const u8, source: Pipe.Source }{
+        .{ .text = "a=pipe_command_output:cat", .source = .command_output },
+        .{ .text = "a=pipe_viewport:cat", .source = .viewport },
+        .{ .text = "a=pipe_selection:cat", .source = .selection },
+    }) |case| {
+        const pipe = (try parse(arena, case.text)).action.pipe;
+        try std.testing.expectEqual(case.source, pipe.source);
+        try std.testing.expectEqualStrings("cat", pipe.command);
+    }
 }
 
 test "repeatable bindings replace, unbind and restore without losing other triggers" {

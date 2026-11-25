@@ -175,6 +175,11 @@ standard input when
 .B Ctrl+Shift+G
 is pressed.
 The default is unset.
+See the
+.B pipe_*
+actions of
+.B keybind
+for other keys and text.
 .TP
 .BI term " = name"
 Set the
@@ -467,6 +472,19 @@ and
 sends ESC [ followed by
 .IR string .
 Text actions replace the key's own encoding on press and repeat.
+.BI pipe_viewport: command\fR,\fP
+.BI pipe_screen: command\fR,\fP
+.BI pipe_selection: command\fR,\fP
+and
+.BI pipe_command_output: command
+run
+.I command
+verbatim with
+.B /bin/sh \-c
+in the current directory and write to its standard input the rows on screen,
+all scrollback and the screen, the selection, or the last OSC 133-delimited
+command output. Nothing runs when there is no such text. These actions are
+Monstar's own, not Ghostty's.
 .B unbind
 removes a shortcut and passes its input to the application.
 .PP
@@ -479,14 +497,15 @@ keybind = super+d=rex_detach
 .fi
 .PP
 For example, add a five-line shortcut, remove the default up shortcut, send
-Shift+Enter as a CSI u sequence, and add the conventional Insert clipboard
-keys:
+Shift+Enter as a CSI u sequence, add the conventional Insert clipboard
+keys, and pick a URL on screen:
 .nf
 keybind = ctrl+shift+k=scroll_page_lines:-5
 keybind = shift+up=unbind
 keybind = shift+enter=csi:13;2u
 keybind = ctrl+insert=copy_to_clipboard
 keybind = shift+insert=paste_from_clipboard
+keybind = ctrl+shift+o=pipe_viewport:xurls | fuzzel \-\-dmenu | xargs \-r xdg\-open
 .fi
 .PP
 Triggers accept lowercase

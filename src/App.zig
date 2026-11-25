@@ -2514,10 +2514,22 @@ fn jumpPrompt(self: *App, delta: isize) void {
 }
 
 /// Ctrl+Shift+G: pipe the most recent OSC 133-delimited command output to
-/// the configured shell command. The command runs as `/bin/sh -c <value>`.
+/// `pipe-command-output`.
 fn pipeCommandOutput(self: *App) void {
     const command = self.config.pipe_command_output orelse return;
-    const output = self.lastCommandOutput() orelse return;
+    self.pipeText(.command_output, command);
+}
+
+/// Run `/bin/sh -c <command>` in the shell's OSC 7 directory with the
+/// source's text on stdin. Nothing runs when the source has no text.
+fn pipeText(self: *App, source: keybind.Pipe.Source, command: [:0]const u8) void {
+    const screen = self.term.screens.active;
+    const output = switch (source) {
+        .command_output => semanticCommandOutputText(self.alloc, screen),
+        .viewport => pagesText(self.alloc, screen, .viewport),
+        .screen => pagesText(self.alloc, screen, .screen),
+        .selection => self.selectionText(),
+    } orelse return;
     defer self.alloc.free(output);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.alloc);
@@ -2536,8 +2548,11 @@ fn pipeCommandOutput(self: *App) void {
     spawnPipeCommand(command, output, envp, pwd);
 }
 
-fn lastCommandOutput(self: *App) ?[:0]const u8 {
-    return semanticCommandOutputText(self.alloc, self.term.screens.active);
+/// Written rows from `tag`'s top-left through its bottom-right.
+fn pagesText(alloc: std.mem.Allocator, screen: *vt.Screen, tag: vt.point.Tag) ?[:0]const u8 {
+    const bottom_right = screen.pages.getBottomRight(tag) orelse return null;
+    const sel = vt.Selection.init(screen.pages.getTopLeft(tag), bottom_right, false);
+    return screen.selectionString(alloc, .{ .sel = sel, .trim = false }) catch null;
 }
 
 fn semanticCommandOutputText(alloc: std.mem.Allocator, screen: *vt.Screen) ?[:0]const u8 {
@@ -6986,6 +7001,7 @@ const KeyBindingAction = union(enum) {
     copy_to_clipboard,
     paste_from_clipboard,
     text: []const u8,
+    pipe: keybind.Pipe,
     passthrough,
 };
 
@@ -7004,6 +7020,7 @@ fn keyBindingAction(
             .copy_to_clipboard => .copy_to_clipboard,
             .paste_from_clipboard => .paste_from_clipboard,
             .text => |bytes| .{ .text = bytes },
+            .pipe => |pipe| .{ .pipe = pipe },
             .scroll_page_lines => |lines| if (active_screen == .primary) .{ .lines = lines } else .passthrough,
         };
     }
@@ -7055,6 +7072,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
         .rex_detach => if (self.rex_client) |client| return if (action == .press) client.detach(),
         .copy_to_clipboard => return if (action == .press) self.copyToClipboard(),
         .paste_from_clipboard => return if (action == .press) self.beginPaste(.clipboard),
+        .pipe => |pipe| return if (action == .press) self.pipeText(pipe.source, pipe.command),
         // Bound text replaces the key's encoding on press and repeat, like
         // typing, and the release is consumed.
         .text => |bytes| {
@@ -8565,6 +8583,28 @@ test "semantic command output extracts most recent completed output" {
     const output = semanticCommandOutputText(alloc, term.screens.active).?;
     defer alloc.free(output);
     try std.testing.expectEqualStrings("one\ntwo", output);
+}
+
+test "pipe text follows the scrolled viewport or the whole screen" {
+    const alloc = std.testing.allocator;
+    var term: vt.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer term.deinit(alloc);
+    for ([_][]const u8{ "one", "two", "three", "four", "five" }, 0..) |line, i| {
+        if (i > 0) {
+            term.carriageReturn();
+            try term.linefeed();
+        }
+        try term.printString(line);
+    }
+    const screen = term.screens.active;
+    screen.pages.scroll(.{ .delta_row = -1 });
+
+    const viewport = pagesText(alloc, screen, .viewport).?;
+    defer alloc.free(viewport);
+    try std.testing.expectEqualStrings("two\nthree\nfour", viewport);
+    const all = pagesText(alloc, screen, .screen).?;
+    defer alloc.free(all);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour\nfive", all);
 }
 
 test "search backspace removes one UTF-8 codepoint" {

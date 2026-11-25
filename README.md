@@ -168,7 +168,8 @@ Other settings:
   `term = xterm-256color` when remote hosts lack Monstar's terminfo; see
   [Terminfo](#terminfo).
 - **pipe-command-output** — Shell command that receives the last command's
-  output on stdin when `Ctrl+Shift+G` is pressed.
+  output on stdin when `Ctrl+Shift+G` is pressed. For other keys or text, see
+  the `pipe_*` actions in [Keybindings](#keybindings).
 - **scrollback-limit** — Terminal page storage in bytes, including the active
   screen (default `50000000`).
 - **image-storage-limit** — Kitty graphics image storage in bytes per screen;
@@ -193,7 +194,8 @@ Other settings:
   `deny` (default `allow`). `deny` answers reads as if the clipboard were
   empty and keeps OSC 52 copying working.
 - **keybind** — Repeatable Ghostty-style `trigger=action` bindings for
-  scrolling, new windows, clipboard, and sending text. See
+  scrolling, new windows, clipboard, sending text, and piping text to
+  commands. See
   [Keybindings](#keybindings) below.
 - **background / foreground / cursor-color / cursor-text** — Terminal colors
   as `#RRGGBB` or `RRGGBB`; explicit colors override the theme.
@@ -247,6 +249,9 @@ keybind = shift+insert=paste_from_clipboard
 # Send Shift+Enter and Alt+Shift+Enter as CSI u so TUIs can tell them apart:
 keybind = shift+enter=csi:13;2u
 keybind = alt+shift+enter=text:\x1b[13;4u
+# Pick a URL on screen, or open all scrollback in an editor:
+keybind = ctrl+shift+o=pipe_viewport:xurls | fuzzel --dmenu | xargs -r xdg-open
+keybind = ctrl+shift+e=pipe_screen:f=$(mktemp) && cat > "$f" && zed "$f"
 ```
 
 `new_window` opens an independent window in the current directory.
@@ -254,6 +259,11 @@ keybind = alt+shift+enter=text:\x1b[13;4u
 `Ctrl+Shift+V`. `text:` sends its value with Zig string literal escapes such as
 `\x1b`, `\n`, and `\u{2028}` decoded; `csi:` sends `ESC [` followed by its
 value. Text actions replace the key's own encoding on press and repeat.
+`pipe_viewport:`, `pipe_screen:`, `pipe_selection:`, and `pipe_command_output:`
+run their value verbatim with `/bin/sh -c` in the current directory and write
+to its stdin the rows on screen, all scrollback and the screen, the selection,
+or the last OSC 133 command output. Nothing runs when there is no such text.
+`Ctrl+Shift+G` pipes the last command output to `pipe-command-output`.
 For `scroll_page_lines`, negative counts scroll up; positive counts scroll down. Counts range from
 `-32768` to `32767`. Multiple triggers can invoke the same action; repeating a
 trigger replaces its previous binding. Invalid entries leave previous bindings
@@ -269,7 +279,7 @@ Include Shift when it is held to produce punctuation, for example
 
 Configured bindings take precedence over fixed shortcuts below; `unbind`
 passes the key to the application instead. Only the actions above are
-currently supported. Ghostty sequences, binding flags, and other actions are
+currently supported; the `pipe_*` actions are Monstar's own. Ghostty sequences, binding flags, and other actions are
 not yet supported. Search mode retains its own controls.
 
 | Shortcut | Action |
