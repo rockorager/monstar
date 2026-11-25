@@ -136,8 +136,10 @@ pub fn eql(a: *const Modal, b: *const Modal) bool {
 }
 
 /// Escape cancels, Enter or Space picks the focused choice, Tab and the
-/// arrow keys move focus, and a choice's letter picks it directly.
-pub fn handleKey(self: *Modal, event: vt.input.KeyEvent) KeyResult {
+/// arrow keys move focus, and a choice's letter picks it directly. Until
+/// `armed`, only cancelling works, so keys typed before the modal appeared
+/// cannot pick a choice.
+pub fn handleKey(self: *Modal, event: vt.input.KeyEvent, armed: bool) KeyResult {
     if (event.action == .release) return .ignored;
     const mods = event.mods;
     if (mods.alt or mods.super) return .ignored;
@@ -145,8 +147,9 @@ pub fn handleKey(self: *Modal, event: vt.input.KeyEvent) KeyResult {
         'c', 'g' => .{ .picked = self.content.cancel },
         else => .ignored,
     };
+    if (event.key == .escape) return .{ .picked = self.content.cancel };
+    if (!armed) return .ignored;
     switch (event.key) {
-        .escape => return .{ .picked = self.content.cancel },
         .enter, .numpad_enter, .space => return .{ .picked = self.focused },
         .tab => return self.move(mods.shift),
         .arrow_left => return self.move(true),
@@ -386,18 +389,23 @@ test "modal detail escapes characters that hide or reorder text" {
 test "modal keys move focus, pick by letter, and cancel" {
     var modal = try testModal(null, "");
     defer modal.deinit();
-    try std.testing.expectEqual(KeyResult{ .picked = 2 }, modal.handleKey(testKey(.enter, 0, .{})));
-    try std.testing.expectEqual(KeyResult.moved, modal.handleKey(testKey(.tab, '\t', .{})));
+    // Before arming, only cancelling works.
+    try std.testing.expectEqual(KeyResult.ignored, modal.handleKey(testKey(.tab, '\t', .{}), false));
+    try std.testing.expectEqual(KeyResult.ignored, modal.handleKey(testKey(.key_o, 'o', .{}), false));
+    try std.testing.expectEqual(@as(usize, 2), modal.focused);
+    try std.testing.expectEqual(KeyResult{ .picked = 2 }, modal.handleKey(testKey(.escape, 0, .{}), false));
+    try std.testing.expectEqual(KeyResult{ .picked = 2 }, modal.handleKey(testKey(.enter, 0, .{}), true));
+    try std.testing.expectEqual(KeyResult.moved, modal.handleKey(testKey(.tab, '\t', .{}), true));
     try std.testing.expectEqual(@as(usize, 0), modal.focused);
-    try std.testing.expectEqual(KeyResult.moved, modal.handleKey(testKey(.tab, '\t', .{ .shift = true })));
-    try std.testing.expectEqual(KeyResult.moved, modal.handleKey(testKey(.arrow_left, 0, .{})));
-    try std.testing.expectEqual(KeyResult{ .picked = 1 }, modal.handleKey(testKey(.space, ' ', .{})));
-    try std.testing.expectEqual(KeyResult{ .picked = 1 }, modal.handleKey(testKey(.key_c, 'c', .{ .shift = true })));
+    try std.testing.expectEqual(KeyResult.moved, modal.handleKey(testKey(.tab, '\t', .{ .shift = true }), true));
+    try std.testing.expectEqual(KeyResult.moved, modal.handleKey(testKey(.arrow_left, 0, .{}), true));
+    try std.testing.expectEqual(KeyResult{ .picked = 1 }, modal.handleKey(testKey(.space, ' ', .{}), true));
+    try std.testing.expectEqual(KeyResult{ .picked = 1 }, modal.handleKey(testKey(.key_c, 'c', .{ .shift = true }), true));
     // Ctrl+C cancels rather than picking Copy, and Ctrl+O does nothing.
-    try std.testing.expectEqual(KeyResult{ .picked = 2 }, modal.handleKey(testKey(.key_c, 'c', .{ .ctrl = true })));
-    try std.testing.expectEqual(KeyResult.ignored, modal.handleKey(testKey(.key_o, 'o', .{ .ctrl = true })));
-    try std.testing.expectEqual(KeyResult{ .picked = 2 }, modal.handleKey(testKey(.escape, 0, .{})));
-    try std.testing.expectEqual(KeyResult.ignored, modal.handleKey(testKey(.key_x, 'x', .{})));
+    try std.testing.expectEqual(KeyResult{ .picked = 2 }, modal.handleKey(testKey(.key_c, 'c', .{ .ctrl = true }), true));
+    try std.testing.expectEqual(KeyResult.ignored, modal.handleKey(testKey(.key_o, 'o', .{ .ctrl = true }), true));
+    try std.testing.expectEqual(KeyResult{ .picked = 2 }, modal.handleKey(testKey(.escape, 0, .{}), true));
+    try std.testing.expectEqual(KeyResult.ignored, modal.handleKey(testKey(.key_x, 'x', .{}), true));
 }
 
 test "modal layout wraps the detail and gives up message rows first" {

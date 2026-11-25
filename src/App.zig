@@ -77,18 +77,34 @@ const LinkPress = struct {
 const ModalAction = union(enum) {
     /// Choices follow LinkChoice. The URI is owned by App.
     open_link: []u8,
+    /// An OSC 52 read of this selection kind waits for its reply. Choices
+    /// follow ReadChoice.
+    osc52_read: u8,
 };
 
 const ActiveModal = struct {
     modal: Modal,
     action: ModalAction,
+    /// monotonicNs time from which keys other than cancel pick choices.
+    armed_at_ns: u64,
 };
+
+/// Dialogs a program opens without user input ignore keys this long, so
+/// typing that was meant for the program cannot answer them.
+const unsolicited_modal_delay_ns = 600 * std.time.ns_per_ms;
 
 const LinkChoice = enum { open, copy, cancel };
 const link_choices = [_]Modal.Choice{
     .{ .label = "Open", .key = 'o' },
     .{ .label = "Copy", .key = 'c' },
     .{ .label = "Cancel" },
+};
+
+const ReadChoice = enum { allow, deny };
+// Allow has no letter: typing must never grant a read.
+const read_choices = [_]Modal.Choice{
+    .{ .label = "Allow" },
+    .{ .label = "Deny", .key = 'd' },
 };
 
 /// A left press that may become a Kitty drag-out gesture.
@@ -3195,6 +3211,15 @@ fn setOsc52Clipboard(self: *App, kind: u8, data: []const u8) void {
         switch (self.config.clipboard_read) {
             .allow => self.beginOsc52Read(kind),
             .deny => self.writeOsc52ClipboardReport(kind, ""),
+            .ask => self.openModal(.{
+                .title = switch (osc52Target(kind)) {
+                    .clipboard => "Allow clipboard read?",
+                    .primary => "Allow primary selection read?",
+                },
+                .choices = &read_choices,
+                .focused = @backingInt(ReadChoice.deny),
+                .cancel = @backingInt(ReadChoice.deny),
+            }, .{ .osc52_read = kind }, unsolicited_modal_delay_ns),
         }
         return;
     }
@@ -3538,10 +3563,10 @@ test "busy OSC 52 read replies empty without disturbing the active transfer" {
     try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
 }
 
-test "clipboard-read deny answers OSC 52 reads empty while a selection is offered" {
+test "clipboard-read policies answer OSC 52 reads while a selection is offered" {
     const alloc = std.testing.allocator;
     const linux = std.os.linux;
-    for ([_]Config.ClipboardRead{ .allow, .deny }) |policy| {
+    for ([_]Config.ClipboardRead{ .allow, .deny, .ask }) |policy| {
         var fds: [2]posix.fd_t = undefined;
         try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(
             linux.AF.UNIX,
@@ -3573,6 +3598,26 @@ test "clipboard-read deny answers OSC 52 reads empty while a selection is offere
         defer app.write_queue.deinit(alloc);
         app.pty.master = output[1];
         app.rex_client = null;
+        // State the dialog touches when it opens and closes.
+        app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+        defer app.term.deinit(alloc);
+        app.window = try alloc.create(Window);
+        defer alloc.destroy(app.window);
+        app.window.cursor_shape = .text;
+        app.keyboard.state = null;
+        app.modal = null;
+        defer if (app.modal) |*active| app.deinitModal(active);
+        app.link_press = null;
+        app.hovered_link = null;
+        app.link_active = false;
+        app.link_checked_cell = null;
+        app.mouse_shape_explicit = false;
+        app.scrollbar_hovered = false;
+        app.scrollbar_drag = null;
+        app.scrollbar_alpha = 0;
+        app.async_generation = 0;
+        app.async_force_full = false;
+        app.held_frame = null;
 
         // Play the compositor: offer a text/plain selection on the device.
         const offer_id: u32 = 0xff000000;
@@ -3598,6 +3643,38 @@ test "clipboard-read deny answers OSC 52 reads empty while a selection is offere
                 try std.testing.expectEqual(@as(posix.fd_t, -1), app.clipboard.transferFd());
                 const n = try posix.read(output[0], &buf);
                 try std.testing.expectEqualStrings("\x1b]52;c;\x07", buf[0..n]);
+            },
+            .ask => {
+                // The read waits on the dialog, which ignores typing at first.
+                try std.testing.expect(app.modal != null);
+                try std.testing.expectEqual(@as(posix.fd_t, -1), app.clipboard.transferFd());
+                try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
+                app.handleModalKey(.{ .action = .press, .key = .tab, .unshifted_codepoint = '\t' });
+                app.handleModalKey(.{ .action = .press, .key = .enter });
+                try std.testing.expect(app.modal != null);
+                try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
+
+                // A second read while the dialog is open is denied at once.
+                app.setOsc52Clipboard('p', "?");
+                var n = try posix.read(output[0], &buf);
+                try std.testing.expectEqualStrings("\x1b]52;p;\x07", buf[0..n]);
+
+                // Escape denies; Enter on the default choice denies too.
+                app.handleModalKey(.{ .action = .press, .key = .escape });
+                try std.testing.expect(app.modal == null);
+                n = try posix.read(output[0], &buf);
+                try std.testing.expectEqualStrings("\x1b]52;c;\x07", buf[0..n]);
+
+                // Once armed, moving to Allow and pressing Enter reads.
+                app.setOsc52Clipboard('c', "?");
+                app.modal.?.armed_at_ns = 0;
+                app.handleModalKey(.{ .action = .press, .key = .key_a, .unshifted_codepoint = 'a' });
+                try std.testing.expect(app.modal != null);
+                app.handleModalKey(.{ .action = .press, .key = .tab, .unshifted_codepoint = '\t' });
+                app.handleModalKey(.{ .action = .press, .key = .enter });
+                try std.testing.expect(app.modal == null);
+                try std.testing.expect(app.clipboard.transferFd() >= 0);
+                try std.testing.expectError(error.WouldBlock, posix.read(output[0], &buf));
             },
         }
     }
@@ -4266,26 +4343,32 @@ fn confirmOpenLink(self: *App, uri: []const u8) void {
         .choices = &link_choices,
         .focused = @backingInt(LinkChoice.cancel),
         .cancel = @backingInt(LinkChoice.cancel),
-    }, .{ .open_link = owned });
+    }, .{ .open_link = owned }, 0);
 }
 
 /// Show a dialog that takes the keyboard until a choice is picked. Takes
-/// ownership of `action`'s memory, even on failure.
-fn openModal(self: *App, content: Modal.Content, action: ModalAction) void {
-    const modal = Modal.init(self.alloc, content) catch |err| {
+/// ownership of `action`'s memory, even on failure. While another dialog is
+/// open, or when this one cannot be shown, `action` runs with the cancel
+/// choice instead, so a request waiting on the answer still gets one.
+fn openModal(self: *App, content: Modal.Content, action: ModalAction, arm_delay_ns: u64) void {
+    const modal = if (self.modal == null) Modal.init(self.alloc, content) catch |err| modal: {
         log.warn("failed to open dialog: {}", .{err});
+        break :modal null;
+    } else null;
+    if (modal == null) {
+        self.runModalAction(action, content.cancel);
         self.freeModalAction(action);
         return;
-    };
-    if (self.modal) |*old| self.deinitModal(old);
-    self.modal = .{ .modal = modal, .action = action };
+    }
+    self.modal = .{ .modal = modal.?, .action = action, .armed_at_ns = monotonicNs() + arm_delay_ns };
     self.cancelLinkPress();
     self.syncHoveredLink(true);
     self.requestFullAsyncRedraw();
 }
 
 fn handleModalKey(self: *App, event: vt.input.KeyEvent) void {
-    const result = self.modal.?.modal.handleKey(event);
+    const active = &self.modal.?;
+    const result = active.modal.handleKey(event, monotonicNs() >= active.armed_at_ns);
     switch (result) {
         .ignored => {},
         .moved => self.requestFullAsyncRedraw(),
@@ -4293,15 +4376,23 @@ fn handleModalKey(self: *App, event: vt.input.KeyEvent) void {
             var closed = self.modal.?;
             self.modal = null;
             defer self.deinitModal(&closed);
-            switch (closed.action) {
-                .open_link => |uri| switch (@as(LinkChoice, @fromBackingInt(@intCast(choice)))) {
-                    .open => self.openUri(uri),
-                    .copy => self.copyLink(uri),
-                    .cancel => {},
-                },
-            }
+            self.runModalAction(closed.action, choice);
             self.syncHoveredLink(true);
             self.requestFullAsyncRedraw();
+        },
+    }
+}
+
+fn runModalAction(self: *App, action: ModalAction, choice: usize) void {
+    switch (action) {
+        .open_link => |uri| switch (@as(LinkChoice, @fromBackingInt(@intCast(choice)))) {
+            .open => self.openUri(uri),
+            .copy => self.copyLink(uri),
+            .cancel => {},
+        },
+        .osc52_read => |kind| switch (@as(ReadChoice, @fromBackingInt(@intCast(choice)))) {
+            .allow => self.beginOsc52Read(kind),
+            .deny => self.writeOsc52ClipboardReport(kind, ""),
         },
     }
 }
@@ -4314,6 +4405,7 @@ fn deinitModal(self: *App, active: *ActiveModal) void {
 fn freeModalAction(self: *App, action: ModalAction) void {
     switch (action) {
         .open_link => |uri| self.alloc.free(uri),
+        .osc52_read => {},
     }
 }
 
