@@ -55,7 +55,7 @@ pub fn create(
     const dimensions = try bufferDimensions(width, height);
     const capacity = try grownBufferCapacity(0, dimensions.size);
 
-    const fd = try posix.memfd_create("monstar-shm", linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
+    const fd = try createMemfd();
     errdefer _ = linux.close(fd);
     if (linux.errno(linux.ftruncate(fd, @intCast(capacity))) != .SUCCESS) return error.ShmFailed;
     // udmabuf requires this seal, and it keeps a compositor mapping of the
@@ -217,6 +217,20 @@ fn grownBufferCapacity(current: usize, required: usize) !usize {
     return if (aligned <= max_capacity) aligned else required;
 }
 
+/// Linux 6.3's MFD_NOEXEC_SEAL, which std.os.linux.MFD lacks.
+const mfd_noexec_seal = 0x0008;
+
+/// Create the pool memfd without the execute bit, sealed so it cannot gain
+/// one; MFD_NOEXEC_SEAL implies MFD_ALLOW_SEALING. Kernels older than 6.3
+/// reject the flag with EINVAL and get a plain sealable memfd instead.
+fn createMemfd() !posix.fd_t {
+    const name = "monstar-shm";
+    var rc = linux.memfd_create(name, linux.MFD.CLOEXEC | mfd_noexec_seal);
+    if (linux.errno(rc) == .INVAL) rc = linux.memfd_create(name, linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
+    if (linux.errno(rc) != .SUCCESS) return error.ShmFailed;
+    return @intCast(rc);
+}
+
 fn shmFormat(format: Format) wl.Shm.Format {
     return switch (format) {
         .xrgb8888 => .xrgb8888,
@@ -274,4 +288,17 @@ fn residentBytes(data: []align(std.heap.page_size_min) u8) usize {
     var pages: usize = 0;
     for (vec[0 .. data.len / page]) |entry| pages += entry & 1;
     return pages * page;
+}
+
+test "SHM memfd accepts the shrink seal and is exec-sealed where the kernel supports it" {
+    const fd = try createMemfd();
+    defer _ = linux.close(fd);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(fd, linux.F.ADD_SEALS, linux.F.SEAL_SHRINK)));
+
+    const probe = linux.memfd_create("monstar-shm-probe", linux.MFD.CLOEXEC | mfd_noexec_seal);
+    if (linux.errno(probe) != .SUCCESS) return; // Older than Linux 6.3.
+    _ = linux.close(@intCast(probe));
+    const seals = linux.fcntl(fd, linux.F.GET_SEALS, 0);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(seals));
+    try std.testing.expect(seals & linux.F.SEAL_EXEC != 0);
 }
