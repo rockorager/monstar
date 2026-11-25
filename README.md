@@ -309,6 +309,11 @@ Hold `Shift` while dragging to select text after an application captures the
 mouse. Hold `Ctrl+Shift` instead of `Ctrl` to open or copy a link in this
 state. Middle-click to paste the primary selection.
 
+While `Ctrl` is held over a link, its target shows in the bottom-left corner.
+An OSC 8 hyperlink's text can differ from its target, so monstar asks before
+opening one that is not `http`, `https`, or `mailto`: `O` opens, `C` copies,
+`Escape` cancels.
+
 ## Linux integration
 
 - XDG desktop portals open links, local files, and directories. Portal

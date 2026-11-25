@@ -115,6 +115,19 @@ pub fn fillRect(self: Canvas, x: u31, y: u31, w: u31, h: u31, color: u32) !void 
     }
 }
 
+/// Blend opaque `color` over a rectangle at constant `alpha`, clipped; see
+/// pixel_raster.blendRect.
+pub fn blendRect(self: Canvas, x: u31, y: u31, w: u31, h: u31, color: u32, alpha: u8) !void {
+    switch (self.target) {
+        .pixels => |pixels| pixel_raster.blendRect(pixels, self.stride, self.width, self.height, x, y, w, h, color, alpha),
+        .gpu => |list| {
+            if (alpha == 0 or x >= self.width or y >= self.height) return;
+            const rect = self.surfaceRect(x, y, @min(@as(u32, x) + w, self.width), @min(@as(u32, y) + h, self.height)) orelse return;
+            try list.blend(rect, color, alpha);
+        },
+    }
+}
+
 /// Blend glyph `g` with its top-left at (`x0`, `y0`); see pixel_raster.blitGlyph.
 pub fn blitGlyph(
     self: Canvas,

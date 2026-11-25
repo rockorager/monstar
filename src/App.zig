@@ -28,6 +28,7 @@ const keybind = @import("keybind.zig");
 const Font = @import("Font.zig");
 const Keyboard = @import("Keyboard.zig");
 const Link = @import("Link.zig");
+const Modal = @import("Modal.zig");
 const Pty = @import("Pty.zig");
 const rex = @import("rex.zig");
 const ReadPipeline = @import("ReadPipeline.zig");
@@ -58,15 +59,36 @@ const log = std.log.scoped(.app);
 const HoveredLink = struct {
     uri: []u8,
     range: ?Renderer.LinkRange,
+    /// Set by OSC 8, so the text on screen may differ from `uri`.
+    osc8: bool,
 };
 
 const LinkAction = enum { open, copy };
 
 const LinkPress = struct {
     uri: []u8,
+    osc8: bool,
     cell: vt.Coordinate,
     button: u32,
     action: LinkAction,
+};
+
+/// What picking a choice in the open modal does.
+const ModalAction = union(enum) {
+    /// Choices follow LinkChoice. The URI is owned by App.
+    open_link: []u8,
+};
+
+const ActiveModal = struct {
+    modal: Modal,
+    action: ModalAction,
+};
+
+const LinkChoice = enum { open, copy, cancel };
+const link_choices = [_]Modal.Choice{
+    .{ .label = "Open", .key = 'o' },
+    .{ .label = "Copy", .key = 'c' },
+    .{ .label = "Cancel" },
 };
 
 /// A left press that may become a Kitty drag-out gesture.
@@ -280,6 +302,9 @@ link_checked_cell: ?vt.Coordinate,
 link_active: bool,
 /// A link click acts only if release occurs over the original cell.
 link_press: ?LinkPress,
+/// Open dialog. It takes all keyboard input, and the terminal gets no
+/// pointer presses or motion while it is open.
+modal: ?ActiveModal,
 drag_press: ?DragPress,
 /// Wheel state accumulated between pointer frame events.
 scroll_pixels: f64,
@@ -869,6 +894,7 @@ pub fn init(
         .link_checked_cell = null,
         .link_active = false,
         .link_press = null,
+        .modal = null,
         .drag_press = null,
         .scroll_pixels = 0,
         .scroll_frame_pixels = 0,
@@ -1905,6 +1931,7 @@ pub fn deinit(self: *App) void {
     self.async_job.deinit(self.alloc, &self.kitty_cache);
     if (self.hovered_link) |link| self.alloc.free(link.uri);
     if (self.link_press) |press| self.alloc.free(press.uri);
+    if (self.modal) |*active| self.deinitModal(active);
     self.kitty_cache.deinit(self.alloc);
     self.clearImeText();
     if (self.search) |*search| search.deinit(self.alloc, &self.term);
@@ -3342,6 +3369,7 @@ fn linkModifiersActive(mods: vt.input.KeyMods, mouse_reporting: bool) bool {
 }
 
 fn linksActive(self: *App) bool {
+    if (self.modal != null) return false;
     return linkModifiersActive(
         self.keyboard.currentMods(),
         self.term.flags.mouse_event != .none,
@@ -3659,6 +3687,7 @@ test "mode 2031 reports only on query, not when enabled or restored" {
     app.window.cursor_shape = .text;
     app.keyboard.state = null;
     app.hovered_link = null;
+    app.modal = null;
     app.mouse_shape_explicit = false;
     app.scrollbar_hovered = false;
     app.scrollbar_drag = null;
@@ -3759,6 +3788,7 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .motion => |motion| {
             self.pointer_x = motion.surface_x.toDouble();
             self.pointer_y = motion.surface_y.toDouble();
+            if (self.modal != null) return;
             self.updateDragPress();
             if (self.scrollbar_drag != null) {
                 self.dragScrollbar();
@@ -3805,6 +3835,8 @@ fn pointerEvent(ctx: *anyopaque, event: wl.Pointer.Event) void {
         .frame => self.finishScrollFrame(),
         .button => |button| {
             self.last_serial = button.serial;
+            // Releases still finish gestures that began before the modal.
+            if (self.modal != null and button.state == .pressed) return;
             if (button.state == .pressed) self.stopFling();
             if (button.button == 272) { // BTN_LEFT
                 if (button.state == .released) self.endDragPress();
@@ -4066,7 +4098,7 @@ fn oscHyperlinkAtPin(pin: vt.Pin) ?[]const u8 {
 fn detectHoveredLink(self: *App) !?HoveredLink {
     const pin = self.linkPinAtPointer() orelse return null;
     if (oscHyperlinkAtPin(pin)) |uri| {
-        return .{ .uri = try self.alloc.dupe(u8, uri), .range = null };
+        return .{ .uri = try self.alloc.dupe(u8, uri), .range = null, .osc8 = true };
     }
 
     const screen = self.term.screens.active;
@@ -4094,6 +4126,7 @@ fn detectHoveredLink(self: *App) !?HoveredLink {
             return .{
                 .uri = try self.alloc.dupe(u8, text[match.start..match.end]),
                 .range = self.linkRange(selection),
+                .osc8 = false,
             };
         }
         offset = match.end;
@@ -4137,9 +4170,14 @@ fn highlightRange(
     };
 }
 
+fn modalsEqual(a: ?Modal, b: ?*const Modal) bool {
+    const modal = a orelse return b == null;
+    return b != null and modal.eql(b.?);
+}
+
 fn hoveredLinksEqual(a: ?HoveredLink, b: ?HoveredLink) bool {
     if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?.uri, b.?.uri) and std.meta.eql(a.?.range, b.?.range);
+    return std.mem.eql(u8, a.?.uri, b.?.uri) and std.meta.eql(a.?.range, b.?.range) and a.?.osc8 == b.?.osc8;
 }
 
 /// Recompute the link only while the exact activation modifiers are held.
@@ -4178,13 +4216,14 @@ fn hoveredLinkUri(self: *App) ?[]const u8 {
 
 fn armLinkPress(self: *App, button: u32, action: LinkAction) bool {
     const uri = self.hoveredLinkUri() orelse return false;
+    const osc8 = self.hovered_link.?.osc8;
     const cell = self.linkCellAtPointer() orelse return false;
     const owned = self.alloc.dupe(u8, uri) catch |err| {
         log.warn("failed to save pressed link: {}", .{err});
         return false;
     };
     if (self.link_press) |old| self.alloc.free(old.uri);
-    self.link_press = .{ .uri = owned, .cell = cell, .button = button, .action = action };
+    self.link_press = .{ .uri = owned, .osc8 = osc8, .cell = cell, .button = button, .action = action };
     return true;
 }
 
@@ -4205,11 +4244,77 @@ fn finishLinkPress(self: *App, button: u32) bool {
         std.meta.eql(cell.?, press.cell) and std.mem.eql(u8, uri.?, press.uri))
     {
         switch (press.action) {
-            .open => self.openUri(press.uri),
+            .open => if (press.osc8 and !Link.opensWithoutAsking(press.uri))
+                self.confirmOpenLink(press.uri)
+            else
+                self.openUri(press.uri),
             .copy => self.copyLink(press.uri),
         }
     }
     return true;
+}
+
+/// Ask before opening an OSC 8 link that opens in another app.
+fn confirmOpenLink(self: *App, uri: []const u8) void {
+    const owned = self.alloc.dupe(u8, uri) catch |err| {
+        log.warn("failed to save hyperlink URI: {}", .{err});
+        return;
+    };
+    self.openModal(.{
+        .title = "Open link?",
+        .detail = uri,
+        .choices = &link_choices,
+        .focused = @backingInt(LinkChoice.cancel),
+        .cancel = @backingInt(LinkChoice.cancel),
+    }, .{ .open_link = owned });
+}
+
+/// Show a dialog that takes the keyboard until a choice is picked. Takes
+/// ownership of `action`'s memory, even on failure.
+fn openModal(self: *App, content: Modal.Content, action: ModalAction) void {
+    const modal = Modal.init(self.alloc, content) catch |err| {
+        log.warn("failed to open dialog: {}", .{err});
+        self.freeModalAction(action);
+        return;
+    };
+    if (self.modal) |*old| self.deinitModal(old);
+    self.modal = .{ .modal = modal, .action = action };
+    self.cancelLinkPress();
+    self.syncHoveredLink(true);
+    self.requestFullAsyncRedraw();
+}
+
+fn handleModalKey(self: *App, event: vt.input.KeyEvent) void {
+    const result = self.modal.?.modal.handleKey(event);
+    switch (result) {
+        .ignored => {},
+        .moved => self.requestFullAsyncRedraw(),
+        .picked => |choice| {
+            var closed = self.modal.?;
+            self.modal = null;
+            defer self.deinitModal(&closed);
+            switch (closed.action) {
+                .open_link => |uri| switch (@as(LinkChoice, @fromBackingInt(@intCast(choice)))) {
+                    .open => self.openUri(uri),
+                    .copy => self.copyLink(uri),
+                    .cancel => {},
+                },
+            }
+            self.syncHoveredLink(true);
+            self.requestFullAsyncRedraw();
+        },
+    }
+}
+
+fn deinitModal(self: *App, active: *ActiveModal) void {
+    self.freeModalAction(active.action);
+    active.modal.deinit();
+}
+
+fn freeModalAction(self: *App, action: ModalAction) void {
+    switch (action) {
+        .open_link => |uri| self.alloc.free(uri),
+    }
 }
 
 fn copyLink(self: *App, uri: []const u8) void {
@@ -5629,6 +5734,7 @@ test "wheel frames route reports, viewport movement, and keys without sharing re
     app.async_generation = 0;
     app.held_frame = null;
     app.hovered_link = null;
+    app.modal = null;
     app.link_active = false;
     app.link_checked_cell = null;
     app.scroll_offset = 0;
@@ -6447,6 +6553,10 @@ fn textInputEvent(ctx: *anyopaque, event: zwp.TextInputV3.Event) void {
 }
 
 fn applyPendingIme(self: *App) void {
+    if (self.modal != null) {
+        self.resetPendingIme();
+        return;
+    }
     if (self.search != null) {
         if (self.ime_pending_commit) |commit| {
             self.appendSearchText(commit);
@@ -7061,6 +7171,7 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
 
+    if (self.modal != null) return self.handleModalKey(event);
     if (self.search != null) return self.handleSearchKey(event);
 
     var bound_text: ?[]const u8 = null;
@@ -7144,6 +7255,7 @@ test "fixed shortcuts consume repeats and releases only with matching modifiers"
     app.config = .{};
     defer app.config.keybinds.deinit(alloc);
     app.search = null;
+    app.modal = null;
     app.term = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
     defer app.term.deinit(alloc);
     app.write_queue = .empty;
@@ -7670,6 +7782,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             self.ime_preedit == null and self.async_job.preedit == null and
             self.async_job.link_hint == null and
             self.search == null and self.async_job.search == null and
+            self.modal == null and self.async_job.modal == null and
             new_scrollbar == null and self.async_job.scrollbar == null and
             new_copy_brackets == null and self.async_job.copy_brackets == null and
             !has_kitty_graphics and self.async_job.kitty.len == 0)
@@ -7726,7 +7839,8 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         const hovered = if (hyperlink_hints) self.hovered_link else null;
         const new_link: ?[]const u8 = if (hovered) |link| link.uri else null;
         const new_range: ?Renderer.LinkRange = if (hovered) |link| link.range else null;
-        const new_preedit: ?[]const u8 = if (self.search == null) self.ime_preedit else null;
+        const new_preedit: ?[]const u8 = if (self.search == null and self.modal == null) self.ime_preedit else null;
+        const new_modal: ?*const Modal = if (self.modal) |*active| &active.modal else null;
         var new_search_matches = try self.searchMatchesForRender();
         errdefer new_search_matches.deinit(self.alloc);
         const new_search = try self.searchOverlayText();
@@ -7741,8 +7855,9 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
             !std.meta.eql(self.async_job.search_range, new_search_range) or
             !std.mem.eql(bool, self.async_job.search_matches.items, new_search_matches.items) or
             !std.meta.eql(self.async_job.scrollbar, new_scrollbar) or
-            !std.meta.eql(self.async_job.copy_brackets, new_copy_brackets);
-        try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_search, new_search_no_match, new_range, new_search_range, new_search_matches, new_scrollbar, new_copy_brackets, hyperlink_hints);
+            !std.meta.eql(self.async_job.copy_brackets, new_copy_brackets) or
+            !modalsEqual(self.async_job.modal, new_modal);
+        try self.async_job.replaceOverlays(self.alloc, new_preedit, new_link, new_search, new_search_no_match, new_range, new_search_range, new_search_matches, new_scrollbar, new_copy_brackets, hyperlink_hints, new_modal);
         new_search_matches = .empty;
         var kitty_changed = false;
         if (has_kitty_graphics) {
@@ -7838,6 +7953,7 @@ fn startAsyncRender(self: *App) !AsyncRenderStart {
         .search_no_match = self.async_job.search_no_match,
         .scrollbar = if (frozen) null else self.async_job.scrollbar,
         .copy_brackets = if (frozen) null else self.async_job.copy_brackets,
+        .modal = if (self.async_job.modal) |*modal| modal else null,
         .kitty_items = self.async_job.kitty,
         .overlay_dirty = overlay_dirty,
         .scroll_shift = if (scroll) |value| value.shift else null,
@@ -8658,6 +8774,7 @@ test "search Enter waits for results without blocking and can be cancelled or ed
         app.pointer_inside = false;
         app.link_active = false;
         app.hovered_link = null;
+        app.modal = null;
         app.mouse_shape_explicit = false;
         app.keyboard = try .init();
         defer app.keyboard.deinit();

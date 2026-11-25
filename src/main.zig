@@ -601,6 +601,7 @@ test {
     _ = @import("KittyImageCache.zig");
     _ = @import("kitty_graphics.zig");
     _ = Link;
+    _ = @import("Modal.zig");
     _ = Pty;
     _ = @import("ReadPipeline.zig");
     _ = Renderer;

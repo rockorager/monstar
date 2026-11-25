@@ -12,6 +12,7 @@ const vt = @import("ghostty-vt");
 const AsyncRaster = @import("AsyncRaster.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
+const Modal = @import("Modal.zig");
 const Renderer = @import("Renderer.zig");
 const ScrollDetector = @import("ScrollDetector.zig");
 const VulkanRenderer = @import("VulkanRenderer.zig");
@@ -37,6 +38,7 @@ const Overlays = struct {
     link_range: ?Renderer.LinkRange = null,
     search_rows: ?[2]u16 = null,
     hyperlink_hints: bool = false,
+    modal: bool = false,
 };
 
 const reset = "\x1b[0m\x1b[2J\x1b[H";
@@ -86,6 +88,8 @@ const steps = [_]Step{
         .link_range = .{ .start = .{ .x = 5, .y = 1 }, .end = .{ .x = 20, .y = 1 } },
     } },
     .{ .name = "overlays removed", .input = "x" },
+    .{ .name = "modal", .overlays = .{ .modal = true } },
+    .{ .name = "modal removed", .input = "y" },
     .{ .name = "kitty", .input = reset ++ "Kitty images:\r\n" },
     .{ .name = "kitty text change", .input = "\x1b[3;1H\x1b[1mtext under and over images\x1b[0m" },
 };
@@ -124,6 +128,16 @@ pub fn run(init: std.process.Init) !void {
     const w = &stdout.interface;
     defer w.flush() catch {};
     try w.print("font {s} {d}px, cell {d}x{d}, surface {d}x{d}\n", .{ config.font_family, font_size_px, font.cell_width, font.cell_height, width, height });
+
+    var modal: Modal = try .init(alloc, .{
+        .title = "Open this link?",
+        .detail = "steam://run/440//-novid%20+connect%20203.0.113.7:27015",
+        .message = "Links like this open in whichever app handles them.",
+        .choices = &.{ .{ .label = "Open", .key = 'o' }, .{ .label = "Copy", .key = 'c' }, .{ .label = "Cancel" } },
+        .focused = 2,
+        .cancel = 2,
+    });
+    defer modal.deinit();
 
     const vulkan = try VulkanRenderer.create(alloc, .{ .validation = std.mem.eql(u8, getenv(init, "MONSTAR_VK_VALIDATION"), "1") });
     defer vulkan.destroy();
@@ -195,13 +209,15 @@ pub fn run(init: std.process.Init) !void {
                 .search = step.overlays.search,
                 .search_no_match = false,
                 .scrollbar = step.overlays.scrollbar,
+                .modal = if (step.overlays.modal) &modal else null,
                 .kitty_items = items,
                 .overlay_dirty = !std.meta.eql(previous, step.overlays) or items.len > 0,
                 .scroll_shift = if (scroll) |value| value.shift else null,
                 .repair = .none,
             };
             // Overlay removal repaints fully, as App does.
-            if (previous.scrollbar != null and step.overlays.scrollbar == null) state.dirty = .full;
+            if ((previous.scrollbar != null and step.overlays.scrollbar == null) or
+                (previous.modal and !step.overlays.modal)) state.dirty = .full;
             previous = step.overlays;
             if (step_index == 0) state.dirty = .full;
 

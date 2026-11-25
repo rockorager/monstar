@@ -16,6 +16,7 @@ const vt = @import("ghostty-vt");
 const Canvas = @import("Canvas.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
+const Modal = @import("Modal.zig");
 const Renderer = @import("Renderer.zig");
 const VulkanRenderer = @import("VulkanRenderer.zig");
 
@@ -71,6 +72,8 @@ pub const Job = struct {
     scrollbar: ?Renderer.ScrollbarThumb,
     /// Corner brackets around the selection after a copy.
     copy_brackets: ?Renderer.CopyBrackets = null,
+    /// Dialog drawn above everything else.
+    modal: ?*const Modal = null,
     /// Visible kitty placements, resolved on the main thread with image
     /// data repointed at cache-pinned copies; empty when no graphics are
     /// visible.
@@ -96,7 +99,7 @@ pub const Job = struct {
         return self.preedit != null or self.link_hint != null or
             self.search != null or self.search_matches.len > 0 or
             self.scrollbar != null or self.copy_brackets != null or
-            self.kitty_items.len > 0;
+            self.modal != null or self.kitty_items.len > 0;
     }
 };
 
@@ -577,6 +580,9 @@ fn renderJobOn(self: *AsyncRaster, job: Job, canvas: Canvas, damage: *Damage) !v
         }
         if (job.copy_brackets) |brackets| {
             try self.renderer.drawCopyBrackets(self.state, canvas, job.grid_x, job.grid_y, job.grid_height, job.scroll_offset, brackets);
+        }
+        if (job.modal) |modal| {
+            try self.renderer.drawModal(self.state, canvas, grid, modal);
         }
         damage.* = .full;
         return;

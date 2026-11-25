@@ -94,6 +94,32 @@ fn fillSpan(dst: []u32, color: u32) void {
     for (dst[i..]) |*px| px.* = color;
 }
 
+/// Blend opaque `color` over a rectangle at constant `alpha`, in linear light
+/// like glyphs and the scrollbar capsule.
+pub fn blendRect(
+    pixels: []u32,
+    stride: u31,
+    buf_width: u31,
+    buf_height: u31,
+    x: u31,
+    y: u31,
+    w: u31,
+    h: u31,
+    color: u32,
+    alpha: u8,
+) void {
+    std.debug.assert(color >> 24 == 0xff);
+    if (alpha == 0 or x >= buf_width or y >= buf_height) return;
+    const x_end = @min(x + w, buf_width);
+    const y_end = @min(y + h, buf_height);
+    const fg_linear = decodeRgb(color);
+    for (y..y_end) |row| {
+        for (pixels[row * stride + x .. row * stride + x_end]) |*pixel| {
+            pixel.* = blendDecoded(color, fg_linear, pixel.*, alpha);
+        }
+    }
+}
+
 pub fn blendCapsule(
     pixels: []u32,
     stride: u31,

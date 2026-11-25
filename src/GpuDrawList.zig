@@ -57,6 +57,8 @@ pub const Kind = enum(u16) {
     image = 4,
     /// Antialiased scrollbar capsule.
     capsule = 5,
+    /// `color`'s RGB at the constant alpha in its top byte.
+    blend = 6,
 };
 
 pub const GlyphKind = enum { text, color, color_as_text };
@@ -263,6 +265,12 @@ fn baseOp(r: Rect, kind: Kind, color: u32) Op {
 /// Replace `r` with premultiplied `color`.
 pub fn fill(self: *GpuDrawList, r: Rect, color: u32) !void {
     try self.push(baseOp(r, .fill, color), true);
+}
+
+/// Blend opaque `rgb` over `r` at constant `alpha`, above the text layer:
+/// text drawn before it corrects coverage against the unblended background.
+pub fn blend(self: *GpuDrawList, r: Rect, rgb: u32, alpha: u8) !void {
+    try self.push(baseOp(r, .blend, (rgb & 0xffffff) | @as(u32, alpha) << 24), false);
 }
 
 /// Blend glyph `g` over `r`; (`texel_x`, `texel_y`) is the glyph texel under

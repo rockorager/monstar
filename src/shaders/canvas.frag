@@ -35,6 +35,7 @@ const uint KIND_COLOR = 2u;
 const uint KIND_COLOR_AS_TEXT = 3u;
 const uint KIND_IMAGE = 4u;
 const uint KIND_CAPSULE = 5u;
+const uint KIND_BLEND = 6u;
 
 uvec4 bytes(vec4 v) {
     return uvec4(v * 255.0 + 0.5);
@@ -125,6 +126,8 @@ void main() {
     } else if (kind == KIND_IMAGE) {
         uvec4 t = bytes(texelFetch(images[nonuniformEXT(tex)], src, 0));
         emit(t.rgb, t.a);
+    } else if (kind == KIND_BLEND) {
+        emit(fg, color >> 24);
     } else {
         // KIND_CAPSULE: pixel_raster.blendCapsule in single precision.
         float center_x = float(v_a.z & 0xffffu) * 0.5;

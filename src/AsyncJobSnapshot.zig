@@ -5,6 +5,7 @@ const AsyncJobSnapshot = @This();
 const std = @import("std");
 const Renderer = @import("Renderer.zig");
 const KittyImageCache = @import("KittyImageCache.zig");
+const Modal = @import("Modal.zig");
 
 preedit: ?[]u8 = null,
 link_hint: ?[]u8 = null,
@@ -16,6 +17,7 @@ search_matches: std.ArrayList(bool) = .empty,
 scrollbar: ?Renderer.ScrollbarThumb = null,
 copy_brackets: ?Renderer.CopyBrackets = null,
 hyperlink_hints: bool = false,
+modal: ?Modal = null,
 kitty: []Renderer.KittyRenderItem = &.{},
 
 pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {
@@ -23,6 +25,7 @@ pub fn deinit(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyIm
     if (self.link_hint) |value| alloc.free(value);
     if (self.search) |value| alloc.free(value);
     self.search_matches.deinit(alloc);
+    if (self.modal) |*modal| modal.deinit();
     self.releaseKitty(alloc, cache);
 }
 
@@ -39,6 +42,7 @@ pub fn replaceOverlays(
     scrollbar: ?Renderer.ScrollbarThumb,
     copy_brackets: ?Renderer.CopyBrackets,
     hyperlink_hints: bool,
+    modal: ?*const Modal,
 ) !void {
     var new_preedit: ?[]u8 = null;
     errdefer if (new_preedit) |value| alloc.free(value);
@@ -48,11 +52,14 @@ pub fn replaceOverlays(
     const matches = search_matches;
     if (preedit) |value| new_preedit = try alloc.dupe(u8, value);
     if (link_hint) |value| new_link_hint = try alloc.dupe(u8, value);
+    var new_modal: ?Modal = if (modal) |value| try value.clone(alloc) else null;
+    errdefer if (new_modal) |*value| value.deinit();
 
     if (self.preedit) |value| alloc.free(value);
     if (self.link_hint) |value| alloc.free(value);
     if (self.search) |value| alloc.free(value);
     self.search_matches.deinit(alloc);
+    if (self.modal) |*value| value.deinit();
     self.preedit = new_preedit;
     self.link_hint = new_link_hint;
     self.search = search;
@@ -63,6 +70,7 @@ pub fn replaceOverlays(
     self.scrollbar = scrollbar;
     self.copy_brackets = copy_brackets;
     self.hyperlink_hints = hyperlink_hints;
+    self.modal = new_modal;
 }
 
 pub fn releaseKitty(self: *AsyncJobSnapshot, alloc: std.mem.Allocator, cache: *KittyImageCache) void {

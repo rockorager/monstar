@@ -16,6 +16,7 @@ const CellDamageTracker = @import("CellDamageTracker.zig");
 const Config = @import("Config.zig");
 const Font = @import("Font.zig");
 const GpuDrawList = @import("GpuDrawList.zig");
+const Modal = @import("Modal.zig");
 const TextShaper = @import("TextShaper.zig");
 const glyph_constraints = @import("glyph_constraints.zig");
 const kitty_graphics = @import("kitty_graphics.zig");
@@ -916,6 +917,116 @@ pub fn drawSearch(
     );
 }
 
+/// Draw `modal` centered on the grid over a scrim that dims the whole
+/// surface. Colors come from the terminal's foreground, background, and
+/// palette, so the dialog follows light and dark themes and OSC 4/10/11
+/// changes. Blue (palette 4) rings the focused choice.
+pub fn drawModal(
+    self: *Renderer,
+    state: *const vt.RenderState,
+    canvas: Canvas,
+    grid: Canvas,
+    modal: *const Modal,
+) !void {
+    const fg = state.colors.foreground;
+    const bg = state.colors.background;
+    // Light themes need less black for the same dimming; on dark themes the
+    // dialog also lifts its surface toward the foreground to stand out.
+    const dark = lightness(bg) < lightness(fg);
+    try canvas.blendRect(0, 0, canvas.width, canvas.height, argb(.{ .r = 0, .g = 0, .b = 0 }), if (dark) 150 else 110);
+    const surface = if (dark) blendRgb(fg, bg, 20) else bg;
+    const border = blendRgb(fg, surface, 80);
+    const muted = blendRgb(fg, surface, 150);
+    const well = blendRgb(fg, surface, 16);
+    const idle = blendRgb(fg, surface, 36);
+    const focus = state.colors.palette[4];
+
+    const l = modal.layout(state.cols, state.rows);
+    const cw = self.font.cell_width;
+    const ch = self.font.cell_height;
+    const box_x: u31 = l.x * cw;
+    const box_y: u31 = l.y * ch;
+    const box_w: u31 = l.width * cw;
+    const box_h: u31 = l.height * ch;
+    try grid.fillRect(box_x, box_y, box_w, box_h, argb(surface));
+    const t: u31 = @intCast(@max(1, self.font.sprite_metrics.box_thickness));
+    try grid.fillRect(box_x, box_y, box_w, t, argb(border));
+    try grid.fillRect(box_x, box_y + box_h - t, box_w, t, argb(border));
+    try grid.fillRect(box_x, box_y, t, box_h, argb(border));
+    try grid.fillRect(box_x + box_w - t, box_y, t, box_h, argb(border));
+
+    const content = &modal.content;
+    try self.drawModalLine(grid, l.title, l.inner_x, l.title_y, l.inner_width, fg, .bold);
+    if (l.detail_len > 0) {
+        try grid.fillRect((l.inner_x - 1) * cw, l.detail_y * ch, (l.inner_width + 2) * cw, @as(u31, l.detail_len) * ch, argb(well));
+    }
+    for (l.detail[0..l.detail_len], 0..) |line, i| {
+        try self.drawModalLine(grid, line, l.inner_x, l.detail_y + @as(u16, @intCast(i)), l.inner_width, fg, .regular);
+    }
+    for (l.message[0..l.message_len], 0..) |line, i| {
+        try self.drawModalLine(grid, line, l.inner_x, l.message_y + @as(u16, @intCast(i)), l.inner_width, muted, .regular);
+    }
+
+    // Buttons grow a quarter cell above and below their label row, into the
+    // blank row above and the bottom padding row.
+    const button_pad_y: u31 = ch / 4;
+    const row_y: u31 = l.buttons_y * ch - button_pad_y;
+    const button_h: u31 = ch + 2 * button_pad_y;
+    // The ring sits in the gaps between buttons, clear of their fill.
+    const ring_t: u31 = 2 * t;
+    const ring_gap: u31 = 2 * t;
+    var x: u31 = l.buttons_x;
+    for (content.choices, 0..) |choice, i| {
+        const label_width: u31 = @intCast(Modal.textWidth(choice.label));
+        const width = label_width + 2 * Modal.button_padding;
+        const focused = i == modal.focused;
+        try grid.fillRect(x * cw, row_y, width * cw, button_h, argb(idle));
+        if (focused) {
+            const out = ring_gap + ring_t;
+            const rx = x * cw - out;
+            const ry = row_y - out;
+            const rw = width * cw + 2 * out;
+            const rh = button_h + 2 * out;
+            try grid.fillRect(rx, ry, rw, ring_t, argb(focus));
+            try grid.fillRect(rx, ry + rh - ring_t, rw, ring_t, argb(focus));
+            try grid.fillRect(rx, ry, ring_t, rh, argb(focus));
+            try grid.fillRect(rx + rw - ring_t, ry, ring_t, rh, argb(focus));
+        }
+        const label_x = x + Modal.button_padding;
+        try self.drawModalLine(grid, .{ .text = choice.label }, label_x, l.buttons_y, label_width, fg, if (focused) .bold else .regular);
+        if (choice.key) |key| underline: {
+            const index = for (choice.label, 0..) |byte, j| {
+                if (std.ascii.toLower(byte) == key) break j;
+            } else break :underline;
+            const column: u31 = @intCast(Modal.textWidth(choice.label[0..index]));
+            const metrics = self.font.sprite_metrics;
+            try grid.fillRect((label_x + column) * cw, l.buttons_y * ch + @as(u31, @intCast(metrics.underline_position)), cw, @intCast(@max(1, metrics.underline_thickness)), argb(fg));
+        }
+        x += width + Modal.button_gap;
+    }
+}
+
+fn drawModalLine(
+    self: *Renderer,
+    canvas: Canvas,
+    line: Modal.Line,
+    x: u31,
+    row: u16,
+    width: u31,
+    fg: vt.color.RGB,
+    style: Font.FaceStyle,
+) !void {
+    const y = @as(u31, row) * self.font.cell_height;
+    const used = try self.drawOverlayRun(canvas, try self.overlayCodepoints(line.text), x, y, width, fg, style);
+    if (line.ellipsis) _ = try self.drawOverlayRun(canvas, &.{0x2026}, x + used, y, width - used, fg, style);
+}
+
+/// Rec. 709 weights on encoded channels; enough to tell a light theme from a
+/// dark one.
+fn lightness(rgb: vt.color.RGB) u32 {
+    return 2126 * @as(u32, rgb.r) + 7152 * @as(u32, rgb.g) + 722 * @as(u32, rgb.b);
+}
+
 /// Draw a macOS-style overlay scrollbar: a narrow adaptive pill with no
 /// track. Geometry is in full-surface physical pixels rather than grid-local
 /// pixels, so the thumb stays against the window edge when padding is used.
@@ -1061,7 +1172,6 @@ fn renderTextOverlay(
     const box_width = visible.width + padding * 2;
     const box_x: u31 = if (position == .top_right) cols - box_width else 0;
     const y: u31 = if (position == .top_right) 0 else canvas.height - self.font.cell_height;
-    const baseline_y: i32 = @as(i32, @intCast(y)) + self.font.baseline;
 
     try canvas.fillRect(
         box_x * self.font.cell_width,
@@ -1071,18 +1181,36 @@ fn renderTextOverlay(
         argb(bg),
     );
 
-    var x = box_x + padding;
-    var i = visible.start;
-    const text_end = x + visible.width;
+    _ = try self.drawOverlayRun(canvas, cps[visible.start..], box_x + padding, y, visible.width, fg, .regular);
+}
+
+/// Draw codepoints left to right from cell column `x_start` on the cell row
+/// whose top is `y`, stopping before a cluster would pass `max_width` cells.
+/// Returns the cells used.
+fn drawOverlayRun(
+    self: *Renderer,
+    canvas: Canvas,
+    cps: []const u21,
+    x_start: u31,
+    y: u31,
+    max_width: u31,
+    fg: vt.color.RGB,
+    style: Font.FaceStyle,
+) !u31 {
+    const baseline_y: i32 = @as(i32, @intCast(y)) + self.font.baseline;
+    var x = x_start;
+    var i: usize = 0;
+    const text_end = x_start + max_width;
     while (i < cps.len and x < text_end) {
         const cluster = vt.unicode.graphemeWidth(u21, cps[i..]);
         if (cluster.len == 0) break;
         const cp = cps[i];
-        i += cluster.len;
         const span: u31 = cluster.width;
+        if (x + span > text_end) break;
+        i += cluster.len;
         if (span == 0) continue;
 
-        const face_idx = self.font.faceForCodepoint(self.alloc, cp);
+        const face_idx = self.font.faceForCluster(self.alloc, &.{cp}, style);
         if (face_idx == Font.sprite_face_index) {
             const g = try self.font.spriteGlyph(self.alloc, cp, @intCast(@min(span, 2)));
             self.noteOverhang(@as(i32, self.font.baseline) - g.bearing_y, g.height);
@@ -1111,6 +1239,7 @@ fn renderTextOverlay(
         }
         x += span;
     }
+    return x - x_start;
 }
 
 fn renderKittyItems(

@@ -1,4 +1,5 @@
-//! Automatic links derived from visible terminal text.
+//! Automatic links derived from visible terminal text, and which hyperlink
+//! targets may open without asking.
 
 const std = @import("std");
 
@@ -38,6 +39,18 @@ const schemes = [_]Scheme{
     .{ .prefix = "gopher://", .kind = .authority },
     .{ .prefix = "news:", .kind = .opaque_uri },
 };
+
+/// Whether an OSC 8 hyperlink target may open without asking. Its text can
+/// differ from its target, and most schemes hand the target to whatever app
+/// registered them, which may act on it at once. Web and mail links go to a
+/// browser or a mail composer instead.
+pub fn opensWithoutAsking(uri: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, uri, ':') orelse return false;
+    const scheme = uri[0..colon];
+    if (std.ascii.eqlIgnoreCase(scheme, "mailto")) return true;
+    if (!std.ascii.eqlIgnoreCase(scheme, "https") and !std.ascii.eqlIgnoreCase(scheme, "http")) return false;
+    return std.mem.startsWith(u8, uri[colon..], "://") and uri.len > colon + 3;
+}
 
 /// Find the first automatic link at or after `offset`.
 pub fn find(text: []const u8, offset: usize) ?Match {
@@ -286,4 +299,23 @@ test "automatic links keep byte offsets across Unicode separators" {
     try std.testing.expectEqual(@as(usize, 29), second.start);
     try std.testing.expectEqualStrings("mailto:u@example.net", text[second.start..second.end]);
     try std.testing.expectEqual(null, find(text, second.end));
+}
+
+test "only web and mail hyperlinks open without asking" {
+    for ([_][]const u8{ "https://example.com", "HTTP://example.com/a", "mailto:a@example.com" }) |uri| {
+        try std.testing.expect(opensWithoutAsking(uri));
+    }
+    for ([_][]const u8{
+        "steam://run/440",
+        "file:///etc/passwd",
+        "magnet:?xt=urn:btih:abc",
+        "javascript:alert(1)",
+        "https:relative",
+        "https://",
+        "xhttps://example.com",
+        "example.com",
+        "",
+    }) |uri| {
+        try std.testing.expect(!opensWithoutAsking(uri));
+    }
 }
