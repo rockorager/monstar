@@ -8112,13 +8112,13 @@ fn hasReadyRedraw(self: *App) bool {
 fn redrawIfNeeded(self: *App) !void {
     if (self.canCommitHeldFrame()) self.commitHeldFrame();
     if (!self.hasContentRedraw()) return;
-    switch (try self.startAsyncRender()) {
-        .submitted, .no_work => {
-            self.needs_redraw = false;
-            self.geometry_redraw = false;
-        },
-        .deferred => {},
-    }
+    const started = try self.startAsyncRender();
+    if (started == .deferred) return;
+    self.needs_redraw = false;
+    self.geometry_redraw = false;
+    // Dropped frames force the next one in full, so a committed frame is
+    // attached.
+    if (started == .no_work) self.window.commitConfigure();
 }
 
 /// Commit a finished frame that was held for the frame callback, unless
@@ -8482,6 +8482,7 @@ fn finishAsyncRender(self: *App) void {
         // The target may have been repaired, but it matches the current
         // surface. Do not advance frame history unless a commit does.
         self.cancelFrameTarget(frame);
+        self.window.commitConfigure();
         self.clearRenderDirty();
         self.syncTextInputCursorRect(&self.render_state);
         return;

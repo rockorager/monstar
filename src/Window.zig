@@ -95,6 +95,8 @@ surface_preferred_scale: ?u32,
 pending_scale_changed: bool,
 pending_geometry_changed: bool,
 pending_draw: bool,
+/// An acked configure awaits the surface commit that applies it.
+configure_uncommitted: bool,
 running: bool,
 fatal_error: ?anyerror,
 /// A frame callback is outstanding; committing now would outpace the
@@ -455,6 +457,7 @@ pub fn create(
         .pending_scale_changed = false,
         .pending_geometry_changed = false,
         .pending_draw = false,
+        .configure_uncommitted = false,
         .running = true,
         .fatal_error = null,
         .frame_pending = false,
@@ -958,6 +961,7 @@ pub fn commitRender(self: *Window, buffer: *Buffer, damage: Damage) !void {
         telemetry.beforeCommit(self.surface, phys_width, phys_height);
     }
     self.surface.commit();
+    self.configure_uncommitted = false;
     buffer.busy = true;
     if (self.initial_activation_token) |token| {
         self.initial_activation_token = null;
@@ -997,6 +1001,7 @@ pub fn beginExternalCommit(self: *Window, width: u31, height: u31) !void {
 }
 
 pub fn endExternalCommit(self: *Window) void {
+    self.configure_uncommitted = false;
     if (self.initial_activation_token) |token| {
         self.initial_activation_token = null;
         if (token.len > 0) self.activate(token);
@@ -1750,6 +1755,7 @@ fn xdgSurfaceListener(xdg_surface: *xdg.Surface, event: xdg.Surface.Event, self:
     switch (event) {
         .configure => |configure| {
             xdg_surface.ackConfigure(configure.serial);
+            self.configure_uncommitted = true;
             const resized = self.width != self.pending_width or
                 self.height != self.pending_height;
             self.width = self.pending_width;
@@ -1794,6 +1800,16 @@ fn commitResizedViewport(self: *Window) void {
     else
         self.surface.damage(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
     self.surface.commit();
+    self.configure_uncommitted = false;
+}
+
+/// Commit an acked configure that no new frame will carry, such as a state
+/// change that keeps the size. Call only once a frame is attached and no
+/// render target is checked out.
+pub fn commitConfigure(self: *Window) void {
+    if (!self.configure_uncommitted) return;
+    self.surface.commit();
+    self.configure_uncommitted = false;
 }
 
 fn scheduleDraw(self: *Window) void {
