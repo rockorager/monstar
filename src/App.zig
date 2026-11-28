@@ -7259,6 +7259,26 @@ fn handleScrollbackKey(self: *App, event: vt.input.KeyEvent, scroll: KeyBindingA
     self.syncHoveredLink(true);
 }
 
+const FontSizeAction = enum {
+    increase,
+    decrease,
+    reset,
+};
+
+fn fontSizeShortcutAction(event: vt.input.KeyEvent) ?FontSizeAction {
+    if (!event.mods.ctrl or event.mods.alt or event.mods.super) return null;
+    // Allow Shift only when the layout consumed it to produce the character
+    // (for example `+` on US, `=` on latam/de, or `0` on French AZERTY).
+    if (event.mods.shift and !event.consumed_mods.shift) return null;
+    if (event.utf8.len != 1) return null;
+    return switch (event.utf8[0]) {
+        '+', '=' => .increase,
+        '-' => .decrease,
+        '0' => .reset,
+        else => null,
+    };
+}
+
 fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     var utf8_buf: [16]u8 = undefined;
     const event = self.keyboard.translate(&utf8_buf, evdev_keycode, action) orelse return;
@@ -7286,14 +7306,13 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     } else if (!event.mods.alt and !event.mods.super) {
         // Fixed shortcuts fire once, but their matching repeats and releases
         // must not leak into the application as keyboard-protocol input.
-        // Shift is only allowed on `=` (for `Ctrl++`); ctrl+_ and ctrl+) belong to the application.
-        if (event.mods.ctrl) {
-            switch (event.unshifted_codepoint) {
-                '=' => return if (action == .press) self.adjustRuntimeFontSize(1),
-                '-' => if (!event.mods.shift) return if (action == .press) self.adjustRuntimeFontSize(-1),
-                '0' => if (!event.mods.shift) return if (action == .press) self.resetRuntimeFontSize(),
-                else => {},
-            }
+        if (fontSizeShortcutAction(event)) |font_action| {
+            if (action == .press) switch (font_action) {
+                .increase => self.adjustRuntimeFontSize(1),
+                .decrease => self.adjustRuntimeFontSize(-1),
+                .reset => self.resetRuntimeFontSize(),
+            };
+            return;
         }
 
         // Copy/paste bindings take priority over the application.
@@ -7333,6 +7352,140 @@ fn onKey(self: *App, evdev_keycode: u32, action: vt.input.KeyAction) void {
     }
 }
 
+fn loadTestKeymap(keyboard: *Keyboard, layout: [*:0]const u8) !void {
+    const linux = std.os.linux;
+    const names: c.xkb_rule_names = .{ .layout = layout, .options = "" };
+    const keymap = c.xkb_keymap_new_from_names(keyboard.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse
+        return error.KeymapParseFailed;
+    defer c.xkb_keymap_unref(keymap);
+    const keymap_text = c.xkb_keymap_get_as_string(keymap, c.XKB_KEYMAP_FORMAT_TEXT_V1) orelse
+        return error.KeymapParseFailed;
+    defer std.c.free(keymap_text);
+    const keymap_size = std.mem.len(keymap_text) + 1;
+    const keymap_fd = try posix.memfd_createZ("shortcut-test", linux.MFD.CLOEXEC);
+    // setKeymap takes ownership of this fd, including on failure.
+    try std.testing.expectEqual(keymap_size, linux.write(keymap_fd, keymap_text, keymap_size));
+    try keyboard.setKeymap(keymap_fd, @intCast(keymap_size));
+}
+
+test "font size shortcuts resolve layout-produced characters across keyboard layouts" {
+    const Case = struct {
+        evdev: u32,
+        shift: bool = false,
+        num_lock: bool = false,
+        extra_mod: ?u32 = null,
+        expected: ?FontSizeAction,
+    };
+    const layouts = [_]struct { layout: [*:0]const u8, cases: []const Case }{
+        .{
+            .layout = "us",
+            .cases = &.{
+                .{ .evdev = 13, .expected = .increase }, // Ctrl+=
+                .{ .evdev = 13, .shift = true, .expected = .increase }, // Ctrl++ (Shift+=)
+                .{ .evdev = 12, .expected = .decrease }, // Ctrl+-
+                .{ .evdev = 12, .shift = true, .expected = null }, // Ctrl+_ (readline undo)
+                .{ .evdev = 11, .expected = .reset }, // Ctrl+0
+                .{ .evdev = 11, .shift = true, .expected = null }, // Ctrl+)
+                .{ .evdev = 78, .expected = .increase }, // Ctrl+KP_Add
+                .{ .evdev = 78, .shift = true, .expected = null }, // unconsumed Shift
+                .{ .evdev = 74, .expected = .decrease }, // Ctrl+KP_Subtract
+                .{ .evdev = 74, .shift = true, .expected = null }, // unconsumed Shift
+                .{ .evdev = 82, .expected = null }, // Ctrl+KP_Insert (NumLock off)
+                .{ .evdev = 82, .num_lock = true, .expected = .reset }, // Ctrl+KP_0 (NumLock on)
+                .{ .evdev = 82, .num_lock = true, .shift = true, .expected = null }, // unconsumed Shift
+                .{ .evdev = 13, .extra_mod = 56, .expected = null }, // Ctrl+Alt+=
+                .{ .evdev = 13, .extra_mod = 125, .expected = null }, // Ctrl+Super+=
+            },
+        },
+        .{
+            .layout = "latam",
+            .cases = &.{
+                .{ .evdev = 27, .expected = .increase }, // Ctrl++ (unshifted AD12)
+                .{ .evdev = 27, .shift = true, .expected = null }, // Ctrl+*
+                .{ .evdev = 53, .expected = .decrease }, // Ctrl+- (AB10)
+                .{ .evdev = 53, .shift = true, .expected = null }, // Ctrl+_
+                .{ .evdev = 11, .expected = .reset }, // Ctrl+0 (AE10)
+                .{ .evdev = 11, .shift = true, .expected = .increase }, // Ctrl+= (Shift+0)
+                .{ .evdev = 78, .expected = .increase }, // Ctrl+KP_Add
+            },
+        },
+        .{
+            .layout = "de",
+            .cases = &.{
+                .{ .evdev = 27, .expected = .increase }, // Ctrl++ (AD12)
+                .{ .evdev = 27, .shift = true, .expected = null }, // Ctrl+*
+                .{ .evdev = 53, .expected = .decrease }, // Ctrl+- (AB10)
+                .{ .evdev = 11, .expected = .reset }, // Ctrl+0 (AE10)
+                .{ .evdev = 11, .shift = true, .expected = .increase }, // Ctrl+= (Shift+0)
+            },
+        },
+        .{
+            .layout = "fr",
+            .cases = &.{
+                .{ .evdev = 13, .expected = .increase }, // Ctrl+= (AE12)
+                .{ .evdev = 13, .shift = true, .expected = .increase }, // Ctrl++ (Shift+=)
+                .{ .evdev = 7, .expected = .decrease }, // Ctrl+- (AE06)
+                .{ .evdev = 7, .shift = true, .expected = null }, // Ctrl+6
+                .{ .evdev = 11, .expected = null }, // Ctrl+à
+                .{ .evdev = 11, .shift = true, .expected = .reset }, // Ctrl+0 (Shift+à)
+            },
+        },
+        .{
+            .layout = "jp",
+            .cases = &.{
+                .{ .evdev = 39, .expected = null }, // Ctrl+;
+                .{ .evdev = 39, .shift = true, .expected = .increase }, // Ctrl++ (Shift+;)
+                .{ .evdev = 12, .expected = .decrease }, // Ctrl+- (AE11)
+                .{ .evdev = 12, .shift = true, .expected = .increase }, // Ctrl+= (Shift+-)
+                .{ .evdev = 11, .expected = .reset }, // Ctrl+0
+            },
+        },
+        .{
+            .layout = "cz",
+            .cases = &.{
+                .{ .evdev = 2, .expected = .increase }, // Ctrl++ (AE01)
+                .{ .evdev = 2, .shift = true, .expected = null }, // Ctrl+1
+                .{ .evdev = 12, .expected = .increase }, // Ctrl+= (AE11)
+                .{ .evdev = 12, .shift = true, .expected = null }, // Ctrl+%
+                .{ .evdev = 53, .expected = .decrease }, // Ctrl+- (AB10)
+                .{ .evdev = 11, .shift = true, .expected = .reset }, // Ctrl+0 (Shift+é)
+            },
+        },
+    };
+
+    for (layouts) |group| {
+        var kb: Keyboard = try .init();
+        defer kb.deinit();
+        try loadTestKeymap(&kb, group.layout);
+        _ = c.xkb_state_update_key(kb.state.?, 29 + 8, c.XKB_KEY_DOWN); // Ctrl
+
+        for (group.cases) |case| {
+            if (case.num_lock) {
+                _ = c.xkb_state_update_key(kb.state.?, 69 + 8, c.XKB_KEY_DOWN);
+                _ = c.xkb_state_update_key(kb.state.?, 69 + 8, c.XKB_KEY_UP);
+            }
+            defer if (case.num_lock) {
+                _ = c.xkb_state_update_key(kb.state.?, 69 + 8, c.XKB_KEY_DOWN);
+                _ = c.xkb_state_update_key(kb.state.?, 69 + 8, c.XKB_KEY_UP);
+            };
+            if (case.shift) _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_DOWN);
+            defer if (case.shift) {
+                _ = c.xkb_state_update_key(kb.state.?, 42 + 8, c.XKB_KEY_UP);
+            };
+            if (case.extra_mod) |mod| _ = c.xkb_state_update_key(kb.state.?, mod + 8, c.XKB_KEY_DOWN);
+            defer if (case.extra_mod) |mod| {
+                _ = c.xkb_state_update_key(kb.state.?, mod + 8, c.XKB_KEY_UP);
+            };
+
+            var utf8_buf: [16]u8 = undefined;
+            for ([_]vt.input.KeyAction{ .press, .repeat, .release }) |action| {
+                const event = kb.translate(&utf8_buf, case.evdev, action).?;
+                try std.testing.expectEqual(case.expected, fontSizeShortcutAction(event));
+            }
+        }
+    }
+}
+
 test "fixed shortcuts consume repeats and releases only with matching modifiers" {
     const alloc = std.testing.allocator;
     const linux = std.os.linux;
@@ -7367,18 +7520,7 @@ test "fixed shortcuts consume repeats and releases only with matching modifiers"
     defer alloc.destroy(app.window);
     app.window.pointer_enter_serial = null;
 
-    const names: c.xkb_rule_names = .{ .layout = "us", .options = "" };
-    const keymap = c.xkb_keymap_new_from_names(app.keyboard.context, &names, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse
-        return error.KeymapParseFailed;
-    defer c.xkb_keymap_unref(keymap);
-    const keymap_text = c.xkb_keymap_get_as_string(keymap, c.XKB_KEYMAP_FORMAT_TEXT_V1) orelse
-        return error.KeymapParseFailed;
-    defer std.c.free(keymap_text);
-    const keymap_size = std.mem.len(keymap_text) + 1;
-    const keymap_fd = try posix.memfd_createZ("shortcut-test", linux.MFD.CLOEXEC);
-    // setKeymap takes ownership of this fd, including on failure.
-    try std.testing.expectEqual(keymap_size, linux.write(keymap_fd, keymap_text, keymap_size));
-    try app.keyboard.setKeymap(keymap_fd, @intCast(keymap_size));
+    try loadTestKeymap(&app.keyboard, "us");
     _ = c.xkb_state_update_key(app.keyboard.state.?, 29 + 8, c.XKB_KEY_DOWN); // Ctrl
 
     for ([_]bool{ false, true }) |kitty| {
@@ -7481,6 +7623,52 @@ test "fixed shortcuts consume repeats and releases only with matching modifiers"
             };
             try std.testing.expectEqualStrings(if (action == .release) "" else "\x1b[13;2u", buf[0..n]);
         }
+    }
+
+    // Non-US layouts (latam): unshifted Ctrl++ (AD12), Ctrl+KP_Add, Ctrl+Shift+0
+    // (=), Ctrl+- (AB10), and Ctrl+0 consume repeats and releases, while
+    // Ctrl+Shift+- (_) and Ctrl+Shift++ (*) still reach the application.
+    try loadTestKeymap(&app.keyboard, "latam");
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 29 + 8, c.XKB_KEY_DOWN); // Ctrl
+    for ([_]bool{ false, true }) |kitty| {
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        if (kitty) stream.nextSlice("\x1b[>3u");
+        defer if (kitty) stream.nextSlice("\x1b[<u");
+
+        for ([_]struct { key: u32, shift: bool }{
+            .{ .key = 27, .shift = false }, // Ctrl++
+            .{ .key = 78, .shift = false }, // Ctrl+KP_Add
+            .{ .key = 53, .shift = false }, // Ctrl+-
+            .{ .key = 11, .shift = false }, // Ctrl+0
+            .{ .key = 11, .shift = true }, // Ctrl+= (Shift+0)
+        }) |case| {
+            if (case.shift) _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_DOWN);
+            defer if (case.shift) {
+                _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_UP);
+            };
+            for ([_]vt.input.KeyAction{ .repeat, .release }) |action| {
+                app.onKey(case.key, action);
+                const n = posix.read(fds[0], &buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                try std.testing.expectEqualStrings("", buf[0..n]);
+            }
+        }
+    }
+    _ = c.xkb_state_update_key(app.keyboard.state.?, 42 + 8, c.XKB_KEY_DOWN); // Shift
+    app.onKey(53, .press); // Ctrl+_ (latam Shift+-)
+    const undo_n = try posix.read(fds[0], &buf);
+    try std.testing.expectEqualStrings("\x1f", buf[0..undo_n]);
+    {
+        var stream = app.term.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("\x1b[>3u");
+        defer stream.nextSlice("\x1b[<u");
+        app.onKey(27, .press); // Ctrl+* (latam Shift++)
+        const star_n = try posix.read(fds[0], &buf);
+        try std.testing.expect(star_n > 0);
     }
 }
 
